@@ -22,7 +22,7 @@ on:
 
 permissions:
   contents: write
-  # `tunnel-docker` job pushes to ghcr.io/${{ github.repository_owner }}/mhrv-tunnel-node.
+  # `tunnel-docker` job pushes to ghcr.io/${{ github.repository_owner }}/rahgozar-tunnel-node.
   # `packages: write` is required by docker/login-action when authenticating
   # to GHCR with the workflow's auto-provisioned GITHUB_TOKEN. Granted at
   # the workflow level so the matrix-build job (which doesn't need it) and
@@ -31,7 +31,7 @@ permissions:
   packages: write
 
 # Auto-updater public key, embedded into every release binary at compile
-# time via `option_env!("MHRV_UPDATE_PUBKEY")` (see src/update_apply.rs).
+# time via `option_env!("RAHGOZAR_UPDATE_PUBKEY")` (see src/update_apply.rs).
 # Read from the repo variable `MINISIGN_PUBLIC_KEY` — the bare base64 line
 # from a `minisign -G` .pub file (the one *after* the `untrusted comment`).
 #
@@ -43,9 +43,9 @@ permissions:
 #
 # To enable signed updates end-to-end:
 #   1. Generate a keypair (one-time, offline):
-#        rsign generate -p mhrv-update.pub -s mhrv-update.key
-#   2. `gh variable set MINISIGN_PUBLIC_KEY --body "$(tail -1 mhrv-update.pub)"`
-#   3. `gh secret set MINISIGN_SECRET_KEY < mhrv-update.key`
+#        rsign generate -p rahgozar-update.pub -s rahgozar-update.key
+#   2. `gh variable set MINISIGN_PUBLIC_KEY --body "$(tail -1 rahgozar-update.pub)"`
+#   3. `gh secret set MINISIGN_SECRET_KEY < rahgozar-update.key`
 #   4. Optional, for passphrased keys:
 #        `gh secret set MINISIGN_KEY_PASSWORD --body 'your-passphrase'`
 #   5. `gh variable set MINISIGN_SIGNING_ENABLED --body true`
@@ -53,7 +53,7 @@ permissions:
 # Once those are set, the next tag push produces signed artifacts
 # and the freshly-built binaries enforce verification on the next update.
 env:
-  MHRV_UPDATE_PUBKEY: ${{ vars.MINISIGN_SIGNING_ENABLED == 'true' && vars.MINISIGN_PUBLIC_KEY || '' }}
+  RAHGOZAR_UPDATE_PUBKEY: ${{ vars.MINISIGN_SIGNING_ENABLED == 'true' && vars.MINISIGN_PUBLIC_KEY || '' }}
 
 # Runner strategy:
 #   - Linux + Android + mipsel:       self-hosted (mhrv-hetzner-*, Hetzner
@@ -290,7 +290,7 @@ jobs:
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           docker run --rm -v "$PWD":/src -w /src \
-            -e MHRV_UPDATE_PUBKEY \
+            -e RAHGOZAR_UPDATE_PUBKEY \
             messense/rust-musl-cross:x86_64-musl \
             cargo build --release --target x86_64-unknown-linux-musl --bin rahgozar
           sudo chown -R "$(id -u):$(id -g)" target
@@ -299,7 +299,7 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: |
           docker run --rm -v "$PWD":/src -w /src \
-            -e MHRV_UPDATE_PUBKEY \
+            -e RAHGOZAR_UPDATE_PUBKEY \
             messense/rust-musl-cross:aarch64-musl \
             cargo build --release --target aarch64-unknown-linux-musl --bin rahgozar
           sudo chown -R "$(id -u):$(id -g)" target
@@ -337,7 +337,7 @@ jobs:
           trap 'sudo chown -R "$(id -u):$(id -g)" target 2>/dev/null || true' EXIT
           docker run --rm -v "$PWD":/src -w /src \
             -e RUSTFLAGS='-C target-feature=+soft-float' \
-            -e MHRV_UPDATE_PUBKEY \
+            -e RAHGOZAR_UPDATE_PUBKEY \
             messense/rust-musl-cross:mipsel-musl \
             bash -c '
               set -eux
@@ -653,7 +653,7 @@ jobs:
           RSIGN_PASSWORD: ${{ secrets.MINISIGN_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          if [ -z "${MHRV_UPDATE_PUBKEY:-}" ]; then
+          if [ -z "${RAHGOZAR_UPDATE_PUBKEY:-}" ]; then
             echo "::error::MINISIGN_SIGNING_ENABLED is true but MINISIGN_PUBLIC_KEY repo variable is empty"
             exit 1
           fi
@@ -710,7 +710,7 @@ jobs:
   # takes 8+ minutes if it works, blocks anyone without Rust experience.
   # A prebuilt multi-arch image makes deployment a one-liner:
   #   docker run -d -p 8080:8080 -e TUNNEL_AUTH_KEY=... \
-  #     ghcr.io/dazzling-no-more/mhrv-tunnel-node:latest
+  #     ghcr.io/dazzling-no-more/rahgozar-tunnel-node:latest
   #
   # Tags published per release:
   #   v1.5.0       — exact version pin
@@ -767,9 +767,9 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/${{ github.repository_owner }}/mhrv-tunnel-node:${{ steps.ver.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/mhrv-tunnel-node:${{ steps.ver.outputs.minor }}
-            ${{ github.event_name == 'push' && format('ghcr.io/{0}/mhrv-tunnel-node:latest', github.repository_owner) || '' }}
+            ghcr.io/${{ github.repository_owner }}/rahgozar-tunnel-node:${{ steps.ver.outputs.version }}
+            ghcr.io/${{ github.repository_owner }}/rahgozar-tunnel-node:${{ steps.ver.outputs.minor }}
+            ${{ github.event_name == 'push' && format('ghcr.io/{0}/rahgozar-tunnel-node:latest', github.repository_owner) || '' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

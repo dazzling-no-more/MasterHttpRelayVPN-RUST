@@ -432,7 +432,7 @@ fn update_check_to_json(u: &crate::update_check::UpdateCheck) -> String {
 /// asset to `destPath` using the same rustls + redirect-following client
 /// the desktop UI uses (so we go through CA-pinned TLS, no Java/OkHttp
 /// dependency on the Kotlin side). When this build embeds
-/// `MHRV_UPDATE_PUBKEY`, also downloads `<url>.minisig` and verifies the
+/// `RAHGOZAR_UPDATE_PUBKEY`, also downloads `<url>.minisig` and verifies the
 /// asset before returning success. BLOCKS — call from IO dispatcher.
 ///
 /// Returns a JSON blob:
@@ -502,7 +502,7 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_downloadAsset<'a>(
                     tracing::info!("android: minisign signature verified for {}", dest_s);
                 } else {
                     tracing::warn!(
-                        "android: MHRV_UPDATE_PUBKEY was not set at build time — \
+                        "android: RAHGOZAR_UPDATE_PUBKEY was not set at build time — \
                          installing update without minisign check (rollout mode)."
                     );
                 }

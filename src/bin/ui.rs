@@ -79,11 +79,11 @@ fn main() -> eframe::Result<()> {
     // #28) can force the wgpu backend — DX12 on Windows, Vulkan on
     // Linux, Metal on macOS — by setting the env var:
     //
-    //     MHRV_RENDERER=wgpu rahgozar-ui
+    //     RAHGOZAR_RENDERER=wgpu rahgozar-ui
     //
     // The launcher scripts (run.bat / run.command / run.sh) honour
     // the same variable and forward it through.
-    let use_wgpu = std::env::var("MHRV_RENDERER")
+    let use_wgpu = std::env::var("RAHGOZAR_RENDERER")
         .map(|v| v.eq_ignore_ascii_case("wgpu"))
         .unwrap_or(false);
     let options = eframe::NativeOptions {

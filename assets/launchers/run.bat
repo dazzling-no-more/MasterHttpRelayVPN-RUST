@@ -47,10 +47,10 @@ if not "%UI_EXIT%"=="0" (
     echo or "PainterError" above, your machine doesn't have a usable OpenGL
     echo driver. Retrying once with the DirectX/Vulkan backend...
     echo.
-    set MHRV_RENDERER=wgpu
+    set RAHGOZAR_RENDERER=wgpu
     "%~dp0rahgozar-ui.exe"
     set UI_EXIT=%ERRORLEVEL%
-    set MHRV_RENDERER=
+    set RAHGOZAR_RENDERER=
     if not "%UI_EXIT%"=="0" (
         echo.
         echo ---------------------------------------------------

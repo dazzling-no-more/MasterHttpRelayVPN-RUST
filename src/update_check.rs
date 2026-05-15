@@ -562,8 +562,8 @@ mod tests {
     // Gated by an env var so CI doesn't hit the GitHub API on every run.
     #[tokio::test(flavor = "multi_thread")]
     async fn live_hit_github_if_enabled() {
-        if std::env::var("MHRV_LIVE_UPDATE_CHECK").is_err() {
-            eprintln!("skipping live update check (set MHRV_LIVE_UPDATE_CHECK=1 to run)");
+        if std::env::var("RAHGOZAR_LIVE_UPDATE_CHECK").is_err() {
+            eprintln!("skipping live update check (set RAHGOZAR_LIVE_UPDATE_CHECK=1 to run)");
             return;
         }
         let _ = rustls::crypto::ring::default_provider().install_default();

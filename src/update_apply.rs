@@ -19,7 +19,7 @@
 //! Build with:
 //!
 //! ```text
-//! MHRV_UPDATE_PUBKEY="$(tail -n1 mhrv.pub)" cargo build --release
+//! RAHGOZAR_UPDATE_PUBKEY="$(tail -n1 mhrv.pub)" cargo build --release
 //! ```
 //!
 //! Per release, in CI:
@@ -53,10 +53,10 @@
 //! `main.rs` don't need a `cfg` gate.
 
 /// Compile-time public key for verifying release assets. Set via
-/// `MHRV_UPDATE_PUBKEY` env var at build time. The expected format is the
+/// `RAHGOZAR_UPDATE_PUBKEY` env var at build time. The expected format is the
 /// base64 line from a minisign `.pub` file (the line *after* the `untrusted
 /// comment:` line).
-const PUBKEY_B64_RAW: Option<&str> = option_env!("MHRV_UPDATE_PUBKEY");
+const PUBKEY_B64_RAW: Option<&str> = option_env!("RAHGOZAR_UPDATE_PUBKEY");
 
 fn normalize_embedded_pubkey(raw: Option<&'static str>) -> Option<&'static str> {
     raw.and_then(|s| {
@@ -158,7 +158,7 @@ pub enum ApplyError {
     Download(String),
     #[error("extract: {0}")]
     Extract(String),
-    #[error("signature missing — refusing to apply unsigned update (rebuild without MHRV_UPDATE_PUBKEY to allow this)")]
+    #[error("signature missing — refusing to apply unsigned update (rebuild without RAHGOZAR_UPDATE_PUBKEY to allow this)")]
     SignatureMissing,
     #[error("signature invalid: {0}")]
     SignatureInvalid(String),
@@ -238,7 +238,7 @@ pub async fn download_and_stage(
         }
         (None, _) => {
             tracing::warn!(
-                "update_apply: MHRV_UPDATE_PUBKEY was not set at build time — \
+                "update_apply: RAHGOZAR_UPDATE_PUBKEY was not set at build time — \
                  applying update without signature check (insecure)."
             );
         }

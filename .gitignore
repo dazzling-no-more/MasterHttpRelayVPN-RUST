@@ -7,3 +7,10 @@
 /SCR-*.png
 .claude/
 .vscode/
+
+# Minisign keypair for release-asset signing. The .key file is the
+# secret — never commit. .pub is technically public but listed too
+# so neither shows up in `git status` and there's no chance of an
+# accidental `git add .`.
+/rahgozar-update.key
+/rahgozar-update.pub
