@@ -168,6 +168,17 @@ dependencies {
     testImplementation("androidx.test:core:1.6.1")
 }
 
+// Pick the JUnit 4 runner for all unit-test tasks. AGP doesn't
+// auto-select between JUnit 4 and 5 — without this the test task
+// will compile but report `No tests found` because no runner is
+// registered. (Unit tests don't pull in the cargo/JNI chain on
+// their own: `testDebugUnitTest` doesn't depend on
+// `mergeDebugJniLibFolders`, so the Rust crate isn't built for
+// the host JVM test loop — keeps the test cycle fast.)
+tasks.withType<org.gradle.api.tasks.testing.Test>().configureEach {
+    useJUnit()
+}
+
 // --------------------------------------------------------------------------
 // Cross-compile the Rust crate to arm64 Android and drop the .so into the
 // place Android's packager looks. We hand the work off to `cargo ndk` which

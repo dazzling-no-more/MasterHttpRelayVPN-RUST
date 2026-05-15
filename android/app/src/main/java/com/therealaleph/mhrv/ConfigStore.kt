@@ -78,17 +78,32 @@ enum class UiLang { AUTO, FA, EN }
 enum class Mode { APPS_SCRIPT, DIRECT, FULL }
 
 /**
- * One multi-edge fronting group. Mirrors the Rust `FrontingGroup`
- * struct in `src/config.rs` and the desktop UI's round-tripped form.
+ * One multi-edge fronting group. Mirrors the Rust-side `FrontingGroup`
+ * in [`src/config.rs`](../../../../../../src/config.rs).
  *
- * `domains` matches case-insensitively, exact OR dot-anchored suffix
- * (`vercel.com` covers `*.vercel.com`). First group whose member
- * matches wins, so put more-specific groups earlier in the list.
+ * Tells the proxy: when a CONNECT to one of [domains] arrives, dial
+ * [ip]:443, send the TLS handshake with `SNI=`[sni], then forward the
+ * inner HTTP `Host` to that edge. Picking a benign edge-hosted [sni]
+ * lets DPI see only that hostname while the real target stays inside
+ * the encrypted tunnel.
  */
 data class FrontingGroup(
+    /** Human-readable label used in log lines. Free-form. */
     val name: String,
+    /** Edge IP to dial. Today a single IP per group. */
     val ip: String,
+    /**
+     * SNI on the outbound TLS handshake. Must be served by the same
+     * edge as [domains] or the edge will refuse / 404. Auto-populated
+     * from the hostname the user typed when discovering via
+     * `Native.discoverFront`.
+     */
     val sni: String,
+    /**
+     * Domains routed through this edge. Case-insensitive; an entry
+     * matches the host exactly OR as a dot-anchored suffix (entry
+     * `vercel.com` matches `app.vercel.com` too).
+     */
     val domains: List<String>,
 )
 
@@ -338,6 +353,41 @@ data class MhrvConfig(
             put("fetch_ips_from_api", false)
             put("max_ips_to_scan", 20)
 
+            // Fronting groups: the snake_case JSON shape must match the
+            // Rust-side `FrontingGroup` serde format exactly, otherwise
+            // the proxy will refuse to start with "missing field". The
+            // `domains` array is trimmed/de-duped at write time so a
+            // user pasting messy input doesn't poison the persisted
+            // form.
+            //
+            // Drop draft groups (no domains yet) at save time:
+            // `Config::validate()` in src/config.rs rejects empty
+            // `domains` lists with a hard error, so persisting them
+            // would make Native.startProxy() return 0. The UI keeps
+            // them visible so the user can still fill in domains;
+            // they survive into the saved file only once non-empty.
+            val savableGroups = frontingGroups.mapNotNull { g ->
+                val cleaned = g.domains
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                    .distinct()
+                if (cleaned.isEmpty()) null else g.copy(domains = cleaned)
+            }
+            if (savableGroups.isNotEmpty()) {
+                put("fronting_groups", JSONArray().apply {
+                    savableGroups.forEach { g ->
+                        put(JSONObject().apply {
+                            put("name", g.name)
+                            put("ip", g.ip)
+                            put("sni", g.sni)
+                            put("domains", JSONArray().apply {
+                                g.domains.forEach { put(it) }
+                            })
+                        })
+                    }
+                })
+            }
+
             // Android-only: surfaced in the UI dropdown. The Rust side
             // doesn't read this key (serde ignores unknown fields), which
             // is intentional — proxy-vs-TUN is a service-layer decision
@@ -492,9 +542,21 @@ object ConfigStore {
         if (cleanRelayUrlPatterns.isNotEmpty()) {
             obj.put("relay_url_patterns", JSONArray().apply { cleanRelayUrlPatterns.forEach { put(it) } })
         }
-        if (cfg.frontingGroups.isNotEmpty()) {
+        // Fronting groups: include only fully-populated entries so the QR
+        // receiver doesn't import drafts that the proxy would refuse to
+        // load. Same drop-empty-domains rule as toJson(). Domains are
+        // trimmed + de-duped here so a sharer with messy input doesn't
+        // push that mess across devices.
+        val savableGroups = cfg.frontingGroups.mapNotNull { g ->
+            val cleaned = g.domains
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .distinct()
+            if (cleaned.isEmpty()) null else g.copy(domains = cleaned)
+        }
+        if (savableGroups.isNotEmpty()) {
             obj.put("fronting_groups", JSONArray().apply {
-                for (g in cfg.frontingGroups) {
+                savableGroups.forEach { g ->
                     put(JSONObject().apply {
                         put("name", g.name)
                         put("ip", g.ip)
