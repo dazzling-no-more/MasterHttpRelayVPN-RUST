@@ -23,8 +23,8 @@ use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName};
 use tokio_rustls::rustls::{ClientConfig, RootCertStore};
 use tokio_rustls::TlsConnector;
 
-const REPO_OWNER: &str = "therealaleph";
-const REPO_NAME: &str = "MasterHttpRelayVPN-RUST";
+const REPO_OWNER: &str = "dazzling-no-more";
+const REPO_NAME: &str = "rahgozar";
 const GITHUB_API_HOST: &str = "api.github.com";
 const GITHUB_HOST: &str = "github.com";
 const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");

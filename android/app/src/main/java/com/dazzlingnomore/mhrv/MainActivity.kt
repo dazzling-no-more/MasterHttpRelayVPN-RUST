@@ -1,4 +1,4 @@
-package com.therealaleph.mhrv
+package com.dazzlingnomore.mhrv
 
 import android.Manifest
 import android.app.Activity
@@ -21,9 +21,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
-import com.therealaleph.mhrv.ui.CaInstallOutcome
-import com.therealaleph.mhrv.ui.HomeScreen
-import com.therealaleph.mhrv.ui.theme.MhrvTheme
+import com.dazzlingnomore.mhrv.ui.CaInstallOutcome
+import com.dazzlingnomore.mhrv.ui.HomeScreen
+import com.dazzlingnomore.mhrv.ui.theme.MhrvTheme
 
 // UiLang is in the outer package namespace already.
 

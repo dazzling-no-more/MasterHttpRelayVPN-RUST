@@ -1,4 +1,4 @@
-package com.therealaleph.mhrv
+package com.dazzlingnomore.mhrv
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -498,7 +498,7 @@ class MhrvVpnService : VpnService() {
         private const val CHANNEL_ID = "mhrv.vpn.status"
         private const val NOTIF_ID = 0x1001
         private const val MTU = 1500
-        const val ACTION_STOP = "com.therealaleph.mhrv.STOP"
+        const val ACTION_STOP = "com.dazzlingnomore.mhrv.STOP"
 
         // Magic udpgw destination passed to tun2proxy in Full mode. MUST stay
         // outside tun2proxy's --dns virtual range (198.18.0.0/15) — otherwise

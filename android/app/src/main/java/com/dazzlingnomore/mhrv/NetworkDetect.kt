@@ -1,4 +1,4 @@
-package com.therealaleph.mhrv
+package com.dazzlingnomore.mhrv
 
 import java.net.Inet4Address
 import java.net.InetAddress

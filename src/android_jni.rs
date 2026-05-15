@@ -161,7 +161,7 @@ fn one_shot_runtime() -> Option<Runtime> {
 /// `Native.setDataDir(String)` — must be called once, before `startProxy`.
 /// The Kotlin side passes `context.filesDir.absolutePath`.
 #[no_mangle]
-pub extern "system" fn Java_com_therealaleph_mhrv_Native_setDataDir(
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_setDataDir(
     mut env: JNIEnv,
     _class: JClass,
     path: JString,
@@ -179,7 +179,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_setDataDir(
 /// The config is parsed and validated; on success the proxy server is
 /// spawned on its own tokio runtime and a non-zero handle returned.
 #[no_mangle]
-pub extern "system" fn Java_com_therealaleph_mhrv_Native_startProxy(
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_startProxy(
     mut env: JNIEnv,
     _class: JClass,
     config_json: JString,
@@ -266,7 +266,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_startProxy(
 /// unwind; anything slower, we force-kill (the listener socket is released
 /// as part of the forced shutdown).
 #[no_mangle]
-pub extern "system" fn Java_com_therealaleph_mhrv_Native_stopProxy(
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_stopProxy(
     _env: JNIEnv,
     _class: JClass,
     handle: jlong,
@@ -295,7 +295,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_stopProxy(
 /// public cert to the given path. Init-safe: creates the CA on first call
 /// if it doesn't exist yet.
 #[no_mangle]
-pub extern "system" fn Java_com_therealaleph_mhrv_Native_exportCa(
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_exportCa(
     mut env: JNIEnv,
     _class: JClass,
     dest: JString,
@@ -323,7 +323,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_exportCa(
 
 /// `Native.version()` -> String. Trivial smoke test for the JNI linkage.
 #[no_mangle]
-pub extern "system" fn Java_com_therealaleph_mhrv_Native_version<'a>(
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_version<'a>(
     env: JNIEnv<'a>,
     _class: JClass,
 ) -> jstring {
@@ -336,7 +336,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_version<'a>(
 /// array because it's one JNI call vs. N — the Kotlin side splits on `\n`
 /// for display. Empty string when there's nothing to read.
 #[no_mangle]
-pub extern "system" fn Java_com_therealaleph_mhrv_Native_drainLogs<'a>(
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_drainLogs<'a>(
     env: JNIEnv<'a>,
     _class: JClass,
 ) -> jstring {
@@ -369,7 +369,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_drainLogs<'a>(
 ///
 /// Blocking — hit from a background dispatcher.
 #[no_mangle]
-pub extern "system" fn Java_com_therealaleph_mhrv_Native_checkUpdate<'a>(
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_checkUpdate<'a>(
     env: JNIEnv<'a>,
     _class: JClass,
 ) -> jstring {
@@ -445,7 +445,7 @@ fn update_check_to_json(u: &crate::update_check::UpdateCheck) -> String {
 /// `objects.githubusercontent.com` redirects to). Can be revisited if
 /// users on Iranian networks report the asset host blocked.
 #[no_mangle]
-pub extern "system" fn Java_com_therealaleph_mhrv_Native_downloadAsset<'a>(
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_downloadAsset<'a>(
     mut env: JNIEnv<'a>,
     _class: JClass,
     url: JString,
@@ -532,7 +532,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_downloadAsset<'a>(
 /// like `{"ok":true,"latencyMs":123}` or `{"ok":false,"error":"..."}`.
 /// Blocking call — Kotlin side should invoke on a background coroutine.
 #[no_mangle]
-pub extern "system" fn Java_com_therealaleph_mhrv_Native_testSni<'a>(
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_testSni<'a>(
     mut env: JNIEnv<'a>,
     _class: JClass,
     google_ip: JString,
@@ -577,7 +577,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_testSni<'a>(
 /// Cheap — just reads a handful of atomics. The Kotlin UI polls this on a
 /// timer to render the "Usage today (estimated)" card.
 #[no_mangle]
-pub extern "system" fn Java_com_therealaleph_mhrv_Native_statsJson<'a>(
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_statsJson<'a>(
     env: JNIEnv<'a>,
     _class: JClass,
     handle: jlong,
@@ -620,7 +620,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_statsJson<'a>(
 /// TLS handshakes bounded). Typical case for a healthy CDN is well
 /// under 1s. Always call from a background dispatcher.
 #[no_mangle]
-pub extern "system" fn Java_com_therealaleph_mhrv_Native_discoverFront<'a>(
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_discoverFront<'a>(
     mut env: JNIEnv<'a>,
     _class: JClass,
     hostname: JString,
@@ -700,7 +700,7 @@ pub extern "system" fn Java_com_therealaleph_mhrv_Native_discoverFront<'a>(
 /// This is the C API the tun2proxy maintainer recommends for callers that
 /// need full CLI flexibility (e.g. --udpgw-server). BLOCKS until shutdown.
 #[no_mangle]
-pub extern "system" fn Java_com_therealaleph_mhrv_Native_runTun2proxy<'a>(
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_runTun2proxy<'a>(
     mut env: JNIEnv<'a>,
     _class: JClass,
     cli_args: JString,

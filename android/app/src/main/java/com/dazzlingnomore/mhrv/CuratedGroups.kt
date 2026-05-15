@@ -1,4 +1,4 @@
-package com.therealaleph.mhrv
+package com.dazzlingnomore.mhrv
 
 import android.content.Context
 import android.util.Log

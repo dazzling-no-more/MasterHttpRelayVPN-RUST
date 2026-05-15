@@ -1,11 +1,26 @@
-# mhrv-rs — bypass censorship for free, with your own Google account
+# rahgozar — bypass censorship for free, with your own Google account
 
-[![Latest release](https://img.shields.io/github/v/release/therealaleph/MasterHttpRelayVPN-RUST?display_name=tag&logo=github&label=release&color=blue&cacheSeconds=300)](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases/latest)
-[![Downloads](https://img.shields.io/github/downloads/therealaleph/MasterHttpRelayVPN-RUST/total.svg?label=downloads&logo=github&cacheSeconds=300)](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases)
-[![CI](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/actions/workflows/release.yml/badge.svg)](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/actions/workflows/release.yml)
-[![License: MIT](https://img.shields.io/github/license/therealaleph/MasterHttpRelayVPN-RUST?color=blue)](LICENSE)
-[![Stars](https://img.shields.io/github/stars/therealaleph/MasterHttpRelayVPN-RUST?style=flat&logo=github)](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/stargazers)
-[![Support](https://img.shields.io/badge/❤️_Support-sh1n.org-red?style=flat)](https://sh1n.org/donate)
+[![Latest release](https://img.shields.io/github/v/release/dazzling-no-more/rahgozar?display_name=tag&logo=github&label=release&color=blue&cacheSeconds=300)](https://github.com/dazzling-no-more/rahgozar/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/dazzling-no-more/rahgozar/total.svg?label=downloads&logo=github&cacheSeconds=300)](https://github.com/dazzling-no-more/rahgozar/releases)
+[![CI](https://github.com/dazzling-no-more/rahgozar/actions/workflows/release.yml/badge.svg)](https://github.com/dazzling-no-more/rahgozar/actions/workflows/release.yml)
+[![License: MIT](https://img.shields.io/github/license/dazzling-no-more/rahgozar?color=blue)](LICENSE)
+[![Stars](https://img.shields.io/github/stars/dazzling-no-more/rahgozar?style=flat&logo=github)](https://github.com/dazzling-no-more/rahgozar/stargazers)
+
+> ## About this fork
+>
+> **rahgozar** (Persian for *passerby* / *traveler*, رهگذر) is a community-maintained continuation of [therealaleph/MasterHttpRelayVPN-RUST](https://github.com/therealaleph/MasterHttpRelayVPN-RUST) — the original `mhrv-rs` Apps-Script-relay VPN that's a lifeline for users behind heavy censorship.
+>
+> Upstream went quiet with a queue of unmerged fixes and features piling up. This fork brings that queued work into a usable, releasable state so users have somewhere to get current builds. It's **fully separate** from upstream: different repo, different Android applicationId (`com.dazzlingnomore.mhrv`), different version line (starting at v1.0.0). You can install both side-by-side.
+>
+> **If the upstream maintainer returns,** this fork will gladly hand work back, fold improvements upstream, or wind down. No hard feelings — just keeping the project usable in the meantime. See the [original repo](https://github.com/therealaleph/MasterHttpRelayVPN-RUST) for the project's roots.
+>
+> **What's in v1.0.0 that's not in upstream v1.9.25** (all from queued upstream PRs):
+> - Apps Script edge-DNS batching + cache `getAll` perf wins
+> - YouTube `relay_url_patterns` + SABR strip + exit-node-full SNI
+> - Bundled curated CDN fronting groups (Vercel, Fastly, AWS CloudFront, GitHub) with one-tap loader
+> - Multi-profile config storage (desktop + Android)
+> - Use as upstream proxy for Psiphon / xray (Direct mode)
+> - In-app auto-updater
 
 **A small program that runs on your computer and lets you visit blocked websites for free, using a Google Apps Script you deploy in your own free Google account. Your ISP only sees encrypted traffic to `www.google.com` — it can't tell what you're really visiting.**
 

@@ -12,7 +12,7 @@
       apps. Without this on API 30+ (targetSdk 34), PackageManager
       returns an empty list for CATEGORY_LAUNCHER queries against other
       apps' labels/icons — result: an empty picker dialog. Declaring
-      it makes Android show a "com.therealaleph.mhrv wants to see which
+      it makes Android show a "com.dazzlingnomore.mhrv wants to see which
       apps you have installed" note in Play Protect but no runtime
       prompt.
     -->

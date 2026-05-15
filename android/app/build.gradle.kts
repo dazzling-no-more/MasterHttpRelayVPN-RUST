@@ -7,15 +7,15 @@ plugins {
 }
 
 android {
-    namespace = "com.therealaleph.mhrv"
+    namespace = "com.dazzlingnomore.mhrv"
     compileSdk = 34
 
     defaultConfig {
-        applicationId = "com.therealaleph.mhrv"
+        applicationId = "com.dazzlingnomore.mhrv"
         minSdk = 24 // Android 7.0 — covers 99%+ of live devices.
         targetSdk = 34
-        versionCode = 159
-        versionName = "1.9.25"
+        versionCode = 1
+        versionName = "1.0.0"
 
         // Ship all four mainstream Android ABIs:
         //   - arm64-v8a      — 95%+ of real-world Android phones since 2019

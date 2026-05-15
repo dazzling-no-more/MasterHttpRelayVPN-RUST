@@ -1,4 +1,4 @@
-package com.therealaleph.mhrv
+package com.dazzlingnomore.mhrv
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals

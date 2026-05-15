@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">mhrv-rs</string>
+    <string name="app_name">رهگذر</string>
 
     <!-- Top-bar -->
     <string name="tb_check_update_checking">در حال بررسی…</string>

@@ -1,4 +1,4 @@
-package com.therealaleph.mhrv.ui
+package com.dazzlingnomore.mhrv.ui
 
 import android.app.Activity
 import android.graphics.Bitmap
@@ -29,10 +29,10 @@ import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
-import com.therealaleph.mhrv.ConfigStore
-import com.therealaleph.mhrv.MhrvConfig
+import com.dazzlingnomore.mhrv.ConfigStore
+import com.dazzlingnomore.mhrv.MhrvConfig
 import androidx.compose.foundation.text.selection.SelectionContainer
-import com.therealaleph.mhrv.R
+import com.dazzlingnomore.mhrv.R
 import kotlinx.coroutines.launch
 
 // =========================================================================
@@ -46,16 +46,16 @@ fun ConfigSharingBar(
     onSnackbar: suspend (String) -> Unit,
 ) {
     // Deep link import — requires confirmation before applying.
-    val deepLinkCfg by com.therealaleph.mhrv.MainActivity.pendingDeepLinkConfig
+    val deepLinkCfg by com.dazzlingnomore.mhrv.MainActivity.pendingDeepLinkConfig
     if (deepLinkCfg != null) {
         ImportConfirmDialog(
             cfg = deepLinkCfg!!,
             onConfirm = {
                 onImport(deepLinkCfg!!)
-                com.therealaleph.mhrv.MainActivity.pendingDeepLinkConfig.value = null
+                com.dazzlingnomore.mhrv.MainActivity.pendingDeepLinkConfig.value = null
             },
             onDismiss = {
-                com.therealaleph.mhrv.MainActivity.pendingDeepLinkConfig.value = null
+                com.dazzlingnomore.mhrv.MainActivity.pendingDeepLinkConfig.value = null
             },
         )
     }
@@ -263,9 +263,9 @@ private fun ImportConfirmDialog(
     }
     val preview = ids.take(3).joinToString("\n") { "  ${it.take(20)}…" }
     val modeLabel = when (cfg.mode) {
-        com.therealaleph.mhrv.Mode.APPS_SCRIPT -> "apps_script"
-        com.therealaleph.mhrv.Mode.DIRECT -> "direct"
-        com.therealaleph.mhrv.Mode.FULL -> "full"
+        com.dazzlingnomore.mhrv.Mode.APPS_SCRIPT -> "apps_script"
+        com.dazzlingnomore.mhrv.Mode.DIRECT -> "direct"
+        com.dazzlingnomore.mhrv.Mode.FULL -> "full"
     }
 
     AlertDialog(

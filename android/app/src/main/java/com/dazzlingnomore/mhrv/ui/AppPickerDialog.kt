@@ -1,4 +1,4 @@
-package com.therealaleph.mhrv.ui
+package com.dazzlingnomore.mhrv.ui
 
 import android.content.pm.ApplicationInfo
 import android.content.pm.PackageManager

@@ -1,4 +1,4 @@
-package com.therealaleph.mhrv.ui
+package com.dazzlingnomore.mhrv.ui
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -6,7 +6,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Pins the JSON contract between `Java_com_therealaleph_mhrv_Native_discoverFront`
+ * Pins the JSON contract between `Java_com_dazzlingnomore_mhrv_Native_discoverFront`
  * (Rust, in src/android_jni.rs) and `parseDiscoverResult` (Kotlin, in
  * HomeScreen.kt). The Rust side now uses `serde_json::json!` so it
  * produces canonical JSON, but the parser still has to handle:

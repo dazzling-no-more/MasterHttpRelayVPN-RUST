@@ -1,4 +1,4 @@
-package com.therealaleph.mhrv.ui
+package com.dazzlingnomore.mhrv.ui
 
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -15,11 +15,11 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
-import com.therealaleph.mhrv.MhrvConfig
-import com.therealaleph.mhrv.ProfileStore
-import com.therealaleph.mhrv.R
-import com.therealaleph.mhrv.UiLang
-import com.therealaleph.mhrv.VpnState
+import com.dazzlingnomore.mhrv.MhrvConfig
+import com.dazzlingnomore.mhrv.ProfileStore
+import com.dazzlingnomore.mhrv.R
+import com.dazzlingnomore.mhrv.UiLang
+import com.dazzlingnomore.mhrv.VpnState
 import kotlinx.coroutines.launch
 
 /**

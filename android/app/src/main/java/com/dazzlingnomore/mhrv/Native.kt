@@ -1,4 +1,4 @@
-package com.therealaleph.mhrv
+package com.dazzlingnomore.mhrv
 
 /**
  * JNI bindings for the mhrv_rs Rust crate. The crate is compiled to

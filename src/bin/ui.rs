@@ -1298,14 +1298,14 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.hyperlink_to(
                     egui::RichText::new("mhrv-rs").size(20.0).strong(),
-                    "https://github.com/therealaleph/MasterHttpRelayVPN-RUST",
+                    "https://github.com/dazzling-no-more/rahgozar",
                 );
                 ui.hyperlink_to(
                     egui::RichText::new(format!("v{}", VERSION))
                         .color(egui::Color32::from_gray(140))
                         .monospace(),
                     format!(
-                        "https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases/tag/v{}",
+                        "https://github.com/dazzling-no-more/rahgozar/releases/tag/v{}",
                         VERSION
                     ),
                 );
