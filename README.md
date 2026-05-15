@@ -10,11 +10,11 @@
 >
 > **rahgozar** (Persian for *passerby* / *traveler*, رهگذر) is a community-maintained continuation of [therealaleph/MasterHttpRelayVPN-RUST](https://github.com/therealaleph/MasterHttpRelayVPN-RUST) — the original `mhrv-rs` Apps-Script-relay VPN that's a lifeline for users behind heavy censorship.
 >
-> Upstream went quiet with a queue of unmerged fixes and features piling up. This fork brings that queued work into a usable, releasable state so users have somewhere to get current builds. It's **fully separate** from upstream: different repo, different Android applicationId (`com.dazzlingnomore.mhrv`), different version line (starting at v1.0.0). You can install both side-by-side.
+> Upstream went quiet with a queue of unmerged fixes and features piling up. This fork brings that queued work into a usable, releasable state so users have somewhere to get current builds. It's **fully separate** from upstream: different repo, different Android applicationId (`com.dazzlingnomore.mhrv`), different version line (starting at v2.0.0 to avoid colliding with upstream's historical v1.x tags). You can install both side-by-side.
 >
 > **If the upstream maintainer returns,** this fork will gladly hand work back, fold improvements upstream, or wind down. No hard feelings — just keeping the project usable in the meantime. See the [original repo](https://github.com/therealaleph/MasterHttpRelayVPN-RUST) for the project's roots.
 >
-> **What's in v1.0.0 that's not in upstream v1.9.25** (all from queued upstream PRs):
+> **What's in v2.0.0 that's not in upstream v1.9.25** (all from queued upstream PRs):
 > - Apps Script edge-DNS batching + cache `getAll` perf wins
 > - YouTube `relay_url_patterns` + SABR strip + exit-node-full SNI
 > - Bundled curated CDN fronting groups (Vercel, Fastly, AWS CloudFront, GitHub) with one-tap loader
