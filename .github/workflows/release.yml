@@ -22,7 +22,7 @@ on:
 
 permissions:
   contents: write
-  # `tunnel-docker` job pushes to ghcr.io/therealaleph/mhrv-tunnel-node.
+  # `tunnel-docker` job pushes to ghcr.io/${{ github.repository_owner }}/mhrv-tunnel-node.
   # `packages: write` is required by docker/login-action when authenticating
   # to GHCR with the workflow's auto-provisioned GITHUB_TOKEN. Granted at
   # the workflow level so the matrix-build job (which doesn't need it) and
@@ -76,23 +76,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Pin to Ubuntu 22.04 GLIBC target (GLIBC 2.35) so the glibc builds
-          # load on any distro ≥ Ubuntu 22.04 / Debian 12 / Mint 21 / Fedora 36.
-          # On self-hosted this is a Rust-side choice (cargo target triple),
-          # not an OS-of-the-runner choice — the runner itself is Ubuntu 24.04
-          # (GLIBC 2.39), but we link against the 2.35-era glibc via the
-          # x86_64-unknown-linux-gnu target triple which pins to the oldest
-          # GLIBC symbol version rustc is willing to emit. Users behind tight
+          # ── Linux amd64 (glibc) ────────────────────────────────────────────
+          # ubuntu-latest gives us GLIBC 2.39, but the x86_64-unknown-linux-gnu
+          # target triple still emits the oldest GLIBC symbol version rustc
+          # is willing to emit, so the binary loads on any distro ≥ Ubuntu
+          # 22.04 / Debian 12 / Mint 21 / Fedora 36. Users behind tight
           # internet who can't dist-upgrade keep working.
           - target: x86_64-unknown-linux-gnu
-            os: [self-hosted, linux, x64, mhrv-build]
+            os: ubuntu-latest
             name: mhrv-rs-linux-amd64
-          - target: aarch64-unknown-linux-gnu
-            os: [self-hosted, linux, x64, mhrv-build]
-            name: mhrv-rs-linux-arm64
-          - target: arm-unknown-linux-gnueabihf
-            os: [self-hosted, linux, x64, mhrv-build]
-            name: mhrv-rs-raspbian-armhf
+          # ── macOS + Windows ────────────────────────────────────────────────
+          # Already github-hosted upstream; works unchanged on the fork.
           - target: x86_64-apple-darwin
             os: macos-latest
             name: mhrv-rs-macos-amd64
@@ -102,35 +96,25 @@ jobs:
           - target: x86_64-pc-windows-gnu
             os: windows-latest
             name: mhrv-rs-windows-amd64
-          # i686-pc-windows-msvc target was attempted in v1.7.7-v1.7.10
-          # to support Windows 7 32-bit users (#272, #318). Removed in
-          # v1.7.11 because keeping it on Rust 1.77.2 (last Win7-stable)
-          # is fundamentally fragile: every transitive crate that bumps
-          # its MSRV (e.g. `time` 0.3.47 needs Cargo manifest features
-          # only available in Rust 1.78+) breaks the build, and pinning
-          # transitives is brittle across releases. Win7 users should
-          # self-build per the README; the project no longer ships a
-          # prebuilt i686 Win7 binary. Replaced by the existing
-          # x86_64-pc-windows-gnu (windows-amd64) which covers ~99% of
-          # active Windows installs (incl. all WoA64 emulation).
-          - target: x86_64-unknown-linux-musl
-            os: [self-hosted, linux, x64, mhrv-build]
-            name: mhrv-rs-linux-musl-amd64
-          - target: aarch64-unknown-linux-musl
-            os: [self-hosted, linux, x64, mhrv-build]
-            name: mhrv-rs-linux-musl-arm64
-          # OpenWRT MT7621 (soft-float mipsel 32-bit). Dozens of cheap
-          # home routers run this chipset and they *specifically* need
-          # the soft-float variant — MT7621 has no hardware FPU and a
-          # hard-float binary segfaults on the first fp op. Tier-3 in
-          # Rust since 1.72; we build it via messense's musl-cross
-          # docker image which still has a mipsel-softfloat toolchain.
-          # `continue-on-error: true` so a regression here doesn't block
-          # the rest of the release. Issue #26.
-          - target: mipsel-unknown-linux-musl
-            os: [self-hosted, linux, x64, mhrv-build]
-            name: mhrv-rs-openwrt-mipsel-softfloat
-            mipsel_softfloat: true
+          # ── Cross-compile linux targets disabled for the fork ──────────────
+          # Upstream built these on its self-hosted Hetzner runners
+          # (gcc-aarch64-linux-gnu, gcc-arm-linux-gnueabihf, musl-tools,
+          # messense's mipsel-softfloat docker image — all pre-installed
+          # at runner-setup time). Restoring them on github-hosted runners
+          # needs cross-compile toolchain installs in this workflow (or
+          # `cross-rs/cross`) which is non-trivial; deferred until a fork
+          # release actually needs them.
+          #
+          # Targets that USED to build:
+          #   aarch64-unknown-linux-gnu   → mhrv-rs-linux-arm64
+          #   arm-unknown-linux-gnueabihf → mhrv-rs-raspbian-armhf
+          #   x86_64-unknown-linux-musl   → mhrv-rs-linux-musl-amd64
+          #   aarch64-unknown-linux-musl  → mhrv-rs-linux-musl-arm64
+          #   mipsel-unknown-linux-musl   → mhrv-rs-openwrt-mipsel-softfloat
+          #
+          # Users on those platforms can `cargo build --target <triple>`
+          # locally with the matching cross-toolchain installed, or wait
+          # for these matrix entries to be restored.
 
     runs-on: ${{ matrix.os }}
     # mipsel-softfloat is best-effort: the Rust tier-3 target occasionally
@@ -437,26 +421,41 @@ jobs:
   # project's jniLibs/ tree, which then packages them into a single
   # universal APK. Users pick it once, no per-ABI split.
   #
-  # Runs on self-hosted. The runner has Android SDK + NDK r26c + cargo-ndk
-  # pre-installed under /opt/android-sdk; the env block below points Gradle
-  # at those paths so we don't re-download ~1 GB of SDK per release.
+  # Runs on github-hosted ubuntu-latest. Upstream's self-hosted runner had
+  # Android SDK + NDK r26c + cargo-ndk pre-installed at /opt/android-sdk;
+  # on github-hosted we set those up per-run. Adds ~3–4 min of cold setup
+  # vs the self-hosted instant-start, but doesn't need fork infrastructure.
   android:
-    runs-on: [self-hosted, linux, x64, mhrv-build]
-    env:
-      ANDROID_SDK_ROOT: /opt/android-sdk
-      ANDROID_HOME: /opt/android-sdk
-      ANDROID_NDK_HOME: /opt/android-sdk/ndk/26.2.11394342
-      ANDROID_NDK_ROOT: /opt/android-sdk/ndk/26.2.11394342
-      JAVA_HOME: /usr/lib/jvm/java-17-openjdk-amd64
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # Rust toolchain: idempotent on self-hosted (targets already present),
-      # kept here so the workflow still works if we ever run it on a GH-hosted
-      # fallback.
+      # JDK 17 for the Android Gradle Plugin + Kotlin compiler. The
+      # ubuntu-latest image already ships several JDKs but we pin to 17
+      # to match what android/app/build.gradle.kts targets.
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # Android SDK + NDK r26c. setup-android exports ANDROID_HOME +
+      # ANDROID_SDK_ROOT + ANDROID_NDK_HOME so Gradle and cargo-ndk find
+      # the toolchain without us hardcoding /opt/android-sdk paths.
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: "ndk;26.2.11394342 platforms;android-34 build-tools;34.0.0"
+
+      # Rust toolchain with all four Android targets cargo-ndk needs.
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      # cargo-ndk: glue between cargo and the NDK's clang. Upstream
+      # pre-installed this on its self-hosted runners under /usr/local/bin;
+      # on github-hosted we install it from crates.io per-run. ~30 s cold,
+      # cached on subsequent runs via Swatinem/rust-cache below.
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --locked
 
       # Cache cargo + target/ across Android release builds. Four cargo-ndk
       # release builds back-to-back with LTO is where the cold cost comes
@@ -678,7 +677,7 @@ jobs:
   # takes 8+ minutes if it works, blocks anyone without Rust experience.
   # A prebuilt multi-arch image makes deployment a one-liner:
   #   docker run -d -p 8080:8080 -e TUNNEL_AUTH_KEY=... \
-  #     ghcr.io/therealaleph/mhrv-tunnel-node:latest
+  #     ghcr.io/dazzling-no-more/mhrv-tunnel-node:latest
   #
   # Tags published per release:
   #   v1.5.0       — exact version pin
