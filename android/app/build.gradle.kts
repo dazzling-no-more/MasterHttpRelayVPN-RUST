@@ -153,14 +153,19 @@ dependencies {
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 
-    // Local JVM unit tests (`gradlew :app:test`). JUnit 4 plus the real
-    // org.json:json classes — by default android.jar's stubbed
-    // JSONObject methods all return null in unit tests, which makes
-    // ConfigStore round-trip tests untestable. The org.json artifact
-    // overrides those stubs in the test classpath without affecting
-    // the device runtime.
+    // Local JVM unit tests (`gradlew :app:test`). JUnit 4 plus:
+    //   - org.json:json — by default android.jar's stubbed JSONObject
+    //     methods all return null in unit tests, which makes ConfigStore
+    //     round-trip tests untestable. The org.json artifact overrides
+    //     those stubs in the test classpath without affecting the device
+    //     runtime. (#1033 ConfigStoreTest, CuratedGroupsTest)
+    //   - Robolectric + androidx.test:core — lets ProfileStoreTest use
+    //     a real Android Context without an emulator, to verify the
+    //     storage invariants documented in ProfileStore.kt. (#1057)
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
+    testImplementation("org.robolectric:robolectric:4.13")
+    testImplementation("androidx.test:core:1.6.1")
 }
 
 // --------------------------------------------------------------------------
