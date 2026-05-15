@@ -627,8 +627,20 @@ class ProfileStoreTest {
      */
     @Test
     fun applyProfile_profiles_write_failure_returns_partial() {
-        ProfileStore.upsert(ctx, "home", MhrvConfig(authKey = "homekey"))
-        ProfileStore.upsert(ctx, "other", MhrvConfig(authKey = "otherkey"))
+        // Snapshots must pass `validateRuntimeShape` — apps_script
+        // mode (the default) requires a deployment ID + auth_key,
+        // otherwise applyProfile short-circuits with Failed before
+        // ever reaching the step-1 write we're trying to verify here.
+        ProfileStore.upsert(
+            ctx,
+            "home",
+            MhrvConfig(appsScriptUrls = listOf("HOME_ID"), authKey = "homekey"),
+        )
+        ProfileStore.upsert(
+            ctx,
+            "other",
+            MhrvConfig(appsScriptUrls = listOf("OTHER_ID"), authKey = "otherkey"),
+        )
         val profilesBefore = profilesFile.readText()
         assertEquals("other", ProfileStore.load(ctx).active)
 

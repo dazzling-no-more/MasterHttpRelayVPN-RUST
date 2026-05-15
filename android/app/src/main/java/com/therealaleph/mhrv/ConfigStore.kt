@@ -410,18 +410,6 @@ data class MhrvConfig(
                 UiLang.EN -> "en"
             })
 
-            if (frontingGroups.isNotEmpty()) {
-                put("fronting_groups", JSONArray().apply {
-                    for (g in frontingGroups) {
-                        put(JSONObject().apply {
-                            put("name", g.name)
-                            put("ip", g.ip)
-                            put("sni", g.sni)
-                            put("domains", JSONArray().apply { g.domains.forEach { put(it) } })
-                        })
-                    }
-                })
-            }
             // Splice back any keys this build doesn't model (so they
             // survive a load → edit → save round-trip and reach the
             // native runtime, which IS the source of truth for them).
