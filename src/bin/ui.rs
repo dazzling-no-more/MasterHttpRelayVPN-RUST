@@ -251,6 +251,12 @@ struct FormState {
     google_ip_validation: bool,
     normalize_x_graphql: bool,
     youtube_via_relay: bool,
+    /// See `config::Config::relay_url_patterns` for semantics + defaults.
+    /// No UI control; round-tripped so a hand-edited list survives Save.
+    relay_url_patterns: Vec<String>,
+    /// See `config::Config::sabr_strip` for trade-off + when to flip.
+    /// No UI control; round-tripped so a hand-edited `false` survives Save.
+    sabr_strip: bool,
     passthrough_hosts: Vec<String>,
     /// Round-tripped from config.json so the UI's save path doesn't
     /// drop the user's setting. Not currently exposed as a UI control;
@@ -385,6 +391,8 @@ fn load_form() -> (FormState, Option<String>) {
             scan_batch_size: c.scan_batch_size,
             normalize_x_graphql: c.normalize_x_graphql,
             youtube_via_relay: c.youtube_via_relay,
+            relay_url_patterns: c.relay_url_patterns.clone(),
+            sabr_strip: c.sabr_strip,
             passthrough_hosts: c.passthrough_hosts.clone(),
             block_quic: c.block_quic,
             disable_padding: c.disable_padding,
@@ -424,6 +432,8 @@ fn load_form() -> (FormState, Option<String>) {
             scan_batch_size: 500,
             normalize_x_graphql: false,
             youtube_via_relay: false,
+            relay_url_patterns: Vec::new(),
+            sabr_strip: false,
             passthrough_hosts: Vec::new(),
             block_quic: true,
             disable_padding: false,
@@ -580,6 +590,10 @@ impl FormState {
             // config-only flag for now. Passed through from the loaded
             // config if set, otherwise defaults to false.
             youtube_via_relay: self.youtube_via_relay,
+            // Config-only round-trips. Source of truth for both fields
+            // is `config::Config` (defaults, gating, trade-offs).
+            relay_url_patterns: self.relay_url_patterns.clone(),
+            sabr_strip: self.sabr_strip,
             // Similarly config-only for now; round-trips through the
             // file so the UI doesn't drop the user's entries on save.
             passthrough_hosts: self.passthrough_hosts.clone(),
@@ -666,6 +680,15 @@ struct ConfigWire<'a> {
     normalize_x_graphql: bool,
     #[serde(skip_serializing_if = "is_false")]
     youtube_via_relay: bool,
+    /// See `config::Config::relay_url_patterns`. Skipped when empty so
+    /// the proxy-applied default isn't echoed into config.json.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    relay_url_patterns: &'a Vec<String>,
+    /// See `config::Config::sabr_strip`. Default `false` (opt-in
+    /// after #977); emitted only when explicitly enabled so unchanged
+    /// configs stay clean.
+    #[serde(skip_serializing_if = "is_false")]
+    sabr_strip: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     passthrough_hosts: &'a Vec<String>,
     // IP-scan knobs. These used to be missing from the wire struct, so
@@ -773,6 +796,8 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
                 .map(|v| v.iter().map(String::as_str).collect()),
             normalize_x_graphql: c.normalize_x_graphql,
             youtube_via_relay: c.youtube_via_relay,
+            relay_url_patterns: &c.relay_url_patterns,
+            sabr_strip: c.sabr_strip,
             passthrough_hosts: &c.passthrough_hosts,
             fetch_ips_from_api: c.fetch_ips_from_api,
             max_ips_to_scan: c.max_ips_to_scan,
@@ -1324,7 +1349,7 @@ impl eframe::App for App {
                 if let Some(s) = &stats {
                     // Compact two-column layout so 7 metrics fit in ~4 rows
                     // instead of a tall vertical strip.
-                    let rows: Vec<(&str, String)> = vec![
+                    let mut rows: Vec<(&str, String)> = vec![
                         ("relay calls", s.relay_calls.to_string()),
                         ("failures", s.relay_failures.to_string()),
                         ("coalesced", s.coalesced.to_string()),
@@ -1348,6 +1373,22 @@ impl eframe::App for App {
                             ),
                         ),
                     ];
+                    // Forwarder rows only appear once the path filter
+                    // has fired at least once — otherwise the typical
+                    // (no-pattern-hit / non-AppsScript) user sees an
+                    // empty pair of "0" rows that adds noise without
+                    // signal. `err` is fast-path-miss count; combine
+                    // with `relay_failures` to gauge end-to-end health.
+                    if s.forwarder_calls + s.forwarder_errors > 0 {
+                        rows.push((
+                            "fwd calls",
+                            format!(
+                                "{} (err {})",
+                                s.forwarder_calls, s.forwarder_errors
+                            ),
+                        ));
+                        rows.push(("fwd bytes", fmt_bytes(s.forwarder_bytes)));
+                    }
                     egui::Grid::new("stats")
                         .num_columns(4)
                         .spacing([16.0, 4.0])
