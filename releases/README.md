@@ -2,7 +2,7 @@
 
 This folder contains the prebuilt binaries from the latest release, committed directly to the repository for users who cannot reach the GitHub Releases page.
 
-Current version: **v1.9.25**
+Current version: **v2.0.0**
 
 | File | Platform | Contents |
 |---|---|---|
@@ -55,7 +55,7 @@ See the [main README](../README.md) for desktop setup (Apps Script deployment, c
 
 این پوشه شامل فایل‌های آخرین نسخه است و مستقیماً در ریپو قرار گرفته برای کاربرانی که به صفحهٔ GitHub Releases دسترسی ندارند.
 
-نسخهٔ فعلی: **v1.9.25**
+نسخهٔ فعلی: **v2.0.0**
 
 ### دانلود از طریق ZIP
 
