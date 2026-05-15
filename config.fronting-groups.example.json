@@ -1,34 +1,10 @@
 {
-  "_comment": "Domain coverage mirrors assets/fronting-groups/curated.json (the bundle the UI's 'Load curated fronting groups' button installs). Edit IPs in-place if a group stops working — re-resolve `sni` with `nslookup`/`dig` and replace.",
-  "mode": "direct",
-  "google_ip": "216.239.38.120",
-  "front_domain": "www.google.com",
-  "listen_host": "127.0.0.1",
-  "listen_port": 8085,
-  "socks5_port": 8086,
-  "log_level": "info",
-  "verify_ssl": true,
+  "_comment": "Domain coverage mirrors assets/fronting-groups/curated.json (the bundle the UI Load curated fronting groups button installs). Edit IPs in-place if a group stops working - re-resolve sni with nslookup/dig and replace. The trailing github-direct / github-content-direct groups are alternate IP routes for gist.github.com / objects-origin.githubusercontent.com; the proxy uses first-match so they only activate if the leading group fails to resolve.",
   "fronting_groups": [
     {
-      "name": "github-direct",
-      "ip": "140.82.121.4",
-      "sni": "github.com",
-      "domains": [
-        "gist.github.com"
-      ]
-    },
-    {
-      "name": "github-content-direct",
-      "ip": "140.82.121.6",
-      "sni": "central.github.com",
-      "domains": [
-        "objects-origin.githubusercontent.com"
-      ]
-    },
-    {
       "name": "vercel",
-      "ip": "76.76.21.21",
-      "sni": "react.dev",
+      "ip": "216.230.84.193",
+      "sni": "nextjs.org",
       "domains": [
         "ai-sdk.dev",
         "cursor.com",
@@ -63,7 +39,7 @@
     },
     {
       "name": "fastly",
-      "ip": "151.101.0.223",
+      "ip": "151.101.128.223",
       "sni": "pypi.org",
       "domains": [
         "buzzfeed.com",
@@ -89,7 +65,6 @@
         "githubusercontent.com",
         "pinimg.com",
         "pinterest.com",
-        "pypi.org",
         "redd.it",
         "reddit.app.link",
         "reddit.com",
@@ -103,17 +78,72 @@
         "redditstatic.com",
         "redditstatus.com",
         "www.fastly.com",
+        "www.pinterest.com",
         "www.python.org",
         "xtls.github.io"
       ]
     },
     {
-      "name": "cloudfront",
-      "ip": "75.2.60.5",
+      "name": "amazon-cloudfront",
+      "ip": "3.33.186.135",
       "sni": "kubernetes.io",
       "domains": [
+        "bitballoon.com",
         "netlify.app",
-        "netlify.com"
+        "netlify.com",
+        "netlifystatus.com"
+      ]
+    },
+    {
+      "name": "github-central",
+      "ip": "140.82.113.21",
+      "sni": "central.github.com",
+      "domains": [
+        "objects-origin.githubusercontent.com",
+        "api.individual.githubcopilot.com",
+        "glb-db52c2cf8be544.github.com",
+        "api.githubcopilot.com"
+      ]
+    },
+    {
+      "name": "github-alive",
+      "ip": "140.82.112.26",
+      "sni": "alive.github.com",
+      "domains": [
+        "alive.github.com",
+        "live.github.com"
+      ]
+    },
+    {
+      "name": "github",
+      "ip": "140.82.121.3",
+      "sni": "github.com",
+      "domains": [
+        "gist.github.com"
+      ]
+    },
+    {
+      "name": "pubmed",
+      "ip": "34.107.134.59",
+      "sni": "pubmed.ncbi.nlm.nih.gov",
+      "domains": [
+        "pmc.ncbi.nlm.nih.gov"
+      ]
+    },
+    {
+      "name": "github-direct",
+      "ip": "140.82.121.4",
+      "sni": "github.com",
+      "domains": [
+        "gist.github.com"
+      ]
+    },
+    {
+      "name": "github-content-direct",
+      "ip": "140.82.121.6",
+      "sni": "central.github.com",
+      "domains": [
+        "objects-origin.githubusercontent.com"
       ]
     }
   ]
