@@ -92,7 +92,7 @@ ISPs can't read inside encrypted HTTPS. They only see the address — `www.googl
 
 ### Step 2 — Download mhrv-rs
 
-Go to the [latest release page](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases/latest) and download the file for your computer:
+Go to the [latest release page](https://github.com/dazzling-no-more/rahgozar/releases/latest) and download the file for your computer:
 
 | You're on | Download this |
 |---|---|
@@ -183,18 +183,28 @@ If something doesn't work:
 
 ## Need help?
 
-- Search [open and closed issues](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues?q=is%3Aissue) — your problem might already be answered
-- Open a [new issue](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues/new) with: your config (mask `auth_key`!), exactly what you tried, exactly what you saw in the log
+- Search [open and closed issues on rahgozar](https://github.com/dazzling-no-more/rahgozar/issues?q=is%3Aissue) — and the larger [upstream archive on therealaleph/MasterHttpRelayVPN-RUST](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues?q=is%3Aissue) where most of the project's history lives — your problem might already be answered
+- Open a [new issue on rahgozar](https://github.com/dazzling-no-more/rahgozar/issues/new) with: your config (mask `auth_key`!), exactly what you tried, exactly what you saw in the log
 
 ## Credits
 
-Original project: **[@masterking32/MasterHttpRelayVPN](https://github.com/masterking32/MasterHttpRelayVPN)**. The idea, the Apps Script protocol, the proxy architecture — all his. This Rust port exists to make client-side distribution easier (single binary, no Python install).
+This fork stands on three upstream projects you should know about and support before considering anything for the fork:
 
-Most of the Rust code in this port was written with [Anthropic's Claude](https://claude.com), reviewed by a human on every commit.
+- **[@masterking32/MasterHttpRelayVPN](https://github.com/masterking32/MasterHttpRelayVPN)** — the original Python project where it all started. The Apps Script relay protocol, the proxy architecture, the idea of turning your own free Google account into a relay — all his. Without this, none of the rest exists.
+- **[@therealaleph/MasterHttpRelayVPN-RUST](https://github.com/therealaleph/MasterHttpRelayVPN-RUST)** — the Rust port (`mhrv-rs`) this fork continues. therealaleph rewrote the Python project in Rust to ship single-binary clients, built the desktop + Android UIs, and ran the project through the entire v1.x → v1.9.25 era. Almost every line of code in this fork is his work; we just kept the lights on while upstream went quiet.
+- **[@patterniha/MITM-DomainFronting](https://github.com/patterniha/MITM-DomainFronting)** — the CDN fronting-groups concept (routing specific domains through Vercel / Fastly / CloudFront edges via SNI) that became the curated fronting bundle shipped here. Independent project; the Xray config there inspired our integration. See [`docs/fronting-groups.md`](docs/fronting-groups.md) for the lineage.
 
-## Support this project
+Most of the Rust code in this port (including this fork's merge and rebrand work) was written with [Anthropic's Claude](https://claude.com), reviewed by a human on every commit.
 
-[❤️ Donate at sh1n.org](https://sh1n.org/donate) — covers hosting and CI runner costs. Starring the repo also helps signal the project is worth keeping alive.
+## Support these projects
+
+**If you've benefited from this software, send your support upstream — not to this fork.** rahgozar takes no donations and exists only to keep users covered while upstream is inactive. The substantive engineering happened in the three projects above; please support them directly:
+
+- **[@masterking32](https://github.com/masterking32)** — author of the original Python project. Sponsor on GitHub or via any method listed on his profile / repo.
+- **[@therealaleph](https://github.com/therealaleph)** — Rust port author. Donate at **[sh1n.org/donate](https://sh1n.org/donate)** (covers hosting / CI / years of maintenance).
+- **[@patterniha](https://github.com/patterniha)** — MITM-DomainFronting author. Sponsor on GitHub or via methods listed in his repo.
+
+Starring those three upstream repos also signals their work is worth keeping alive. If upstream `mhrv-rs` resumes, this fork will fold work back and wind down — the goal here is continuity of access for users behind heavy censorship, nothing more.
 
 ---
 
@@ -264,7 +274,7 @@ ISP داخل HTTPS رمزشده را نمی‌تواند بخواند. فقط آ
 
 ### مرحلهٔ ۲ — دانلود mhrv-rs
 
-به [صفحهٔ آخرین release](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases/latest) برو و فایل مناسب کامپیوترت را دانلود کن:
+به [صفحهٔ آخرین release](https://github.com/dazzling-no-more/rahgozar/releases/latest) برو و فایل مناسب کامپیوترت را دانلود کن:
 
 | سیستم تو | فایل دانلود |
 |---|---|
@@ -355,17 +365,27 @@ System Settings → Network → Wi-Fi → Details → **Proxies** → هر دو 
 
 ## کمک می‌خواهی؟
 
-- در [issueهای باز و بسته](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues?q=is%3Aissue) جست‌وجو کن — احتمالاً مشکلت قبلاً جواب داده شده
-- یک [issue جدید](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues/new) باز کن با: کانفیگت (حتماً `auth_key` را پنهان کن!)، دقیقاً چه کاری کردی، دقیقاً چه دیدی در log
+- در [issueهای rahgozar](https://github.com/dazzling-no-more/rahgozar/issues?q=is%3Aissue) جست‌وجو کن — و در [بایگانی بزرگ‌تر بالادست therealaleph/MasterHttpRelayVPN-RUST](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues?q=is%3Aissue) که بیشتر تاریخ پروژه آن‌جاست — احتمالاً مشکلت قبلاً جواب داده شده
+- یک [issue جدید در rahgozar](https://github.com/dazzling-no-more/rahgozar/issues/new) باز کن با: کانفیگت (حتماً `auth_key` را پنهان کن!)، دقیقاً چه کاری کردی، دقیقاً چه دیدی در log
 
 ## اعتبار
 
-پروژهٔ اصلی: **[@masterking32/MasterHttpRelayVPN](https://github.com/masterking32/MasterHttpRelayVPN)**. ایده، پروتکل Apps Script، معماری پروکسی — همه از اوست. این پورت Rust برای ساده‌تر کردن توزیع سمت کلاینت است (یک فایل اجرایی، بدون نصب پایتون).
+این فورک روی سه پروژهٔ بالادست ایستاده — قبل از این که به این فورک فکر کنی، باید این سه را بشناسی و حمایتشان کنی:
 
-بیشتر کد Rust این پورت با کمک [Claude شرکت Anthropic](https://claude.com) نوشته شده، روی هر commit انسانی بازبینی شده.
+- پروژهٔ اصلی پایتون **[@masterking32/MasterHttpRelayVPN](https://github.com/masterking32/MasterHttpRelayVPN)** — همه‌چیز از این‌جا شروع شد. پروتکل Apps Script، معماری پروکسی، ایدهٔ استفاده از حساب گوگل خودت به‌عنوان رلهٔ رایگان — همه از اوست. بدون این، هیچ‌کدام از باقی وجود نداشت.
+- پورت Rust به نام **[@therealaleph/MasterHttpRelayVPN-RUST](https://github.com/therealaleph/MasterHttpRelayVPN-RUST)** (`mhrv-rs`) — این فورک ادامهٔ همان است. therealaleph پروژهٔ پایتون را به Rust بازنویسی کرد تا کلاینت‌های تک‌فایلی منتشر کند، رابط دسکتاپ و اندروید را ساخت، و پروژه را از v1.x تا v1.9.25 پیش برد. تقریباً هر خط کد این فورک کار اوست؛ ما فقط چراغ را روشن نگه داشتیم.
+- ایدهٔ گروه‌های fronting در **[@patterniha/MITM-DomainFronting](https://github.com/patterniha/MITM-DomainFronting)** — مسیریابی دامنه‌های خاص از طریق edge های Vercel / Fastly / CloudFront با SNI، که به بستهٔ آمادهٔ fronting این پروژه تبدیل شد. پروژه‌ای مستقل؛ کانفیگ Xray آن الهام‌بخش ادغام ما بود. جزئیات در [`docs/fronting-groups.md`](docs/fronting-groups.md).
 
-## حمایت از پروژه
+بیشتر کد Rust این پورت (شامل کار ادغام و rebrand این فورک) با کمک [Claude شرکت Anthropic](https://claude.com) نوشته شده و روی هر commit انسانی بازبینی شده است.
 
-[❤️ کمک مالی در sh1n.org](https://sh1n.org/donate) — برای پوشش هزینهٔ هاستینگ و runner CI. ستاره دادن به ریپو هم نشان می‌دهد پروژه ارزش ادامه دادن دارد.
+## حمایت از این پروژه‌ها
+
+اگر از این نرم‌افزار سود برده‌ای، **حمایتت را به بالادست بفرست، نه به این فورک.** رهگذر هیچ کمک مالی‌ای نمی‌گیرد و فقط برای پوشش کاربران در دورانی که بالادست غیرفعال است وجود دارد. مهندسی اصلی در سه پروژهٔ بالا انجام شده؛ لطفاً مستقیماً از آن‌ها حمایت کن:
+
+- در GitHub Sponsors از **[@masterking32](https://github.com/masterking32)** — نویسندهٔ پروژهٔ اصلی پایتون. یا از طریق روش‌های ذکر شده در پروفایل و ریپوی او.
+- در **[sh1n.org/donate](https://sh1n.org/donate)** برای **[@therealaleph](https://github.com/therealaleph)** — نویسندهٔ پورت Rust. پوشش هزینهٔ هاستینگ / CI / سال‌ها نگه‌داری.
+- در GitHub Sponsors از **[@patterniha](https://github.com/patterniha)** — نویسندهٔ MITM-DomainFronting. یا از طریق روش‌های ذکر شده در ریپوی او.
+
+ستاره دادن به این سه ریپوی بالادست هم نشان می‌دهد کارشان ارزش ادامه دادن دارد. اگر mhrv-rs بالادست دوباره فعال شد، این فورک تغییرات را برمی‌گرداند و کنار می‌کشد — هدف فقط تداوم دسترسی برای کاربران پشت سانسور سنگین است، نه چیز دیگر.
 
 </div>
