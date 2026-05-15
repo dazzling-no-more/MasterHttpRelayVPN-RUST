@@ -9,7 +9,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 
 /**
- * Visual theme tuned to match the desktop `mhrv-rs-ui` eframe UI pixel-for-pixel
+ * Visual theme tuned to match the desktop `rahgozar-ui` eframe UI pixel-for-pixel
  * where Compose semantics allow. The canonical source lives in `src/bin/ui.rs`
  * — these constants are the same `egui::Color32` values, re-expressed as
  * `Color(0xAARRGGBB)`. If you change a value here and not there (or vice

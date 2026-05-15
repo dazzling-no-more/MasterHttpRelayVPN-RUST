@@ -72,7 +72,7 @@ android {
     // universal APK (~50 MB, all four ABIs bundled) is the bottleneck —
     // users on slow or unstable censorship-tunnel paths often can't
     // pull down 50 MB reliably. Per-ABI APKs are ~15 MB each (only one
-    // copy of libmhrv_rs.so + libtun2proxy.so instead of four), which
+    // copy of librahgozar.so + libtun2proxy.so instead of four), which
     // is small enough to succeed where the universal fails.
     //
     // Keeping the universal APK too (`isUniversalApk = true`) because
@@ -102,7 +102,7 @@ android {
         buildConfig = true
     }
 
-    // libmhrv_rs.so is produced by `cargo ndk` in the repo root and dropped
+    // librahgozar.so is produced by `cargo ndk` in the repo root and dropped
     // under app/src/main/jniLibs/<abi>/. The cargoBuild task below runs
     // that before each assembleDebug / assembleRelease.
     sourceSets["main"].jniLibs.srcDirs("src/main/jniLibs")
@@ -226,7 +226,7 @@ tasks.register<Exec>("cargoBuildDebug") {
     // never worth it just for a Rust stack trace you wouldn't see in
     // logcat anyway. If you need Rust debug symbols, temporarily drop
     // `--release` below and accept the APK size.
-    description = "Cross-compile mhrv_rs for all ABIs (release — same as cargoBuildRelease)"
+    description = "Cross-compile rahgozar for all ABIs (release — same as cargoBuildRelease)"
     workingDir = rustCrateDir
     commandLine(buildList<String> {
         add("cargo"); add("ndk")
@@ -239,7 +239,7 @@ tasks.register<Exec>("cargoBuildDebug") {
 
 tasks.register<Exec>("cargoBuildRelease") {
     group = "build"
-    description = "Cross-compile mhrv_rs for all ABIs (release)"
+    description = "Cross-compile rahgozar for all ABIs (release)"
     workingDir = rustCrateDir
     commandLine(buildList<String> {
         add("cargo"); add("ndk")

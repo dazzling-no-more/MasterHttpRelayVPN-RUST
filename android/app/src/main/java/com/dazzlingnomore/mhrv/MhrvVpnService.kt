@@ -15,7 +15,7 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Foreground VpnService that:
- *   1. Runs the mhrv-rs Rust proxy (HTTP + SOCKS5 on 127.0.0.1).
+ *   1. Runs the rahgozar Rust proxy (HTTP + SOCKS5 on 127.0.0.1).
  *   2. Establishes a VPN TUN interface capturing all device traffic.
  *   3. Spawns tun2proxy in a background thread — it reads IP packets from
  *      the TUN fd, runs a userspace TCP/IP stack, and funnels every TCP/UDP
@@ -129,7 +129,7 @@ class MhrvVpnService : VpnService() {
 
         proxyHandle = Native.startProxy(cfg.toJson())
         if (proxyHandle == 0L) {
-            Log.e(TAG, "Native.startProxy returned 0 — see logcat tag mhrv_rs")
+            Log.e(TAG, "Native.startProxy returned 0 — see logcat tag rahgozar")
             try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
             stopSelf()
             return
@@ -164,7 +164,7 @@ class MhrvVpnService : VpnService() {
         //    - setBlocking(false): we're going to hand the fd to tun2proxy,
         //      which does its own async I/O.
         val builder = Builder()
-            .setSession("mhrv-rs")
+            .setSession("rahgozar")
             .setMtu(MTU)
             .addAddress("10.0.0.2", 32)
             .addRoute("0.0.0.0", 0)
@@ -462,10 +462,10 @@ class MhrvVpnService : VpnService() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val ch = NotificationChannel(
                 CHANNEL_ID,
-                "mhrv-rs",
+                "rahgozar",
                 NotificationManager.IMPORTANCE_LOW,
             ).apply {
-                description = "Status of the mhrv-rs VPN"
+                description = "Status of the rahgozar VPN"
                 setShowBadge(false)
             }
             mgr.createNotificationChannel(ch)
@@ -483,7 +483,7 @@ class MhrvVpnService : VpnService() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("mhrv-rs VPN is active")
+            .setContentTitle("rahgozar VPN is active")
             .setContentText("HTTP 127.0.0.1:$httpPort  ·  SOCKS5 127.0.0.1:$socks5Port")
             .setSmallIcon(android.R.drawable.presence_online)
             .setContentIntent(openIntent)

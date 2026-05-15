@@ -1,24 +1,24 @@
 [package]
-name = "mhrv-rs"
+name = "rahgozar"
 version = "2.0.0"
 edition = "2021"
-description = "Rust port of MasterHttpRelayVPN -- DPI bypass via Google Apps Script relay with domain fronting"
+description = "rahgozar — community continuation of mhrv-rs (Rust port of MasterHttpRelayVPN). DPI bypass via Google Apps Script relay with domain fronting."
 license = "MIT"
 
 [lib]
-name = "mhrv_rs"
+name = "rahgozar"
 path = "src/lib.rs"
-# `cdylib` lets the Android app dlopen libmhrv_rs.so via System.loadLibrary.
+# `cdylib` lets the Android app dlopen librahgozar.so via System.loadLibrary.
 # `rlib` keeps the desktop binaries linking normally — same .rlib is used
-# for `mhrv-rs` and `mhrv-rs-ui` builds on macOS/Linux/Windows.
+# for `rahgozar` and `rahgozar-ui` builds on macOS/Linux/Windows.
 crate-type = ["rlib", "cdylib"]
 
 [[bin]]
-name = "mhrv-rs"
+name = "rahgozar"
 path = "src/main.rs"
 
 [[bin]]
-name = "mhrv-rs-ui"
+name = "rahgozar-ui"
 path = "src/bin/ui.rs"
 required-features = ["ui"]
 

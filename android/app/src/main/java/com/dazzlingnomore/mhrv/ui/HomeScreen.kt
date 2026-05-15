@@ -205,7 +205,7 @@ fun HomeScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("mhrv-rs") },
+                title = { Text("rahgozar") },
                 actions = {
                     // Language toggle — cycles AUTO → FA → EN → AUTO.
                     // Saving writes to config.json and triggers activity
@@ -388,7 +388,7 @@ fun HomeScreen(
             // like Psiphon's. See docs/use-as-upstream.md.
             //
             // Gating on PROXY_ONLY: Android allows only one active VPN at a
-            // time. If mhrv-rs is running its own VpnService (VPN_TUN mode),
+            // time. If rahgozar is running its own VpnService (VPN_TUN mode),
             // Psiphon cannot establish its own VPN and the upstream address
             // here is not actionable. Show the warning copy first so the
             // user knows to stop, flip to PROXY_ONLY, and Connect again
@@ -650,7 +650,7 @@ fun HomeScreen(
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
-                        "mhrv-rs creates a local certificate authority so it can decrypt " +
+                        "rahgozar creates a local certificate authority so it can decrypt " +
                         "and re-encrypt HTTPS traffic before tunnelling it through the Apps " +
                         "Script relay. Without this CA installed as trusted, apps will show " +
                         "certificate errors."

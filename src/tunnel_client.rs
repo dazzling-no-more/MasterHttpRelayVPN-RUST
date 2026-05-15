@@ -989,7 +989,7 @@ async fn fire_batch(
                 if err_msg.contains("The script completed but did not return anything") {
                     tracing::error!(
                         "batch failed (script {}): got the v1.8.0 decoy/placeholder body — \
-                         could be (1) AUTH_KEY mismatch between mhrv-rs config and Code.gs \
+                         could be (1) AUTH_KEY mismatch between rahgozar config and Code.gs \
                          (run a direct curl probe against the deployment to verify), \
                          (2) Apps Script execution timeout or per-100s quota tear (try \
                          lowering parallel_concurrency in config), (3) Apps Script \

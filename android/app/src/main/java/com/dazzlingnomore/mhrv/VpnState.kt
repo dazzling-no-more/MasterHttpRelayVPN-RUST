@@ -5,7 +5,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * Process-wide observable for "is mhrv-rs's VPN/proxy currently up?"
+ * Process-wide observable for "is rahgozar's VPN/proxy currently up?"
  *
  * The activity and the service live in the same process (same UID, same
  * ClassLoader), so a plain singleton with a `MutableStateFlow` is the

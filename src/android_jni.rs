@@ -57,7 +57,7 @@ fn slot_map() -> &'static Mutex<std::collections::HashMap<u64, Running>> {
 // Logging bridge.
 //
 // We fan each tracing event out two ways:
-//   1. `__android_log_write` — lands in `adb logcat` under tag `mhrv_rs`.
+//   1. `__android_log_write` — lands in `adb logcat` under tag `rahgozar`.
 //   2. An in-memory ring buffer the Kotlin UI drains via `Native.drainLogs()`.
 // The first path was enough to get past "startProxy returned 0 — silent
 // failure"; the second path gives the user a live log panel without making
@@ -92,7 +92,7 @@ impl std::io::Write for LogcatWriter {
         let mut cstr = Vec::with_capacity(trimmed.len() + 1);
         cstr.extend_from_slice(trimmed);
         cstr.push(0);
-        static TAG: &[u8] = b"mhrv_rs\0";
+        static TAG: &[u8] = b"rahgozar\0";
         unsafe {
             __android_log_write(
                 ANDROID_LOG_INFO,
@@ -358,7 +358,7 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_drainLogs<'a>(
 /// Returned shape, one of:
 ///   {"kind":"upToDate","current":"1.0.0","latest":"1.0.0"}
 ///   {"kind":"updateAvailable","current":"1.0.0","latest":"1.1.0","url":"https://...",
-///    "assetName":"mhrv-rs-android-arm64-v8a-v1.1.0.apk",
+///    "assetName":"rahgozar-android-arm64-v8a-v1.1.0.apk",
 ///    "assetUrl":"https://...","assetSize":12345678}
 ///   {"kind":"offline","reason":"..."}
 ///   {"kind":"error","reason":"..."}

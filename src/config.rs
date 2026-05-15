@@ -57,18 +57,14 @@ impl ScriptId {
     }
 }
 
-/// Top-level config schema. Marked `#[non_exhaustive]` so adding a new
-/// field (which the YouTube + DPI work has done several times in the
-/// last few releases) isn't a breaking change for downstream Rust
-/// consumers depending on `mhrv_rs` as a library — they'll be forced
-/// to use functional-update or `serde_json::from_str` rather than a
-/// full struct literal, which means a new field added later doesn't
-/// fail their build until they choose to surface it.
-///
-/// In-crate code can still construct via struct literal as usual;
-/// `#[non_exhaustive]` only restricts cross-crate construction.
+/// Top-level config schema. The `rahgozar-ui` bin constructs this via
+/// struct literal in `src/bin/ui.rs::to_config()`, so every field must
+/// stay accessible to the same-package bin crate. (A `#[non_exhaustive]`
+/// marker was tried earlier to "future-proof for downstream consumers,"
+/// but bin-vs-lib are separate crates from rustc's view and that broke
+/// the UI build with E0639. No external crates depend on us as a
+/// library anyway — `rahgozar` isn't published to crates.io.)
 #[derive(Debug, Clone, Deserialize)]
-#[non_exhaustive]
 pub struct Config {
     pub mode: String,
     #[serde(default = "default_google_ip")]
@@ -126,7 +122,7 @@ pub struct Config {
     /// {www, mail, drive, docs, calendar}.google.com). Set to an explicit list
     /// to pick exactly which SNI names get rotated through — useful when one
     /// of the defaults is locally blocked (e.g. mail.google.com in Iran at
-    /// various times). Can be tested per-name via the UI or `mhrv-rs test-sni`.
+    /// various times). Can be tested per-name via the UI or `rahgozar test-sni`.
     #[serde(default)]
     pub sni_hosts: Option<Vec<String>>,
     #[serde(default = "default_fetch_ips_from_api")]
@@ -485,7 +481,7 @@ pub struct Config {
     ///
     /// The destination sees the exit node's outbound IP, not Google's.
     /// CF anti-bot's "this is a Google datacenter" heuristic doesn't
-    /// fire. mhrv-rs's DPI cover (Iran ISP only sees the SNI-rewritten
+    /// fire. rahgozar's DPI cover (Iran ISP only sees the SNI-rewritten
     /// TLS to a Google IP) is unchanged — the second hop happens
     /// inside Apps Script, invisible from the user's network.
     ///
@@ -804,7 +800,7 @@ impl Config {
                 )));
             }
             // Parse the SNI here so an invalid hostname fails the same
-            // load path the UI / `mhrv-rs` CLI both use, rather than
+            // load path the UI / `rahgozar` CLI both use, rather than
             // surfacing later only when ProxyServer::new tries to build
             // the TLS server name. Same fail-fast contract as the rest
             // of validate(). The parse is cheap; runtime path repeats

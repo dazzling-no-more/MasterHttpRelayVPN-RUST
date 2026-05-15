@@ -3,11 +3,11 @@
 <plist version="1.0">
 <dict>
     <key>CFBundleName</key>
-    <string>mhrv-rs</string>
+    <string>rahgozar</string>
     <key>CFBundleDisplayName</key>
-    <string>mhrv-rs</string>
+    <string>rahgozar</string>
     <key>CFBundleIdentifier</key>
-    <string>com.dazzlingnomore.mhrv-rs</string>
+    <string>com.dazzlingnomore.rahgozar</string>
     <key>CFBundleVersion</key>
     <string>__VERSION__</string>
     <key>CFBundleShortVersionString</key>
@@ -15,7 +15,7 @@
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleExecutable</key>
-    <string>mhrv-rs-ui</string>
+    <string>rahgozar-ui</string>
     <key>CFBundleSignature</key>
     <string>????</string>
     <key>LSMinimumSystemVersion</key>

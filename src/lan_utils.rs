@@ -15,7 +15,7 @@
 //! This is the same pattern used by `gethostbyname` callers and by every
 //! other "what's my LAN IP" helper across the ecosystem — no
 //! getifaddrs / `if_nameindex` boilerplate, no platform-specific code,
-//! works on every target the rest of mhrv-rs builds on.
+//! works on every target the rest of rahgozar builds on.
 
 use std::net::{IpAddr, UdpSocket};
 

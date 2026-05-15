@@ -107,7 +107,7 @@
     <string name="snack_logs_copied">Logs copied to clipboard</string>
     <string name="snack_update_available_url">Update v%1$s → v%2$s  %3$s</string>
     <string name="snack_update_available">Update available: v%1$s → v%2$s</string>
-    <string name="snack_update_enable_unknown_apps">Enable "Install unknown apps" for mhrv-rs, then tap the version label to retry.</string>
+    <string name="snack_update_enable_unknown_apps">Enable "Install unknown apps" for rahgozar, then tap the version label to retry.</string>
     <string name="snack_update_downloading">Downloading and verifying update… (%1$.1f MB)</string>
     <string name="snack_update_open_installer_failed">Couldn\'t open installer: %1$s</string>
     <string name="snack_update_download_failed">Download failed: %1$s</string>
@@ -169,7 +169,7 @@
     <!-- Direct mode upstream-proxy banner (see docs/use-as-upstream.md). -->
     <string name="direct_upstream_help">Also works as an upstream proxy for Psiphon / xray — unfronted hosts pass through as raw TCP.</string>
     <string name="direct_upstream_label">Upstream for Psiphon / xray:</string>
-    <string name="direct_upstream_vpn_tun_warning">Psiphon needs Android\'s single VPN slot. Stop mhrv-rs, switch Connection mode to PROXY_ONLY, then Connect again — only then can Psiphon use the address below.</string>
+    <string name="direct_upstream_vpn_tun_warning">Psiphon needs Android\'s single VPN slot. Stop rahgozar, switch Connection mode to PROXY_ONLY, then Connect again — only then can Psiphon use the address below.</string>
     <string name="btn_copy_lower">copy</string>
     <string name="snack_upstream_copied">Copied %1$s</string>
 

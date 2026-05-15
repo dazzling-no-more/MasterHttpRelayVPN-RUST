@@ -1,8 +1,8 @@
 package com.dazzlingnomore.mhrv
 
 /**
- * JNI bindings for the mhrv_rs Rust crate. The crate is compiled to
- * libmhrv_rs.so and loaded at app start.
+ * JNI bindings for the rahgozar Rust crate. The crate is compiled to
+ * librahgozar.so and loaded at app start.
  *
  * All methods are blocking on a short-lived native call — the proxy itself
  * runs on a Rust-side tokio runtime, not on the JVM thread that calls in.
@@ -14,7 +14,7 @@ package com.dazzlingnomore.mhrv
 object Native {
 
     init {
-        System.loadLibrary("mhrv_rs")
+        System.loadLibrary("rahgozar")
     }
 
     /**
@@ -44,7 +44,7 @@ object Native {
      */
     external fun exportCa(destPath: String): Boolean
 
-    /** mhrv_rs crate version. Smoke test for JNI linkage. */
+    /** rahgozar crate version. Smoke test for JNI linkage. */
     external fun version(): String
 
     /**
@@ -67,7 +67,7 @@ object Native {
     external fun testSni(googleIp: String, sni: String): String
 
     /**
-     * Ask GitHub's Releases API whether a newer version of mhrv-rs is
+     * Ask GitHub's Releases API whether a newer version of rahgozar is
      * out. Returns a JSON blob, one of:
      *   - `{"kind":"upToDate","current":"1.0.0","latest":"1.0.0"}`
      *   - `{"kind":"updateAvailable","current":"1.0.0","latest":"1.1.0","url":"https://...",`

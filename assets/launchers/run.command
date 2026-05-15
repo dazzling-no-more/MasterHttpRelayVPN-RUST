@@ -4,8 +4,8 @@
 set -eu
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-CLI="$DIR/mhrv-rs"
-UI="$DIR/mhrv-rs-ui"
+CLI="$DIR/rahgozar"
+UI="$DIR/rahgozar-ui"
 
 if [ ! -x "$CLI" ]; then
     echo "error: $CLI not found or not executable"
@@ -22,5 +22,5 @@ if [ ! -x "$UI" ]; then
     exec "$CLI"
 fi
 
-echo "Starting mhrv-rs UI..."
+echo "Starting rahgozar UI..."
 "$UI"

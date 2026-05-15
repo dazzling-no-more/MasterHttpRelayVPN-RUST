@@ -7,11 +7,11 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
-use mhrv_rs::cert_installer::{install_ca, is_ca_trusted, reconcile_sudo_environment, remove_ca};
-use mhrv_rs::config::Config;
-use mhrv_rs::mitm::{MitmCertManager, CA_CERT_FILE};
-use mhrv_rs::proxy_server::ProxyServer;
-use mhrv_rs::{scan_ips, scan_sni, test_cmd};
+use rahgozar::cert_installer::{install_ca, is_ca_trusted, reconcile_sudo_environment, remove_ca};
+use rahgozar::config::Config;
+use rahgozar::mitm::{MitmCertManager, CA_CERT_FILE};
+use rahgozar::proxy_server::ProxyServer;
+use rahgozar::{scan_ips, scan_sni, test_cmd};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -33,14 +33,14 @@ enum Command {
 
 fn print_help() {
     println!(
-        "mhrv-rs {} — Rust port of MasterHttpRelayVPN (apps_script mode only)
+        "rahgozar {} — Rust port of MasterHttpRelayVPN (apps_script mode only)
 
 USAGE:
-    mhrv-rs [OPTIONS]                  Start the proxy server (default)
-    mhrv-rs test [OPTIONS]             Probe the Apps Script relay end-to-end
-    mhrv-rs scan-ips [OPTIONS]         Scan Google frontend IPs for reachability + latency
-    mhrv-rs scan-sni         Scan Google SNI name using Google frontend IPs found in 'scan-ips' command
-    mhrv-rs test-sni [OPTIONS]         Probe each SNI name in the rotation pool against google_ip
+    rahgozar [OPTIONS]                  Start the proxy server (default)
+    rahgozar test [OPTIONS]             Probe the Apps Script relay end-to-end
+    rahgozar scan-ips [OPTIONS]         Scan Google frontend IPs for reachability + latency
+    rahgozar scan-sni         Scan Google SNI name using Google frontend IPs found in 'scan-ips' command
+    rahgozar test-sni [OPTIONS]         Probe each SNI name in the rotation pool against google_ip
 
 OPTIONS:
     -c, --config PATH    Path to config.json (default: ./config.json)
@@ -99,7 +99,7 @@ fn parse_args() -> Result<Args, String> {
                 std::process::exit(0);
             }
             "-V" | "--version" => {
-                println!("mhrv-rs {}", VERSION);
+                println!("rahgozar {}", VERSION);
                 std::process::exit(0);
             }
             "-c" | "--config" => {
@@ -140,15 +140,15 @@ async fn main() -> ExitCode {
     // next to us, finish the swap (Windows: rename + re-exec; Unix:
     // late-apply rename) before any other init touches state. Best-effort:
     // a failure logs and falls through.
-    mhrv_rs::update_apply::finalize_pending_at_startup();
+    rahgozar::update_apply::finalize_pending_at_startup();
 
     // Install default rustls crypto provider (ring).
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Must run before anything else reads HOME / USER / data_dir — if
-    // the user ran `sudo ./mhrv-rs ...`, this re-points HOME at the
+    // the user ran `sudo ./rahgozar ...`, this re-points HOME at the
     // invoking user's home so user-scoped cert paths (Firefox profiles,
-    // macOS login keychain, the mhrv-rs data dir) are not silently
+    // macOS login keychain, the rahgozar data dir) are not silently
     // operated against root's home. No-op on Windows and for non-sudo
     // invocations.
     reconcile_sudo_environment();
@@ -168,7 +168,7 @@ async fn main() -> ExitCode {
     // not have to redeploy Code.gs after regenerating the CA.
     if args.remove_cert {
         init_logging("info");
-        let base = mhrv_rs::data_dir::data_dir();
+        let base = rahgozar::data_dir::data_dir();
         match remove_ca(&base) {
             Ok(outcome) => {
                 tracing::info!("{}", outcome.summary());
@@ -188,7 +188,7 @@ async fn main() -> ExitCode {
     // --install-cert can run without a valid config — only needs the CA file.
     if args.install_cert {
         init_logging("info");
-        let base = mhrv_rs::data_dir::data_dir();
+        let base = rahgozar::data_dir::data_dir();
         if let Err(e) = MitmCertManager::new_in(&base) {
             eprintln!("failed to initialize CA: {}", e);
             return ExitCode::FAILURE;
@@ -206,7 +206,7 @@ async fn main() -> ExitCode {
         }
     }
 
-    let config_path = mhrv_rs::data_dir::resolve_config_path(args.config_path.as_deref());
+    let config_path = rahgozar::data_dir::resolve_config_path(args.config_path.as_deref());
     let config = match Config::load(&config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -226,7 +226,7 @@ async fn main() -> ExitCode {
     // of fds under normal proxy load. This logs the before/after values
     // at info level so field reports tell us whether the kernel cap is
     // the real culprit.
-    mhrv_rs::rlimit::raise_nofile_limit_best_effort();
+    rahgozar::rlimit::raise_nofile_limit_best_effort();
 
     match args.command {
         Command::Test => {
@@ -273,7 +273,7 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    tracing::warn!("mhrv-rs {} starting (mode: {})", VERSION, mode.as_str());
+    tracing::warn!("rahgozar {} starting (mode: {})", VERSION, mode.as_str());
     tracing::info!(
         "HTTP proxy   : {}:{}",
         config.listen_host,
@@ -281,7 +281,7 @@ async fn main() -> ExitCode {
     );
     tracing::info!("SOCKS5 proxy : {}:{}", config.listen_host, socks5_port);
     match mode {
-        mhrv_rs::config::Mode::AppsScript => {
+        rahgozar::config::Mode::AppsScript => {
             tracing::info!(
                 "Apps Script relay: SNI={} -> script.google.com (via {})",
                 config.front_domain,
@@ -294,7 +294,7 @@ async fn main() -> ExitCode {
                 tracing::info!("Script ID: {}", sids[0]);
             }
         }
-        mhrv_rs::config::Mode::Direct => {
+        rahgozar::config::Mode::Direct => {
             tracing::warn!(
                 "direct mode: SNI-rewrite tunnel only (Google edge {} + any \
                  configured fronting_groups). Open https://script.google.com \
@@ -305,7 +305,7 @@ async fn main() -> ExitCode {
                 config.listen_port
             );
         }
-        mhrv_rs::config::Mode::Full => {
+        rahgozar::config::Mode::Full => {
             tracing::info!(
                 "Full tunnel: SNI={} -> script.google.com (via {})",
                 config.front_domain,
@@ -325,7 +325,7 @@ async fn main() -> ExitCode {
     }
 
     // Initialize MITM manager (generates CA on first run).
-    let base = mhrv_rs::data_dir::data_dir();
+    let base = rahgozar::data_dir::data_dir();
     let mitm = match MitmCertManager::new_in(&base) {
         Ok(m) => m,
         Err(e) => {
@@ -335,7 +335,7 @@ async fn main() -> ExitCode {
     };
     let ca_path = base.join(CA_CERT_FILE);
 
-    if !args.no_cert_check && mode != mhrv_rs::config::Mode::Full {
+    if !args.no_cert_check && mode != rahgozar::config::Mode::Full {
         if !is_ca_trusted(&ca_path) {
             tracing::warn!("MITM CA is not (obviously) trusted — attempting install...");
             match install_ca(&ca_path) {

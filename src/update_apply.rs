@@ -508,7 +508,7 @@ fn extract_tar_gz(path: &Path, dest: &Path) -> Result<(), ApplyError> {
 /// extension, or with one when current_exe doesn't). Errors if more
 /// than one match — defensive against future multi-binary archives
 /// where multiple files could plausibly satisfy the same name (e.g.
-/// `mhrv-rs-ui` shipped at root AND inside an `extras/` dir would
+/// `rahgozar-ui` shipped at root AND inside an `extras/` dir would
 /// otherwise pick whichever `read_dir` returned first).
 fn find_binary(root: &Path, target_name: &str) -> Result<PathBuf, ApplyError> {
     let stem = Path::new(target_name)
@@ -814,55 +814,55 @@ mod tests {
 
     #[test]
     fn staged_path_appends_new() {
-        let p = Path::new("/tmp/foo/mhrv-rs-ui");
+        let p = Path::new("/tmp/foo/rahgozar-ui");
         assert_eq!(
             staged_path(p),
-            PathBuf::from("/tmp/foo/mhrv-rs-ui.new")
+            PathBuf::from("/tmp/foo/rahgozar-ui.new")
         );
-        let p = Path::new("C:/x/mhrv-rs-ui.exe");
+        let p = Path::new("C:/x/rahgozar-ui.exe");
         assert_eq!(
             staged_path(p).file_name().unwrap().to_string_lossy(),
-            "mhrv-rs-ui.exe.new"
+            "rahgozar-ui.exe.new"
         );
     }
 
     #[test]
     fn find_binary_matches_with_or_without_exe() {
         let dir = tempfile::tempdir().unwrap();
-        let nested = dir.path().join("mhrv-rs-1.0");
+        let nested = dir.path().join("rahgozar-1.0");
         std::fs::create_dir_all(&nested).unwrap();
-        let bin = nested.join("mhrv-rs-ui");
+        let bin = nested.join("rahgozar-ui");
         std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
         // current_exe has .exe, archive has bare name → still match by stem.
-        let found = find_binary(dir.path(), "mhrv-rs-ui.exe").unwrap();
+        let found = find_binary(dir.path(), "rahgozar-ui.exe").unwrap();
         assert_eq!(found, bin);
         // current_exe has bare name, archive has bare name → match.
-        let found = find_binary(dir.path(), "mhrv-rs-ui").unwrap();
+        let found = find_binary(dir.path(), "rahgozar-ui").unwrap();
         assert_eq!(found, bin);
     }
 
     #[test]
     fn find_binary_errors_on_ambiguous_match() {
         let dir = tempfile::tempdir().unwrap();
-        // Two files would both satisfy the stem `mhrv-rs-ui`: one at root
+        // Two files would both satisfy the stem `rahgozar-ui`: one at root
         // and one inside a subdir. We want the function to refuse rather
         // than silently pick by `read_dir` order.
-        std::fs::write(dir.path().join("mhrv-rs-ui"), b"a").unwrap();
+        std::fs::write(dir.path().join("rahgozar-ui"), b"a").unwrap();
         let sub = dir.path().join("inner");
         std::fs::create_dir_all(&sub).unwrap();
-        std::fs::write(sub.join("mhrv-rs-ui"), b"b").unwrap();
-        let res = find_binary(dir.path(), "mhrv-rs-ui");
+        std::fs::write(sub.join("rahgozar-ui"), b"b").unwrap();
+        let res = find_binary(dir.path(), "rahgozar-ui");
         assert!(matches!(res, Err(ApplyError::AmbiguousBinary(_))));
     }
 
     #[test]
     fn find_binary_skips_unrelated_names() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("mhrv-rs"), b"cli").unwrap();
-        std::fs::write(dir.path().join("mhrv-rs-ui-extras"), b"x").unwrap();
-        std::fs::write(dir.path().join("mhrv-rs-ui"), b"ui").unwrap();
-        let found = find_binary(dir.path(), "mhrv-rs-ui").unwrap();
-        assert_eq!(found.file_name().unwrap(), "mhrv-rs-ui");
+        std::fs::write(dir.path().join("rahgozar"), b"cli").unwrap();
+        std::fs::write(dir.path().join("rahgozar-ui-extras"), b"x").unwrap();
+        std::fs::write(dir.path().join("rahgozar-ui"), b"ui").unwrap();
+        let found = find_binary(dir.path(), "rahgozar-ui").unwrap();
+        assert_eq!(found.file_name().unwrap(), "rahgozar-ui");
     }
 
     #[test]
@@ -951,14 +951,14 @@ mod tests {
     #[test]
     fn cleanup_stale_old_only_touches_our_name() {
         let dir = tempfile::tempdir().unwrap();
-        let our = dir.path().join("mhrv-rs-ui.old");
+        let our = dir.path().join("rahgozar-ui.old");
         let theirs = dir.path().join("someone-elses.old");
         std::fs::write(&our, b"x").unwrap();
         std::fs::write(&theirs, b"y").unwrap();
         // current would normally be the actual exe path; we simulate by
         // pointing at a name in this dir.
-        let current = dir.path().join("mhrv-rs-ui");
-        cleanup_stale_old(&current, "mhrv-rs-ui");
+        let current = dir.path().join("rahgozar-ui");
+        cleanup_stale_old(&current, "rahgozar-ui");
         assert!(!our.exists(), "ours should be removed");
         assert!(theirs.exists(), "unrelated .old must NOT be removed");
     }
@@ -972,7 +972,7 @@ mod tests {
         assert_eq!(s.swap_target(), PathBuf::from("/p/foo.exe"));
         let s = StagedUpdate {
             staged_path: PathBuf::from("/Apps/Mhrv.app.new"),
-            relaunch_path: PathBuf::from("/Apps/Mhrv.app/Contents/MacOS/mhrv-rs-ui"),
+            relaunch_path: PathBuf::from("/Apps/Mhrv.app/Contents/MacOS/rahgozar-ui"),
         };
         assert_eq!(s.swap_target(), PathBuf::from("/Apps/Mhrv.app"));
     }
@@ -980,12 +980,12 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_bundle_for_exe_detects_layout() {
-        let inside = Path::new("/Applications/Mhrv.app/Contents/MacOS/mhrv-rs-ui");
+        let inside = Path::new("/Applications/Mhrv.app/Contents/MacOS/rahgozar-ui");
         assert_eq!(
             macos_bundle_for_exe(inside),
             Some(PathBuf::from("/Applications/Mhrv.app"))
         );
-        let outside = Path::new("/usr/local/bin/mhrv-rs-ui");
+        let outside = Path::new("/usr/local/bin/rahgozar-ui");
         assert!(macos_bundle_for_exe(outside).is_none());
         let near_miss = Path::new("/X/NotAnApp/Contents/MacOS/foo");
         assert!(macos_bundle_for_exe(near_miss).is_none());

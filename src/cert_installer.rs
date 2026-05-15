@@ -972,7 +972,7 @@ fn enable_mozilla_enterprise_roots() {
 // distinguish our own line from a user-authored one with the same
 // value. Any user-authored `security.enterprise_roots.enabled` line
 // (with or without our marker above it) means "hands off".
-const FX_MARKER: &str = "// mhrv-rs: auto-added, safe to strip with --remove-cert";
+const FX_MARKER: &str = "// rahgozar: auto-added, safe to strip with --remove-cert";
 const FX_PREF: &str = r#"user_pref("security.enterprise_roots.enabled", true);"#;
 
 #[derive(Debug, PartialEq, Eq)]

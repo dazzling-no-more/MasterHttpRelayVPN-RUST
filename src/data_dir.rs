@@ -1,10 +1,10 @@
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-const APP_NAME: &str = "mhrv-rs";
+const APP_NAME: &str = "rahgozar";
 
 /// Global override. On Android the app sets this to its private files dir
-/// before any other mhrv-rs code runs — avoids `directories` crate returning
+/// before any other rahgozar code runs — avoids `directories` crate returning
 /// a questionable path inside `/data/data/...` that the app may not own.
 /// On desktop platforms nobody sets this and the normal fallback applies.
 static DATA_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
@@ -20,9 +20,9 @@ pub fn set_data_dir(path: PathBuf) {
 /// it if necessary. Falls back to the current directory if the dir can't be
 /// determined (rare).
 ///
-/// - macOS:   `~/Library/Application Support/mhrv-rs`
-/// - Linux:   `~/.config/mhrv-rs` (or `$XDG_CONFIG_HOME/mhrv-rs`)
-/// - Windows: `%APPDATA%\mhrv-rs`
+/// - macOS:   `~/Library/Application Support/rahgozar`
+/// - Linux:   `~/.config/rahgozar` (or `$XDG_CONFIG_HOME/rahgozar`)
+/// - Windows: `%APPDATA%\rahgozar`
 /// - Android: whatever the app passed to `set_data_dir()` (typically the
 ///   app's private `filesDir`).
 pub fn data_dir() -> PathBuf {

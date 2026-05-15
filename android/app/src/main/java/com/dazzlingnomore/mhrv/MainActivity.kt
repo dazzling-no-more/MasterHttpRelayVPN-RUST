@@ -100,7 +100,7 @@ class MainActivity : AppCompatActivity() {
      *  dialog with the deployment IDs and a trust warning. */
     private fun handleDeepLink(intent: Intent?) {
         val data = intent?.data ?: return
-        if (data.scheme != "mhrv-rs") return
+        if (data.scheme != "rahgozar") return
         val cfg = ConfigStore.decode(data.toString()) ?: return
         pendingDeepLinkConfig.value = cfg
     }

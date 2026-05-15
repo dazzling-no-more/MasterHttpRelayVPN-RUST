@@ -1,4 +1,4 @@
-//! `mhrv-rs test` — end-to-end probe of the Apps Script relay.
+//! `rahgozar test` — end-to-end probe of the Apps Script relay.
 //!
 //! Sends one GET through the relay to api.ipify.org and verifies the
 //! response is a real IP-lookup response, not just any HTTP 200. Emits
@@ -21,8 +21,8 @@ const TEST_URL: &str = "https://api.ipify.org/?format=json";
 
 pub async fn run(config: &Config) -> bool {
     if matches!(config.mode_kind(), Ok(Mode::Direct)) {
-        let msg = "`mhrv-rs test` probes the Apps Script relay, which isn't \
-                   wired up in direct mode. Run `mhrv-rs test-sni` to check \
+        let msg = "`rahgozar test` probes the Apps Script relay, which isn't \
+                   wired up in direct mode. Run `rahgozar test-sni` to check \
                    the SNI-rewrite tunnel instead.";
         println!("{}", msg);
         tracing::error!("{}", msg);
@@ -37,7 +37,7 @@ pub async fn run(config: &Config) -> bool {
         // browser (which DOES go through the tunnel). Rather than fake
         // a passing test, refuse the same way we do for direct mode and
         // tell the user how to actually verify Full mode.
-        let msg = "`mhrv-rs test` is wired only for the apps_script relay \
+        let msg = "`rahgozar test` is wired only for the apps_script relay \
                    path. In full mode the data plane is the pipelined \
                    tunnel mux talking to your tunnel-node — Test Relay \
                    would bypass that and probe Apps Script directly, \

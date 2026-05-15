@@ -4,7 +4,7 @@ package com.github.shadowsocks.bg
  * JNI bridge to the tun2proxy crate's Android entry points.
  *
  * The tun2proxy Rust crate (already pulled in as an Android-only dep of
- * libmhrv_rs) defines its C entry points under this exact package path:
+ * librahgozar) defines its C entry points under this exact package path:
  *   Java_com_github_shadowsocks_bg_Tun2proxy_run
  *   Java_com_github_shadowsocks_bg_Tun2proxy_stop
  *
@@ -14,10 +14,10 @@ package com.github.shadowsocks.bg
  *
  * The crate is reusing Shadowsocks-Android's original JNI convention.
  *
- * NOTE: the tun2proxy JNI symbols live in libtun2proxy.so (not libmhrv_rs.so).
- * tun2proxy is pulled in as a Rust dep of mhrv-rs, but because nothing in
- * mhrv-rs calls these symbols directly, Rust's rlib-level dead-code
- * elimination drops them from libmhrv_rs.so. The cdylib variant of tun2proxy
+ * NOTE: the tun2proxy JNI symbols live in libtun2proxy.so (not librahgozar.so).
+ * tun2proxy is pulled in as a Rust dep of rahgozar, but because nothing in
+ * rahgozar calls these symbols directly, Rust's rlib-level dead-code
+ * elimination drops them from librahgozar.so. The cdylib variant of tun2proxy
  * (which rustc builds alongside the rlib) retains them, so we ship that .so
  * separately and load it explicitly here.
  */

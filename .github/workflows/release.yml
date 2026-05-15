@@ -84,7 +84,7 @@ jobs:
           # internet who can't dist-upgrade keep working.
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            name: mhrv-rs-linux-amd64
+            name: rahgozar-linux-amd64
           # ── Linux arm64 + armhf (glibc) ───────────────────────────────────
           # Cross-compiled from x86_64 ubuntu-latest via apt-installed
           # gcc-aarch64-linux-gnu / gcc-arm-linux-gnueabihf. Upstream had
@@ -92,13 +92,13 @@ jobs:
           # them per-job (~30 s, cached by rust-cache afterward).
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-latest
-            name: mhrv-rs-linux-arm64
+            name: rahgozar-linux-arm64
             linux_cross_apt: gcc-aarch64-linux-gnu
             cargo_linker_var: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
             cargo_linker_val: aarch64-linux-gnu-gcc
           - target: arm-unknown-linux-gnueabihf
             os: ubuntu-latest
-            name: mhrv-rs-raspbian-armhf
+            name: rahgozar-raspbian-armhf
             linux_cross_apt: gcc-arm-linux-gnueabihf
             cargo_linker_var: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
             cargo_linker_val: arm-linux-gnueabihf-gcc
@@ -106,13 +106,13 @@ jobs:
           # Already github-hosted upstream; works unchanged on the fork.
           - target: x86_64-apple-darwin
             os: macos-latest
-            name: mhrv-rs-macos-amd64
+            name: rahgozar-macos-amd64
           - target: aarch64-apple-darwin
             os: macos-latest
-            name: mhrv-rs-macos-arm64
+            name: rahgozar-macos-arm64
           - target: x86_64-pc-windows-gnu
             os: windows-latest
-            name: mhrv-rs-windows-amd64
+            name: rahgozar-windows-amd64
           # ── Linux musl (static, OpenWRT / Alpine / libc-less) ─────────────
           # Built via the messense/rust-musl-cross docker images that
           # ship a complete musl toolchain. ubuntu-latest has docker
@@ -120,10 +120,10 @@ jobs:
           # existing "Build CLI (musl via docker)" steps further down.
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            name: mhrv-rs-linux-musl-amd64
+            name: rahgozar-linux-musl-amd64
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
-            name: mhrv-rs-linux-musl-arm64
+            name: rahgozar-linux-musl-arm64
           # ── OpenWRT MT7621 (mipsel-softfloat, Rust tier-3) ────────────────
           # Dozens of cheap home routers run this chipset and they
           # *specifically* need the soft-float variant — MT7621 has no
@@ -134,7 +134,7 @@ jobs:
           # the rest of the release. Issue #26.
           - target: mipsel-unknown-linux-musl
             os: ubuntu-latest
-            name: mhrv-rs-openwrt-mipsel-softfloat
+            name: rahgozar-openwrt-mipsel-softfloat
             mipsel_softfloat: true
 
     runs-on: ${{ matrix.os }}
@@ -281,7 +281,7 @@ jobs:
 
       - name: Build CLI
         if: "!endsWith(matrix.target, '-linux-musl')"
-        run: cargo build --release --target ${{ matrix.target }} --bin mhrv-rs
+        run: cargo build --release --target ${{ matrix.target }} --bin rahgozar
 
       # Fully-static musl builds for OpenWRT / Alpine / libc-less systems.
       # messense/rust-musl-cross ships a pre-built musl toolchain so `ring`
@@ -292,7 +292,7 @@ jobs:
           docker run --rm -v "$PWD":/src -w /src \
             -e MHRV_UPDATE_PUBKEY \
             messense/rust-musl-cross:x86_64-musl \
-            cargo build --release --target x86_64-unknown-linux-musl --bin mhrv-rs
+            cargo build --release --target x86_64-unknown-linux-musl --bin rahgozar
           sudo chown -R "$(id -u):$(id -g)" target
 
       - name: Build CLI (musl via docker, arm64)
@@ -301,7 +301,7 @@ jobs:
           docker run --rm -v "$PWD":/src -w /src \
             -e MHRV_UPDATE_PUBKEY \
             messense/rust-musl-cross:aarch64-musl \
-            cargo build --release --target aarch64-unknown-linux-musl --bin mhrv-rs
+            cargo build --release --target aarch64-unknown-linux-musl --bin rahgozar
           sudo chown -R "$(id -u):$(id -g)" target
 
       # OpenWRT MT7621 / mipsel-softfloat. messense doesn't publish a
@@ -352,7 +352,7 @@ jobs:
               cargo +nightly build --release \
                 -Z build-std=std,panic_abort \
                 --target mipsel-unknown-linux-musl \
-                --bin mhrv-rs
+                --bin rahgozar
             '
           rc=$?
           # `trap … EXIT` will fire the chown on shell exit — the explicit
@@ -366,24 +366,24 @@ jobs:
       # are headless, bundling X11 makes no sense).
       - name: Build UI
         if: matrix.target != 'aarch64-unknown-linux-gnu' && matrix.target != 'arm-unknown-linux-gnueabihf' && !endsWith(matrix.target, '-linux-musl')
-        run: cargo build --release --target ${{ matrix.target }} --features ui --bin mhrv-rs-ui
+        run: cargo build --release --target ${{ matrix.target }} --features ui --bin rahgozar-ui
 
       - name: Package (unix)
         if: runner.os != 'Windows'
         run: |
           mkdir -p dist
-          cp target/${{ matrix.target }}/release/mhrv-rs dist/mhrv-rs
-          chmod +x dist/mhrv-rs
-          if [ -f target/${{ matrix.target }}/release/mhrv-rs-ui ]; then
-            cp target/${{ matrix.target }}/release/mhrv-rs-ui dist/mhrv-rs-ui
-            chmod +x dist/mhrv-rs-ui
+          cp target/${{ matrix.target }}/release/rahgozar dist/rahgozar
+          chmod +x dist/rahgozar
+          if [ -f target/${{ matrix.target }}/release/rahgozar-ui ]; then
+            cp target/${{ matrix.target }}/release/rahgozar-ui dist/rahgozar-ui
+            chmod +x dist/rahgozar-ui
           fi
           # OpenWRT / musl archives get the procd init script instead of run.sh,
           # since routers don't have a CA to install and run headless via procd.
           case "${{ matrix.target }}" in
             *-linux-musl)
-              cp assets/openwrt/mhrv-rs.init dist/mhrv-rs.init
-              chmod +x dist/mhrv-rs.init
+              cp assets/openwrt/rahgozar.init dist/rahgozar.init
+              chmod +x dist/rahgozar.init
               ;;
             *)
               cp assets/launchers/run.sh dist/run.sh
@@ -404,19 +404,19 @@ jobs:
           # possible leading "v" so both paths produce the bare version.
           VER="${{ inputs.version || github.ref_name }}"
           VER="${VER#v}"
-          ./assets/macos/build-app.sh dist/mhrv-rs-ui "$VER" dist
+          ./assets/macos/build-app.sh dist/rahgozar-ui "$VER" dist
           # Make a clean zip of just the .app for the release
           cd dist
-          zip -qry "${{ matrix.name }}-app.zip" mhrv-rs.app
+          zip -qry "${{ matrix.name }}-app.zip" rahgozar.app
 
       - name: Package (windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/${{ matrix.target }}/release/mhrv-rs.exe dist/mhrv-rs.exe
-          if (Test-Path target/${{ matrix.target }}/release/mhrv-rs-ui.exe) {
-            Copy-Item target/${{ matrix.target }}/release/mhrv-rs-ui.exe dist/mhrv-rs-ui.exe
+          Copy-Item target/${{ matrix.target }}/release/rahgozar.exe dist/rahgozar.exe
+          if (Test-Path target/${{ matrix.target }}/release/rahgozar-ui.exe) {
+            Copy-Item target/${{ matrix.target }}/release/rahgozar-ui.exe dist/rahgozar-ui.exe
           }
           Copy-Item assets/launchers/run.bat dist/run.bat
 
@@ -426,16 +426,16 @@ jobs:
           cd dist
           case "${{ matrix.target }}" in
             *-pc-windows-*)
-              7z a -tzip "${{ matrix.name }}.zip" mhrv-rs.exe mhrv-rs-ui.exe run.bat
+              7z a -tzip "${{ matrix.name }}.zip" rahgozar.exe rahgozar-ui.exe run.bat
               ;;
             *-apple-darwin)
-              tar czf "${{ matrix.name }}.tar.gz" mhrv-rs mhrv-rs-ui run.sh run.command
+              tar czf "${{ matrix.name }}.tar.gz" rahgozar rahgozar-ui run.sh run.command
               ;;
             *-linux-musl)
-              tar czf "${{ matrix.name }}.tar.gz" mhrv-rs mhrv-rs.init
+              tar czf "${{ matrix.name }}.tar.gz" rahgozar rahgozar.init
               ;;
             *)
-              tar czf "${{ matrix.name }}.tar.gz" mhrv-rs mhrv-rs-ui run.sh 2>/dev/null || tar czf "${{ matrix.name }}.tar.gz" mhrv-rs run.sh
+              tar czf "${{ matrix.name }}.tar.gz" rahgozar rahgozar-ui run.sh 2>/dev/null || tar czf "${{ matrix.name }}.tar.gz" rahgozar run.sh
               ;;
           esac
 
@@ -534,14 +534,14 @@ jobs:
           # We publish all of them so users behind narrow / flaky
           # censorship tunnels can grab the per-ABI APK that matches
           # their device (~15 MB) instead of the ~50 MB universal.
-          # Universal stays named `mhrv-rs-android-universal-v*.apk` so
+          # Universal stays named `rahgozar-android-universal-v*.apk` so
           # existing download links and Telegram mirrors keep working.
           declare -A ABI_TO_OUTNAME=(
-            ["universal"]="mhrv-rs-android-universal-v${VER}.apk"
-            ["arm64-v8a"]="mhrv-rs-android-arm64-v8a-v${VER}.apk"
-            ["armeabi-v7a"]="mhrv-rs-android-armeabi-v7a-v${VER}.apk"
-            ["x86_64"]="mhrv-rs-android-x86_64-v${VER}.apk"
-            ["x86"]="mhrv-rs-android-x86-v${VER}.apk"
+            ["universal"]="rahgozar-android-universal-v${VER}.apk"
+            ["arm64-v8a"]="rahgozar-android-arm64-v8a-v${VER}.apk"
+            ["armeabi-v7a"]="rahgozar-android-armeabi-v7a-v${VER}.apk"
+            ["x86_64"]="rahgozar-android-x86_64-v${VER}.apk"
+            ["x86"]="rahgozar-android-x86-v${VER}.apk"
           )
 
           missing=0
@@ -559,7 +559,7 @@ jobs:
           # Require at least the universal — if that's missing something
           # is genuinely broken and we should fail loud rather than ship
           # a partial release.
-          if [ ! -f "../dist/mhrv-rs-android-universal-v${VER}.apk" ]; then
+          if [ ! -f "../dist/rahgozar-android-universal-v${VER}.apk" ]; then
             echo "::error::universal APK missing; actual outputs:"
             find app/build/outputs/apk -type f -name '*.apk' -print
             exit 1
@@ -570,7 +570,7 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: mhrv-rs-android-universal
+          name: rahgozar-android-universal
           path: dist/*.apk
           if-no-files-found: error
 
@@ -977,7 +977,7 @@ jobs:
             -delete
 
           # Copy desktop archives. Their names already include the
-          # platform identifier (mhrv-rs-linux-amd64.tar.gz, etc.) and
+          # platform identifier (rahgozar-linux-amd64.tar.gz, etc.) and
           # are version-stable — no rename needed.
           for f in artifacts/*.tar.gz artifacts/*.zip; do
             [ -f "$f" ] || continue
@@ -985,10 +985,10 @@ jobs:
           done
 
           # Android APKs come with the version baked into the name
-          # (mhrv-rs-android-universal-v1.7.5.apk). Copy all of them so
+          # (rahgozar-android-universal-v1.7.5.apk). Copy all of them so
           # users on slow connections can grab a per-ABI APK (~37 MB)
           # instead of the universal (~110 MB).
-          for f in artifacts/mhrv-rs-android-*.apk; do
+          for f in artifacts/rahgozar-android-*.apk; do
             [ -f "$f" ] || continue
             cp "$f" "releases/$(basename "$f")"
           done
@@ -1013,7 +1013,7 @@ jobs:
             sed -i.bak \
               -e "s/Current version: \*\*v[0-9][0-9.]*\*\*/Current version: **v${VER}**/" \
               -e "s/نسخهٔ فعلی: \*\*v[0-9][0-9.]*\*\*/نسخهٔ فعلی: **v${VER}**/" \
-              -e "s/mhrv-rs-android-universal-v[0-9][0-9.]*\.apk/mhrv-rs-android-universal-v${VER}.apk/g" \
+              -e "s/rahgozar-android-universal-v[0-9][0-9.]*\.apk/rahgozar-android-universal-v${VER}.apk/g" \
               releases/README.md
             rm -f releases/README.md.bak
           fi

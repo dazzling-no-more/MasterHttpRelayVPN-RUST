@@ -265,7 +265,7 @@ async fn https_raw_get(
     let req = format!(
         "GET {path} HTTP/1.1\r\n\
          Host: {host}\r\n\
-         User-Agent: mhrv-rs/{ver} (update-check)\r\n\
+         User-Agent: rahgozar/{ver} (update-check)\r\n\
          Accept: {accept}\r\n\
          Connection: close\r\n\
          \r\n",
@@ -511,14 +511,14 @@ mod tests {
     #[test]
     fn pick_asset_prefers_app_zip_on_macos() {
         let assets = serde_json::json!([
-            {"name": "mhrv-rs-linux-amd64.tar.gz", "browser_download_url": "https://x/a", "size": 1},
-            {"name": "mhrv-rs-macos-arm64.tar.gz", "browser_download_url": "https://x/b", "size": 2},
-            {"name": "mhrv-rs-macos-arm64-app.zip", "browser_download_url": "https://x/c", "size": 3},
+            {"name": "rahgozar-linux-amd64.tar.gz", "browser_download_url": "https://x/a", "size": 1},
+            {"name": "rahgozar-macos-arm64.tar.gz", "browser_download_url": "https://x/b", "size": 2},
+            {"name": "rahgozar-macos-arm64-app.zip", "browser_download_url": "https://x/c", "size": 3},
         ]);
         let arr = assets.as_array().unwrap();
         if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
             let picked = pick_asset_for_platform(arr).expect("should pick");
-            assert_eq!(picked.name, "mhrv-rs-macos-arm64-app.zip");
+            assert_eq!(picked.name, "rahgozar-macos-arm64-app.zip");
         }
     }
 
@@ -534,18 +534,18 @@ mod tests {
     #[test]
     fn pick_asset_android_picks_per_abi_apk_over_universal() {
         let assets = serde_json::json!([
-            {"name": "mhrv-rs-android-universal-v1.9.1.apk", "browser_download_url": "https://x/universal", "size": 1},
-            {"name": "mhrv-rs-android-arm64-v8a-v1.9.1.apk", "browser_download_url": "https://x/arm64", "size": 2},
-            {"name": "mhrv-rs-android-armeabi-v7a-v1.9.1.apk", "browser_download_url": "https://x/armv7", "size": 3},
-            {"name": "mhrv-rs-android-x86_64-v1.9.1.apk", "browser_download_url": "https://x/x86_64", "size": 4},
-            {"name": "mhrv-rs-android-x86-v1.9.1.apk", "browser_download_url": "https://x/x86", "size": 5},
+            {"name": "rahgozar-android-universal-v1.9.1.apk", "browser_download_url": "https://x/universal", "size": 1},
+            {"name": "rahgozar-android-arm64-v8a-v1.9.1.apk", "browser_download_url": "https://x/arm64", "size": 2},
+            {"name": "rahgozar-android-armeabi-v7a-v1.9.1.apk", "browser_download_url": "https://x/armv7", "size": 3},
+            {"name": "rahgozar-android-x86_64-v1.9.1.apk", "browser_download_url": "https://x/x86_64", "size": 4},
+            {"name": "rahgozar-android-x86-v1.9.1.apk", "browser_download_url": "https://x/x86", "size": 5},
         ]);
         let arr = assets.as_array().unwrap();
         let cases = [
-            ("aarch64", "mhrv-rs-android-arm64-v8a-v1.9.1.apk"),
-            ("arm", "mhrv-rs-android-armeabi-v7a-v1.9.1.apk"),
-            ("x86_64", "mhrv-rs-android-x86_64-v1.9.1.apk"),
-            ("x86", "mhrv-rs-android-x86-v1.9.1.apk"),
+            ("aarch64", "rahgozar-android-arm64-v8a-v1.9.1.apk"),
+            ("arm", "rahgozar-android-armeabi-v7a-v1.9.1.apk"),
+            ("x86_64", "rahgozar-android-x86_64-v1.9.1.apk"),
+            ("x86", "rahgozar-android-x86-v1.9.1.apk"),
         ];
         for (arch, expected) in cases {
             let picked = pick_asset_for_target(arr, "android", arch).expect("should pick");

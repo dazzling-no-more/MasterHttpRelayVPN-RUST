@@ -229,7 +229,7 @@ async fn probe_with(google_ip: &str, sni: &str, connector: TlsConnector) -> Prob
     }
 }
 
-/// `mhrv-rs test-sni` CLI entry point. Probes every SNI in the active pool
+/// `rahgozar test-sni` CLI entry point. Probes every SNI in the active pool
 /// (either the user's `sni_hosts` list or the auto-expanded default from
 /// `front_domain`) against `google_ip` and prints a sorted table.
 pub async fn run(config: &Config) -> bool {

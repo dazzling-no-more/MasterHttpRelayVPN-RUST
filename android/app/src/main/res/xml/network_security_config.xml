@@ -5,7 +5,7 @@
       requests. This lets us talk to our OWN local MITM proxy (which signs
       leaf certs with the CA we generate). Without this declaration, on
       Android 7+ apps ignore user CAs — which is the whole pain point
-      users hit when trying to use mhrv-rs from the phone.
+      users hit when trying to use rahgozar from the phone.
 
       The system default (cleartextTrafficPermitted=false) stays. Plain
       HTTP is not allowed except to localhost, which the VpnService loop

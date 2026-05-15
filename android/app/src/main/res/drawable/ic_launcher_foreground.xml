@@ -1,7 +1,21 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  Vector launcher icon. Simple monogram "M" in the mhrv-rs accent color.
-  Using a vector keeps the APK small and adapts to any density.
+  rahgozar launcher icon — stylized arched doorway / passage.
+
+  The name "rahgozar" (رهگذر) means "passerby" or "traveler" in Persian;
+  the arched gate silhouette represents the unobstructed passage the
+  user's traffic travels through. Language-independent symbol: a non-
+  Persian speaker still reads "doorway = passage" at a glance.
+
+  Geometry: two subpaths with `fillType="evenOdd"` — the outer shape
+  is the filled arch silhouette; the inner shape is the doorway opening
+  that gets subtracted out, leaving the visible "frame" as the arch.
+  Both subpaths fit inside Android's adaptive-icon safe zone (the
+  72×72 circle centered in the 108-unit viewport) so the design isn't
+  clipped under circular / squircle launchers.
+
+  Color: Persian turquoise (#1ABC9C). High contrast against the black
+  background (set in mipmap-anydpi-v26/ic_launcher.xml).
 -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
@@ -9,6 +23,7 @@
     android:viewportWidth="108"
     android:viewportHeight="108">
     <path
-        android:fillColor="#4678B4"
-        android:pathData="M30,30 L30,78 L38,78 L38,46 L54,70 L70,46 L70,78 L78,78 L78,30 L70,30 L54,56 L38,30 Z" />
+        android:fillType="evenOdd"
+        android:fillColor="#1ABC9C"
+        android:pathData="M27,80 L27,47 C27,28 81,28 81,47 L81,80 Z M41,80 L41,57 C41,42 67,42 67,57 L67,80 Z" />
 </vector>

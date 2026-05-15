@@ -166,7 +166,7 @@ pub async fn discover_front(hostname: &str) -> Result<DiscoveredFront, String> {
         if filtered_count > 0 {
             return Err(format!(
                 "all {} resolved addresses were non-public (reserved / private / loopback). \
-                 mhrv-rs only probes globally-routable IPs for CDN edges.",
+                 rahgozar only probes globally-routable IPs for CDN edges.",
                 filtered_count,
             ));
         }

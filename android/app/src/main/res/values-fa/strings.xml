@@ -92,7 +92,7 @@
     <string name="snack_logs_copied">لاگ‌ها در کلیپ‌بورد کپی شدند</string>
     <string name="snack_update_available_url">به‌روزرسانی نسخهٔ %1$s → %2$s  %3$s</string>
     <string name="snack_update_available">به‌روزرسانی موجود است: نسخهٔ %1$s → %2$s</string>
-    <string name="snack_update_enable_unknown_apps">برای mhrv-rs گزینهٔ «Install unknown apps» را فعال کنید، سپس برای تلاش دوباره روی برچسب نسخه بزنید.</string>
+    <string name="snack_update_enable_unknown_apps">برای rahgozar گزینهٔ «Install unknown apps» را فعال کنید، سپس برای تلاش دوباره روی برچسب نسخه بزنید.</string>
     <string name="snack_update_downloading">در حال دانلود و بررسی به‌روزرسانی… (%1$.1f MB)</string>
     <string name="snack_update_open_installer_failed">باز کردن نصب‌کننده ممکن نبود: %1$s</string>
     <string name="snack_update_download_failed">دانلود ناموفق بود: %1$s</string>
@@ -149,7 +149,7 @@
     <!-- Direct mode upstream-proxy banner (see docs/use-as-upstream.fa.md). -->
     <string name="direct_upstream_help">به‌عنوان پروکسی upstream برای سایفون / xray هم کار می‌کند — هاست‌های fronted نشده به‌صورت TCP خام عبور می‌کنند.</string>
     <string name="direct_upstream_label">آدرس upstream برای سایفون / xray:</string>
-    <string name="direct_upstream_vpn_tun_warning">سایفون به تنها اسلات VPN اندروید نیاز دارد. mhrv-rs را متوقف کن، Connection mode را به PROXY_ONLY تغییر بده، بعد دوباره Connect را بزن — تنها در این حالت سایفون می‌تواند از آدرس زیر استفاده کند.</string>
+    <string name="direct_upstream_vpn_tun_warning">سایفون به تنها اسلات VPN اندروید نیاز دارد. rahgozar را متوقف کن، Connection mode را به PROXY_ONLY تغییر بده، بعد دوباره Connect را بزن — تنها در این حالت سایفون می‌تواند از آدرس زیر استفاده کند.</string>
     <string name="btn_copy_lower">کپی</string>
     <string name="snack_upstream_copied">%1$s کپی شد</string>
 

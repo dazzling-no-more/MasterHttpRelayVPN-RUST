@@ -34,7 +34,7 @@ import java.security.cert.CertificateFactory
  */
 object CaInstall {
     private const val CA_FILENAME = "ca.crt"
-    private const val CA_FRIENDLY_NAME = "mhrv-rs MITM CA"
+    private const val CA_FRIENDLY_NAME = "rahgozar MITM CA"
 
     /** Stable path where the UI stages the exported CA. */
     fun caFile(ctx: Context): File = File(ctx.filesDir, CA_FILENAME)

@@ -418,7 +418,7 @@ pub struct DomainFronter {
     /// fine.
     per_site: Arc<std::sync::Mutex<HashMap<String, HostStat>>>,
     /// Daily-scoped counters, reset at 00:00 UTC. Tracks what *this
-    /// mhrv-rs process* has observed today — NOT the authoritative
+    /// rahgozar process* has observed today — NOT the authoritative
     /// Apps Script quota bucket on Google's side (which counts across
     /// every client hitting the same deployment). Useful as a local
     /// "budget used today" estimate in the UI.
@@ -1029,7 +1029,7 @@ impl DomainFronter {
                  (common in Iran / IR);\n  \
                  (2) the `google_ip` in your config is pointing at a non-Google host;\n  \
                  (3) your system clock is way off (NTP not synced).\n\
-                 Fixes (try in order): run `mhrv-rs scan-ips` to find a different Google \
+                 Fixes (try in order): run `rahgozar scan-ips` to find a different Google \
                  frontend IP that isn't being MITM'd; check `date` on your host; as a \
                  LAST RESORT set `\"verify_ssl\": false` in config.json — this lets the \
                  relay work even through a middlebox, but your traffic is then only \
@@ -2304,7 +2304,7 @@ impl DomainFronter {
     /// Backward-compatible wrapper around `relay_parallel_range_to`
     /// that buffers the full response into a `Vec<u8>` before
     /// returning. Retained so downstream callers (and external
-    /// consumers of `mhrv-rs` as a library) that depend on the pre-
+    /// consumers of `rahgozar` as a library) that depend on the pre-
     /// 1.9.23 `-> Vec<u8>` signature keep working without code
     /// changes. New code should prefer `relay_parallel_range_to`,
     /// which streams large files chunk-by-chunk instead of buffering

@@ -2239,8 +2239,8 @@ async fn dispatch_tunnel(
     if peek_n >= 1 && peek_buf[0] == 0x16 {
         // Looks like TLS: MITM + relay via Apps Script. Note: upstream_socks5
         // is NOT consulted here by design — HTTPS goes through the Apps Script
-        // relay, which is the whole reason mhrv-rs exists. If you want HTTPS
-        // to flow through xray, disable mhrv-rs and point your browser at
+        // relay, which is the whole reason rahgozar exists. If you want HTTPS
+        // to flow through xray, disable rahgozar and point your browser at
         // xray directly.
         tracing::info!(
             "dispatch {}:{} -> MITM + Apps Script relay (TLS detected)",

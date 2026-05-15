@@ -9,16 +9,16 @@ use tokio::runtime::Runtime;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::task::JoinHandle;
 
-use mhrv_rs::cdn_discover::{discover_front, DiscoveredFront};
-use mhrv_rs::cert_installer::{install_ca, reconcile_sudo_environment, remove_ca};
-use mhrv_rs::config::{Config, FrontingGroup, ScriptId};
-use mhrv_rs::data_dir;
-use mhrv_rs::domain_fronter::{DomainFronter, DEFAULT_GOOGLE_SNI_POOL};
-use mhrv_rs::lan_utils::{advertise_proxy_host, detect_lan_ip, is_share_on_lan};
-use mhrv_rs::mitm::{MitmCertManager, CA_CERT_FILE};
-use mhrv_rs::profiles::{self, ProfilesFile};
-use mhrv_rs::proxy_server::ProxyServer;
-use mhrv_rs::{scan_ips, scan_sni, test_cmd};
+use rahgozar::cdn_discover::{discover_front, DiscoveredFront};
+use rahgozar::cert_installer::{install_ca, reconcile_sudo_environment, remove_ca};
+use rahgozar::config::{Config, FrontingGroup, ScriptId};
+use rahgozar::data_dir;
+use rahgozar::domain_fronter::{DomainFronter, DEFAULT_GOOGLE_SNI_POOL};
+use rahgozar::lan_utils::{advertise_proxy_host, detect_lan_ip, is_share_on_lan};
+use rahgozar::mitm::{MitmCertManager, CA_CERT_FILE};
+use rahgozar::profiles::{self, ProfilesFile};
+use rahgozar::proxy_server::ProxyServer;
+use rahgozar::{scan_ips, scan_sni, test_cmd};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const WIN_WIDTH: f32 = 520.0;
@@ -30,14 +30,14 @@ fn main() -> eframe::Result<()> {
     // because on Windows a staged `<exe>.new` is what got launched, and we
     // need to rename it back to the canonical exe and re-exec before
     // touching state, opening windows, etc.
-    mhrv_rs::update_apply::finalize_pending_at_startup();
+    rahgozar::update_apply::finalize_pending_at_startup();
 
     let _ = rustls::crypto::ring::default_provider().install_default();
     // Re-point HOME at the invoking user if this binary was launched
     // under sudo (see cert_installer::reconcile_sudo_environment). Must
     // run before any data_dir / firefox_profile_dirs call.
     reconcile_sudo_environment();
-    mhrv_rs::rlimit::raise_nofile_limit_best_effort();
+    rahgozar::rlimit::raise_nofile_limit_best_effort();
 
     let shared = Arc::new(Shared::default());
     let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<Cmd>();
@@ -79,7 +79,7 @@ fn main() -> eframe::Result<()> {
     // #28) can force the wgpu backend — DX12 on Windows, Vulkan on
     // Linux, Metal on macOS — by setting the env var:
     //
-    //     MHRV_RENDERER=wgpu mhrv-rs-ui
+    //     MHRV_RENDERER=wgpu rahgozar-ui
     //
     // The launcher scripts (run.bat / run.command / run.sh) honour
     // the same variable and forward it through.
@@ -90,7 +90,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([WIN_WIDTH, WIN_HEIGHT])
             .with_min_inner_size([420.0, 400.0])
-            .with_title(format!("mhrv-rs {}", VERSION)),
+            .with_title(format!("rahgozar {}", VERSION)),
         renderer: if use_wgpu {
             eframe::Renderer::Wgpu
         } else {
@@ -114,7 +114,7 @@ fn main() -> eframe::Result<()> {
     //     next restart.
     let (profiles, profiles_load_ok, profile_toast) = match ProfilesFile::load() {
         Ok(pf) => (pf, true, None),
-        Err(mhrv_rs::profiles::ProfileError::CorruptOnDisk(msg)) => {
+        Err(rahgozar::profiles::ProfileError::CorruptOnDisk(msg)) => {
             let path = profiles::profiles_path();
             let backup = pick_corrupt_backup_path(&path);
             let renamed = std::fs::rename(&path, &backup);
@@ -159,7 +159,7 @@ fn main() -> eframe::Result<()> {
     let initial_toast = initial_toast.or_else(|| profile_toast.map(|m| (m, Instant::now())));
 
     eframe::run_native(
-        "mhrv-rs",
+        "rahgozar",
         options,
         Box::new(move |cc| {
             cc.egui_ctx.set_visuals(egui::Visuals::dark());
@@ -211,8 +211,8 @@ struct Shared {
 struct UiState {
     running: bool,
     started_at: Option<Instant>,
-    last_stats: Option<mhrv_rs::domain_fronter::StatsSnapshot>,
-    last_per_site: Vec<(String, mhrv_rs::domain_fronter::HostStat)>,
+    last_stats: Option<rahgozar::domain_fronter::StatsSnapshot>,
+    last_per_site: Vec<(String, rahgozar::domain_fronter::HostStat)>,
     log: VecDeque<String>,
     /// Result + timestamp for transient status banners (auto-hide after 10s).
     ca_trusted: Option<bool>,
@@ -263,14 +263,14 @@ struct UiState {
     ///   - Ok(StagedUpdate)  → ready, show "Restart now" button
     ///   - Err(msg)          → show the error inline
     /// Cleared on next install attempt.
-    last_install: Option<Result<mhrv_rs::update_apply::StagedUpdate, String>>,
+    last_install: Option<Result<rahgozar::update_apply::StagedUpdate, String>>,
     last_install_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug)]
 enum UpdateProbeState {
     InFlight,
-    Done(mhrv_rs::update_check::UpdateCheck),
+    Done(rahgozar::update_check::UpdateCheck),
 }
 
 #[derive(Clone, Debug)]
@@ -325,27 +325,27 @@ enum Cmd {
     /// through our local HTTP proxy (useful when the user's ISP IP has
     /// exhausted GitHub's unauthenticated rate limit).
     CheckUpdate {
-        route: mhrv_rs::update_check::Route,
+        route: rahgozar::update_check::Route,
     },
     /// Download a release asset to ~/Downloads. Fires when the user clicks
     /// the "Download update" button after a successful CheckUpdate surfaces
     /// an UpdateAvailable with a matching platform asset.
     DownloadUpdate {
-        route: mhrv_rs::update_check::Route,
+        route: rahgozar::update_check::Route,
         url: String,
         name: String,
     },
     /// Resolve `hostname` to all of its A/AAAA records and TLS-probe
     /// each one with SNI=hostname, so the user can drop the best IP
     /// into a new `FrontingGroup` without hand-running `dig` and
-    /// `openssl s_client`. See `mhrv_rs::cdn_discover`.
+    /// `openssl s_client`. See `rahgozar::cdn_discover`.
     DiscoverFront { hostname: String },
     /// Download + verify + extract + stage a release asset, ready to swap
     /// in on next launch (or via restart_to_apply). Fires when the user
     /// clicks the "Install update" button after a successful CheckUpdate
     /// surfaces an UpdateAvailable with a matching platform asset.
     InstallUpdate {
-        route: mhrv_rs::update_check::Route,
+        route: rahgozar::update_check::Route,
         url: String,
         name: String,
     },
@@ -510,7 +510,7 @@ struct FormState {
     /// Optional second-hop exit node for CF-anti-bot bypass (chatgpt.com /
     /// claude.ai / grok.com / x.com). Config-only — no UI editor yet.
     /// See `assets/exit_node/` for the generic exit-node handler.
-    exit_node: mhrv_rs::config::ExitNodeConfig,
+    exit_node: rahgozar::config::ExitNodeConfig,
     /// Verbatim passthrough buffer for any config.json key this build
     /// doesn't model. Captured at load time from `Config::extras` and
     /// re-emitted by [`to_config`] / `ConfigWire` so Save-config and
@@ -702,7 +702,7 @@ fn load_form() -> (FormState, Option<String>) {
             auto_blacklist_window_secs: 30,
             auto_blacklist_cooldown_secs: 120,
             request_timeout_secs: 30,
-            exit_node: mhrv_rs::config::ExitNodeConfig::default(),
+            exit_node: rahgozar::config::ExitNodeConfig::default(),
             extras: std::collections::BTreeMap::new(),
             hosts_passthrough: std::collections::HashMap::new(),
             enable_batching: false,
@@ -933,7 +933,7 @@ fn save_config(cfg: &Config) -> Result<PathBuf, String> {
     // pre-delete window where the user could lose their previous
     // config.json to a failed write.
     let value = serde_json::to_value(ConfigWire::from(cfg)).map_err(|e| e.to_string())?;
-    mhrv_rs::profiles::write_config_json_to(&path, &value).map_err(|e| e.to_string())?;
+    rahgozar::profiles::write_config_json_to(&path, &value).map_err(|e| e.to_string())?;
     Ok(path)
 }
 
@@ -1040,7 +1040,7 @@ struct ConfigWire<'a> {
     /// exit-node setup stay clean. Round-tripped through FormState so
     /// Save preserves user-edited values.
     #[serde(skip_serializing_if = "is_default_exit_node")]
-    exit_node: &'a mhrv_rs::config::ExitNodeConfig,
+    exit_node: &'a rahgozar::config::ExitNodeConfig,
 
     /// Verbatim passthrough of unknown / future config.json keys
     /// captured at load time. Re-emitted via `#[serde(flatten)]`
@@ -1055,7 +1055,7 @@ fn is_default_strikes(v: &u32) -> bool { *v == 3 }
 fn is_default_window_secs(v: &u64) -> bool { *v == 30 }
 fn is_default_cooldown_secs(v: &u64) -> bool { *v == 120 }
 fn is_default_timeout_secs(v: &u64) -> bool { *v == 30 }
-fn is_default_exit_node(en: &&mhrv_rs::config::ExitNodeConfig) -> bool {
+fn is_default_exit_node(en: &&rahgozar::config::ExitNodeConfig) -> bool {
     !en.enabled
         && en.relay_url.is_empty()
         && en.psk.is_empty()
@@ -1297,7 +1297,7 @@ impl eframe::App for App {
             let running = self.shared.state.lock().unwrap().running;
             ui.horizontal(|ui| {
                 ui.hyperlink_to(
-                    egui::RichText::new("mhrv-rs").size(20.0).strong(),
+                    egui::RichText::new("rahgozar").size(20.0).strong(),
                     "https://github.com/dazzling-no-more/rahgozar",
                 );
                 ui.hyperlink_to(
@@ -1424,7 +1424,7 @@ impl eframe::App for App {
             // Lets users add Vercel / Fastly / Akamai / Netlify edges (or any
             // multi-tenant CDN) by typing a known-hosted hostname; we resolve
             // it via DNS + TLS-probe each IP and let the user add the best
-            // one as a new `FrontingGroup`. See `mhrv_rs::cdn_discover` for
+            // one as a new `FrontingGroup`. See `rahgozar::cdn_discover` for
             // the probe logic. The editor lives outside `direct_mode` gating
             // because fronting groups also fire in `apps_script` mode — only
             // `full` mode short-circuits them (warned at proxy startup).
@@ -1999,7 +1999,7 @@ impl eframe::App for App {
                             )
                             .clicked()
                         {
-                            match mhrv_rs::curated_groups::merge_into(&mut self.form.fronting_groups) {
+                            match rahgozar::curated_groups::merge_into(&mut self.form.fronting_groups) {
                                 Ok(report) => {
                                     self.toast = Some((
                                         format!(
@@ -2528,7 +2528,7 @@ impl eframe::App for App {
             } else if update_check_fresh {
                 let done = self.shared.state.lock().unwrap().last_update_check.clone();
                 if let Some(UpdateProbeState::Done(r)) = done {
-                    use mhrv_rs::update_check::UpdateCheck;
+                    use rahgozar::update_check::UpdateCheck;
                     let color = match &r {
                         UpdateCheck::UpToDate { .. } => OK_GREEN,
                         UpdateCheck::UpdateAvailable { .. } => {
@@ -2802,7 +2802,7 @@ impl App {
     /// proxy is running and we have a local HTTP listen_port, tunnel
     /// through it (GitHub sees Apps Script's IP instead of the user's
     /// rate-limited ISP IP). Otherwise go direct.
-    fn update_check_route(&self) -> mhrv_rs::update_check::Route {
+    fn update_check_route(&self) -> rahgozar::update_check::Route {
         let running = self.shared.state.lock().unwrap().running;
         if running {
             if let Ok(port) = self.form.listen_port.trim().parse::<u16>() {
@@ -2811,10 +2811,10 @@ impl App {
                 } else {
                     self.form.listen_host.trim().to_string()
                 };
-                return mhrv_rs::update_check::Route::Proxy { host, port };
+                return rahgozar::update_check::Route::Proxy { host, port };
             }
         }
-        mhrv_rs::update_check::Route::Direct
+        rahgozar::update_check::Route::Direct
     }
 
     /// Top-of-form profile bar: dropdown selector + "Save as profile" +
@@ -3716,7 +3716,7 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                 // a friendly notice instead and skip the test path.
                 let mode_kind = cfg.mode_kind().ok();
                 let mode_explainer = match mode_kind {
-                    Some(mhrv_rs::config::Mode::Full) => Some(
+                    Some(rahgozar::config::Mode::Full) => Some(
                         "Test Relay is wired only for apps_script mode. \
                          In full mode the data plane is the tunnel-node — \
                          to verify it end-to-end, start the proxy and load \
@@ -3725,7 +3725,7 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                          tunnel-node's VPS IP. Tracking a real Full-mode \
                          test in #160."
                     ),
-                    Some(mhrv_rs::config::Mode::Direct) => Some(
+                    Some(rahgozar::config::Mode::Direct) => Some(
                         "Test Relay is wired only for apps_script mode. \
                          In direct mode there is no Apps Script relay — \
                          every request goes through the SNI-rewrite tunnel \
@@ -3803,7 +3803,7 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                         Ok(()) => push_log(&shared2, "[ui] CA install ok"),
                         Err(msg) => {
                             push_log(&shared2, &format!("[ui] {}", msg));
-                            push_log(&shared2, "[ui] hint: run the terminal binary with sudo/admin: mhrv-rs --install-cert");
+                            push_log(&shared2, "[ui] hint: run the terminal binary with sudo/admin: rahgozar --install-cert");
                         }
                     }
                 });
@@ -3861,7 +3861,7 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                         }
                         Err(e) => {
                             push_log(&shared2, &format!("[ui] CA remove failed: {}", e));
-                            push_log(&shared2, "[ui] hint: run the terminal binary with sudo/admin: mhrv-rs --remove-cert");
+                            push_log(&shared2, "[ui] hint: run the terminal binary with sudo/admin: rahgozar --remove-cert");
                         }
                     }
                 });
@@ -3941,7 +3941,7 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     // The file and the trust-store entry can be out of
                     // sync (e.g. after a partial removal), and that
                     // mismatch is exactly what Check CA must surface.
-                    let trusted = mhrv_rs::cert_installer::is_ca_trusted_by_name();
+                    let trusted = rahgozar::cert_installer::is_ca_trusted_by_name();
                     push_log(
                         &shared2,
                         &format!(
@@ -3963,7 +3963,7 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     st.last_update_check_at = Some(Instant::now());
                 }
                 rt.spawn(async move {
-                    let result = mhrv_rs::update_check::check(route).await;
+                    let result = rahgozar::update_check::check(route).await;
                     push_log(
                         &shared2,
                         &format!("[ui] update check: {}", result.summary()),
@@ -3986,7 +3986,7 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                 rt.spawn(async move {
                     let dir = downloads_dir();
                     let out = dir.join(&name);
-                    let result = mhrv_rs::update_check::download_asset(route, &url, &out).await;
+                    let result = rahgozar::update_check::download_asset(route, &url, &out).await;
                     let log_msg = match result {
                         Ok(bytes) => {
                             let log_msg = format!(
@@ -4036,7 +4036,7 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                 push_log(&shared, &format!("[ui] installing {}", name));
                 rt.spawn(async move {
                     let result =
-                        mhrv_rs::update_apply::download_and_stage(route, &url, &name).await;
+                        rahgozar::update_apply::download_and_stage(route, &url, &name).await;
                     let log_msg = match result {
                         Ok(staged) => {
                             let log_msg = format!(
@@ -4077,7 +4077,7 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     .and_then(|r| r.as_ref().ok().cloned());
                 if let Some(staged) = staged {
                     push_log(&shared, "[ui] restarting to apply update");
-                    if let Err(e) = mhrv_rs::update_apply::restart_to_apply(&staged) {
+                    if let Err(e) = rahgozar::update_apply::restart_to_apply(&staged) {
                         push_log(&shared, &format!("[ui] restart failed: {}", e));
                         let mut st = shared.state.lock().unwrap();
                         st.last_install = Some(Err(format!("restart failed: {}", e)));
@@ -4289,7 +4289,7 @@ fn push_log(shared: &Shared, msg: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mhrv_rs::config::Config;
+    use rahgozar::config::Config;
 
     fn mk_group(name: &str, ip: &str, sni: &str, domains: &[&str]) -> FrontingGroup {
         FrontingGroup {

@@ -587,7 +587,7 @@ def post_main_channel_pointer(
     clicking through to the specific release post.
     """
     parts = [
-        f"<b>📦 mhrv-rs v{html_escape(version)} released</b>",
+        f"<b>📦 rahgozar v{html_escape(version)} released</b>",
         "",
     ]
     if english_notes_brief:
@@ -701,7 +701,7 @@ def main() -> int:
     _persian_notes, english_notes = load_changelog(repo_root_from_script(), args.version)
     english_brief = brief_changelog(english_notes) if english_notes else None
     announce_lines = [
-        f"<b>📦 mhrv-rs {html_escape('v' + args.version)} released</b>",
+        f"<b>📦 rahgozar {html_escape('v' + args.version)} released</b>",
         "",
     ]
     if english_brief:

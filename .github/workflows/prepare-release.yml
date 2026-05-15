@@ -8,7 +8,7 @@
 #
 # What it bumps in the PR:
 #   - Cargo.toml                        version = "X.Y.Z"
-#   - Cargo.lock                        mhrv-rs entry's version
+#   - Cargo.lock                        rahgozar entry's version
 #   - android/app/build.gradle.kts      versionName = "X.Y.Z"
 #                                       versionCode = previous + 1
 #
@@ -95,7 +95,7 @@ jobs:
           NEW_VER: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
-          # Edit both files via Python so we anchor on the `name = "mhrv-rs"`
+          # Edit both files via Python so we anchor on the `name = "rahgozar"`
           # line and only touch the package's own version, not unrelated
           # `version = "..."` lines elsewhere in the lockfile.
           python3 <<'PY'
@@ -105,13 +105,13 @@ jobs:
               p = pathlib.Path(path)
               src = p.read_text()
               new = re.sub(
-                  r'(name = "mhrv-rs"\nversion = ")[0-9.]+(")',
+                  r'(name = "rahgozar"\nversion = ")[0-9.]+(")',
                   rf'\g<1>{ver}\g<2>',
                   src,
                   count=1,
               )
               if new == src:
-                  sys.exit(f"ERROR: mhrv-rs version line not found in {path}")
+                  sys.exit(f"ERROR: rahgozar version line not found in {path}")
               p.write_text(new)
               print(f"{path} -> {ver}")
           PY

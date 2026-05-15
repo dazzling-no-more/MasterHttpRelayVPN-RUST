@@ -1,12 +1,12 @@
 #!/bin/sh
-# mhrv-rs launcher for Linux / macOS.
+# rahgozar launcher for Linux / macOS.
 # Runs the CLI once (initializes the MITM CA in the user data dir and installs
 # it into the system trust store; may prompt for sudo), then launches the UI.
 set -eu
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
-CLI="$DIR/mhrv-rs"
-UI="$DIR/mhrv-rs-ui"
+CLI="$DIR/rahgozar"
+UI="$DIR/rahgozar-ui"
 
 if [ ! -x "$CLI" ]; then
     echo "error: $CLI not found or not executable" >&2
@@ -21,5 +21,5 @@ if [ ! -x "$UI" ]; then
     exec "$CLI"
 fi
 
-echo "Starting mhrv-rs UI..."
+echo "Starting rahgozar UI..."
 exec "$UI"

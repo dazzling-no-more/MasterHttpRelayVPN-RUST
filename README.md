@@ -27,12 +27,6 @@
 🇬🇧 [English Quick Start](#quick-start) · [Full Guide (advanced topics)](docs/guide.md)
 🇮🇷 [راه‌اندازی سریع فارسی](#راه‌اندازی-سریع) · [راهنمای کامل (مباحث پیشرفته)](docs/guide.fa.md)
 
-<p align="center" dir="rtl">
-  ۱. <a href="https://www.youtube.com/watch?v=voCwxgvWR5U" target="_blank" rel="noopener noreferrer">راهنمای تصویری راه اندازی به زبان فارسی</a> (YouTube)
-  <br>
-  ۲. <a href="https://kian-irani.github.io/mhrv-setup-full-tunell/" target="_blank" rel="noopener noreferrer">راهنمای جامع متنی راه اندازی به زبان فارسی</a> با تشکر از <a href="https://github.com/KIAN-IRANi" target="_blank" rel="noopener noreferrer">Kian Irani</a>
-</p>
-
 ---
 
 ## What you get
@@ -46,15 +40,15 @@
 ## How it works (the simple picture)
 
 ```
-   you  →  browser  →  mhrv-rs  ──┐
-                                  │ ISP only sees:  www.google.com
-                                  ▼
+   you  →  browser  →  rahgozar  ──┐
+                                   │ ISP only sees:  www.google.com
+                                   ▼
                           Google's network
-                                  │
-                                  ▼
+                                   │
+                                   ▼
               your free Apps Script  fetches  the real site
-                                  │
-                                  ▼
+                                   │
+                                   ▼
                 Twitter / ChatGPT / blocked-site of your choice
 ```
 
@@ -75,9 +69,11 @@ ISPs can't read inside encrypted HTTPS. They only see the address — `www.googl
 3. Delete the default code in the editor
 4. Open the file [`assets/apps_script/Code.gs`](assets/apps_script/Code.gs) in this repo, copy all of it, paste into the Apps Script editor (replacing what was there)
 5. Find this line near the top:
+
    ```js
    const AUTH_KEY = "CHANGE_ME_TO_A_STRONG_SECRET";
    ```
+
    Change `CHANGE_ME_TO_A_STRONG_SECRET` to a long random string of your own. **Keep this string** — you'll paste it into the app in Step 3. Treat it like a password.
 6. Click 💾 **Save** (or `Ctrl/Cmd+S`)
 7. Click **Deploy** (top right) → **New deployment**
@@ -90,18 +86,18 @@ ISPs can't read inside encrypted HTTPS. They only see the address — `www.googl
 
 > **Tip:** if you ever update `Code.gs` later, don't make a new deployment. Edit the code, then go to **Deploy → Manage deployments → ✏️ → Version: New version → Deploy**. The Deployment ID stays the same.
 
-### Step 2 — Download mhrv-rs
+### Step 2 — Download rahgozar
 
 Go to the [latest release page](https://github.com/dazzling-no-more/rahgozar/releases/latest) and download the file for your computer:
 
 | You're on | Download this |
 |---|---|
-| Mac with Apple Silicon (M1 / M2 / M3 / M4 chip) | `mhrv-rs-macos-arm64-app.zip` |
-| Mac with Intel chip | `mhrv-rs-macos-amd64-app.zip` |
-| Windows | `mhrv-rs-windows-amd64.zip` |
-| Linux (Ubuntu / Mint / Fedora / Debian / Arch) | `mhrv-rs-linux-amd64.tar.gz` |
-| Android phone or tablet | `mhrv-rs-android-universal-v*.apk` |
-| OpenWRT router or Alpine | `mhrv-rs-linux-musl-amd64.tar.gz` |
+| Mac with Apple Silicon (M1 / M2 / M3 / M4 chip) | `rahgozar-macos-arm64-app.zip` |
+| Mac with Intel chip | `rahgozar-macos-amd64-app.zip` |
+| Windows | `rahgozar-windows-amd64.zip` |
+| Linux (Ubuntu / Mint / Fedora / Debian / Arch) | `rahgozar-linux-amd64.tar.gz` |
+| Android phone or tablet | `rahgozar-android-universal-v*.apk` |
+| OpenWRT router or Alpine | `rahgozar-linux-musl-amd64.tar.gz` |
 
 > **Mac: not sure if Apple Silicon or Intel?** Click  → **About This Mac**. If "Chip" says **Apple**, get arm64. If **Intel**, get amd64.
 
@@ -113,13 +109,15 @@ Unzip it.
 
 Double-click the launcher:
 
+| Platform | Launcher |
+|---|---|
 | Mac | `run.command` |
 | Windows | `run.bat` |
 | Linux | `./run.sh` (in a terminal) |
 
-The first time, it asks for your computer password. This is to install one small certificate so your browser trusts mhrv-rs. **The certificate is generated on your computer and never leaves it** — no cloud, no Google, nothing remote can use it.
+The first time, it asks for your computer password. This is to install one small certificate so your browser trusts rahgozar. **The certificate is generated on your computer and never leaves it** — no cloud, no Google, nothing remote can use it.
 
-The mhrv-rs window opens. Fill in:
+The rahgozar window opens. Fill in:
 
 - **Apps Script ID(s)** → paste the **Deployment ID** from Step 1
 - **Auth key** → paste the random string you put in `Code.gs`
@@ -129,7 +127,7 @@ Click **Save config**, then **Start**. The status circle goes green if it works.
 
 > **Test it:** click the **Test** button. It sends one request through the relay and tells you if it worked.
 
-### Step 4 — Tell your browser to use mhrv-rs
+### Step 4 — Tell your browser to use rahgozar
 
 #### Firefox (recommended — easiest)
 
@@ -155,7 +153,7 @@ Open any blocked site in your browser. It should load.
 
 If something doesn't work:
 
-- Click **Test** in the mhrv-rs window — it pinpoints which step is failing
+- Click **Test** in the rahgozar window — it pinpoints which step is failing
 - Look at the **Recent log** panel at the bottom of the window
 - See [Common questions](#common-questions) below
 
@@ -173,9 +171,9 @@ If something doesn't work:
 
 **Telegram is unstable.** Telegram uses MTProto, which Apps Script doesn't speak. Pair with [xray](https://github.com/XTLS/Xray-core) on your machine — see [Telegram via xray in the full guide](docs/guide.md#telegram-via-xray).
 
-**ISP blocks `script.google.com` itself.** mhrv-rs has a `direct` mode that uses only the SNI-rewrite tunnel (no Apps Script). Use it once to access `script.google.com` to deploy your script, then switch to apps_script mode. See [direct mode](docs/guide.md#direct-mode).
+**ISP blocks `script.google.com` itself.** rahgozar has a `direct` mode that uses only the SNI-rewrite tunnel (no Apps Script). Use it once to access `script.google.com` to deploy your script, then switch to apps_script mode. See [direct mode](docs/guide.md#direct-mode).
 
-**I want to use mhrv-rs as Psiphon's (or xray's) upstream proxy.** Run mhrv-rs in `direct` mode and point Psiphon's *upstream proxy* setting at the host:port shown under the Connect button. Unfronted hosts pass through as raw TCP, so Psiphon's bootstrap traffic reaches Psiphon's servers untouched. See [docs/use-as-upstream.md](docs/use-as-upstream.md).
+**I want to use rahgozar as Psiphon's (or xray's) upstream proxy.** Run rahgozar in `direct` mode and point Psiphon's *upstream proxy* setting at the host:port shown under the Connect button. Unfronted hosts pass through as raw TCP, so Psiphon's bootstrap traffic reaches Psiphon's servers untouched. See [docs/use-as-upstream.md](docs/use-as-upstream.md).
 
 **My Google search shows up without JavaScript.** The Apps Script `User-Agent` is fixed to `Google-Apps-Script` (Google won't let scripts change it), so some sites serve a no-JS fallback. Workaround: add the affected domain to your `hosts` map so it goes through the SNI-rewrite tunnel with your real browser User-Agent. `google.com`, `youtube.com`, `fonts.googleapis.com` are already on this list by default.
 
@@ -191,7 +189,7 @@ If something doesn't work:
 This fork stands on three upstream projects you should know about and support before considering anything for the fork:
 
 - **[@masterking32/MasterHttpRelayVPN](https://github.com/masterking32/MasterHttpRelayVPN)** — the original Python project where it all started. The Apps Script relay protocol, the proxy architecture, the idea of turning your own free Google account into a relay — all his. Without this, none of the rest exists.
-- **[@therealaleph/MasterHttpRelayVPN-RUST](https://github.com/therealaleph/MasterHttpRelayVPN-RUST)** — the Rust port (`mhrv-rs`) this fork continues. therealaleph rewrote the Python project in Rust to ship single-binary clients, built the desktop + Android UIs, and ran the project through the entire v1.x → v1.9.25 era. Almost every line of code in this fork is his work; we just kept the lights on while upstream went quiet.
+- **[@therealaleph/MasterHttpRelayVPN-RUST](https://github.com/therealaleph/MasterHttpRelayVPN-RUST)** — the Rust port (`mhrv-rs`) this fork continues. therealaleph rewrote the Python project in Rust to ship single-binary clients, built the desktop + Android UIs.
 - **[@patterniha/MITM-DomainFronting](https://github.com/patterniha/MITM-DomainFronting)** — the CDN fronting-groups concept (routing specific domains through Vercel / Fastly / CloudFront edges via SNI) that became the curated fronting bundle shipped here. Independent project; the Xray config there inspired our integration. See [`docs/fronting-groups.md`](docs/fronting-groups.md) for the lineage.
 
 Most of the Rust code in this port (including this fork's merge and rebrand work) was written with [Anthropic's Claude](https://claude.com), reviewed by a human on every commit.
@@ -210,7 +208,7 @@ Starring those three upstream repos also signals their work is worth keeping ali
 
 <div dir="rtl">
 
-# mhrv-rs — دور زدن سانسور به‌رایگان، با حساب گوگل خودت
+# رهگذر — دور زدن سانسور به‌رایگان، با حساب گوگل خودت
 
 **یک برنامهٔ کوچک که روی کامپیوترت اجرا می‌شود و کمک می‌کند سایت‌های مسدودشده را با یک اسکریپت رایگان که توی حساب گوگل خودت می‌سازی، باز کنی. ISP فقط می‌بیند که داری به `www.google.com` وصل می‌شوی — نمی‌فهمد در واقع چه سایتی را باز کرده‌ای.**
 
@@ -228,7 +226,7 @@ Starring those three upstream repos also signals their work is worth keeping ali
 ## چطور کار می‌کند (تصویر ساده)
 
 ```
-  تو  ←  مرورگر  ←  mhrv-rs  ──┐
+        تو  ←  مرورگر  ←  rahgozar 
                                 │ ISP فقط می‌بیند:  www.google.com
                                 ▼
                          شبکهٔ گوگل
@@ -240,7 +238,7 @@ Starring those three upstream repos also signals their work is worth keeping ali
               توییتر / ChatGPT / هر سایت مسدودی
 ```
 
-ISP داخل HTTPS رمزشده را نمی‌تواند بخواند. فقط آدرس را می‌بیند — `www.google.com`. جست‌وجوی واقعی صفحه داخل شبکهٔ گوگل، در تونل رمزشده اتفاق می‌افتد.
+محتوای HTTPS رمزشده برای ISP قابل خواندن نیست. فقط آدرس را می‌بیند — `www.google.com`. جست‌وجوی واقعی صفحه داخل شبکهٔ گوگل، در تونل رمزشده اتفاق می‌افتد.
 
 ## راه‌اندازی سریع
 
@@ -265,25 +263,25 @@ ISP داخل HTTPS رمزشده را نمی‌تواند بخواند. فقط آ
 ۷. روی **Deploy** (بالا سمت راست) → **New deployment**
 ۸. روی آیکون چرخ‌دندهٔ ⚙ کنار "Select type" کلیک کن → **Web app** را انتخاب کن
 ۹. تنظیم کن:
-   - **Execute as:** *Me* (حساب گوگل خودت)
-   - **Who has access:** *Anyone*
-۱۰. **Deploy** را بزن. ممکن است گوگل برای دادن دسترسی سؤال کند — **Authorize access** را بزن و تأیید کن
+   - فیلد **Execute as:** را روی *Me* (حساب گوگل خودت) بگذار
+   - فیلد **Who has access:** را روی *Anyone* بگذار
+۱۰. روی **Deploy** بزن. ممکن است گوگل برای دادن دسترسی سؤال کند — روی **Authorize access** بزن و تأیید کن
 ۱۱. گوگل یک **Deployment ID** نشانت می‌دهد (یک رشتهٔ تصادفی طولانی). **کپی‌اش کن** — در مرحلهٔ ۳ لازم داری.
 
 > **نکته:** اگر بعداً `Code.gs` را به‌روزرسانی کنی، Deployment جدید نساز. کد را ویرایش کن، بعد **Deploy → Manage deployments → ✏️ → Version: New version → Deploy**. Deployment ID همان قبلی می‌ماند.
 
-### مرحلهٔ ۲ — دانلود mhrv-rs
+### مرحلهٔ ۲ — دانلود رهگذر
 
 به [صفحهٔ آخرین release](https://github.com/dazzling-no-more/rahgozar/releases/latest) برو و فایل مناسب کامپیوترت را دانلود کن:
 
 | سیستم تو | فایل دانلود |
 |---|---|
-| مک با تراشهٔ Apple Silicon (M1 / M2 / M3 / M4) | `mhrv-rs-macos-arm64-app.zip` |
-| مک با تراشهٔ Intel | `mhrv-rs-macos-amd64-app.zip` |
-| ویندوز | `mhrv-rs-windows-amd64.zip` |
-| لینوکس (Ubuntu / Mint / Fedora / Debian / Arch) | `mhrv-rs-linux-amd64.tar.gz` |
-| گوشی یا تبلت اندروید | `mhrv-rs-android-universal-v*.apk` |
-| روتر OpenWRT یا Alpine | `mhrv-rs-linux-musl-amd64.tar.gz` |
+| مک با تراشهٔ Apple Silicon (M1 / M2 / M3 / M4) | `rahgozar-macos-arm64-app.zip` |
+| مک با تراشهٔ Intel | `rahgozar-macos-amd64-app.zip` |
+| ویندوز | `rahgozar-windows-amd64.zip` |
+| لینوکس (Ubuntu / Mint / Fedora / Debian / Arch) | `rahgozar-linux-amd64.tar.gz` |
+| گوشی یا تبلت اندروید | `rahgozar-android-universal-v*.apk` |
+| روتر OpenWRT یا Alpine | `rahgozar-linux-musl-amd64.tar.gz` |
 
 > **مک: مطمئن نیستی Apple Silicon است یا Intel؟** کلیک کن  → **About This Mac**. اگر "Chip" نوشت **Apple**، arm64 بگیر. اگر **Intel** بود، amd64.
 
@@ -295,33 +293,35 @@ ISP داخل HTTPS رمزشده را نمی‌تواند بخواند. فقط آ
 
 روی فایل اجرا دو بار کلیک کن:
 
+| سیستم | فایل اجرا |
+|---|---|
 | مک | `run.command` |
 | ویندوز | `run.bat` |
 | لینوکس | `./run.sh` (در ترمینال) |
 
-اولین بار رمز کامپیوترت را می‌خواهد. این برای نصب یک گواهی کوچک است تا مرورگرت به mhrv-rs اعتماد کند. **گواهی روی کامپیوتر خودت ساخته می‌شود و هیچ‌وقت جایی ارسال نمی‌شود** — نه روی ابر، نه به گوگل، هیچ منبع راه‌دوری نمی‌تواند ازش استفاده کند.
+اولین بار رمز کامپیوترت را می‌خواهد. این برای نصب یک گواهی کوچک است تا مرورگرت به رهگذر اعتماد کند. **گواهی روی کامپیوتر خودت ساخته می‌شود و هیچ‌وقت جایی ارسال نمی‌شود** — نه روی ابر، نه به گوگل، هیچ منبع راه‌دوری نمی‌تواند ازش استفاده کند.
 
-پنجرهٔ mhrv-rs باز می‌شود. این فیلدها را پر کن:
+پنجرهٔ رهگذر باز می‌شود. این فیلدها را پر کن:
 
-- **Apps Script ID(s)** ← **Deployment ID** از مرحلهٔ ۱ را پیست کن
-- **Auth key** ← همان رشتهٔ تصادفی که در `Code.gs` گذاشتی
-- بقیه را پیش‌فرض ول کن
+- در فیلد **Apps Script ID(s)** مقدار **Deployment ID** از مرحلهٔ ۱ را پیست کن
+- در فیلد **Auth key** همان رشتهٔ تصادفی که در `Code.gs` گذاشتی را وارد کن
+- بقیه فیلدها را روی مقدار پیش‌فرض رها کن
 
 روی **Save config** و بعد **Start** بزن. اگر کار کند، دایرهٔ وضعیت سبز می‌شود.
 
 > **تستش کن:** دکمهٔ **Test** را بزن. یک درخواست از طریق رله می‌فرستد و می‌گوید کار کرد یا نه.
 
-### مرحلهٔ ۴ — مرورگر را روی mhrv-rs تنظیم کن
+### مرحلهٔ ۴ — مرورگر را روی رهگذر تنظیم کن
 
 #### فایرفاکس (پیشنهادی — ساده‌ترین)
 
 ۱. فایرفاکس → منوی ☰ → **Settings**
 ۲. در کادر جست‌وجو "proxy" تایپ کن
 ۳. زیر Network Settings روی **Settings…** کلیک کن
-۴. **Manual proxy configuration** را انتخاب کن
-۵. **HTTP Proxy:** `127.0.0.1` پورت: `8085`
-۶. ☑ **"Also use this proxy for HTTPS"** را تیک بزن
-۷. **OK**
+۴. گزینهٔ **Manual proxy configuration** را انتخاب کن
+۵. در فیلد **HTTP Proxy** آدرس `127.0.0.1` و پورت `8085` را بگذار
+۶. تیک گزینهٔ **"Also use this proxy for HTTPS"** ☑ را بزن
+۷. روی **OK** بزن
 
 #### کروم / Edge
 
@@ -329,7 +329,7 @@ ISP داخل HTTPS رمزشده را نمی‌تواند بخواند. فقط آ
 
 #### مک (سراسری)
 
-System Settings → Network → Wi-Fi → Details → **Proxies** → هر دو **Web Proxy (HTTP)** و **Secure Web Proxy (HTTPS)** را روشن کن، هر دو روی `127.0.0.1:8085`.
+از مسیر System Settings → Network → Wi-Fi → Details → **Proxies** برو و هر دو گزینهٔ **Web Proxy (HTTP)** و **Secure Web Proxy (HTTPS)** را روشن کن، هر دو روی `127.0.0.1:8085`.
 
 ### مرحلهٔ ۵ — امتحان کن
 
@@ -337,7 +337,7 @@ System Settings → Network → Wi-Fi → Details → **Proxies** → هر دو 
 
 اگر چیزی کار نکرد:
 
-- در پنجرهٔ mhrv-rs دکمهٔ **Test** را بزن — می‌گوید کجا گیر کرده
+- در پنجرهٔ رهگذر دکمهٔ **Test** را بزن — می‌گوید کجا گیر کرده
 - پنل **Recent log** پایین پنجره را نگاه کن
 - بخش [سؤالات رایج](#سؤالات-رایج) پایین را ببین
 
@@ -351,13 +351,13 @@ System Settings → Network → Wi-Fi → Details → **Proxies** → هر دو 
 
 **ویدیوی یوتیوب پخش نمی‌شود.** chunkهای ویدیوی یوتیوب از `googlevideo.com` می‌آیند و Apps Script نمی‌تواند به آن برسد (گوگل اجازهٔ دسترسی Apps Script به CDN ویدیوی خودش را نمی‌دهد). صفحهٔ خود یوتیوب لود می‌شود، فقط پخش ویدیو تحت تأثیر است. راه‌حل: Full Tunnel + VPS، یا `.googlevideo.com` را به `passthrough_hosts` در کانفیگت اضافه کن (مرورگر مستقیم می‌رود اما روی ISP ایران throttle می‌خورد).
 
-**ChatGPT / Claude / Grok کپچای Cloudflare نشان می‌دهد.** Cloudflare آی‌پی‌های دیتاسنتر گوگل را به‌عنوان bot شناسایی می‌کند. راه‌حل: یک **exit node** راه‌اندازی کن — یک handler کوچک TypeScript که روی یک host serverless (Deno Deploy، fly.io، VPS شخصی) deploy می‌کنی و پل می‌سازه از Apps Script به سایت Cloudflare. [`assets/exit_node/README.fa.md`](assets/exit_node/README.fa.md).
+**در ChatGPT / Claude / Grok کپچای Cloudflare ظاهر می‌شود.** Cloudflare آی‌پی‌های دیتاسنتر گوگل را به‌عنوان bot شناسایی می‌کند. راه‌حل: یک **exit node** راه‌اندازی کن — یک handler کوچک TypeScript که روی یک host serverless (Deno Deploy، fly.io، VPS شخصی) deploy می‌کنی و پل می‌سازه از Apps Script به سایت Cloudflare. [`assets/exit_node/README.fa.md`](assets/exit_node/README.fa.md).
 
 **تلگرام پایدار نیست.** تلگرام از MTProto استفاده می‌کند که Apps Script نمی‌فهمد. روی کامپیوترت با [xray](https://github.com/XTLS/Xray-core) جفتش کن — [بخش تلگرام در راهنمای کامل](docs/guide.fa.md#تلگرام-با-xray).
 
-**ISP خود `script.google.com` را مسدود کرده.** mhrv-rs یک حالت `direct` دارد که فقط از تونل بازنویسی SNI استفاده می‌کند (بدون Apps Script). یک‌بار از این حالت استفاده کن تا به `script.google.com` برسی و اسکریپت را دیپلوی کنی، بعد به حالت apps_script سوئیچ کن. [حالت direct](docs/guide.fa.md#حالت-direct).
+**وقتی ISP خود `script.google.com` را مسدود کرده.** رهگذر یک حالت `direct` دارد که فقط از تونل بازنویسی SNI استفاده می‌کند (بدون Apps Script). یک‌بار از این حالت استفاده کن تا به `script.google.com` برسی و اسکریپت را دیپلوی کنی، بعد به حالت apps_script سوئیچ کن. [حالت direct](docs/guide.fa.md#حالت-direct).
 
-**می‌خواهم از mhrv-rs به‌عنوان پروکسی upstream برای Psiphon (یا xray) استفاده کنم.** mhrv-rs را در حالت `direct` اجرا کن و در تنظیمات Psiphon قسمت *upstream proxy* را روی host:port که زیر دکمهٔ Connect نمایش داده می‌شود تنظیم کن. هاست‌هایی که در لیست fronting قرار ندارند به‌صورت raw TCP عبور می‌کنند، پس ترافیک bootstrap سایفون به سرورهای سایفون دست‌نخورده می‌رسد. [docs/use-as-upstream.fa.md](docs/use-as-upstream.fa.md).
+**می‌خواهم از رهگذر به‌عنوان پروکسی upstream برای Psiphon (یا xray) استفاده کنم.** رهگذر را در حالت `direct` اجرا کن و در تنظیمات Psiphon قسمت *upstream proxy* را روی host:port که زیر دکمهٔ Connect نمایش داده می‌شود تنظیم کن. هاست‌هایی که در لیست fronting قرار ندارند به‌صورت raw TCP عبور می‌کنند، پس ترافیک bootstrap سایفون به سرورهای سایفون دست‌نخورده می‌رسد. [docs/use-as-upstream.fa.md](docs/use-as-upstream.fa.md).
 
 **جست‌وجوی گوگلم بدون JavaScript ظاهر می‌شود.** `User-Agent` Apps Script ثابت روی `Google-Apps-Script` است (گوگل نمی‌گذارد اسکریپت‌ها عوضش کنند)، پس بعضی سایت‌ها نسخهٔ بدون JS برمی‌گردانند. راه‌حل: دامنهٔ مورد نظر را به `hosts` اضافه کن تا از تونل بازنویسی SNI با User-Agent واقعی مرورگرت برود. `google.com`، `youtube.com`، `fonts.googleapis.com` به‌طور پیش‌فرض در این لیست‌اند.
 
@@ -385,7 +385,5 @@ System Settings → Network → Wi-Fi → Details → **Proxies** → هر دو 
 - در GitHub Sponsors از **[@masterking32](https://github.com/masterking32)** — نویسندهٔ پروژهٔ اصلی پایتون. یا از طریق روش‌های ذکر شده در پروفایل و ریپوی او.
 - در **[sh1n.org/donate](https://sh1n.org/donate)** برای **[@therealaleph](https://github.com/therealaleph)** — نویسندهٔ پورت Rust. پوشش هزینهٔ هاستینگ / CI / سال‌ها نگه‌داری.
 - در GitHub Sponsors از **[@patterniha](https://github.com/patterniha)** — نویسندهٔ MITM-DomainFronting. یا از طریق روش‌های ذکر شده در ریپوی او.
-
-ستاره دادن به این سه ریپوی بالادست هم نشان می‌دهد کارشان ارزش ادامه دادن دارد. اگر mhrv-rs بالادست دوباره فعال شد، این فورک تغییرات را برمی‌گرداند و کنار می‌کشد — هدف فقط تداوم دسترسی برای کاربران پشت سانسور سنگین است، نه چیز دیگر.
 
 </div>

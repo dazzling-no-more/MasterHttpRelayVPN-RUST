@@ -9,7 +9,7 @@ import java.io.File
  * Config I/O. The source of truth is a JSON file in the app's files dir —
  * the Rust side parses the same file, so we don't maintain two schemas.
  *
- * What the Android UI exposes is a pragmatic subset of the full mhrv-rs
+ * What the Android UI exposes is a pragmatic subset of the full rahgozar
  * config, but we now track parity with the desktop UI on the dimensions
  * that actually matter on a phone:
  *   - multiple deployment IDs (round-robin)
@@ -39,7 +39,7 @@ enum class ConnectionMode { VPN_TUN, PROXY_ONLY }
  *
  * - [ALL]  — tunnel every app (default; the package list is ignored).
  * - [ONLY] — allow-list: tunnel ONLY the apps in `splitApps`. Everything
- *   else bypasses the VPN. Useful when you want mhrv-rs for a specific
+ *   else bypasses the VPN. Useful when you want rahgozar for a specific
  *   browser / messenger and nothing else.
  * - [EXCEPT] — deny-list: tunnel everything EXCEPT the apps in
  *   `splitApps`. Useful for excluding a banking app that would break
@@ -473,7 +473,7 @@ object ConfigStore {
     }
 
     /** Prefix for encoded config strings so we can detect them in clipboard. */
-    private const val HASH_PREFIX = "mhrv-rs://"
+    private const val HASH_PREFIX = "rahgozar://"
 
     /** Encode config as a shareable base64 string with prefix.
      *  Only includes non-default fields to keep the hash short. */
