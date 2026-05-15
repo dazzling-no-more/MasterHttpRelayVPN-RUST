@@ -85,6 +85,23 @@ jobs:
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
             name: mhrv-rs-linux-amd64
+          # ── Linux arm64 + armhf (glibc) ───────────────────────────────────
+          # Cross-compiled from x86_64 ubuntu-latest via apt-installed
+          # gcc-aarch64-linux-gnu / gcc-arm-linux-gnueabihf. Upstream had
+          # these pre-installed on its self-hosted runners; we apt-install
+          # them per-job (~30 s, cached by rust-cache afterward).
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: mhrv-rs-linux-arm64
+            linux_cross_apt: gcc-aarch64-linux-gnu
+            cargo_linker_var: CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER
+            cargo_linker_val: aarch64-linux-gnu-gcc
+          - target: arm-unknown-linux-gnueabihf
+            os: ubuntu-latest
+            name: mhrv-rs-raspbian-armhf
+            linux_cross_apt: gcc-arm-linux-gnueabihf
+            cargo_linker_var: CARGO_TARGET_ARM_UNKNOWN_LINUX_GNUEABIHF_LINKER
+            cargo_linker_val: arm-linux-gnueabihf-gcc
           # ── macOS + Windows ────────────────────────────────────────────────
           # Already github-hosted upstream; works unchanged on the fork.
           - target: x86_64-apple-darwin
@@ -96,25 +113,29 @@ jobs:
           - target: x86_64-pc-windows-gnu
             os: windows-latest
             name: mhrv-rs-windows-amd64
-          # ── Cross-compile linux targets disabled for the fork ──────────────
-          # Upstream built these on its self-hosted Hetzner runners
-          # (gcc-aarch64-linux-gnu, gcc-arm-linux-gnueabihf, musl-tools,
-          # messense's mipsel-softfloat docker image — all pre-installed
-          # at runner-setup time). Restoring them on github-hosted runners
-          # needs cross-compile toolchain installs in this workflow (or
-          # `cross-rs/cross`) which is non-trivial; deferred until a fork
-          # release actually needs them.
-          #
-          # Targets that USED to build:
-          #   aarch64-unknown-linux-gnu   → mhrv-rs-linux-arm64
-          #   arm-unknown-linux-gnueabihf → mhrv-rs-raspbian-armhf
-          #   x86_64-unknown-linux-musl   → mhrv-rs-linux-musl-amd64
-          #   aarch64-unknown-linux-musl  → mhrv-rs-linux-musl-arm64
-          #   mipsel-unknown-linux-musl   → mhrv-rs-openwrt-mipsel-softfloat
-          #
-          # Users on those platforms can `cargo build --target <triple>`
-          # locally with the matching cross-toolchain installed, or wait
-          # for these matrix entries to be restored.
+          # ── Linux musl (static, OpenWRT / Alpine / libc-less) ─────────────
+          # Built via the messense/rust-musl-cross docker images that
+          # ship a complete musl toolchain. ubuntu-latest has docker
+          # pre-installed; no per-job toolchain setup needed beyond the
+          # existing "Build CLI (musl via docker)" steps further down.
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            name: mhrv-rs-linux-musl-amd64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            name: mhrv-rs-linux-musl-arm64
+          # ── OpenWRT MT7621 (mipsel-softfloat, Rust tier-3) ────────────────
+          # Dozens of cheap home routers run this chipset and they
+          # *specifically* need the soft-float variant — MT7621 has no
+          # hardware FPU and a hard-float binary segfaults on the first
+          # fp op. Built inside messense/rust-musl-cross:mipsel-musl with
+          # nightly Rust + `-Z build-std` + `-C target-feature=+soft-float`.
+          # `continue-on-error: true` so a tier-3 regression doesn't block
+          # the rest of the release. Issue #26.
+          - target: mipsel-unknown-linux-musl
+            os: ubuntu-latest
+            name: mhrv-rs-openwrt-mipsel-softfloat
+            mipsel_softfloat: true
 
     runs-on: ${{ matrix.os }}
     # mipsel-softfloat is best-effort: the Rust tier-3 target occasionally
@@ -227,6 +248,18 @@ jobs:
           sudo apt-get install -y gcc-arm-linux-gnueabihf
           echo '[target.arm-unknown-linux-gnueabihf]' >> ~/.cargo/config.toml
           echo 'linker = "arm-linux-gnueabihf-gcc"' >> ~/.cargo/config.toml
+
+      # Cross-compile gcc for the glibc arm64 / armhf targets. apt-installed
+      # per-job; rust-cache won't help here (it's a system package) but the
+      # install is fast (~20 s for the two .deb downloads). We also export
+      # the linker env var here rather than via .cargo/config.toml so the
+      # setting is scoped to this job and doesn't bleed into cached state.
+      - name: Install Linux cross-compile gcc
+        if: matrix.linux_cross_apt != ''
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ${{ matrix.linux_cross_apt }}
+          echo "${{ matrix.cargo_linker_var }}=${{ matrix.cargo_linker_val }}" >> "$GITHUB_ENV"
 
       - name: Install Windows MinGW toolchain
         if: matrix.target == 'x86_64-pc-windows-gnu'
