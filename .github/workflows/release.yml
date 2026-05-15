@@ -616,29 +616,23 @@ jobs:
           # crate release's Cargo.lock so transitive bumps are deliberate too.
           cargo install --quiet --locked --version "${RSIGN2_VERSION}" rsign2
 
+      # Pull only the artifacts we actually need to sign. Filtering on
+      # `rahgozar-*` skips the buildkit attestation artifact that
+      # docker/build-push-action@v6 uploads with a `dazzling-no-more~rahgozar~XXX.dockerbuild`
+      # name — `gh run download` (the previous tool) tried to extract it
+      # as a zip and failed, then left half-extracted files around that
+      # blocked the retry with a "file exists" error.
+      # `merge-multiple: true` flattens each artifact's subdir so the
+      # signer loop below sees files directly under `dist/`.
       - name: Download all build artifacts
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p dist
-          # Same retry pattern as the `release` job — the artifacts API
-          # has been intermittently 5-retries-exhausted on this workflow,
-          # `gh run download` against the current run ID is more reliable.
-          for attempt in 1 2 3; do
-            if gh run download "${GITHUB_RUN_ID}" --dir dist --repo "${GITHUB_REPOSITORY}"; then
-              echo "downloaded all artifacts on attempt $attempt"
-              # `gh run download` puts each artifact in its own subdir;
-              # flatten so the sign loop sees `dist/<file>` directly.
-              find dist -type f -mindepth 2 -exec mv -f {} dist/ \;
-              find dist -type d -empty -delete
-              ls -la dist/
-              exit 0
-            fi
-            echo "download attempt $attempt failed; retrying in 30s..."
-            sleep 30
-          done
-          echo "::error::failed to download artifacts after 3 attempts"
-          exit 1
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: rahgozar-*
+          merge-multiple: true
+
+      - name: List downloaded artifacts
+        run: ls -la dist/
 
       - name: Sign artifacts
         env:
