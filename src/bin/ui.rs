@@ -339,7 +339,9 @@ enum Cmd {
     /// each one with SNI=hostname, so the user can drop the best IP
     /// into a new `FrontingGroup` without hand-running `dig` and
     /// `openssl s_client`. See `rahgozar::cdn_discover`.
-    DiscoverFront { hostname: String },
+    DiscoverFront {
+        hostname: String,
+    },
     /// Download + verify + extract + stage a release asset, ready to swap
     /// in on next launch (or via restart_to_apply). Fires when the user
     /// clicks the "Install update" button after a successful CheckUpdate
@@ -1051,10 +1053,18 @@ struct ConfigWire<'a> {
     extras: &'a std::collections::BTreeMap<String, serde_json::Value>,
 }
 
-fn is_default_strikes(v: &u32) -> bool { *v == 3 }
-fn is_default_window_secs(v: &u64) -> bool { *v == 30 }
-fn is_default_cooldown_secs(v: &u64) -> bool { *v == 120 }
-fn is_default_timeout_secs(v: &u64) -> bool { *v == 30 }
+fn is_default_strikes(v: &u32) -> bool {
+    *v == 3
+}
+fn is_default_window_secs(v: &u64) -> bool {
+    *v == 30
+}
+fn is_default_cooldown_secs(v: &u64) -> bool {
+    *v == 120
+}
+fn is_default_timeout_secs(v: &u64) -> bool {
+    *v == 30
+}
 fn is_default_exit_node(en: &&rahgozar::config::ExitNodeConfig) -> bool {
     !en.enabled
         && en.relay_url.is_empty()
@@ -2852,8 +2862,8 @@ impl App {
             } else {
                 active.clone()
             };
-            let combo = egui::ComboBox::from_id_source("profile_picker")
-                .selected_text(selected_label);
+            let combo =
+                egui::ComboBox::from_id_source("profile_picker").selected_text(selected_label);
             ui.add_enabled_ui(!running, |ui| {
                 let resp = combo.show_ui(ui, |ui| {
                     if names.is_empty() {
@@ -2864,10 +2874,7 @@ impl App {
                         );
                     } else {
                         for name in &names {
-                            if ui
-                                .selectable_label(active == *name, name.clone())
-                                .clicked()
-                            {
+                            if ui.selectable_label(active == *name, name.clone()).clicked() {
                                 chosen = Some(name.clone());
                             }
                         }
@@ -2889,13 +2896,11 @@ impl App {
             // Config inside the running ProxyServer task.
             let save_as_enabled = self.profiles_load_ok && !running;
             ui.add_enabled_ui(save_as_enabled, |ui| {
-                let resp = ui
-                    .button("Save as profile…")
-                    .on_hover_text(
-                        "Capture the current form (deployment IDs, mode, auth key, \
+                let resp = ui.button("Save as profile…").on_hover_text(
+                    "Capture the current form (deployment IDs, mode, auth key, \
                          and all tuning knobs) under a name so you can switch back \
                          to it later.",
-                    );
+                );
                 if resp.clicked() {
                     self.save_as_dialog = Some(SaveAsState::default());
                 }
@@ -3000,9 +3005,7 @@ impl App {
             .default_width(360.0)
             .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, -40.0))
             .show(ctx, |ui| {
-                ui.label(
-                    "Profile name:",
-                );
+                ui.label("Profile name:");
                 let resp = ui.add(
                     egui::TextEdit::singleline(&mut state.name)
                         .desired_width(f32::INFINITY)
@@ -3015,8 +3018,7 @@ impl App {
                     ui.colored_label(ERR_RED, err);
                 }
                 let trimmed = state.name.trim().to_string();
-                let exists = !trimmed.is_empty()
-                    && self.profiles.find(&trimmed).is_some();
+                let exists = !trimmed.is_empty() && self.profiles.find(&trimmed).is_some();
                 if exists {
                     ui.small(
                         egui::RichText::new(format!(
@@ -3045,10 +3047,7 @@ impl App {
         if let Some((name, overwrite)) = commit {
             match self.save_form_as_profile(&name, overwrite) {
                 Ok(()) => {
-                    self.toast = Some((
-                        format!("Saved profile '{}'", name),
-                        Instant::now(),
-                    ));
+                    self.toast = Some((format!("Saved profile '{}'", name), Instant::now()));
                     close = true;
                 }
                 Err(msg) => {
@@ -3094,8 +3093,7 @@ impl App {
             .to_config()
             .map_err(|e| format!("Form is invalid: {}", e))?;
         let wire = ConfigWire::from(&cfg);
-        let value = serde_json::to_value(&wire)
-            .map_err(|e| format!("serialize failed: {}", e))?;
+        let value = serde_json::to_value(&wire).map_err(|e| format!("serialize failed: {}", e))?;
 
         // Pre-validate the profile mutation would succeed (collision /
         // empty-name checks) BEFORE touching config.json, so we don't
@@ -3103,9 +3101,11 @@ impl App {
         // operation is rejected.
         let mut next = self.profiles.clone();
         if overwrite {
-            next.upsert(name, value.clone()).map_err(|e| format!("{}", e))?;
+            next.upsert(name, value.clone())
+                .map_err(|e| format!("{}", e))?;
         } else {
-            next.insert_new(name, value.clone()).map_err(|e| format!("{}", e))?;
+            next.insert_new(name, value.clone())
+                .map_err(|e| format!("{}", e))?;
         }
 
         // Step 1: write the snapshot to config.json. On failure,
@@ -3189,12 +3189,8 @@ impl App {
                             ui.horizontal(|ui| {
                                 let is_active = *name == active;
                                 if is_active {
-                                    ui.label(
-                                        egui::RichText::new("●")
-                                            .color(OK_GREEN)
-                                            .strong(),
-                                    )
-                                    .on_hover_text("Active profile");
+                                    ui.label(egui::RichText::new("●").color(OK_GREEN).strong())
+                                        .on_hover_text("Active profile");
                                 } else {
                                     ui.label("  ");
                                 }
@@ -3203,10 +3199,7 @@ impl App {
                                         .rename_buf
                                         .entry(name.clone())
                                         .or_insert_with(|| name.clone());
-                                    ui.add(
-                                        egui::TextEdit::singleline(buf)
-                                            .desired_width(180.0),
-                                    );
+                                    ui.add(egui::TextEdit::singleline(buf).desired_width(180.0));
                                     if ui.button("OK").clicked() {
                                         let to = buf.clone();
                                         pending = Some(Action::CommitRename {
@@ -3219,9 +3212,7 @@ impl App {
                                         state.rename_buf.remove(name);
                                         state.error = None;
                                     }
-                                } else if state.pending_delete.as_deref()
-                                    == Some(name.as_str())
-                                {
+                                } else if state.pending_delete.as_deref() == Some(name.as_str()) {
                                     // Confirm-delete row: replaces the
                                     // usual action buttons with an
                                     // explicit "Confirm delete?" prompt.
@@ -3248,10 +3239,7 @@ impl App {
                                         state.error = None;
                                     }
                                 } else {
-                                    ui.label(
-                                        egui::RichText::new(name.clone())
-                                            .monospace(),
-                                    );
+                                    ui.label(egui::RichText::new(name.clone()).monospace());
                                     if ui.small_button("Rename").clicked() {
                                         state.renaming = Some(name.clone());
                                         state.error = None;
@@ -3295,9 +3283,9 @@ impl App {
             // (invariant 3 in src/profiles.rs).
             let mut next = self.profiles.clone();
             let outcome: Result<(), String> = match &action {
-                Action::CommitRename { from, to } => next
-                    .rename(from, to)
-                    .map_err(|e| format!("{}", e)),
+                Action::CommitRename { from, to } => {
+                    next.rename(from, to).map_err(|e| format!("{}", e))
+                }
                 Action::Duplicate(name) => {
                     // Pick a unique copy name: "name (copy)", "name (copy 2)", …
                     let mut candidate = format!("{} (copy)", name);
@@ -3309,9 +3297,7 @@ impl App {
                     next.duplicate(name, &candidate)
                         .map_err(|e| format!("{}", e))
                 }
-                Action::Delete(name) => {
-                    next.delete(name).map_err(|e| format!("{}", e))
-                }
+                Action::Delete(name) => next.delete(name).map_err(|e| format!("{}", e)),
             };
             let state = self.manage_dialog.as_mut().unwrap();
             match outcome.and_then(|_| next.save().map_err(|e| format!("save failed: {}", e))) {
@@ -3509,8 +3495,7 @@ impl App {
                     let custom_label = ui.add_sized(
                         [0.0, 0.0],
                         egui::Label::new(
-                            egui::RichText::new("Custom SNI")
-                                .color(egui::Color32::TRANSPARENT),
+                            egui::RichText::new("Custom SNI").color(egui::Color32::TRANSPARENT),
                         ),
                     );
                     ui.add(
@@ -3723,14 +3708,14 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                          https://whatismyipaddress.com in your browser \
                          via 127.0.0.1:8085. The IP shown should be your \
                          tunnel-node's VPS IP. Tracking a real Full-mode \
-                         test in #160."
+                         test in #160.",
                     ),
                     Some(rahgozar::config::Mode::Direct) => Some(
                         "Test Relay is wired only for apps_script mode. \
                          In direct mode there is no Apps Script relay — \
                          every request goes through the SNI-rewrite tunnel \
                          straight to Google's edge. Verify by loading \
-                         https://www.google.com via the proxy."
+                         https://www.google.com via the proxy.",
                     ),
                     _ => None,
                 };
@@ -4209,10 +4194,7 @@ fn install_ui_tracing(shared: Arc<Shared>, config_level: &str) {
 /// by `install_ui_tracing`. `apply_log_level` uses it to swap in a new
 /// filter when the user clicks Save with a different log level (#401).
 static LOG_RELOAD: std::sync::OnceLock<
-    tracing_subscriber::reload::Handle<
-        tracing_subscriber::EnvFilter,
-        tracing_subscriber::Registry,
-    >,
+    tracing_subscriber::reload::Handle<tracing_subscriber::EnvFilter, tracing_subscriber::Registry>,
 > = std::sync::OnceLock::new();
 
 /// Reinstall the tracing filter at runtime. Called from the Save handler
@@ -4373,9 +4355,7 @@ mod tests {
         // the user gets when pasting from a Telegram channel that
         // formatted the list with mixed delimiters.
         let groups = vec![mk_group("g", "1.1.1.1", "sni.test", &[])];
-        let buffers = vec![
-            "  a.com , b.com\n\n c.com,  ,\nd.com  ".to_string(),
-        ];
+        let buffers = vec!["  a.com , b.com\n\n c.com,  ,\nd.com  ".to_string()];
         let out = build_fronting_groups_from_editor(&groups, &buffers);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].domains, vec!["a.com", "b.com", "c.com", "d.com"]);
@@ -4397,10 +4377,7 @@ mod tests {
         // byte-exact, matching the Android `.distinct()` behaviour.
         // That's intentional: aggressive case-collapsing here would
         // surprise a user who deliberately typed varied casing.
-        assert_eq!(
-            out[0].domains,
-            vec!["a.com", "b.com", "c.com", "B.COM"],
-        );
+        assert_eq!(out[0].domains, vec!["a.com", "b.com", "c.com", "B.COM"],);
     }
 
     #[test]
@@ -4410,7 +4387,12 @@ mod tests {
         // shorter than the groups Vec — for instance right at
         // first launch before the editor has rendered. In that
         // case the existing `g.domains` is the source of truth.
-        let groups = vec![mk_group("loaded", "9.9.9.9", "x.test", &["alpha.test", "beta.test"])];
+        let groups = vec![mk_group(
+            "loaded",
+            "9.9.9.9",
+            "x.test",
+            &["alpha.test", "beta.test"],
+        )];
         let buffers: Vec<String> = vec![]; // no buffers — should fall back
         let out = build_fronting_groups_from_editor(&groups, &buffers);
         assert_eq!(out.len(), 1);
@@ -4457,7 +4439,10 @@ mod tests {
         // Modelled fields must NOT be duplicated by the extras flatten
         // (would happen if Config also stuck them in `extras`).
         assert_eq!(out.get("mode"), Some(&serde_json::json!("apps_script")));
-        assert_eq!(out.get("auth_key"), Some(&serde_json::json!("MY_REAL_SECRET")));
+        assert_eq!(
+            out.get("auth_key"),
+            Some(&serde_json::json!("MY_REAL_SECRET"))
+        );
     }
 
     /// Carry-through of `block_quic` / `disable_padding` / `enable_batching`
@@ -4500,7 +4485,10 @@ mod tests {
         let wire = ConfigWire::from(&cfg);
         let out = serde_json::to_value(&wire).unwrap();
         // block_quic defaults true → should NOT appear in output.
-        assert!(out.get("block_quic").is_none(), "default block_quic must be omitted");
+        assert!(
+            out.get("block_quic").is_none(),
+            "default block_quic must be omitted"
+        );
         assert!(out.get("disable_padding").is_none());
         assert!(out.get("enable_batching").is_none());
         assert!(out.get("coalesce_step_ms").is_none());

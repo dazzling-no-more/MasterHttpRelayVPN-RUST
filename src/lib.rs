@@ -12,10 +12,10 @@ pub mod mitm;
 pub mod profiles;
 pub mod proxy_server;
 pub mod rlimit;
-pub mod tunnel_client;
 pub mod scan_ips;
 pub mod scan_sni;
 pub mod test_cmd;
+pub mod tunnel_client;
 pub mod update_check;
 
 // Desktop-only — Android delegates APK install to PackageInstaller, doesn't

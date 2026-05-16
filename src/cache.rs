@@ -87,7 +87,9 @@ impl ResponseCache {
             }
         }
 
-        inner.entries.insert(key.clone(), CachedResponse { bytes, expires });
+        inner
+            .entries
+            .insert(key.clone(), CachedResponse { bytes, expires });
         inner.order.push_back(key);
         inner.size += size;
     }
@@ -107,9 +109,7 @@ impl ResponseCache {
 
 pub fn parse_ttl(raw_response: &[u8], url: &str) -> Option<Duration> {
     let sep = b"\r\n\r\n";
-    let hdr_end = raw_response
-        .windows(sep.len())
-        .position(|w| w == sep)?;
+    let hdr_end = raw_response.windows(sep.len()).position(|w| w == sep)?;
     let hdr = std::str::from_utf8(&raw_response[..hdr_end]).ok()?;
     let hdr_lower = hdr.to_ascii_lowercase();
 
@@ -117,7 +117,10 @@ pub fn parse_ttl(raw_response: &[u8], url: &str) -> Option<Duration> {
     if !first_line.starts_with("http/1.1 200") && !first_line.starts_with("http/1.0 200") {
         return None;
     }
-    if hdr_lower.contains("no-store") || hdr_lower.contains("no-cache") || hdr_lower.contains("private") {
+    if hdr_lower.contains("no-store")
+        || hdr_lower.contains("no-cache")
+        || hdr_lower.contains("private")
+    {
         return None;
     }
     if hdr_lower.contains("set-cookie:") {
@@ -139,9 +142,8 @@ pub fn parse_ttl(raw_response: &[u8], url: &str) -> Option<Duration> {
 
     let path_no_query = url.split('?').next().unwrap_or(url).to_ascii_lowercase();
     const STATIC_EXTS: &[&str] = &[
-        ".css", ".js", ".mjs", ".woff", ".woff2", ".ttf", ".otf", ".eot",
-        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico", ".avif",
-        ".mp3", ".mp4", ".wasm", ".webm", ".ogg",
+        ".css", ".js", ".mjs", ".woff", ".woff2", ".ttf", ".otf", ".eot", ".png", ".jpg", ".jpeg",
+        ".gif", ".webp", ".svg", ".ico", ".avif", ".mp3", ".mp4", ".wasm", ".webm", ".ogg",
     ];
     for ext in STATIC_EXTS {
         if path_no_query.ends_with(ext) {
@@ -166,10 +168,7 @@ pub fn parse_ttl(raw_response: &[u8], url: &str) -> Option<Duration> {
 }
 
 pub fn is_cacheable_method(method: &str) -> bool {
-    matches!(
-        method.to_ascii_uppercase().as_str(),
-        "GET" | "HEAD"
-    )
+    matches!(method.to_ascii_uppercase().as_str(), "GET" | "HEAD")
 }
 
 pub fn cache_key(method: &str, url: &str) -> String {
@@ -264,7 +263,10 @@ mod tests {
 
     #[test]
     fn non_200_rejected() {
-        let raw = mk_resp("HTTP/1.1 404 Not Found\r\nCache-Control: max-age=600", "body");
+        let raw = mk_resp(
+            "HTTP/1.1 404 Not Found\r\nCache-Control: max-age=600",
+            "body",
+        );
         assert!(parse_ttl(&raw, "http://x.com/page").is_none());
     }
 

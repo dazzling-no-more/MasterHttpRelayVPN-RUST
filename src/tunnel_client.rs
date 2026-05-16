@@ -292,7 +292,11 @@ pub struct TunnelMux {
 }
 
 impl TunnelMux {
-    pub fn start(fronter: Arc<DomainFronter>, coalesce_step_ms: u64, coalesce_max_ms: u64) -> Arc<Self> {
+    pub fn start(
+        fronter: Arc<DomainFronter>,
+        coalesce_step_ms: u64,
+        coalesce_max_ms: u64,
+    ) -> Arc<Self> {
         // Dedupe before snapshotting: the aggregate `all_legacy` gate
         // compares `legacy_deployments.len()` (a HashMap, so unique
         // keys) against this count, so using the raw `num_scripts()`
@@ -317,17 +321,23 @@ impl TunnelMux {
             unique_n,
             CONCURRENCY_PER_DEPLOYMENT
         );
-        let step = if coalesce_step_ms > 0 { coalesce_step_ms } else { DEFAULT_COALESCE_STEP_MS };
-        let max = if coalesce_max_ms > 0 { coalesce_max_ms } else { DEFAULT_COALESCE_MAX_MS };
+        let step = if coalesce_step_ms > 0 {
+            coalesce_step_ms
+        } else {
+            DEFAULT_COALESCE_STEP_MS
+        };
+        let max = if coalesce_max_ms > 0 {
+            coalesce_max_ms
+        } else {
+            DEFAULT_COALESCE_MAX_MS
+        };
         tracing::info!("batch coalesce: step={}ms max={}ms", step, max);
         // Reply timeout co-varies with `request_timeout_secs` so an
         // operator who raises the batch budget doesn't have sessions
         // abandoning replies just before the HTTP round-trip would
         // have completed. See the `reply_timeout` field comment for
         // the invariant.
-        let reply_timeout = fronter
-            .batch_timeout()
-            .saturating_add(REPLY_TIMEOUT_SLACK);
+        let reply_timeout = fronter.batch_timeout().saturating_add(REPLY_TIMEOUT_SLACK);
         let (tx, rx) = mpsc::channel(512);
         tokio::spawn(mux_loop(rx, fronter, step, max));
         Arc::new(Self {
@@ -616,7 +626,12 @@ impl TunnelMux {
     }
 }
 
-async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>, coalesce_step_ms: u64, coalesce_max_ms: u64) {
+async fn mux_loop(
+    mut rx: mpsc::Receiver<MuxMsg>,
+    fronter: Arc<DomainFronter>,
+    coalesce_step_ms: u64,
+    coalesce_max_ms: u64,
+) {
     let coalesce_step = Duration::from_millis(coalesce_step_ms);
     let coalesce_max = Duration::from_millis(coalesce_max_ms);
     // One semaphore per deployment ID, each allowing 30 concurrent requests.
@@ -705,7 +720,9 @@ async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>, c
                         data: Some(data),
                         encode_empty: true,
                     };
-                    accum.push_or_fire(op, op_bytes, reply, &sems, &fronter).await;
+                    accum
+                        .push_or_fire(op, op_bytes, reply, &sems, &fronter)
+                        .await;
                 }
                 MuxMsg::Data { sid, data, reply } => {
                     let op_bytes = encoded_len(data.len());
@@ -717,7 +734,9 @@ async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>, c
                         data: if data.is_empty() { None } else { Some(data) },
                         encode_empty: false,
                     };
-                    accum.push_or_fire(op, op_bytes, reply, &sems, &fronter).await;
+                    accum
+                        .push_or_fire(op, op_bytes, reply, &sems, &fronter)
+                        .await;
                 }
                 MuxMsg::UdpOpen {
                     host,
@@ -734,7 +753,9 @@ async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>, c
                         data: if data.is_empty() { None } else { Some(data) },
                         encode_empty: false,
                     };
-                    accum.push_or_fire(op, op_bytes, reply, &sems, &fronter).await;
+                    accum
+                        .push_or_fire(op, op_bytes, reply, &sems, &fronter)
+                        .await;
                 }
                 MuxMsg::UdpData { sid, data, reply } => {
                     let op_bytes = encoded_len(data.len());
@@ -746,7 +767,9 @@ async fn mux_loop(mut rx: mpsc::Receiver<MuxMsg>, fronter: Arc<DomainFronter>, c
                         data: if data.is_empty() { None } else { Some(data) },
                         encode_empty: false,
                     };
-                    accum.push_or_fire(op, op_bytes, reply, &sems, &fronter).await;
+                    accum
+                        .push_or_fire(op, op_bytes, reply, &sems, &fronter)
+                        .await;
                 }
                 MuxMsg::Close { sid } => {
                     close_sids.push(sid);
@@ -1606,11 +1629,7 @@ mod tests {
     #[test]
     fn negative_cache_ignores_non_unreachable_errors() {
         let (mux, _rx) = mux_for_test();
-        mux.record_unreachable_if_match(
-            "example.com",
-            443,
-            "connect failed: connection refused",
-        );
+        mux.record_unreachable_if_match("example.com", 443, "connect failed: connection refused");
         assert!(!mux.is_unreachable("example.com", 443));
     }
 
@@ -1642,9 +1661,10 @@ mod tests {
     async fn negative_cache_skips_outer_relay_errors() {
         let (mux, mut rx) = mux_for_test();
         let mux_for_task = mux.clone();
-        let task = tokio::spawn(async move {
-            connect_plain("real.target.example", 443, &mux_for_task).await
-        });
+        let task =
+            tokio::spawn(
+                async move { connect_plain("real.target.example", 443, &mux_for_task).await },
+            );
 
         // Receive the Connect msg and reply with an outer Err whose string
         // would otherwise match `is_unreachable_error_str`.
@@ -1654,7 +1674,7 @@ mod tests {
             other => panic!("expected Connect, got {:?}", std::mem::discriminant(&other)),
         };
         let _ = reply.send(Err(
-            "relay failed: Network is unreachable (os error 101)".into(),
+            "relay failed: Network is unreachable (os error 101)".into()
         ));
 
         let res = task.await.expect("task");
@@ -1680,11 +1700,7 @@ mod tests {
                 "connect failed: Network is unreachable (os error 101)",
             );
         }
-        let len = mux
-            .unreachable_cache
-            .lock()
-            .map(|g| g.len())
-            .unwrap_or(0);
+        let len = mux.unreachable_cache.lock().map(|g| g.len()).unwrap_or(0);
         assert!(
             len <= UNREACHABLE_CACHE_MAX,
             "cache size {} exceeded cap {}",
@@ -1903,7 +1919,11 @@ mod tests {
             match msg {
                 MuxMsg::Data { sid, data, reply } => {
                     assert_eq!(sid, "sid-mixed");
-                    assert!(data.is_empty(), "expected empty poll, got {} bytes", data.len());
+                    assert!(
+                        data.is_empty(),
+                        "expected empty poll, got {} bytes",
+                        data.len()
+                    );
                     let last = i == 5;
                     let _ = reply.send(Ok((
                         TunnelResponse {
@@ -2070,23 +2090,11 @@ mod tests {
     #[test]
     fn should_fire_when_payload_would_exceed_cap() {
         // Exactly at the cap is fine — strict `>`.
-        assert!(!should_fire(
-            10,
-            MAX_BATCH_PAYLOAD_BYTES - 100,
-            100,
-        ));
+        assert!(!should_fire(10, MAX_BATCH_PAYLOAD_BYTES - 100, 100,));
         // One byte over: fire.
-        assert!(should_fire(
-            10,
-            MAX_BATCH_PAYLOAD_BYTES - 100,
-            101,
-        ));
+        assert!(should_fire(10, MAX_BATCH_PAYLOAD_BYTES - 100, 101,));
         // Sum overflow well past the cap: fire.
-        assert!(should_fire(
-            10,
-            MAX_BATCH_PAYLOAD_BYTES,
-            1,
-        ));
+        assert!(should_fire(10, MAX_BATCH_PAYLOAD_BYTES, 1,));
     }
 
     /// Reply indices must point at the slot the op occupies *within its
@@ -2131,7 +2139,11 @@ mod tests {
         push_no_fire(&mut accum, mk_op("a2"), 4, mk_reply());
         assert_eq!(accum.pending_ops.len(), 3);
         assert_eq!(
-            accum.data_replies.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            accum
+                .data_replies
+                .iter()
+                .map(|(i, _)| *i)
+                .collect::<Vec<_>>(),
             vec![0, 1, 2],
         );
         assert_eq!(accum.payload_bytes, 12);
@@ -2147,7 +2159,11 @@ mod tests {
         push_no_fire(&mut accum, mk_op("b1"), 4, mk_reply());
         assert_eq!(accum.pending_ops.len(), 2);
         assert_eq!(
-            accum.data_replies.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            accum
+                .data_replies
+                .iter()
+                .map(|(i, _)| *i)
+                .collect::<Vec<_>>(),
             vec![0, 1],
             "post-flush indices must restart at 0 — otherwise fire_batch's \
              batch_resp.r.get(idx) returns None and every session in the \

@@ -328,7 +328,8 @@ fn decode_chunked_http_body(mut body: &[u8]) -> Result<Vec<u8>, &'static str> {
             .windows(2)
             .position(|w| w == b"\r\n")
             .ok_or("truncated chunk size line")?;
-        let size_line = std::str::from_utf8(&body[..line_end]).map_err(|_| "bad chunk size line")?;
+        let size_line =
+            std::str::from_utf8(&body[..line_end]).map_err(|_| "bad chunk size line")?;
         let size = usize::from_str_radix(size_line.trim().split(';').next().unwrap_or(""), 16)
             .map_err(|_| "bad chunk size")?;
         body = &body[line_end + 2..];
@@ -378,7 +379,10 @@ fn is_public_google_sni_candidate(domain: &str) -> bool {
         "withgoogle.com",
     ];
     public_suffixes.iter().any(|suffix| {
-        domain == *suffix || domain.strip_suffix(suffix).is_some_and(|prefix| prefix.ends_with('.'))
+        domain == *suffix
+            || domain
+                .strip_suffix(suffix)
+                .is_some_and(|prefix| prefix.ends_with('.'))
     })
 }
 
@@ -689,6 +693,8 @@ tus\":0}\r\n\
         assert!(is_public_google_sni_candidate("www.google.com"));
         assert!(is_public_google_sni_candidate("fonts.googleapis.com"));
         assert!(!is_public_google_sni_candidate("ams15s21-in-f14.1e100.net"));
-        assert!(!is_public_google_sni_candidate("82.221.107.34.bc.googleusercontent.com"));
+        assert!(!is_public_google_sni_candidate(
+            "82.221.107.34.bc.googleusercontent.com"
+        ));
     }
 }

@@ -113,16 +113,12 @@ pub async fn discover_front(hostname: &str) -> Result<DiscoveredFront, String> {
     }
 
     let resolve_target = format!("{}:443", hostname);
-    let resolved = match tokio::time::timeout(
-        DNS_TIMEOUT,
-        tokio::net::lookup_host(resolve_target),
-    )
-    .await
-    {
-        Ok(Ok(iter)) => iter.collect::<Vec<_>>(),
-        Ok(Err(e)) => return Err(format!("dns: {}", e)),
-        Err(_) => return Err("dns timeout".into()),
-    };
+    let resolved =
+        match tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host(resolve_target)).await {
+            Ok(Ok(iter)) => iter.collect::<Vec<_>>(),
+            Ok(Err(e)) => return Err(format!("dns: {}", e)),
+            Err(_) => return Err("dns timeout".into()),
+        };
 
     // Dedup IPs while preserving the resolver's order — some CDNs
     // return A records in a deliberate per-client-rotated order, and
@@ -146,11 +142,7 @@ pub async fn discover_front(hostname: &str) -> Result<DiscoveredFront, String> {
         .filter(|ip| {
             if !is_public_routable_ip(*ip) {
                 filtered_count += 1;
-                tracing::warn!(
-                    "discover_front({}): dropped non-public IP {}",
-                    hostname,
-                    ip,
-                );
+                tracing::warn!("discover_front({}): dropped non-public IP {}", hostname, ip,);
                 return false;
             }
             seen.insert(*ip)
@@ -392,11 +384,7 @@ async fn probe_one(ip: IpAddr, sni: &str, connector: TlsConnector) -> Discovered
     };
 
     let started = Instant::now();
-    let tcp = match tokio::time::timeout(
-        PROBE_TIMEOUT,
-        tokio::net::TcpStream::connect(addr),
-    )
-    .await
+    let tcp = match tokio::time::timeout(PROBE_TIMEOUT, tokio::net::TcpStream::connect(addr)).await
     {
         Ok(Ok(t)) => t,
         Ok(Err(e)) => return mk_err(format!("connect: {}", e)),
@@ -466,9 +454,21 @@ mod tests {
         let df = DiscoveredFront {
             hostname: "example.test".into(),
             ips: vec![
-                DiscoveredIp { ip: "10.0.0.1".into(), latency_ms: None, error: Some("connect timeout".into()) },
-                DiscoveredIp { ip: "10.0.0.2".into(), latency_ms: Some(50), error: None },
-                DiscoveredIp { ip: "10.0.0.3".into(), latency_ms: Some(80), error: None },
+                DiscoveredIp {
+                    ip: "10.0.0.1".into(),
+                    latency_ms: None,
+                    error: Some("connect timeout".into()),
+                },
+                DiscoveredIp {
+                    ip: "10.0.0.2".into(),
+                    latency_ms: Some(50),
+                    error: None,
+                },
+                DiscoveredIp {
+                    ip: "10.0.0.3".into(),
+                    latency_ms: Some(80),
+                    error: None,
+                },
             ],
         };
         assert_eq!(df.best_ip(), Some("10.0.0.2"));
@@ -481,28 +481,28 @@ mod tests {
         // of cloud-provider IPs that MUST pass (regression guard
         // for "we got too aggressive and dropped real CDN edges").
         let bad_v4 = [
-            "0.0.0.0",          // unspecified
-            "0.1.2.3",          // 0.0.0.0/8
-            "10.0.0.1",         // RFC1918
+            "0.0.0.0",  // unspecified
+            "0.1.2.3",  // 0.0.0.0/8
+            "10.0.0.1", // RFC1918
             "10.255.255.255",
-            "100.64.0.1",       // CGNAT
+            "100.64.0.1", // CGNAT
             "100.127.255.254",
-            "127.0.0.1",        // loopback
+            "127.0.0.1", // loopback
             "127.10.20.30",
-            "169.254.169.254",  // cloud metadata!
-            "172.16.0.1",       // RFC1918
+            "169.254.169.254", // cloud metadata!
+            "172.16.0.1",      // RFC1918
             "172.31.255.254",
-            "192.0.0.1",        // IETF protocol
-            "192.0.2.99",       // TEST-NET-1
-            "192.168.1.1",      // RFC1918
-            "198.18.0.1",       // benchmarking
+            "192.0.0.1",   // IETF protocol
+            "192.0.2.99",  // TEST-NET-1
+            "192.168.1.1", // RFC1918
+            "198.18.0.1",  // benchmarking
             "198.19.255.254",
-            "198.51.100.1",     // TEST-NET-2
-            "203.0.113.1",      // TEST-NET-3
-            "224.0.0.1",        // multicast
+            "198.51.100.1", // TEST-NET-2
+            "203.0.113.1",  // TEST-NET-3
+            "224.0.0.1",    // multicast
             "239.255.255.255",
-            "240.0.0.1",        // Class E
-            "255.255.255.255",  // broadcast
+            "240.0.0.1",       // Class E
+            "255.255.255.255", // broadcast
         ];
         for s in bad_v4 {
             let ip: IpAddr = s.parse().unwrap();
@@ -516,15 +516,15 @@ mod tests {
         // Real CDN edges (Akamai, Fastly, Cloudflare, Google) and
         // assorted public unicast — must pass.
         let good_v4 = [
-            "1.1.1.1",          // Cloudflare DNS
-            "8.8.8.8",          // Google DNS
-            "151.101.0.223",    // Fastly
-            "2.22.151.143",     // Akamai (the IPs from the user's Twitter list)
-            "76.76.21.21",      // Vercel
-            "172.15.0.1",       // just outside RFC1918 172.16/12
-            "172.32.0.1",       // also outside
-            "100.63.255.254",   // just outside CGNAT 100.64/10
-            "100.128.0.1",      // also outside
+            "1.1.1.1",        // Cloudflare DNS
+            "8.8.8.8",        // Google DNS
+            "151.101.0.223",  // Fastly
+            "2.22.151.143",   // Akamai (the IPs from the user's Twitter list)
+            "76.76.21.21",    // Vercel
+            "172.15.0.1",     // just outside RFC1918 172.16/12
+            "172.32.0.1",     // also outside
+            "100.63.255.254", // just outside CGNAT 100.64/10
+            "100.128.0.1",    // also outside
         ];
         for s in good_v4 {
             let ip: IpAddr = s.parse().unwrap();
@@ -539,21 +539,21 @@ mod tests {
     #[test]
     fn is_public_routable_ip_rejects_reserved_v6_ranges() {
         let bad_v6 = [
-            "::",                       // unspecified
-            "::1",                       // loopback
-            "::ffff:127.0.0.1",          // v4-mapped loopback — must re-check
-            "::ffff:192.168.1.1",        // v4-mapped private
-            "::1.2.3.4",                 // IPv4-compatible (0::/96, deprecated)
-            "fe80::1",                   // link-local
-            "febf:ffff:ffff::1",         // still link-local fe80::/10
-            "fc00::1",                   // ULA
-            "fd00::1",                   // ULA
-            "ff02::1",                   // multicast
+            "::",                 // unspecified
+            "::1",                // loopback
+            "::ffff:127.0.0.1",   // v4-mapped loopback — must re-check
+            "::ffff:192.168.1.1", // v4-mapped private
+            "::1.2.3.4",          // IPv4-compatible (0::/96, deprecated)
+            "fe80::1",            // link-local
+            "febf:ffff:ffff::1",  // still link-local fe80::/10
+            "fc00::1",            // ULA
+            "fd00::1",            // ULA
+            "ff02::1",            // multicast
             "ff00::abc",
-            "fec0::1",                   // deprecated site-local
-            "2001:db8::1",               // documentation
+            "fec0::1",     // deprecated site-local
+            "2001:db8::1", // documentation
             "2001:db8:ffff::1",
-            "100::1",                    // discard
+            "100::1", // discard
         ];
         for s in bad_v6 {
             let ip: IpAddr = s.parse().unwrap();
@@ -660,9 +660,11 @@ mod tests {
     async fn discovered_front_best_ip_none_when_all_fail() {
         let df = DiscoveredFront {
             hostname: "example.test".into(),
-            ips: vec![
-                DiscoveredIp { ip: "10.0.0.1".into(), latency_ms: None, error: Some("x".into()) },
-            ],
+            ips: vec![DiscoveredIp {
+                ip: "10.0.0.1".into(),
+                latency_ms: None,
+                error: Some("x".into()),
+            }],
         };
         assert_eq!(df.best_ip(), None);
         assert!(df.ok_ips().is_empty());

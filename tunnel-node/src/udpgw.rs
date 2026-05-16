@@ -73,7 +73,12 @@ impl DstAddr {
                 (name.as_str(), *port)
                     .to_socket_addrs()?
                     .next()
-                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "DNS resolution failed"))
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::AddrNotAvailable,
+                            "DNS resolution failed",
+                        )
+                    })
             }
         }
     }
@@ -102,8 +107,8 @@ impl DstAddr {
 
     fn serialised_len(&self) -> usize {
         match self {
-            DstAddr::V4(..) => 1 + 4 + 2,       // ATYP + IPv4 + port
-            DstAddr::V6(..) => 1 + 16 + 2,       // ATYP + IPv6 + port
+            DstAddr::V4(..) => 1 + 4 + 2,                 // ATYP + IPv4 + port
+            DstAddr::V6(..) => 1 + 16 + 2,                // ATYP + IPv6 + port
             DstAddr::Domain(n, _) => 1 + 1 + n.len() + 2, // ATYP + len + name + port
         }
     }
@@ -135,7 +140,10 @@ fn try_parse_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>, std::io::Error>
 
     let body = &buf[2..total];
     if body.len() < 3 {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "frame too short"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "frame too short",
+        ));
     }
     let flags = body[0];
     let conn_id = u16::from_be_bytes([body[1], body[2]]);
@@ -144,13 +152,19 @@ fn try_parse_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>, std::io::Error>
     let (addr, payload_start) = if flags & FLAG_DATA != 0 {
         // Parse SOCKS5-style address.
         if rest.is_empty() {
-            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "missing ATYP"));
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "missing ATYP",
+            ));
         }
         let atyp = rest[0];
         match atyp {
             ATYP_IPV4 => {
                 if rest.len() < 1 + 4 + 2 {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "short IPv4 addr"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "short IPv4 addr",
+                    ));
                 }
                 let ip = Ipv4Addr::new(rest[1], rest[2], rest[3], rest[4]);
                 let port = u16::from_be_bytes([rest[5], rest[6]]);
@@ -158,7 +172,10 @@ fn try_parse_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>, std::io::Error>
             }
             ATYP_IPV6 => {
                 if rest.len() < 1 + 16 + 2 {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "short IPv6 addr"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "short IPv6 addr",
+                    ));
                 }
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(&rest[1..17]);
@@ -168,18 +185,27 @@ fn try_parse_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>, std::io::Error>
             }
             ATYP_DOMAIN => {
                 if rest.len() < 2 {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "short domain addr"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "short domain addr",
+                    ));
                 }
                 let dlen = rest[1] as usize;
                 if rest.len() < 2 + dlen + 2 {
-                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "short domain addr"));
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "short domain addr",
+                    ));
                 }
                 let name = String::from_utf8_lossy(&rest[2..2 + dlen]).into_owned();
                 let port = u16::from_be_bytes([rest[2 + dlen], rest[3 + dlen]]);
                 (Some(DstAddr::Domain(name, port)), 2 + dlen + 2)
             }
             _ => {
-                return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("unknown ATYP 0x{:02x}", atyp)));
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("unknown ATYP 0x{:02x}", atyp),
+                ));
             }
         }
     } else {
@@ -188,7 +214,15 @@ fn try_parse_frame(buf: &[u8]) -> Result<Option<(Frame, usize)>, std::io::Error>
 
     let payload = rest[payload_start..].to_vec();
 
-    Ok(Some((Frame { flags, conn_id, addr, payload }, total)))
+    Ok(Some((
+        Frame {
+            flags,
+            conn_id,
+            addr,
+            payload,
+        },
+        total,
+    )))
 }
 
 fn serialise_frame(frame: &Frame) -> Vec<u8> {
@@ -250,7 +284,8 @@ pub async fn udpgw_server_task(stream: DuplexStream) {
     };
 
     // Persistent sockets keyed by (conn_id, dest_addr).
-    let mut sockets: std::collections::HashMap<(u16, SocketAddr), ConnSocket> = std::collections::HashMap::new();
+    let mut sockets: std::collections::HashMap<(u16, SocketAddr), ConnSocket> =
+        std::collections::HashMap::new();
 
     let mut buf = Vec::with_capacity(65536);
     let mut tmp = [0u8; 65536];
@@ -344,7 +379,13 @@ async fn get_or_create_socket(
         }
     });
 
-    sockets.insert(key, ConnSocket { sock: sock.clone(), _reader: reader.abort_handle() });
+    sockets.insert(
+        key,
+        ConnSocket {
+            sock: sock.clone(),
+            _reader: reader.abort_handle(),
+        },
+    );
     Some(sock)
 }
 
@@ -423,7 +464,12 @@ mod tests {
 
     #[test]
     fn keepalive_round_trip() {
-        let frame = Frame { flags: FLAG_KEEPALIVE, conn_id: 42, addr: None, payload: vec![] };
+        let frame = Frame {
+            flags: FLAG_KEEPALIVE,
+            conn_id: 42,
+            addr: None,
+            payload: vec![],
+        };
         let bytes = serialise_frame(&frame);
         let (parsed, consumed) = try_parse_frame(&bytes).unwrap().unwrap();
         assert_eq!(consumed, bytes.len());
@@ -505,16 +551,33 @@ mod tests {
 
     #[test]
     fn partial_frame_returns_none() {
-        let frame = Frame { flags: FLAG_KEEPALIVE, conn_id: 1, addr: None, payload: vec![] };
+        let frame = Frame {
+            flags: FLAG_KEEPALIVE,
+            conn_id: 1,
+            addr: None,
+            payload: vec![],
+        };
         let bytes = serialise_frame(&frame);
         // Give it only half the bytes.
-        assert!(try_parse_frame(&bytes[..bytes.len() / 2]).unwrap().is_none());
+        assert!(try_parse_frame(&bytes[..bytes.len() / 2])
+            .unwrap()
+            .is_none());
     }
 
     #[test]
     fn two_frames_in_buffer() {
-        let f1 = serialise_frame(&Frame { flags: FLAG_KEEPALIVE, conn_id: 1, addr: None, payload: vec![] });
-        let f2 = serialise_frame(&Frame { flags: FLAG_KEEPALIVE, conn_id: 2, addr: None, payload: vec![] });
+        let f1 = serialise_frame(&Frame {
+            flags: FLAG_KEEPALIVE,
+            conn_id: 1,
+            addr: None,
+            payload: vec![],
+        });
+        let f2 = serialise_frame(&Frame {
+            flags: FLAG_KEEPALIVE,
+            conn_id: 2,
+            addr: None,
+            payload: vec![],
+        });
         let mut buf = f1.clone();
         buf.extend_from_slice(&f2);
 

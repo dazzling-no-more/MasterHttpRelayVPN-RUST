@@ -57,7 +57,10 @@ pub fn is_share_on_lan(listen_host: &str) -> bool {
 /// (`127.0.0.1`, `localhost`, `::1`, `[::1]`).
 pub fn is_loopback_only(listen_host: &str) -> bool {
     let trimmed = listen_host.trim().to_ascii_lowercase();
-    matches!(trimmed.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]")
+    matches!(
+        trimmed.as_str(),
+        "127.0.0.1" | "localhost" | "::1" | "[::1]"
+    )
 }
 
 /// Map a `listen_host` bind value to an address that a client on the

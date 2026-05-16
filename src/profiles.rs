@@ -168,8 +168,7 @@ impl ProfilesFile {
         // `config` — otherwise applying it would clobber config.json
         // with non-config bytes (e.g. `null`).
         for (i, p) in pf.profiles.iter().enumerate() {
-            validate_profile(i, p)
-                .map_err(|msg| ProfileError::CorruptOnDisk(msg))?;
+            validate_profile(i, p).map_err(|msg| ProfileError::CorruptOnDisk(msg))?;
         }
         // Names must be unique. With duplicates, `active` and every
         // by-name operation (apply / rename / delete) become
@@ -451,8 +450,7 @@ pub fn write_config_json_to(
             .map_err(|e| ProfileError::Write(parent.display().to_string(), e))?;
     }
     let tmp = cfg_path.with_extension("json.tmp");
-    std::fs::write(&tmp, json)
-        .map_err(|e| ProfileError::Write(tmp.display().to_string(), e))?;
+    std::fs::write(&tmp, json).map_err(|e| ProfileError::Write(tmp.display().to_string(), e))?;
     // Atomic replace via rename — same rationale as ProfilesFile::save_to.
     // Do NOT pre-delete the target; rename(2) and MoveFileExW with
     // MOVEFILE_REPLACE_EXISTING are atomic on POSIX and Windows
@@ -474,11 +472,8 @@ mod tests {
     use serde_json::json;
 
     fn temp_profiles_path(label: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "mhrv-profiles-{}-{}",
-            label,
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("mhrv-profiles-{}-{}", label, std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("profiles.json")
     }
@@ -738,7 +733,8 @@ mod tests {
     fn apply_profile_with_paths_ok() {
         let (pp, cp) = temp_pair("ok");
         let mut pf = ProfilesFile::default();
-        pf.upsert("home", loadable_snapshot(json!({"k": 1}))).unwrap();
+        pf.upsert("home", loadable_snapshot(json!({"k": 1})))
+            .unwrap();
         // Reset active so the apply has work to do.
         pf.active = String::new();
         pf.save_to(&pp).unwrap();
@@ -1003,7 +999,11 @@ mod tests {
             r#"{"active":"empty","profiles":[{"name":"empty","config":{}}]}"#,
         )
         .unwrap();
-        std::fs::write(&cp, r#"{"mode":"apps_script","auth_key":"orig","script_id":"X"}"#).unwrap();
+        std::fs::write(
+            &cp,
+            r#"{"mode":"apps_script","auth_key":"orig","script_id":"X"}"#,
+        )
+        .unwrap();
         let before = std::fs::read_to_string(&cp).unwrap();
 
         let result = apply_profile_with_paths(&pp, &cp, "empty");
@@ -1037,7 +1037,11 @@ mod tests {
             "profiles": [{"name": "bad", "config": snapshot}],
         });
         std::fs::write(&pp, serde_json::to_string(&pf).unwrap()).unwrap();
-        std::fs::write(&cp, r#"{"mode":"apps_script","auth_key":"orig","script_id":"X"}"#).unwrap();
+        std::fs::write(
+            &cp,
+            r#"{"mode":"apps_script","auth_key":"orig","script_id":"X"}"#,
+        )
+        .unwrap();
         let before = std::fs::read_to_string(&cp).unwrap();
 
         let result = apply_profile_with_paths(&pp, &cp, "bad");

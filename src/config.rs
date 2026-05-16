@@ -132,7 +132,7 @@ pub struct Config {
     pub max_ips_to_scan: usize,
 
     #[serde(default = "default_scan_batch_size")]
-    pub scan_batch_size:usize,
+    pub scan_batch_size: usize,
 
     #[serde(default = "default_google_ip_validation")]
     pub google_ip_validation: bool,
@@ -586,10 +586,18 @@ pub struct FrontingGroup {
     pub domains: Vec<String>,
 }
 
-fn default_fetch_ips_from_api() -> bool { false }
-fn default_max_ips_to_scan() -> usize { 100 }
-fn default_scan_batch_size() -> usize {500}
-fn default_google_ip_validation() -> bool {true}
+fn default_fetch_ips_from_api() -> bool {
+    false
+}
+fn default_max_ips_to_scan() -> usize {
+    100
+}
+fn default_scan_batch_size() -> usize {
+    500
+}
+fn default_google_ip_validation() -> bool {
+    true
+}
 
 /// Default for `tunnel_doh`: `true` (DoH stays inside the tunnel).
 /// Flipped from `false` in v1.9.0 per #468 — Iran ISPs filter direct
@@ -597,12 +605,16 @@ fn default_google_ip_validation() -> bool {true}
 /// …) and the prior bypass-on default silently broke DNS for the
 /// dominant userbase. Users on networks where direct DoH works can
 /// opt back in with `tunnel_doh: false`.
-fn default_tunnel_doh() -> bool { true }
+fn default_tunnel_doh() -> bool {
+    true
+}
 
 /// Default for `block_quic`: `true`. QUIC over the TCP-based tunnel
 /// causes TCP-over-TCP meltdown (<1 Mbps). Browsers fall back to
 /// HTTPS/TCP within seconds of the silent UDP drop. Issue #793.
-fn default_block_quic() -> bool { true }
+fn default_block_quic() -> bool {
+    true
+}
 
 /// Default for `block_doh`: `true` (browser DoH is rejected so the
 /// browser falls back to system DNS, which `tun2proxy` resolves
@@ -614,17 +626,27 @@ fn default_block_quic() -> bool { true }
 /// the full DoH-via-Apps-Script penalty on every page load. Power
 /// users who specifically want browser DoH (with the latency cost)
 /// can opt back in by setting `block_doh: false`.
-fn default_block_doh() -> bool { true }
+fn default_block_doh() -> bool {
+    true
+}
 
 /// Defaults for the auto-blacklist tuning knobs (#391, #444). These
 /// preserve historical behavior — `3 strikes / 30s window / 120s cooldown`.
-fn default_auto_blacklist_strikes() -> u32 { 3 }
-fn default_auto_blacklist_window_secs() -> u64 { 30 }
-fn default_auto_blacklist_cooldown_secs() -> u64 { 120 }
+fn default_auto_blacklist_strikes() -> u32 {
+    3
+}
+fn default_auto_blacklist_window_secs() -> u64 {
+    30
+}
+fn default_auto_blacklist_cooldown_secs() -> u64 {
+    120
+}
 
 /// Default for `request_timeout_secs`: 30s, matching the historical
 /// hard-coded `BATCH_TIMEOUT` and Apps Script's typical response cliff.
-fn default_request_timeout_secs() -> u64 { 30 }
+fn default_request_timeout_secs() -> u64 {
+    30
+}
 
 /// Default for `sabr_strip`: `false`. Flipped from `true` after #977
 /// testing — both strip-all and keep-first variants of the heuristic
@@ -635,7 +657,9 @@ fn default_request_timeout_secs() -> u64 { 30 }
 /// specifically hit "Response too large" 502s on long-form 1080p+
 /// videos can opt in with `sabr_strip: true` (uses the keep-first
 /// flavour, less aggressive than upstream's strip-all).
-fn default_sabr_strip() -> bool { false }
+fn default_sabr_strip() -> bool {
+    false
+}
 
 fn default_google_ip() -> String {
     "216.239.38.120".into()
@@ -715,10 +739,7 @@ fn validate_relay_url_pattern(p: &str) -> Result<(), String> {
             ));
         }
         if label.len() > 63 {
-            return Err(format!(
-                "host label '{}' exceeds 63 characters",
-                label
-            ));
+            return Err(format!("host label '{}' exceeds 63 characters", label));
         }
         let bytes = label.as_bytes();
         if bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
@@ -786,17 +807,20 @@ impl Config {
         for (i, g) in self.fronting_groups.iter().enumerate() {
             if g.name.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!(
-                    "fronting_groups[{}]: name is empty", i
+                    "fronting_groups[{}]: name is empty",
+                    i
                 )));
             }
             if g.ip.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!(
-                    "fronting_groups[{}] ('{}'): ip is empty", i, g.name
+                    "fronting_groups[{}] ('{}'): ip is empty",
+                    i, g.name
                 )));
             }
             if g.sni.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!(
-                    "fronting_groups[{}] ('{}'): sni is empty", i, g.name
+                    "fronting_groups[{}] ('{}'): sni is empty",
+                    i, g.name
                 )));
             }
             // Parse the SNI here so an invalid hostname fails the same
@@ -813,13 +837,15 @@ impl Config {
             }
             if g.domains.is_empty() {
                 return Err(ConfigError::Invalid(format!(
-                    "fronting_groups[{}] ('{}'): domains list is empty", i, g.name
+                    "fronting_groups[{}] ('{}'): domains list is empty",
+                    i, g.name
                 )));
             }
             for d in &g.domains {
                 if d.trim().is_empty() {
                     return Err(ConfigError::Invalid(format!(
-                        "fronting_groups[{}] ('{}'): empty domain entry", i, g.name
+                        "fronting_groups[{}] ('{}'): empty domain entry",
+                        i, g.name
                     )));
                 }
             }
@@ -926,7 +952,8 @@ mod tests {
             "mode": "direct"
         }"#;
         let cfg: Config = serde_json::from_str(s).unwrap();
-        cfg.validate().expect("direct must validate without script_id / auth_key");
+        cfg.validate()
+            .expect("direct must validate without script_id / auth_key");
         assert_eq!(cfg.mode_kind().unwrap(), Mode::Direct);
     }
 
@@ -938,7 +965,8 @@ mod tests {
             "mode": "google_only"
         }"#;
         let cfg: Config = serde_json::from_str(s).unwrap();
-        cfg.validate().expect("google_only alias must still validate");
+        cfg.validate()
+            .expect("google_only alias must still validate");
         assert_eq!(cfg.mode_kind().unwrap(), Mode::Direct);
     }
 
@@ -1035,9 +1063,15 @@ mod tests {
             }]
         }"#;
         let cfg: Config = serde_json::from_str(s).unwrap();
-        let err = cfg.validate().expect_err("invalid sni must fail validate()");
+        let err = cfg
+            .validate()
+            .expect_err("invalid sni must fail validate()");
         let msg = format!("{}", err);
-        assert!(msg.contains("invalid sni"), "error should mention invalid sni: {}", msg);
+        assert!(
+            msg.contains("invalid sni"),
+            "error should mention invalid sni: {}",
+            msg
+        );
     }
 
     #[test]
@@ -1049,10 +1083,7 @@ mod tests {
             r#"{ "name": "n", "ip": "1.2.3.4","sni": "a.b", "domains": []        }"#,
             r#"{ "name": "n", "ip": "1.2.3.4","sni": "a.b", "domains": ["  "]    }"#,
         ] {
-            let s = format!(
-                r#"{{ "mode": "direct", "fronting_groups": [{}] }}"#,
-                bad
-            );
+            let s = format!(r#"{{ "mode": "direct", "fronting_groups": [{}] }}"#, bad);
             let cfg: Config = serde_json::from_str(&s).unwrap();
             assert!(
                 cfg.validate().is_err(),
@@ -1249,7 +1280,10 @@ mod tests {
             "sabr_strip": true
         }"#;
         let cfg: Config = serde_json::from_str(s).unwrap();
-        assert!(cfg.sabr_strip, "explicit true must round-trip for opt-in users");
+        assert!(
+            cfg.sabr_strip,
+            "explicit true must round-trip for opt-in users"
+        );
     }
 
     #[test]

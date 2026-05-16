@@ -241,17 +241,25 @@ mod tests {
             .key_usage()
             .expect("key_usage extension lookup")
             .expect("key_usage extension present");
-        assert!(ku.value.digital_signature(), "leaf must have digitalSignature KU");
-        assert!(ku.value.key_encipherment(), "leaf must have keyEncipherment KU");
+        assert!(
+            ku.value.digital_signature(),
+            "leaf must have digitalSignature KU"
+        );
+        assert!(
+            ku.value.key_encipherment(),
+            "leaf must have keyEncipherment KU"
+        );
 
         // SAN has the domain we asked for.
         let san = parsed
             .subject_alternative_name()
             .expect("san extension lookup")
             .expect("san extension present");
-        let has_name = san.value.general_names.iter().any(|n| {
-            matches!(n, GeneralName::DNSName(s) if *s == "example.com")
-        });
+        let has_name = san
+            .value
+            .general_names
+            .iter()
+            .any(|n| matches!(n, GeneralName::DNSName(s) if *s == "example.com"));
         assert!(has_name, "leaf SAN must contain example.com");
 
         let _ = std::fs::remove_dir_all(&tmp);

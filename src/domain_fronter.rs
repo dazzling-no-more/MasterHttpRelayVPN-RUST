@@ -658,22 +658,13 @@ impl DomainFronter {
             auto_blacklist_cooldown: Duration::from_secs(
                 config.auto_blacklist_cooldown_secs.clamp(1, 86400),
             ),
-            batch_timeout: Duration::from_secs(
-                config.request_timeout_secs.clamp(5, 300),
-            ),
+            batch_timeout: Duration::from_secs(config.request_timeout_secs.clamp(5, 300)),
             exit_node_enabled: config.exit_node.enabled
                 && !config.exit_node.relay_url.is_empty()
                 && !config.exit_node.psk.is_empty(),
-            exit_node_url: config
-                .exit_node
-                .relay_url
-                .trim_end_matches('/')
-                .to_string(),
+            exit_node_url: config.exit_node.relay_url.trim_end_matches('/').to_string(),
             exit_node_psk: config.exit_node.psk.clone(),
-            exit_node_full: matches!(
-                config.exit_node.mode.to_ascii_lowercase().as_str(),
-                "full"
-            ),
+            exit_node_full: matches!(config.exit_node.mode.to_ascii_lowercase().as_str(), "full"),
             exit_node_hosts: config
                 .exit_node
                 .hosts
@@ -973,9 +964,7 @@ impl DomainFronter {
     pub(crate) fn record_timeout_strike(&self, script_id: &str) {
         let now = Instant::now();
         let mut counts = self.script_timeouts.lock().unwrap();
-        let entry = counts
-            .entry(script_id.to_string())
-            .or_insert((now, 0));
+        let entry = counts.entry(script_id.to_string()).or_insert((now, 0));
         if now.duration_since(entry.0) > self.auto_blacklist_window {
             *entry = (now, 1);
         } else {
@@ -1101,8 +1090,7 @@ impl DomainFronter {
         // accurately at the end.
         let h2_self = self.clone();
         let h2_handle = tokio::spawn(async move {
-            !h2_self.h2_disabled.load(Ordering::Relaxed)
-                && h2_self.ensure_h2().await.is_some()
+            !h2_self.h2_disabled.load(Ordering::Relaxed) && h2_self.ensure_h2().await.is_some()
         });
 
         let mut warmed = 0usize;
@@ -1243,10 +1231,7 @@ impl DomainFronter {
             let _ = self
                 .relay_uncoalesced("HEAD", "http://example.com/", &[], &[], None)
                 .await;
-            tracing::debug!(
-                "container keepalive: {}ms",
-                t0.elapsed().as_millis()
-            );
+            tracing::debug!("container keepalive: {}ms", t0.elapsed().as_millis());
         }
     }
 
@@ -1367,8 +1352,7 @@ impl DomainFronter {
         // for many seconds otherwise, eating the outer budget that
         // should be reserved for an h1 fallback round-trip.
         let open_result =
-            tokio::time::timeout(Duration::from_secs(H2_OPEN_TIMEOUT_SECS), self.open_h2())
-                .await;
+            tokio::time::timeout(Duration::from_secs(H2_OPEN_TIMEOUT_SECS), self.open_h2()).await;
 
         let (send, dead) = match open_result {
             Ok(Ok(pair)) => pair,
@@ -1376,9 +1360,7 @@ impl DomainFronter {
                 // Definitive: this peer doesn't speak h2. Sticky-disable
                 // so we never re-attempt the handshake.
                 self.h2_disabled.store(true, Ordering::Relaxed);
-                tracing::info!(
-                    "relay peer refused h2 via ALPN; staying on http/1.1"
-                );
+                tracing::info!("relay peer refused h2 via ALPN; staying on http/1.1");
                 *self.h2_cell.lock().await = None;
                 return None;
             }
@@ -1502,11 +1484,15 @@ impl DomainFronter {
         // saturating_sub-style guard: only decrement if non-zero so a
         // direct caller of this helper from a non-Ok path can't
         // underflow the counter.
-        let _ = self.h2_calls.fetch_update(
-            Ordering::Relaxed,
-            Ordering::Relaxed,
-            |c| if c > 0 { Some(c - 1) } else { None },
-        );
+        let _ = self
+            .h2_calls
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| {
+                if c > 0 {
+                    Some(c - 1)
+                } else {
+                    None
+                }
+            });
         self.h2_fallbacks.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1586,11 +1572,8 @@ impl DomainFronter {
         // Phase 1: ready/back-pressure. Bounded short. Timeout here
         // means saturation, not server-side processing — the stream
         // hasn't even opened, so `RequestSent::No`.
-        let ready_result = tokio::time::timeout(
-            Duration::from_secs(H2_READY_TIMEOUT_SECS),
-            send.ready(),
-        )
-        .await;
+        let ready_result =
+            tokio::time::timeout(Duration::from_secs(H2_READY_TIMEOUT_SECS), send.ready()).await;
         let mut send = match ready_result {
             Ok(Ok(s)) => s,
             Ok(Err(e)) => {
@@ -1670,16 +1653,12 @@ impl DomainFronter {
             Ok::<_, (FronterError, RequestSent)>((status, headers, buf))
         };
 
-        let (status, headers, mut buf) = match tokio::time::timeout(
-            response_deadline,
-            response_phase,
-        )
-        .await
-        {
-            Ok(Ok(t)) => t,
-            Ok(Err(e)) => return Err(e),
-            Err(_) => return Err((FronterError::Timeout, RequestSent::Maybe)),
-        };
+        let (status, headers, mut buf) =
+            match tokio::time::timeout(response_deadline, response_phase).await {
+                Ok(Ok(t)) => t,
+                Ok(Err(e)) => return Err(e),
+                Err(_) => return Err((FronterError::Timeout, RequestSent::Maybe)),
+            };
 
         // Mirror `read_http_response`: if the server gzipped the body
         // (we asked for it via accept-encoding), decompress before
@@ -1928,13 +1907,22 @@ impl DomainFronter {
         // Range header is present, skip cache and coalesce entirely.
         let has_range = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("range"));
         let coalescible = is_cacheable_method(method) && body.is_empty() && !has_range;
-        let key = if coalescible { Some(cache_key(method, url)) } else { None };
+        let key = if coalescible {
+            Some(cache_key(method, url))
+        } else {
+            None
+        };
         let t_start = Instant::now();
 
         if let Some(ref k) = key {
             if let Some(hit) = self.cache.get(k) {
                 tracing::debug!("cache hit: {}", url);
-                self.record_site(url, true, hit.len() as u64, t_start.elapsed().as_nanos() as u64);
+                self.record_site(
+                    url,
+                    true,
+                    hit.len() as u64,
+                    t_start.elapsed().as_nanos() as u64,
+                );
                 return hit;
             }
         }
@@ -1967,7 +1955,9 @@ impl DomainFronter {
             }
         }
 
-        let bytes = self.relay_uncoalesced(method, url, headers, body, key.as_deref()).await;
+        let bytes = self
+            .relay_uncoalesced(method, url, headers, body, key.as_deref())
+            .await;
 
         if let Some(ref k) = key {
             let mut inflight = self.inflight.lock().await;
@@ -1976,7 +1966,12 @@ impl DomainFronter {
             }
         }
 
-        self.record_site(url, false, bytes.len() as u64, t_start.elapsed().as_nanos() as u64);
+        self.record_site(
+            url,
+            false,
+            bytes.len() as u64,
+            t_start.elapsed().as_nanos() as u64,
+        );
         bytes
     }
 
@@ -2116,8 +2111,7 @@ impl DomainFronter {
             return write_response_with_head_transform(writer, &first, &transform_head).await;
         }
 
-        let probe_range = match validate_probe_range(status, &resp_headers, resp_body, chunk - 1)
-        {
+        let probe_range = match validate_probe_range(status, &resp_headers, resp_body, chunk - 1) {
             Some(r) => r,
             None => {
                 tracing::warn!(
@@ -2200,7 +2194,9 @@ impl DomainFronter {
                 // refusal, not a client error.
                 tracing::warn!(
                     "range-parallel: refusing {} bytes total for {} — exceeds {} streaming cap",
-                    total, url, MAX_STREAMED_RANGE_BYTES,
+                    total,
+                    url,
+                    MAX_STREAMED_RANGE_BYTES,
                 );
                 let raw = error_response(
                     502,
@@ -2218,7 +2214,9 @@ impl DomainFronter {
 
         tracing::info!(
             "range-parallel: {} bytes total, {} chunks remaining after probe, up to {} in flight",
-            total, expected_chunks, MAX_PARALLEL,
+            total,
+            expected_chunks,
+            MAX_PARALLEL,
         );
 
         // Buffered stitch. `total` is bounded above by
@@ -2274,8 +2272,7 @@ impl DomainFronter {
                         start, end, url, reason,
                     );
                     let raw = self.relay(method, url, headers, body).await;
-                    return write_response_with_head_transform(writer, &raw, &transform_head)
-                        .await;
+                    return write_response_with_head_transform(writer, &raw, &transform_head).await;
                 }
             }
         }
@@ -2287,7 +2284,9 @@ impl DomainFronter {
             // when the parallel stitch can't be trusted.
             tracing::warn!(
                 "range-parallel: stitched {}/{} bytes for {}; falling back to single GET",
-                full.len(), total, url,
+                full.len(),
+                total,
+                url,
             );
             let raw = self.relay(method, url, headers, body).await;
             return write_response_with_head_transform(writer, &raw, &transform_head).await;
@@ -2435,7 +2434,8 @@ impl DomainFronter {
                 );
             }
         };
-        self.bytes_relayed.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        self.bytes_relayed
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
         // Daily-budget counters (reset at 00:00 UTC). Only counts
         // successful relays — the two error branches above don't reach
         // here, matching what Google actually billed to quota.
@@ -2483,7 +2483,9 @@ impl DomainFronter {
         let method_safe_for_fanout = is_method_safe_for_fanout(method);
         let fan = self.parallel_relay.min(self.script_ids.len()).max(1);
         if fan >= 2 && method_safe_for_fanout {
-            return self.do_relay_parallel(method, url, headers, body, fan).await;
+            return self
+                .do_relay_parallel(method, url, headers, body, fan)
+                .await;
         }
 
         // Sequential path: one retry on connection failure, *unless*
@@ -2529,7 +2531,9 @@ impl DomainFronter {
         // `select_ok` over them.
         let mut futs = Vec::with_capacity(ids.len());
         for sid in ids {
-            let fut = self.do_relay_once_with(sid.clone(), method, url, headers, body).boxed();
+            let fut = self
+                .do_relay_once_with(sid.clone(), method, url, headers, body)
+                .boxed();
             futs.push(fut);
         }
 
@@ -2550,7 +2554,8 @@ impl DomainFronter {
         body: &[u8],
     ) -> Result<Vec<u8>, FronterError> {
         let script_id = self.next_script_id();
-        self.do_relay_once_with(script_id, method, url, headers, body).await
+        self.do_relay_once_with(script_id, method, url, headers, body)
+            .await
     }
 
     async fn do_relay_once_with(
@@ -2792,13 +2797,9 @@ impl DomainFronter {
         // return exit-node's raw HTTP response, which is what we want to
         // unwrap below.
         let exit_url = self.exit_node_url.clone();
-        let outer_headers = vec![(
-            "Content-Type".to_string(),
-            "application/json".to_string(),
-        )];
-        let outer_payload: Bytes = Bytes::from(
-            self.build_payload_json("POST", &exit_url, &outer_headers, &inner_json)?,
-        );
+        let outer_headers = vec![("Content-Type".to_string(), "application/json".to_string())];
+        let outer_payload: Bytes =
+            Bytes::from(self.build_payload_json("POST", &exit_url, &outer_headers, &inner_json)?);
 
         // Send the outer payload through the relay machinery and get back
         // Apps Script's response body (which is exit-node's JSON envelope).
@@ -2888,11 +2889,8 @@ impl DomainFronter {
                 // Same fronting-refusal path as the direct relay.
                 // Safe to fall back: 421 means the edge rejected
                 // before invoking the exit node.
-                self.sticky_disable_h2_for_fronting_refusal(
-                    status,
-                    "exit-node outer call",
-                )
-                .await;
+                self.sticky_disable_h2_for_fronting_refusal(status, "exit-node outer call")
+                    .await;
                 // fall through to h1
             }
             Ok((status, _hdrs, resp_body)) => {
@@ -3056,8 +3054,7 @@ impl DomainFronter {
         sid: Option<&str>,
         data: Option<String>,
     ) -> Result<TunnelResponse, FronterError> {
-        let payload: Bytes =
-            Bytes::from(self.build_tunnel_payload(op, host, port, sid, data)?);
+        let payload: Bytes = Bytes::from(self.build_tunnel_payload(op, host, port, sid, data)?);
         let script_id = self.next_script_id();
         let path = format!("/macros/s/{}/exec", script_id);
 
@@ -3258,8 +3255,12 @@ impl DomainFronter {
 
         // Follow redirect chain
         for _ in 0..5 {
-            if !matches!(status, 301 | 302 | 303 | 307 | 308) { break; }
-            let Some(loc) = header_get(&resp_headers, "location") else { break; };
+            if !matches!(status, 301 | 302 | 303 | 307 | 308) {
+                break;
+            }
+            let Some(loc) = header_get(&resp_headers, "location") else {
+                break;
+            };
             let (rpath, rhost) = parse_redirect(&loc);
             let rhost = rhost.unwrap_or_else(|| self.http_host.to_string());
             let req = format!(
@@ -3269,7 +3270,9 @@ impl DomainFronter {
             entry.stream.flush().await?;
             let (s, h, b) =
                 read_http_response_with_header_timeout(&mut entry.stream, batch_timeout).await?;
-            status = s; resp_headers = h; resp_body = b;
+            status = s;
+            resp_headers = h;
+            resp_body = b;
         }
 
         // Route through the same `finalize_batch_response` helper the
@@ -3322,9 +3325,9 @@ impl DomainFronter {
                     &text[..text.len().min(200)]
                 ))
             })?;
-            let end = text.rfind('}').ok_or_else(|| {
-                FronterError::BadResponse("no json end in batch response".into())
-            })?;
+            let end = text
+                .rfind('}')
+                .ok_or_else(|| FronterError::BadResponse("no json end in batch response".into()))?;
             &text[start..=end]
         };
         // Don't log payload content. Batch responses carry base64-encoded
@@ -3397,7 +3400,9 @@ fn split_response(raw: &[u8]) -> Option<(u16, Vec<(String, String)>, &[u8])> {
     let mut lines = head.split(|&b| b == b'\n');
     let status_line = lines.next()?;
     // Status line: "HTTP/1.1 206 Partial Content"
-    let status_line = std::str::from_utf8(status_line).ok()?.trim_end_matches('\r');
+    let status_line = std::str::from_utf8(status_line)
+        .ok()?
+        .trim_end_matches('\r');
     let mut parts = status_line.splitn(3, ' ');
     let _version = parts.next()?;
     let code = parts.next()?.parse::<u16>().ok()?;
@@ -3783,14 +3788,17 @@ where
                     // against future tuning) skips intermediate
                     // thresholds rather than firing N log lines back
                     // to back.
-                    next_progress_log_at = body_bytes_emitted
-                        .saturating_add(STREAM_PROGRESS_LOG_INTERVAL_BYTES);
+                    next_progress_log_at =
+                        body_bytes_emitted.saturating_add(STREAM_PROGRESS_LOG_INTERVAL_BYTES);
                 }
             }
             Err(reason) => {
                 tracing::warn!(
                     "range-parallel-stream: invalid chunk {}-{} for {} ({}); truncating response",
-                    s, e, url_for_log, reason,
+                    s,
+                    e,
+                    url_for_log,
+                    reason,
                 );
                 // Flush the committed prefix to the wire before
                 // declaring failure — see function doc. We
@@ -3879,7 +3887,10 @@ fn normalize_x_graphql_url(url: &str) -> String {
     // Split host from the rest. We accept both "x.com" and common legacy
     // forms; the Python patch only checks x.com so we do the same to be
     // safe about the endpoint actually accepting truncated requests.
-    let Some(rest) = url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")) else {
+    let Some(rest) = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+    else {
         return url.to_string();
     };
     let Some(slash) = rest.find('/') else {
@@ -3908,7 +3919,11 @@ fn normalize_x_graphql_url(url: &str) -> String {
         Some(amp) => &query[..amp],
         None => query,
     };
-    let scheme = if url.starts_with("https://") { "https://" } else { "http://" };
+    let scheme = if url.starts_with("https://") {
+        "https://"
+    } else {
+        "http://"
+    };
     format!("{}{}{}?{}", scheme, host, path, new_query)
 }
 
@@ -4135,10 +4150,7 @@ fn parse_exit_node_response(body: &[u8]) -> Result<Vec<u8>, FronterError> {
                 continue;
             }
             if let Some(val_str) = v_val.as_str() {
-                let _ = std::io::Write::write_fmt(
-                    &mut out,
-                    format_args!("{}: {}\r\n", k, val_str),
-                );
+                let _ = std::io::Write::write_fmt(&mut out, format_args!("{}: {}\r\n", k, val_str));
             }
         }
     }
@@ -4204,10 +4216,7 @@ fn url_host_is_youtube_video_endpoint(url: &str) -> bool {
     if h.is_empty() {
         return false;
     }
-    const YT_VIDEOPLAYBACK_SUFFIXES: &[&str] = &[
-        "googlevideo.com",
-        "youtube.com",
-    ];
+    const YT_VIDEOPLAYBACK_SUFFIXES: &[&str] = &["googlevideo.com", "youtube.com"];
     YT_VIDEOPLAYBACK_SUFFIXES
         .iter()
         .any(|s| h == *s || h.ends_with(&format!(".{}", s)))
@@ -4421,7 +4430,10 @@ fn extract_host(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let authority = after_scheme.split('/').next().unwrap_or("");
     // Strip userinfo if present.
-    let authority = authority.rsplit_once('@').map(|(_, a)| a).unwrap_or(authority);
+    let authority = authority
+        .rsplit_once('@')
+        .map(|(_, a)| a)
+        .unwrap_or(authority);
     // Strip port. Handle IPv6 literals in brackets.
     let host = if let Some(stripped) = authority.strip_prefix('[') {
         // [::1]:443 -> ::1
@@ -4573,7 +4585,12 @@ fn strip_brotli_from_accept_encoding(value: &str) -> String {
     let kept: Vec<&str> = parts
         .into_iter()
         .filter(|p| {
-            let tok = p.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+            let tok = p
+                .split(';')
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
             tok != "br" && tok != "zstd"
         })
         .collect();
@@ -4596,10 +4613,17 @@ fn header_get(headers: &[(String, String)], name: &str) -> Option<String> {
 
 fn parse_redirect(location: &str) -> (String, Option<String>) {
     // Absolute URL: http(s)://host/path?query
-    if let Some(rest) = location.strip_prefix("https://").or_else(|| location.strip_prefix("http://")) {
+    if let Some(rest) = location
+        .strip_prefix("https://")
+        .or_else(|| location.strip_prefix("http://"))
+    {
         let slash = rest.find('/').unwrap_or(rest.len());
         let host = rest[..slash].to_string();
-        let path = if slash < rest.len() { rest[slash..].to_string() } else { "/".into() };
+        let path = if slash < rest.len() {
+            rest[slash..].to_string()
+        } else {
+            "/".into()
+        };
         return (path, Some(host));
     }
     // Relative path.
@@ -4617,7 +4641,9 @@ fn parse_redirect(location: &str) -> (String, Option<String>) {
 /// the 10 s value via `read_http_response_with_header_timeout`, since the
 /// configurable `request_timeout_secs` (default 30 s) is the authoritative
 /// cliff there.
-async fn read_http_response<S>(stream: &mut S) -> Result<(u16, Vec<(String, String)>, Vec<u8>), FronterError>
+async fn read_http_response<S>(
+    stream: &mut S,
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), FronterError>
 where
     S: tokio::io::AsyncRead + Unpin,
 {
@@ -4651,10 +4677,13 @@ where
     // wiring (the entire point of #1088's fix).
     let deadline = tokio::time::Instant::now() + header_read_timeout;
     let header_end = loop {
-        let n = tokio::time::timeout_at(deadline, stream.read(&mut tmp)).await
+        let n = tokio::time::timeout_at(deadline, stream.read(&mut tmp))
+            .await
             .map_err(|_| FronterError::Timeout)??;
         if n == 0 {
-            return Err(FronterError::BadResponse("connection closed before headers".into()));
+            return Err(FronterError::BadResponse(
+                "connection closed before headers".into(),
+            ));
         }
         buf.extend_from_slice(&tmp[..n]);
         if let Some(pos) = find_double_crlf(&buf) {
@@ -4680,8 +4709,8 @@ where
     }
 
     let mut body = buf[header_end + 4..].to_vec();
-    let content_length: Option<usize> = header_get(&headers_out, "content-length")
-        .and_then(|v| v.parse().ok());
+    let content_length: Option<usize> =
+        header_get(&headers_out, "content-length").and_then(|v| v.parse().ok());
     let te = header_get(&headers_out, "transfer-encoding").unwrap_or_default();
     let is_chunked = te.to_ascii_lowercase().contains("chunked");
 
@@ -4701,12 +4730,9 @@ where
             // declared by Content-Length, the response *is* complete.
             // Only propagate the error if Content-Length couldn't be
             // satisfied (real truncation, not a polite-protocol violation).
-            let read_res = timeout(
-                Duration::from_secs(20),
-                stream.read(&mut tmp[..want]),
-            )
-            .await
-            .map_err(|_| FronterError::Timeout)?;
+            let read_res = timeout(Duration::from_secs(20), stream.read(&mut tmp[..want]))
+                .await
+                .map_err(|_| FronterError::Timeout)?;
             let n = match read_res {
                 Ok(n) => n,
                 Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => 0,
@@ -4756,18 +4782,18 @@ where
     let mut out: Vec<u8> = Vec::new();
     let mut tmp = [0u8; 16384];
     loop {
-        let size_line_owned = std::str::from_utf8(&read_crlf_line(stream, &mut buf, &mut tmp).await?)
-            .map_err(|_| FronterError::BadResponse("bad chunk size".into()))?
-            .trim()
-            .to_string();
+        let size_line_owned =
+            std::str::from_utf8(&read_crlf_line(stream, &mut buf, &mut tmp).await?)
+                .map_err(|_| FronterError::BadResponse("bad chunk size".into()))?
+                .trim()
+                .to_string();
         if size_line_owned.is_empty() {
             continue;
         }
-        let size = usize::from_str_radix(
-            size_line_owned.split(';').next().unwrap_or(""),
-            16,
-        )
-        .map_err(|_| FronterError::BadResponse(format!("bad chunk size '{}'", size_line_owned)))?;
+        let size = usize::from_str_radix(size_line_owned.split(';').next().unwrap_or(""), 16)
+            .map_err(|_| {
+                FronterError::BadResponse(format!("bad chunk size '{}'", size_line_owned))
+            })?;
         if size == 0 {
             loop {
                 if read_crlf_line(stream, &mut buf, &mut tmp).await?.is_empty() {
@@ -4819,7 +4845,8 @@ where
             buf.drain(..idx + 2);
             return Ok(line);
         }
-        let n = timeout(Duration::from_secs(20), stream.read(tmp)).await
+        let n = timeout(Duration::from_secs(20), stream.read(tmp))
+            .await
             .map_err(|_| FronterError::Timeout)??;
         if n == 0 {
             return Err(FronterError::BadResponse(
@@ -4845,10 +4872,11 @@ fn parse_status_line(line: &str) -> Result<u16, FronterError> {
     // "HTTP/1.1 200 OK"
     let mut parts = line.split_whitespace();
     let _version = parts.next();
-    let code = parts.next().ok_or_else(|| {
-        FronterError::BadResponse(format!("bad status line: {}", line))
-    })?;
-    code.parse::<u16>().map_err(|_| FronterError::BadResponse(format!("bad status code: {}", code)))
+    let code = parts
+        .next()
+        .ok_or_else(|| FronterError::BadResponse(format!("bad status line: {}", line)))?;
+    code.parse::<u16>()
+        .map_err(|_| FronterError::BadResponse(format!("bad status code: {}", code)))
 }
 
 /// Returns `true` if the HTTP method is safe to fan-out across multiple
@@ -4860,7 +4888,10 @@ fn parse_status_line(line: &str) -> Result<u16, FronterError> {
 /// completes server-side even when our `select_ok` already returned a
 /// winner. See #743 for the user-visible bug (duplicate POSTs).
 fn is_method_safe_for_fanout(method: &str) -> bool {
-    matches!(method.to_ascii_uppercase().as_str(), "GET" | "HEAD" | "OPTIONS")
+    matches!(
+        method.to_ascii_uppercase().as_str(),
+        "GET" | "HEAD" | "OPTIONS"
+    )
 }
 
 /// Recognize HTTP statuses from the h2 path that mean "this edge
@@ -5065,15 +5096,42 @@ fn decode_js_string_escapes(s: &str) -> Option<String> {
                 out.push(ch);
                 i += 6;
             }
-            b'\\' => { out.push('\\'); i += 2; }
-            b'"' => { out.push('"'); i += 2; }
-            b'\'' => { out.push('\''); i += 2; }
-            b'/' => { out.push('/'); i += 2; }
-            b'n' => { out.push('\n'); i += 2; }
-            b'r' => { out.push('\r'); i += 2; }
-            b't' => { out.push('\t'); i += 2; }
-            b'b' => { out.push('\x08'); i += 2; }
-            b'f' => { out.push('\x0c'); i += 2; }
+            b'\\' => {
+                out.push('\\');
+                i += 2;
+            }
+            b'"' => {
+                out.push('"');
+                i += 2;
+            }
+            b'\'' => {
+                out.push('\'');
+                i += 2;
+            }
+            b'/' => {
+                out.push('/');
+                i += 2;
+            }
+            b'n' => {
+                out.push('\n');
+                i += 2;
+            }
+            b'r' => {
+                out.push('\r');
+                i += 2;
+            }
+            b't' => {
+                out.push('\t');
+                i += 2;
+            }
+            b'b' => {
+                out.push('\x08');
+                i += 2;
+            }
+            b'f' => {
+                out.push('\x0c');
+                i += 2;
+            }
             _ => return None,
         }
     }
@@ -5168,10 +5226,7 @@ impl StatsSnapshot {
                 String::new()
             } else {
                 let pct = (self.h2_calls as f64 / total as f64) * 100.0;
-                format!(
-                    " h2-success={}/{} ({:.0}%)",
-                    self.h2_calls, total, pct
-                )
+                format!(" h2-success={}/{} ({:.0}%)", self.h2_calls, total, pct)
             }
         };
         // Forwarder segment is only emitted when the path filter has
@@ -5322,7 +5377,9 @@ pub fn error_response(status: u16, message: &str) -> Vec<u8> {
 }
 
 fn html_escape(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 // Dangerous "accept anything" TLS verifier, used only when config.verify_ssl=false.
@@ -5429,8 +5486,9 @@ mod tests {
             position: 0,
         };
 
-        let (status, _headers, got_body) =
-            read_http_response(&mut stream).await.expect("must succeed despite UnexpectedEof");
+        let (status, _headers, got_body) = read_http_response(&mut stream)
+            .await
+            .expect("must succeed despite UnexpectedEof");
         assert_eq!(status, 200);
         assert_eq!(got_body, body);
     }
@@ -5450,8 +5508,9 @@ mod tests {
             position: 0,
         };
 
-        let (status, _headers, got_body) =
-            read_http_response(&mut stream).await.expect("must succeed despite UnexpectedEof");
+        let (status, _headers, got_body) = read_http_response(&mut stream)
+            .await
+            .expect("must succeed despite UnexpectedEof");
         assert_eq!(status, 200);
         assert_eq!(got_body, body);
     }
@@ -5479,12 +5538,10 @@ mod tests {
             server_side.write_all(response).await.unwrap();
         });
 
-        let (status, _, body) = read_http_response_with_header_timeout(
-            &mut client_side,
-            Duration::from_secs(30),
-        )
-        .await
-        .expect("15 s response must succeed under 30 s header-read budget");
+        let (status, _, body) =
+            read_http_response_with_header_timeout(&mut client_side, Duration::from_secs(30))
+                .await
+                .expect("15 s response must succeed under 30 s header-read budget");
         assert_eq!(status, 200);
         assert!(body.is_empty());
     }
@@ -5517,11 +5574,8 @@ mod tests {
             }
         });
 
-        let result = read_http_response_with_header_timeout(
-            &mut client_side,
-            Duration::from_secs(10),
-        )
-        .await;
+        let result =
+            read_http_response_with_header_timeout(&mut client_side, Duration::from_secs(10)).await;
         assert!(
             matches!(result, Err(FronterError::Timeout)),
             "drip-feed slower than the total deadline must time out — \
@@ -5567,14 +5621,14 @@ mod tests {
     fn unix_to_ymd_utc_handles_known_epochs() {
         // Anchors chosen to catch the common off-by-one errors (pre/post
         // leap day, pre/post epoch, year-end rollover).
-        assert_eq!(unix_to_ymd_utc(0), (1970, 1, 1));                    // epoch
-        assert_eq!(unix_to_ymd_utc(86_399), (1970, 1, 1));               // one sec before day 2
-        assert_eq!(unix_to_ymd_utc(86_400), (1970, 1, 2));               // day 2 starts at midnight
-        assert_eq!(unix_to_ymd_utc(951_782_400), (2000, 2, 29));         // leap day (Feb 29, 2000)
-        assert_eq!(unix_to_ymd_utc(951_868_800), (2000, 3, 1));          // day after leap Feb
-        assert_eq!(unix_to_ymd_utc(1_583_020_800), (2020, 3, 1));        // day after a leap Feb
-        assert_eq!(unix_to_ymd_utc(1_735_689_599), (2024, 12, 31));      // last sec of 2024
-        assert_eq!(unix_to_ymd_utc(1_735_689_600), (2025, 1, 1));        // first sec of 2025
+        assert_eq!(unix_to_ymd_utc(0), (1970, 1, 1)); // epoch
+        assert_eq!(unix_to_ymd_utc(86_399), (1970, 1, 1)); // one sec before day 2
+        assert_eq!(unix_to_ymd_utc(86_400), (1970, 1, 2)); // day 2 starts at midnight
+        assert_eq!(unix_to_ymd_utc(951_782_400), (2000, 2, 29)); // leap day (Feb 29, 2000)
+        assert_eq!(unix_to_ymd_utc(951_868_800), (2000, 3, 1)); // day after leap Feb
+        assert_eq!(unix_to_ymd_utc(1_583_020_800), (2020, 3, 1)); // day after a leap Feb
+        assert_eq!(unix_to_ymd_utc(1_735_689_599), (2024, 12, 31)); // last sec of 2024
+        assert_eq!(unix_to_ymd_utc(1_735_689_600), (2025, 1, 1)); // first sec of 2025
     }
 
     #[test]
@@ -5608,7 +5662,7 @@ mod tests {
         assert!(!pacific_is_dst(2026, 12, 25));
         assert!(!pacific_is_dst(2026, 2, 28));
         assert!(!pacific_is_dst(2026, 11, 5)); // first Sun of Nov 2026 = Nov 1; Nov 5 is past
-        // Inside: PDT.
+                                               // Inside: PDT.
         assert!(pacific_is_dst(2026, 6, 1));
         assert!(pacific_is_dst(2026, 9, 30));
         // Boundary: March 8, 2026 (DST start day) and after = PDT.
@@ -5702,7 +5756,7 @@ mod tests {
         let cases = [
             "https://x.com/home",
             "https://x.com/i/api/2/notifications/view/generic.json",
-            "https://x.com/i/api/graphql/x/y",       // no query
+            "https://x.com/i/api/graphql/x/y", // no query
             "https://x.com/i/api/graphql/x/y?features=1&variables=2", // variables not first
         ];
         for u in cases {
@@ -5721,10 +5775,22 @@ mod tests {
 
     #[test]
     fn extract_host_strips_scheme_port_path() {
-        assert_eq!(extract_host("https://example.com/foo"), Some("example.com".into()));
-        assert_eq!(extract_host("http://foo.bar:8080/x"), Some("foo.bar".into()));
-        assert_eq!(extract_host("https://user:pw@host.test/x"), Some("host.test".into()));
-        assert_eq!(extract_host("https://[2001:db8::1]:443/"), Some("2001:db8::1".into()));
+        assert_eq!(
+            extract_host("https://example.com/foo"),
+            Some("example.com".into())
+        );
+        assert_eq!(
+            extract_host("http://foo.bar:8080/x"),
+            Some("foo.bar".into())
+        );
+        assert_eq!(
+            extract_host("https://user:pw@host.test/x"),
+            Some("host.test".into())
+        );
+        assert_eq!(
+            extract_host("https://[2001:db8::1]:443/"),
+            Some("2001:db8::1".into())
+        );
         assert_eq!(extract_host("API.X.com/foo"), Some("api.x.com".into()));
         assert_eq!(extract_host(""), None);
     }
@@ -5901,8 +5967,14 @@ hello";
         // probe's Content-Range (would mark response as partial and
         // clients would reject mid-stream chunks past the probe's end).
         let probe_headers = vec![
-            ("Content-Type".to_string(), "application/octet-stream".to_string()),
-            ("Content-Range".to_string(), "bytes 0-262143/109605203".to_string()),
+            (
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            ),
+            (
+                "Content-Range".to_string(),
+                "bytes 0-262143/109605203".to_string(),
+            ),
             ("Content-Length".to_string(), "262144".to_string()),
             ("Content-Encoding".to_string(), "gzip".to_string()),
             ("Transfer-Encoding".to_string(), "chunked".to_string()),
@@ -6024,7 +6096,9 @@ hello";
         let total = u64::MAX;
         let chunk = 256 * 1024;
         let probe_end = chunk - 1;
-        let first_ten: Vec<_> = plan_remaining_ranges(probe_end, total, chunk).take(10).collect();
+        let first_ten: Vec<_> = plan_remaining_ranges(probe_end, total, chunk)
+            .take(10)
+            .collect();
         assert_eq!(first_ten.len(), 10);
         // First range starts right after the probe.
         assert_eq!(first_ten[0].0, probe_end + 1);
@@ -6236,7 +6310,10 @@ hello";
 
     impl FlushTrackingWriter {
         fn new() -> Self {
-            Self { buf: Vec::new(), flushed_at: Vec::new() }
+            Self {
+                buf: Vec::new(),
+                flushed_at: Vec::new(),
+            }
         }
     }
 
@@ -6283,7 +6360,11 @@ hello";
         let probe = b"AB";
         let fetches = stream::iter(vec![
             (2u64, 5u64, Ok::<Vec<u8>, &'static str>(b"CDEF".to_vec())),
-            (6u64, 9u64, Err::<Vec<u8>, &'static str>("validation failure")),
+            (
+                6u64,
+                9u64,
+                Err::<Vec<u8>, &'static str>("validation failure"),
+            ),
         ]);
         let mut writer = FlushTrackingWriter::new();
         let result = stream_chunks_to_writer(
@@ -6481,7 +6562,10 @@ hello";
         };
 
         let probe_headers = vec![
-            ("Content-Type".to_string(), "application/octet-stream".to_string()),
+            (
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            ),
             ("Content-Range".to_string(), "bytes 0-3/12".to_string()),
             // Origin sent ACL=* with credentials — exactly the YouTube
             // comments failure mode `inject_cors_response_headers`
@@ -6507,14 +6591,18 @@ hello";
         .await
         .unwrap();
 
-        let sep_pos = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("head terminator");
+        let sep_pos = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("head terminator");
         let head_s = std::str::from_utf8(&buf[..sep_pos + 4]).unwrap();
         let body = &buf[sep_pos + 4..];
 
         // Wildcard origin is gone; request origin is echoed.
         assert!(
             !head_s.contains("Access-Control-Allow-Origin: *"),
-            "wildcard origin must be stripped, head was: {}", head_s,
+            "wildcard origin must be stripped, head was: {}",
+            head_s,
         );
         assert!(head_s.contains("Access-Control-Allow-Origin: https://www.youtube.com\r\n"));
         assert!(head_s.contains("Access-Control-Allow-Credentials: true\r\n"));
@@ -6546,7 +6634,10 @@ hello";
         // function the production dispatch uses.
         use futures_util::stream::{self, StreamExt as _};
         let probe_headers = vec![
-            ("Content-Type".to_string(), "application/octet-stream".to_string()),
+            (
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            ),
             ("Content-Range".to_string(), "bytes 0-3/12".to_string()),
             ("Content-Length".to_string(), "4".to_string()),
             ("X-Origin-Hint".to_string(), "abcd".to_string()),
@@ -6579,7 +6670,10 @@ hello";
         .await
         .unwrap();
 
-        let sep_pos = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("head terminator");
+        let sep_pos = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("head terminator");
         let head = &buf[..sep_pos + 4];
         let body = &buf[sep_pos + 4..];
         let head_s = std::str::from_utf8(head).unwrap();
@@ -6615,13 +6709,20 @@ hello";
         // this gives end-to-end coverage of the failure surface.
         use futures_util::stream::{self, StreamExt as _};
         let probe_headers = vec![
-            ("Content-Type".to_string(), "application/octet-stream".to_string()),
+            (
+                "Content-Type".to_string(),
+                "application/octet-stream".to_string(),
+            ),
             ("Content-Range".to_string(), "bytes 0-3/12".to_string()),
         ];
         let probe_body = b"ABCD";
         let chunks = stream::iter(vec![
             (4u64, 7u64, Ok::<Vec<u8>, &'static str>(b"EFGH".to_vec())),
-            (8u64, 11u64, Err::<Vec<u8>, &'static str>("chunk validation failure")),
+            (
+                8u64,
+                11u64,
+                Err::<Vec<u8>, &'static str>("chunk validation failure"),
+            ),
         ]);
         let identity = |head: &[u8]| head.to_vec();
         let mut buf: Vec<u8> = Vec::new();
@@ -6635,9 +6736,15 @@ hello";
             "https://example.test/big-file",
         )
         .await;
-        assert!(result.is_err(), "mid-stream chunk failure must propagate as Err");
+        assert!(
+            result.is_err(),
+            "mid-stream chunk failure must propagate as Err"
+        );
 
-        let sep_pos = buf.windows(4).position(|w| w == b"\r\n\r\n").expect("head terminator");
+        let sep_pos = buf
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("head terminator");
         let body = &buf[sep_pos + 4..];
         // Committed prefix: probe + first good chunk. NOT the failed
         // chunk and NOT any "after-failure" chunks (there aren't any
@@ -6659,7 +6766,11 @@ hello";
         let probe = b"AB";
         let fetches = stream::iter(vec![
             (2u64, 5u64, Ok::<Vec<u8>, &'static str>(b"CDEF".to_vec())),
-            (6u64, 9u64, Err::<Vec<u8>, &'static str>("Content-Range/body length mismatch")),
+            (
+                6u64,
+                9u64,
+                Err::<Vec<u8>, &'static str>("Content-Range/body length mismatch"),
+            ),
             // This third chunk must NOT be written — the function must
             // bail on the first Err.
             (10u64, 11u64, Ok::<Vec<u8>, &'static str>(b"KL".to_vec())),
@@ -6702,10 +6813,15 @@ hello";
     fn blacklist_heuristics() {
         assert!(should_blacklist(429, ""));
         assert!(should_blacklist(403, "quota"));
-        assert!(should_blacklist(500, "Service invoked too many times per day: urlfetch"));
+        assert!(should_blacklist(
+            500,
+            "Service invoked too many times per day: urlfetch"
+        ));
         assert!(!should_blacklist(200, ""));
         assert!(!should_blacklist(502, "bad gateway"));
-        assert!(looks_like_quota_error("Exception: Service invoked too many times per day"));
+        assert!(looks_like_quota_error(
+            "Exception: Service invoked too many times per day"
+        ));
         assert!(looks_like_quota_error(
             "Exception: Bandbreitenkontingent überschritten: https://example.com. Verringern Sie die Datenübertragungsrate."
         ));
@@ -6731,7 +6847,9 @@ hello";
                 safe,
             );
         }
-        for unsafe_m in ["POST", "PUT", "PATCH", "DELETE", "post", "put", "patch", "delete"] {
+        for unsafe_m in [
+            "POST", "PUT", "PATCH", "DELETE", "post", "put", "patch", "delete",
+        ] {
             assert!(
                 !is_method_safe_for_fanout(unsafe_m),
                 "{} must NOT be safe for fan-out (non-idempotent — duplicate side-effects)",
@@ -6770,7 +6888,10 @@ hello";
         assert_eq!(decode_js_string_escapes(r"ABC").unwrap(), "ABC");
 
         // standard escapes
-        assert_eq!(decode_js_string_escapes(r#"a\nb\t\\\"c"#).unwrap(), "a\nb\t\\\"c");
+        assert_eq!(
+            decode_js_string_escapes(r#"a\nb\t\\\"c"#).unwrap(),
+            "a\nb\t\\\"c"
+        );
 
         // truncated escape returns None instead of panicking
         assert!(decode_js_string_escapes(r"\x7").is_none());
@@ -6862,7 +6983,11 @@ hello";
         let err = read_http_response(&mut server).await.unwrap_err();
         match err {
             FronterError::BadResponse(msg) => {
-                assert!(msg.contains("full response body"), "unexpected error: {}", msg);
+                assert!(
+                    msg.contains("full response body"),
+                    "unexpected error: {}",
+                    msg
+                );
             }
             other => panic!("unexpected error: {}", other),
         }
@@ -7102,9 +7227,7 @@ hello";
     /// incoming request — used by `h2_round_trip_*` tests below.
     /// Returns the bound address and the JoinHandle so the test can
     /// `abort()` the server when done.
-    async fn spawn_h2c_server<F>(
-        handler: F,
-    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>)
+    async fn spawn_h2c_server<F>(handler: F) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>)
     where
         F: Fn(http::Request<h2::RecvStream>) -> (http::Response<()>, Vec<u8>)
             + Send
@@ -7242,7 +7365,15 @@ hello";
         let send = h2c_client(addr).await;
         let fronter = fronter_for_test(false);
         let (status, _hdrs, body) = fronter
-            .h2_round_trip(send, "GET", "/", "127.0.0.1", Bytes::new(), None, TEST_RESPONSE_DEADLINE)
+            .h2_round_trip(
+                send,
+                "GET",
+                "/",
+                "127.0.0.1",
+                Bytes::new(),
+                None,
+                TEST_RESPONSE_DEADLINE,
+            )
             .await
             .unwrap();
         assert_eq!(status, 200);
@@ -7332,7 +7463,10 @@ hello";
         match result {
             Err((_, RequestSent::No)) => {} // expected
             Err((e, RequestSent::Maybe)) => {
-                panic!("dead-conn failure classified as Maybe (unsafe to retry): {}", e)
+                panic!(
+                    "dead-conn failure classified as Maybe (unsafe to retry): {}",
+                    e
+                )
             }
             Ok(_) => panic!("expected error against dropped server"),
         }
@@ -7402,7 +7536,10 @@ hello";
         assert!(plain2.is_retryable(), "Timeout must be retryable");
 
         let wrapped = FronterError::NonRetryable(Box::new(FronterError::Relay("post-send".into())));
-        assert!(!wrapped.is_retryable(), "NonRetryable must not be retryable");
+        assert!(
+            !wrapped.is_retryable(),
+            "NonRetryable must not be retryable"
+        );
 
         // Display must be transparent so log lines look identical.
         let inner_msg = "h2 response: stream RST".to_string();
@@ -7509,7 +7646,10 @@ hello";
             .sticky_disable_h2_for_fronting_refusal(421, "test context")
             .await;
 
-        assert!(fronter.h2_disabled.load(Ordering::Relaxed), "must sticky-disable");
+        assert!(
+            fronter.h2_disabled.load(Ordering::Relaxed),
+            "must sticky-disable"
+        );
         let cell = fronter.h2_cell.lock().await;
         assert!(cell.is_none(), "cell must be cleared");
         assert_eq!(
@@ -7945,20 +8085,12 @@ hello";
 
         // POST on a non-YT host: gate off (host gate).
         assert!(fronter
-            .maybe_strip_sabr_body(
-                "POST",
-                "https://api.example.com/videoplayback",
-                &body,
-            )
+            .maybe_strip_sabr_body("POST", "https://api.example.com/videoplayback", &body,)
             .is_none());
 
         // POST on YT host without /videoplayback path: gate off.
         assert!(fronter
-            .maybe_strip_sabr_body(
-                "POST",
-                "https://www.youtube.com/youtubei/v1/player",
-                &body,
-            )
+            .maybe_strip_sabr_body("POST", "https://www.youtube.com/youtubei/v1/player", &body,)
             .is_none());
     }
 

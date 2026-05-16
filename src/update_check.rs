@@ -150,8 +150,8 @@ pub async fn download_asset(
     // GitHub asset URLs (api.github.com/.../assets/<id>) 302 to
     // objects.githubusercontent.com. Our https_get follows one redirect
     // already, which covers that hop. Beyond that is a bug.
-    let (host, path) = split_url(asset_url)
-        .ok_or_else(|| format!("bad asset URL: {}", asset_url))?;
+    let (host, path) =
+        split_url(asset_url).ok_or_else(|| format!("bad asset URL: {}", asset_url))?;
     let body = https_raw_get(&route, &host, &path, true).await?;
     // Async write so we don't stall the executor on a 50 MB-class spool.
     tokio::fs::write(out_path, &body)
@@ -197,17 +197,13 @@ async fn https_raw_get(
 
     // Raw TCP: either direct to <host>:443 or to our proxy, then CONNECT.
     let tcp = match route {
-        Route::Direct => tokio::time::timeout(
-            Duration::from_secs(5),
-            TcpStream::connect((host, 443u16)),
-        )
-        .await
-        .map_err(|_| "tcp connect timeout".to_string())?
-        .map_err(|e| format!("tcp connect: {}", e))?,
-        Route::Proxy {
-            host: ph,
-            port: pp,
-        } => {
+        Route::Direct => {
+            tokio::time::timeout(Duration::from_secs(5), TcpStream::connect((host, 443u16)))
+                .await
+                .map_err(|_| "tcp connect timeout".to_string())?
+                .map_err(|e| format!("tcp connect: {}", e))?
+        }
+        Route::Proxy { host: ph, port: pp } => {
             let mut t = tokio::time::timeout(
                 Duration::from_secs(5),
                 TcpStream::connect((ph.as_str(), *pp)),
@@ -254,13 +250,12 @@ async fn https_raw_get(
     };
     let _ = tcp.set_nodelay(true);
 
-    let server_name = ServerName::try_from(host.to_string())
-        .map_err(|e| format!("bad host: {}", e))?;
-    let mut tls =
-        tokio::time::timeout(Duration::from_secs(8), connector.connect(server_name, tcp))
-            .await
-            .map_err(|_| "tls handshake timeout".to_string())?
-            .map_err(|e| format!("tls: {}", e))?;
+    let server_name =
+        ServerName::try_from(host.to_string()).map_err(|e| format!("bad host: {}", e))?;
+    let mut tls = tokio::time::timeout(Duration::from_secs(8), connector.connect(server_name, tcp))
+        .await
+        .map_err(|_| "tls handshake timeout".to_string())?
+        .map_err(|e| format!("tls: {}", e))?;
 
     let req = format!(
         "GET {path} HTTP/1.1\r\n\
@@ -272,7 +267,11 @@ async fn https_raw_get(
         path = path,
         host = host,
         ver = CURRENT_VERSION,
-        accept = if binary { "*/*" } else { "application/vnd.github+json" },
+        accept = if binary {
+            "*/*"
+        } else {
+            "application/vnd.github+json"
+        },
     );
     tls.write_all(req.as_bytes())
         .await
@@ -299,10 +298,7 @@ async fn https_raw_get(
                 } else {
                     format!("{} KiB", read_limit / 1024)
                 };
-                return Err(format!(
-                    "response too large (>{} limit)",
-                    limit_label
-                ));
+                return Err(format!("response too large (>{} limit)", limit_label));
             }
         }
         Ok::<(), String>(())
@@ -331,8 +327,8 @@ fn parse_response<'a>(
             .windows(sep.len())
             .position(|w| w == sep)
             .ok_or_else(|| "no HTTP header terminator".to_string())?;
-        let hdr = std::str::from_utf8(&buf[..hdr_end])
-            .map_err(|_| "non-utf8 header".to_string())?;
+        let hdr =
+            std::str::from_utf8(&buf[..hdr_end]).map_err(|_| "non-utf8 header".to_string())?;
         let body = &buf[hdr_end + sep.len()..];
 
         let first = hdr.lines().next().unwrap_or("");
@@ -379,8 +375,8 @@ fn build_root_store(route: &Route) -> Result<RootCertStore, String> {
         if let Ok(mut pem) = std::fs::read(&ca_path) {
             let mut rdr: &[u8] = pem.as_mut_slice();
             let mut added = 0;
-            while let Some(res) = rustls_pemfile::read_one(&mut rdr)
-                .map_err(|e| format!("read ca.crt: {}", e))?
+            while let Some(res) =
+                rustls_pemfile::read_one(&mut rdr).map_err(|e| format!("read ca.crt: {}", e))?
             {
                 if let rustls_pemfile::Item::X509Certificate(der) = res {
                     let cert: CertificateDer<'static> = der;
@@ -435,28 +431,47 @@ fn asset_preferences(os: &str, arch: &str) -> &'static [&'static [&'static str]]
         ("macos", "aarch64") => &[&["macos-arm64-app", ".zip"], &["macos-arm64", ".tar.gz"]],
         ("macos", "x86_64") => &[&["macos-amd64-app", ".zip"], &["macos-amd64", ".tar.gz"]],
         ("windows", _) => &[&["windows-amd64", ".zip"]],
-        ("linux", "aarch64") => &[&["linux-arm64", ".tar.gz"], &["linux-musl-arm64", ".tar.gz"]],
+        ("linux", "aarch64") => &[
+            &["linux-arm64", ".tar.gz"],
+            &["linux-musl-arm64", ".tar.gz"],
+        ],
         ("linux", "arm") => &[&["raspbian-armhf", ".tar.gz"]],
-        ("linux", "x86_64") => &[&["linux-amd64", ".tar.gz"], &["linux-musl-amd64", ".tar.gz"]],
+        ("linux", "x86_64") => &[
+            &["linux-amd64", ".tar.gz"],
+            &["linux-musl-amd64", ".tar.gz"],
+        ],
         // Android: each per-arch APK matches its ABI. Universal is the
         // fallback when no per-arch build is published. The running
         // process's target_arch picks the right one — `Build.SUPPORTED_ABIS[0]`
         // and `target_arch` agree because the Rust cdylib was built for
         // exactly the ABI the device loaded.
-        ("android", "aarch64") => &[&["android-arm64-v8a", ".apk"], &["android-universal", ".apk"]],
-        ("android", "arm") => &[&["android-armeabi-v7a", ".apk"], &["android-universal", ".apk"]],
+        ("android", "aarch64") => &[
+            &["android-arm64-v8a", ".apk"],
+            &["android-universal", ".apk"],
+        ],
+        ("android", "arm") => &[
+            &["android-armeabi-v7a", ".apk"],
+            &["android-universal", ".apk"],
+        ],
         ("android", "x86_64") => &[&["android-x86_64", ".apk"], &["android-universal", ".apk"]],
         ("android", "x86") => &[&["android-x86-", ".apk"], &["android-universal", ".apk"]],
         _ => &[],
     }
 }
 
-fn pick_asset_for_target(assets: &[serde_json::Value], os: &str, arch: &str) -> Option<ReleaseAsset> {
+fn pick_asset_for_target(
+    assets: &[serde_json::Value],
+    os: &str,
+    arch: &str,
+) -> Option<ReleaseAsset> {
     for needles in asset_preferences(os, arch) {
         for a in assets {
             let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let lower = name.to_ascii_lowercase();
-            if needles.iter().all(|n| lower.contains(&n.to_ascii_lowercase())) {
+            if needles
+                .iter()
+                .all(|n| lower.contains(&n.to_ascii_lowercase()))
+            {
                 let url = a
                     .get("browser_download_url")
                     .and_then(|v| v.as_str())

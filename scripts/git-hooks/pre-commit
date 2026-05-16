@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Refuses commits that include signing keys / private configs, and runs
+# rustfmt --check on staged .rs files. Bypass with `git commit --no-verify`
+# (don't do that for the secret check — that's there to stop a key leak).
+
+set -euo pipefail
+
+red()    { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+yellow() { printf '\033[33m%s\033[0m\n' "$*" >&2; }
+
+fail=0
+
+# Filename blocklist. The minisign key and Android keystore are the two
+# files that would actually hurt us if they leaked — anyone with the
+# minisign secret can sign a forged update; anyone with release.jks can
+# sign an APK as us.
+forbidden_globs=(
+  '*.key'
+  '*.jks'
+  '*.pem'
+  '*.p12'
+  '*.pfx'
+  'config.json'
+  'rahgozar-update.key'
+  'rahgozar-update.pub'
+)
+
+mapfile -d '' staged < <(git diff --cached --name-only -z --diff-filter=ACMR)
+
+for f in "${staged[@]:-}"; do
+  [ -z "$f" ] && continue
+  for pat in "${forbidden_globs[@]}"; do
+    case "$f" in
+      $pat|*/$pat)
+        red "x refusing to commit: $f matches forbidden pattern '$pat'"
+        red "  if this is intentional, edit scripts/git-hooks/pre-commit"
+        fail=1
+        ;;
+    esac
+  done
+done
+
+# Content scan for secret markers. Catches PEM private keys, minisign
+# secret-key headers, AWS access keys, and GitHub tokens even when the
+# filename doesn't trip the blocklist above.
+#
+# Each alternation uses a [x] character-class disguise on one letter so
+# the regex string in *this* file does not match itself when the hook
+# scans its own staged blob. `[B]` still matches a literal B; semantics
+# are unchanged.
+secret_re='-----[B]EGIN [A-Z ]*PRIVATE KEY-----|untrusted comment: minisig[n] encrypted secret key|AKI[A][0-9A-Z]{16}|g[h][pousr]_[A-Za-z0-9]{36,}'
+
+for f in "${staged[@]:-}"; do
+  [ -z "$f" ] && continue
+  # Scan the staged blob, not the working-tree file — the user may have
+  # already fixed it on disk but the index still has the bad version.
+  if git show ":0:$f" 2>/dev/null | grep -qE -e "$secret_re"; then
+    red "x refusing to commit: $f contains what looks like a secret"
+    fail=1
+  fi
+done
+
+# rustfmt --check on staged .rs files. Operates per-file so the workspace
+# doesn't need to parse (cargo fmt would pull all deps and is much slower).
+rust_files=()
+for f in "${staged[@]:-}"; do
+  [ -z "$f" ] && continue
+  case "$f" in *.rs) rust_files+=("$f");; esac
+done
+
+if [ "${#rust_files[@]}" -gt 0 ]; then
+  if ! command -v rustfmt >/dev/null 2>&1; then
+    yellow "! rustfmt not in PATH - skipping format check"
+  elif ! rustfmt --check --edition 2021 "${rust_files[@]}" 2>&1; then
+    red "x rustfmt --check failed. Fix with: rustfmt --edition 2021 ${rust_files[*]}"
+    fail=1
+  fi
+fi
+
+if [ "$fail" -ne 0 ]; then
+  red ""
+  red "pre-commit checks failed."
+  exit 1
+fi

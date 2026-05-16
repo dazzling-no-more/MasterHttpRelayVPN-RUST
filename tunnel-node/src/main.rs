@@ -217,7 +217,11 @@ async fn create_session(host: &str, port: u16) -> std::io::Result<ManagedSession
     let inner_ref = inner.clone();
     let reader_handle = tokio::spawn(reader_task(reader, inner_ref));
 
-    Ok(ManagedSession { inner, reader_handle, udpgw_handle: None })
+    Ok(ManagedSession {
+        inner,
+        reader_handle,
+        udpgw_handle: None,
+    })
 }
 
 /// Create a virtual udpgw session backed by an in-process duplex channel.
@@ -237,7 +241,11 @@ fn create_udpgw_session() -> ManagedSession {
     let reader_handle = tokio::spawn(reader_task(read_half, inner_ref));
     let udpgw_handle = Some(tokio::spawn(udpgw::udpgw_server_task(server_half)));
 
-    ManagedSession { inner, reader_handle, udpgw_handle }
+    ManagedSession {
+        inner,
+        reader_handle,
+        udpgw_handle,
+    }
 }
 
 async fn reader_task(mut reader: impl AsyncRead + Unpin, session: Arc<SessionInner>) {
@@ -582,9 +590,15 @@ async fn wait_and_drain(session: &SessionInner, max_wait: Duration) -> (Vec<u8>,
             prev_len = cur_len;
             ever_had_data = true;
         }
-        if is_eof { break; }
-        if Instant::now() >= deadline { break; }
-        if ever_had_data && last_growth.elapsed() > Duration::from_millis(100) { break; }
+        if is_eof {
+            break;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        if ever_had_data && last_growth.elapsed() > Duration::from_millis(100) {
+            break;
+        }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 
@@ -626,32 +640,52 @@ struct AppState {
 struct TunnelRequest {
     k: String,
     op: String,
-    #[serde(default)] host: Option<String>,
-    #[serde(default)] port: Option<u16>,
-    #[serde(default)] sid: Option<String>,
-    #[serde(default)] data: Option<String>,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    sid: Option<String>,
+    #[serde(default)]
+    data: Option<String>,
 }
 
 #[derive(Serialize, Clone, Debug)]
 struct TunnelResponse {
-    #[serde(skip_serializing_if = "Option::is_none")] sid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")] d: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    d: Option<String>,
     /// UDP datagrams returned to the client, base64-encoded individually.
     /// `None` for TCP responses; `Some(vec![])` is never serialized
     /// (the field is dropped when empty by the empty-on-None check above).
-    #[serde(skip_serializing_if = "Option::is_none")] pkts: Option<Vec<String>>,
-    #[serde(skip_serializing_if = "Option::is_none")] eof: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")] e: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")] code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pkts: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    eof: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    e: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
 }
 
 impl TunnelResponse {
     fn error(msg: impl Into<String>) -> Self {
-        Self { sid: None, d: None, pkts: None, eof: None, e: Some(msg.into()), code: None }
+        Self {
+            sid: None,
+            d: None,
+            pkts: None,
+            eof: None,
+            e: Some(msg.into()),
+            code: None,
+        }
     }
     fn unsupported_op(op: &str) -> Self {
         Self {
-            sid: None, d: None, pkts: None, eof: None,
+            sid: None,
+            d: None,
+            pkts: None,
+            eof: None,
             e: Some(format!("unknown op: {}", op)),
             code: Some(CODE_UNSUPPORTED_OP.into()),
         }
@@ -671,10 +705,14 @@ struct BatchRequest {
 #[derive(Deserialize)]
 struct BatchOp {
     op: String,
-    #[serde(default)] sid: Option<String>,
-    #[serde(default)] host: Option<String>,
-    #[serde(default)] port: Option<u16>,
-    #[serde(default)] d: Option<String>, // base64 data
+    #[serde(default)]
+    sid: Option<String>,
+    #[serde(default)]
+    host: Option<String>,
+    #[serde(default)]
+    port: Option<u16>,
+    #[serde(default)]
+    d: Option<String>, // base64 data
 }
 
 #[derive(Serialize)]
@@ -695,9 +733,7 @@ async fn handle_tunnel(
     }
     let resp: TunnelResponse = match req.op.as_str() {
         "connect" => handle_connect(&state, req.host, req.port).await,
-        "connect_data" => {
-            handle_connect_data_single(&state, req.host, req.port, req.data).await
-        }
+        "connect_data" => handle_connect_data_single(&state, req.host, req.port, req.data).await,
         "data" => handle_data_single(&state, req.sid, req.data).await,
         "close" => handle_close(&state, req.sid).await,
         other => TunnelResponse::unsupported_op(other),
@@ -730,10 +766,7 @@ fn decoy_or_unauthorized(diagnostic_mode: bool) -> axum::response::Response {
 // Batch handler
 // ---------------------------------------------------------------------------
 
-async fn handle_batch(
-    State(state): State<AppState>,
-    body: Bytes,
-) -> impl IntoResponse {
+async fn handle_batch(State(state): State<AppState>, body: Bytes) -> impl IntoResponse {
     // Decompress if gzipped
     let json_bytes = if body.starts_with(&[0x1f, 0x8b]) {
         match decompress_gzip(&body) {
@@ -741,8 +774,13 @@ async fn handle_batch(
             Err(e) => {
                 let resp = serde_json::to_vec(&BatchResponse {
                     r: vec![TunnelResponse::error(format!("gzip decode: {}", e))],
-                }).unwrap_or_default();
-                return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp);
+                })
+                .unwrap_or_default();
+                return (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    resp,
+                );
             }
         }
     } else {
@@ -754,8 +792,13 @@ async fn handle_batch(
         Err(e) => {
             let resp = serde_json::to_vec(&BatchResponse {
                 r: vec![TunnelResponse::error(format!("bad json: {}", e))],
-            }).unwrap_or_default();
-            return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp);
+            })
+            .unwrap_or_default();
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                resp,
+            );
         }
     };
 
@@ -763,8 +806,13 @@ async fn handle_batch(
         if state.diagnostic_mode {
             let resp = serde_json::to_vec(&BatchResponse {
                 r: vec![TunnelResponse::error("unauthorized")],
-            }).unwrap_or_default();
-            return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp);
+            })
+            .unwrap_or_default();
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                resp,
+            );
         }
         // Production: same nginx-404 decoy as the single-op path. See
         // `decoy_or_unauthorized` for rationale.
@@ -773,7 +821,11 @@ async fn handle_batch(
                     <hr><center>nginx</center>\r\n</body>\r\n</html>\r\n"
             .as_bytes()
             .to_vec();
-        return (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "text/html")], body);
+        return (
+            StatusCode::NOT_FOUND,
+            [(header::CONTENT_TYPE, "text/html")],
+            body,
+        );
     }
 
     // Process all ops in two phases.
@@ -820,7 +872,10 @@ async fn handle_batch(
                 let host = op.host.clone();
                 let port = op.port;
                 new_conn_jobs.spawn(async move {
-                    (i, NewConn::Connect(handle_connect(&state, host, port).await))
+                    (
+                        i,
+                        NewConn::Connect(handle_connect(&state, host, port).await),
+                    )
                 });
             }
             "connect_data" => {
@@ -858,7 +913,10 @@ async fn handle_batch(
             "data" => {
                 let sid = match &op.sid {
                     Some(s) if !s.is_empty() => s.clone(),
-                    _ => { results.push((i, TunnelResponse::error("missing sid"))); continue; }
+                    _ => {
+                        results.push((i, TunnelResponse::error("missing sid")));
+                        continue;
+                    }
                 };
 
                 // Clone the inner under the map lock and release it
@@ -907,7 +965,10 @@ async fn handle_batch(
             "udp_data" => {
                 let sid = match &op.sid {
                     Some(s) if !s.is_empty() => s.clone(),
-                    _ => { results.push((i, TunnelResponse::error("missing sid"))); continue; }
+                    _ => {
+                        results.push((i, TunnelResponse::error("missing sid")));
+                        continue;
+                    }
                 };
 
                 let inner = {
@@ -998,10 +1059,14 @@ async fn handle_batch(
         // Phase 1 already gave us each session's Arc<…Inner>, so we
         // don't need to re-acquire the sessions map lock here. Cloning
         // the Arc is just a refcount bump.
-        let tcp_inners: Vec<Arc<SessionInner>> =
-            tcp_drains.iter().map(|(_, _, inner)| inner.clone()).collect();
-        let udp_inners: Vec<Arc<UdpSessionInner>> =
-            udp_drains.iter().map(|(_, _, inner)| inner.clone()).collect();
+        let tcp_inners: Vec<Arc<SessionInner>> = tcp_drains
+            .iter()
+            .map(|(_, _, inner)| inner.clone())
+            .collect();
+        let udp_inners: Vec<Arc<UdpSessionInner>> = udp_drains
+            .iter()
+            .map(|(_, _, inner)| inner.clone())
+            .collect();
 
         // Wake on whichever side has work first. The previous
         // `tokio::join!` was conjunctive — a TCP burst still paid the
@@ -1144,13 +1209,21 @@ async fn handle_batch(
     };
 
     let json = serde_json::to_vec(&batch_resp).unwrap_or_default();
-    (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], json)
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json")],
+        json,
+    )
 }
 
 fn tcp_drain_response(sid: String, data: Vec<u8>, eof: bool) -> TunnelResponse {
     TunnelResponse {
         sid: Some(sid),
-        d: if data.is_empty() { None } else { Some(B64.encode(&data)) },
+        d: if data.is_empty() {
+            None
+        } else {
+            Some(B64.encode(&data))
+        },
         pkts: None,
         eof: Some(eof),
         e: None,
@@ -1212,7 +1285,11 @@ fn validate_host_port(
     Ok((host, port))
 }
 
-async fn handle_connect(state: &AppState, host: Option<String>, port: Option<u16>) -> TunnelResponse {
+async fn handle_connect(
+    state: &AppState,
+    host: Option<String>,
+    port: Option<u16>,
+) -> TunnelResponse {
     let (host, port) = match validate_host_port(host, port) {
         Ok(v) => v,
         Err(r) => return r,
@@ -1228,7 +1305,14 @@ async fn handle_connect(state: &AppState, host: Option<String>, port: Option<u16
     let sid = uuid::Uuid::new_v4().to_string();
     tracing::info!("session {} -> {}:{}", sid, host, port);
     state.sessions.lock().await.insert(sid.clone(), session);
-    TunnelResponse { sid: Some(sid), d: None, pkts: None, eof: Some(false), e: None, code: None }
+    TunnelResponse {
+        sid: Some(sid),
+        d: None,
+        pkts: None,
+        eof: Some(false),
+        e: None,
+        code: None,
+    }
 }
 
 /// Open a session and write the client's first bytes in one round trip.
@@ -1345,7 +1429,11 @@ async fn handle_connect_data_single(
     }
     TunnelResponse {
         sid: Some(sid),
-        d: if data.is_empty() { None } else { Some(B64.encode(&data)) },
+        d: if data.is_empty() {
+            None
+        } else {
+            Some(B64.encode(&data))
+        },
         pkts: None,
         eof: Some(eof),
         e: None,
@@ -1353,7 +1441,11 @@ async fn handle_connect_data_single(
     }
 }
 
-async fn handle_data_single(state: &AppState, sid: Option<String>, data: Option<String>) -> TunnelResponse {
+async fn handle_data_single(
+    state: &AppState,
+    sid: Option<String>,
+    data: Option<String>,
+) -> TunnelResponse {
     let sid = match sid {
         Some(s) if !s.is_empty() => s,
         _ => return TunnelResponse::error("missing sid"),
@@ -1396,9 +1488,15 @@ async fn handle_data_single(state: &AppState, sid: Option<String>, data: Option<
     }
     TunnelResponse {
         sid: Some(sid),
-        d: if data.is_empty() { None } else { Some(B64.encode(&data)) },
+        d: if data.is_empty() {
+            None
+        } else {
+            Some(B64.encode(&data))
+        },
         pkts: None,
-        eof: Some(eof), e: None, code: None,
+        eof: Some(eof),
+        e: None,
+        code: None,
     }
 }
 
@@ -1415,7 +1513,14 @@ async fn handle_close(state: &AppState, sid: Option<String>) -> TunnelResponse {
         s.reader_handle.abort();
         tracing::info!("udp session {} closed by client", sid);
     }
-    TunnelResponse { sid: Some(sid), d: None, pkts: None, eof: Some(true), e: None, code: None }
+    TunnelResponse {
+        sid: Some(sid),
+        d: None,
+        pkts: None,
+        eof: Some(true),
+        e: None,
+        code: None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1472,11 +1577,7 @@ async fn cleanup_task(
                 }
             }
             if !stale.is_empty() {
-                tracing::info!(
-                    "cleanup: reaped {}, {} active udp",
-                    stale.len(),
-                    map.len()
-                );
+                tracing::info!("cleanup: reaped {}, {} active udp", stale.len(), map.len());
             }
         }
     }
@@ -1490,8 +1591,7 @@ async fn cleanup_task(
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -1684,9 +1784,8 @@ mod tests {
     #[tokio::test]
     async fn connect_data_rejects_missing_host() {
         let state = fresh_state();
-        let resp = handle_connect_data_single(
-            &state, None, Some(443), Some(B64.encode(b"x")),
-        ).await;
+        let resp =
+            handle_connect_data_single(&state, None, Some(443), Some(B64.encode(b"x"))).await;
         assert!(resp.e.as_deref().unwrap_or("").contains("missing host"));
         assert!(state.sessions.lock().await.is_empty());
     }
@@ -1771,11 +1870,7 @@ mod tests {
         // cap path does.
         let inner = fake_inner().await;
         // 1 MiB buffered, but caller only has 256 KiB budget left.
-        inner
-            .read_buf
-            .lock()
-            .await
-            .resize(1024 * 1024, 0xcd);
+        inner.read_buf.lock().await.resize(1024 * 1024, 0xcd);
 
         let (drained, eof) = drain_now(&inner, 256 * 1024).await;
         assert_eq!(drained.len(), 256 * 1024);
@@ -1793,7 +1888,11 @@ mod tests {
     #[tokio::test]
     async fn drain_now_passes_through_when_under_cap() {
         let inner = fake_inner().await;
-        inner.read_buf.lock().await.extend_from_slice(b"hello world");
+        inner
+            .read_buf
+            .lock()
+            .await
+            .extend_from_slice(b"hello world");
 
         let (data, eof) = drain_now(&inner, usize::MAX).await;
         assert_eq!(data, b"hello world");
@@ -1826,7 +1925,11 @@ mod tests {
     #[tokio::test]
     async fn wait_for_any_drainable_returns_immediately_when_buffer_has_data() {
         let inner = fake_inner().await;
-        inner.read_buf.lock().await.extend_from_slice(b"already here");
+        inner
+            .read_buf
+            .lock()
+            .await
+            .extend_from_slice(b"already here");
 
         let t0 = Instant::now();
         wait_for_any_drainable(&[inner], Duration::from_secs(5)).await;
@@ -2060,7 +2163,9 @@ mod tests {
         let resp = handle_batch(State(state.clone()), Bytes::from(body))
             .await
             .into_response();
-        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let body_bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
         serde_json::from_slice(&body_bytes).unwrap()
     }
 
@@ -2070,10 +2175,7 @@ mod tests {
     /// at ACTIVE_DRAIN_DEADLINE (350 ms) with no data.
     #[tokio::test]
     async fn batch_pure_poll_wakes_on_push() {
-        let push_port = start_push_server(
-            Duration::from_millis(150),
-            b"PUSHED".to_vec(),
-        ).await;
+        let push_port = start_push_server(Duration::from_millis(150), b"PUSHED".to_vec()).await;
         let state = fresh_state();
         let connect_resp = handle_connect(&state, Some("127.0.0.1".into()), Some(push_port)).await;
         let sid = connect_resp.sid.expect("connect should succeed");
@@ -2081,7 +2183,8 @@ mod tests {
         let body = serde_json::to_vec(&serde_json::json!({
             "k": "test-key",
             "ops": [{"op": "data", "sid": sid}],
-        })).unwrap();
+        }))
+        .unwrap();
 
         let t0 = Instant::now();
         let resp = invoke_handle_batch(&state, body).await;
@@ -2099,7 +2202,9 @@ mod tests {
         );
 
         let r = resp["r"].as_array().expect("response must be an array");
-        let d_b64 = r[0]["d"].as_str().expect("response should carry pushed bytes");
+        let d_b64 = r[0]["d"]
+            .as_str()
+            .expect("response should carry pushed bytes");
         let data = B64.decode(d_b64).unwrap();
         assert_eq!(&data[..], b"PUSHED");
     }
@@ -2111,13 +2216,15 @@ mod tests {
     async fn batch_active_caps_at_active_deadline() {
         let silent_port = start_silent_server().await;
         let state = fresh_state();
-        let connect_resp = handle_connect(&state, Some("127.0.0.1".into()), Some(silent_port)).await;
+        let connect_resp =
+            handle_connect(&state, Some("127.0.0.1".into()), Some(silent_port)).await;
         let sid = connect_resp.sid.expect("connect should succeed");
 
         let body = serde_json::to_vec(&serde_json::json!({
             "k": "test-key",
             "ops": [{"op": "data", "sid": sid, "d": B64.encode(b"PING")}],
-        })).unwrap();
+        }))
+        .unwrap();
 
         let t0 = Instant::now();
         let _resp = invoke_handle_batch(&state, body).await;
@@ -2146,10 +2253,7 @@ mod tests {
     /// long-poll actually engaged.
     #[tokio::test]
     async fn batch_empty_string_payload_engages_long_poll() {
-        let push_port = start_push_server(
-            Duration::from_millis(600),
-            b"DELAYED".to_vec(),
-        ).await;
+        let push_port = start_push_server(Duration::from_millis(600), b"DELAYED".to_vec()).await;
         let state = fresh_state();
         let connect_resp = handle_connect(&state, Some("127.0.0.1".into()), Some(push_port)).await;
         let sid = connect_resp.sid.expect("connect should succeed");
@@ -2157,7 +2261,8 @@ mod tests {
         let body = serde_json::to_vec(&serde_json::json!({
             "k": "test-key",
             "ops": [{"op": "data", "sid": sid, "d": ""}],
-        })).unwrap();
+        }))
+        .unwrap();
 
         let t0 = Instant::now();
         let resp = invoke_handle_batch(&state, body).await;
@@ -2175,7 +2280,8 @@ mod tests {
         );
 
         let r = resp["r"].as_array().unwrap();
-        let d_b64 = r[0]["d"].as_str()
+        let d_b64 = r[0]["d"]
+            .as_str()
             .expect("Some(\"\") payload should have engaged long-poll and delivered DELAYED");
         let data = B64.decode(d_b64).unwrap();
         assert_eq!(&data[..], b"DELAYED");
@@ -2238,8 +2344,17 @@ mod tests {
         }
         let drops = inner.queue_drops.load(Ordering::Relaxed);
         let queued = inner.packets.lock().await.len();
-        assert!(drops >= 1, "expected ≥1 drop, got {} (queued={})", drops, queued);
-        assert!(queued <= UDP_QUEUE_LIMIT, "queue exceeded limit: {}", queued);
+        assert!(
+            drops >= 1,
+            "expected ≥1 drop, got {} (queued={})",
+            drops,
+            queued
+        );
+        assert!(
+            queued <= UDP_QUEUE_LIMIT,
+            "queue exceeded limit: {}",
+            queued
+        );
     }
 
     /// Regression for the bug the review caught: a batch mixing UDP and
@@ -2466,11 +2581,7 @@ mod tests {
 
         // TCP session with bytes already buffered → immediately drainable.
         let tcp_inner = fake_inner().await;
-        tcp_inner
-            .read_buf
-            .lock()
-            .await
-            .extend_from_slice(b"ready");
+        tcp_inner.read_buf.lock().await.extend_from_slice(b"ready");
         let tcp_sid = "tcp-sid".to_string();
         state.sessions.lock().await.insert(
             tcp_sid.clone(),
@@ -2485,14 +2596,10 @@ mod tests {
         // succeeds; we just never send anything to it.
         let udp_target = UdpSocket::bind(("127.0.0.1", 0)).await.unwrap();
         let udp_port = udp_target.local_addr().unwrap().port();
-        let (udp_sid, _udp_inner) = handle_udp_open_phase1(
-            &state,
-            Some("127.0.0.1".into()),
-            Some(udp_port),
-            None,
-        )
-        .await
-        .expect("udp open");
+        let (udp_sid, _udp_inner) =
+            handle_udp_open_phase1(&state, Some("127.0.0.1".into()), Some(udp_port), None)
+                .await
+                .expect("udp open");
 
         // Pure-poll batch (no `d` payload) → had_writes_or_connects =
         // false → deadline = LONGPOLL_DEADLINE (15 s). Under the

@@ -134,9 +134,7 @@ const YOUTUBE_RELAY_HOSTS: &[&str] = &[
 /// full `youtube_via_relay = true` knob (which routed every static
 /// asset through the relay too). Ported from upstream
 /// `RELAY_URL_PATTERNS` (commit b3b9220).
-const DEFAULT_RELAY_URL_PATTERNS: &[&str] = &[
-    "youtube.com/youtubei/",
-];
+const DEFAULT_RELAY_URL_PATTERNS: &[&str] = &["youtube.com/youtubei/"];
 
 /// Built-in list of DNS-over-HTTPS endpoints. CONNECTs to these (when
 /// `tunnel_doh` is left at the default of `false`, i.e. bypass enabled)
@@ -176,11 +174,7 @@ const DEFAULT_DOH_HOSTS: &[&str] = &[
     "dns.mullvad.net",
 ];
 
-fn matches_sni_rewrite(
-    host: &str,
-    youtube_via_relay: bool,
-    force_mitm_hosts: &[String],
-) -> bool {
+fn matches_sni_rewrite(host: &str, youtube_via_relay: bool, force_mitm_hosts: &[String]) -> bool {
     let h = host.to_ascii_lowercase();
     let h = h.trim_end_matches('.');
 
@@ -469,8 +463,7 @@ impl ResolvedRouting {
             && !config.exit_node.relay_url.is_empty()
             && !config.exit_node.psk.is_empty();
         let exit_node_full_mode_active = exit_node_full_mode && mode == Mode::AppsScript;
-        let youtube_via_relay_effective =
-            config.youtube_via_relay || exit_node_full_mode_active;
+        let youtube_via_relay_effective = config.youtube_via_relay || exit_node_full_mode_active;
 
         let mut relay_url_patterns: Vec<String> = Vec::new();
         let mut suppressed_yt_patterns: Vec<String> = Vec::new();
@@ -728,9 +721,7 @@ fn is_dot_anchored_match(host: &str, entry: &str) -> bool {
     }
     let hb = host.as_bytes();
     let eb = entry.as_bytes();
-    hb.len() > eb.len()
-        && hb.ends_with(eb)
-        && hb[hb.len() - eb.len() - 1] == b'.'
+    hb.len() > eb.len() && hb.ends_with(eb) && hb[hb.len() - eb.len() - 1] == b'.'
 }
 
 /// True if `host` matches any entry in the user's passthrough list.
@@ -953,8 +944,16 @@ impl ProxyServer {
             mitm,
             rewrite_ctx,
             tunnel_mux: None, // initialized in run() inside the tokio runtime
-            coalesce_step_ms: if config.coalesce_step_ms > 0 { config.coalesce_step_ms as u64 } else { 10 },
-            coalesce_max_ms: if config.coalesce_max_ms > 0 { config.coalesce_max_ms as u64 } else { 1000 },
+            coalesce_step_ms: if config.coalesce_step_ms > 0 {
+                config.coalesce_step_ms as u64
+            } else {
+                10
+            },
+            coalesce_max_ms: if config.coalesce_max_ms > 0 {
+                config.coalesce_max_ms as u64
+            } else {
+                1000
+            },
         })
     }
 
@@ -968,7 +967,11 @@ impl ProxyServer {
         // Initialize TunnelMux inside the runtime (tokio::spawn requires it).
         if self.rewrite_ctx.mode == Mode::Full {
             if let Some(f) = self.fronter.as_ref() {
-                self.tunnel_mux = Some(TunnelMux::start(f.clone(), self.coalesce_step_ms, self.coalesce_max_ms));
+                self.tunnel_mux = Some(TunnelMux::start(
+                    f.clone(),
+                    self.coalesce_step_ms,
+                    self.coalesce_max_ms,
+                ));
             }
         }
 
@@ -1362,7 +1365,11 @@ async fn handle_socks5_client(
     // is the main offender on devices without IPv6.
     if let Some(ref mux) = tunnel_mux {
         if mux.is_unreachable(&host, port) {
-            tracing::info!("SOCKS5 CONNECT -> {}:{} (negative-cached, refusing)", host, port);
+            tracing::info!(
+                "SOCKS5 CONNECT -> {}:{} (negative-cached, refusing)",
+                host,
+                port
+            );
             sock.write_all(&[0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
                 .await?;
             sock.flush().await?;
@@ -2137,8 +2144,7 @@ async fn dispatch_tunnel(
     if port == 443 {
         // `Arc::clone` here is refcount-only; we hold it across the
         // await below without keeping `rewrite_ctx` borrowed.
-        let group_match =
-            match_fronting_group(&host, &rewrite_ctx.fronting_groups).map(Arc::clone);
+        let group_match = match_fronting_group(&host, &rewrite_ctx.fronting_groups).map(Arc::clone);
         if let Some(group) = group_match {
             tracing::info!(
                 "dispatch {}:{} -> sni-rewrite tunnel (fronting group '{}', edge {} sni={})",
@@ -3076,7 +3082,10 @@ where
     // pourya-p's log in #64 showed the real Host header. Match every
     // subdomain of x.com here.
     let host_lower = host.to_ascii_lowercase();
-    let is_x_com = host_lower == "x.com" || host_lower.ends_with(".x.com") || host_lower == "twitter.com" || host_lower.ends_with(".twitter.com");
+    let is_x_com = host_lower == "x.com"
+        || host_lower.ends_with(".x.com")
+        || host_lower == "twitter.com"
+        || host_lower.ends_with(".twitter.com");
     let path = if is_x_com && path.starts_with("/i/api/graphql/") && path.contains("?variables=") {
         match path.split_once('&') {
             Some((short, _)) => {
@@ -3196,16 +3205,8 @@ where
         // general-relay info-spam.
         tracing::info!(target: "yt_forwarder", "dispatch {} {}", method, url);
         let t0 = std::time::Instant::now();
-        match forward_via_sni_rewrite_http(
-            &method,
-            host,
-            port,
-            &path,
-            &headers,
-            &body,
-            rewrite_ctx,
-        )
-        .await
+        match forward_via_sni_rewrite_http(&method, host, port, &path, &headers, &body, rewrite_ctx)
+            .await
         {
             Ok(response_bytes) => {
                 let response_len = response_bytes.len();
@@ -3376,10 +3377,7 @@ fn inject_cors_response_headers(response: &[u8], origin: &str) -> Vec<u8> {
     // Find the header / body separator. If we can't parse the
     // response as HTTP/1.x, hand it back unchanged.
     let sep = b"\r\n\r\n";
-    let Some(idx) = response
-        .windows(sep.len())
-        .position(|w| w == sep)
-    else {
+    let Some(idx) = response.windows(sep.len()).position(|w| w == sep) else {
         return response.to_vec();
     };
     let head_with_terminator = &response[..idx + sep.len()];
@@ -3733,11 +3731,8 @@ async fn do_plain_http_passthrough(
                     port,
                     e
                 );
-                match tokio::time::timeout(
-                    connect_timeout,
-                    TcpStream::connect((target_host, port)),
-                )
-                .await
+                match tokio::time::timeout(connect_timeout, TcpStream::connect((target_host, port)))
+                    .await
                 {
                     Ok(Ok(s)) => s,
                     _ => return Ok(()),
@@ -3843,8 +3838,7 @@ mod tests {
     #[test]
     fn resolve_plain_http_target_parses_absolute_form() {
         let h = headers(&[]);
-        let (host, port, path) =
-            resolve_plain_http_target("http://example.com/", &h).unwrap();
+        let (host, port, path) = resolve_plain_http_target("http://example.com/", &h).unwrap();
         assert_eq!(host, "example.com");
         assert_eq!(port, 80);
         assert_eq!(path, "/");
@@ -3855,8 +3849,7 @@ mod tests {
         assert_eq!(port, 8080);
         assert_eq!(path, "/foo?x=1");
 
-        let (host, port, path) =
-            resolve_plain_http_target("http://example.com", &h).unwrap();
+        let (host, port, path) = resolve_plain_http_target("http://example.com", &h).unwrap();
         assert_eq!(host, "example.com");
         assert_eq!(port, 80);
         assert_eq!(path, "/");
@@ -4031,8 +4024,20 @@ mod tests {
         hosts.insert("example.com".to_string(), "1.2.3.4".to_string());
         let no_force: Vec<String> = vec![];
 
-        assert!(should_use_sni_rewrite(&hosts, "google.com", 443, false, &no_force));
-        assert!(!should_use_sni_rewrite(&hosts, "google.com", 80, false, &no_force));
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "google.com",
+            443,
+            false,
+            &no_force
+        ));
+        assert!(!should_use_sni_rewrite(
+            &hosts,
+            "google.com",
+            80,
+            false,
+            &no_force
+        ));
         assert!(should_use_sni_rewrite(
             &hosts,
             "www.example.com",
@@ -4065,10 +4070,30 @@ mod tests {
 
         // Default behaviour (flag off): everything in the SNI pool
         // rewrites including all YouTube assets.
-        assert!(should_use_sni_rewrite(&hosts, "www.youtube.com", 443, false, &no_force));
-        assert!(should_use_sni_rewrite(&hosts, "i.ytimg.com", 443, false, &no_force));
-        assert!(should_use_sni_rewrite(&hosts, "youtu.be", 443, false, &no_force));
-        assert!(should_use_sni_rewrite(&hosts, "www.google.com", 443, false, &no_force));
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "www.youtube.com",
+            443,
+            false,
+            &no_force
+        ));
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "i.ytimg.com",
+            443,
+            false,
+            &no_force
+        ));
+        assert!(should_use_sni_rewrite(
+            &hosts, "youtu.be", 443, false, &no_force
+        ));
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "www.google.com",
+            443,
+            false,
+            &no_force
+        ));
         assert!(should_use_sni_rewrite(
             &hosts,
             "youtubei.googleapis.com",
@@ -4093,8 +4118,16 @@ mod tests {
         ));
 
         // Flag on: only the API + HTML hosts opt out.
-        assert!(!should_use_sni_rewrite(&hosts, "www.youtube.com", 443, true, &no_force));
-        assert!(!should_use_sni_rewrite(&hosts, "youtu.be", 443, true, &no_force));
+        assert!(!should_use_sni_rewrite(
+            &hosts,
+            "www.youtube.com",
+            443,
+            true,
+            &no_force
+        ));
+        assert!(!should_use_sni_rewrite(
+            &hosts, "youtu.be", 443, true, &no_force
+        ));
         assert!(!should_use_sni_rewrite(
             &hosts,
             "www.youtube-nocookie.com",
@@ -4115,15 +4148,39 @@ mod tests {
         // googlevideo.com still goes through the relay path (not in the
         // SNI list at all — see note above the SNI_REWRITE_SUFFIXES
         // entries) so the same flag-on assertion isn't applicable to it.
-        assert!(should_use_sni_rewrite(&hosts, "i.ytimg.com", 443, true, &no_force));
-        assert!(should_use_sni_rewrite(&hosts, "yt3.ggpht.com", 443, true, &no_force));
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "i.ytimg.com",
+            443,
+            true,
+            &no_force
+        ));
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "yt3.ggpht.com",
+            443,
+            true,
+            &no_force
+        ));
 
         // Flag on: non-YouTube Google suffixes are unaffected. Note
         // youtubei.googleapis.com (above) is the *carve-out* — the
         // broader googleapis.com suffix is NOT carved out, so e.g.
         // Drive / Calendar / etc. continue to SNI-rewrite.
-        assert!(should_use_sni_rewrite(&hosts, "www.google.com", 443, true, &no_force));
-        assert!(should_use_sni_rewrite(&hosts, "fonts.gstatic.com", 443, true, &no_force));
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "www.google.com",
+            443,
+            true,
+            &no_force
+        ));
+        assert!(should_use_sni_rewrite(
+            &hosts,
+            "fonts.gstatic.com",
+            443,
+            true,
+            &no_force
+        ));
         assert!(should_use_sni_rewrite(
             &hosts,
             "drive.googleapis.com",
@@ -4294,7 +4351,10 @@ mod tests {
 
     #[test]
     fn doh_extra_list_extends_default() {
-        let extra = vec![".internal-doh.example".to_string(), "doh.acme.test".to_string()];
+        let extra = vec![
+            ".internal-doh.example".to_string(),
+            "doh.acme.test".to_string(),
+        ];
         // Defaults still match.
         assert!(matches_doh_host("dns.google", &extra));
         // User additions match.
@@ -4537,14 +4597,7 @@ mod tests {
 
     #[test]
     fn forwarder_request_includes_port_in_host_for_nondefault_ports() {
-        let req = build_sni_forward_request_bytes(
-            "GET",
-            "youtube.com",
-            8443,
-            "/",
-            &[],
-            b"",
-        );
+        let req = build_sni_forward_request_bytes("GET", "youtube.com", 8443, "/", &[], b"");
         let (_line, headers, _body) = parse_request(&req);
         assert_eq!(header_get_raw(&headers, "Host"), Some("youtube.com:8443"));
     }
@@ -4608,14 +4661,8 @@ mod tests {
     fn normalize_pattern_preserves_path_dots() {
         // Only the host component gets its trailing dot stripped — path
         // components keep theirs (a path like `/v1.0/` is legitimate).
-        assert_eq!(
-            normalize_pattern("youtube.com/v1.0/"),
-            "youtube.com/v1.0/"
-        );
-        assert_eq!(
-            normalize_pattern("youtube.com./v1.0/"),
-            "youtube.com/v1.0/"
-        );
+        assert_eq!(normalize_pattern("youtube.com/v1.0/"), "youtube.com/v1.0/");
+        assert_eq!(normalize_pattern("youtube.com./v1.0/"), "youtube.com/v1.0/");
     }
 
     #[test]
@@ -4694,9 +4741,7 @@ mod tests {
             r.force_mitm_hosts,
         );
         // Google-edge host kept.
-        assert!(r
-            .force_mitm_hosts
-            .contains(&"googleapis.com".to_string()));
+        assert!(r.force_mitm_hosts.contains(&"googleapis.com".to_string()));
         // And the skip is surfaced for the startup warning.
         assert!(r
             .skipped_force_mitm_hosts
@@ -4750,9 +4795,7 @@ mod tests {
         // filter); googleapis.com IS.
         assert!(!r.force_mitm_hosts.contains(&"youtube.com".to_string()));
         assert!(!r.force_mitm_hosts.contains(&"www.youtube.com".to_string()));
-        assert!(r
-            .force_mitm_hosts
-            .contains(&"googleapis.com".to_string()));
+        assert!(r.force_mitm_hosts.contains(&"googleapis.com".to_string()));
         // Suppressed list surfaces both for the startup warning.
         assert!(r
             .suppressed_yt_patterns
@@ -5064,8 +5107,7 @@ mod tests {
         // `match_fronting_group` returns it for the YT host. This is
         // the call dispatch_tunnel uses at step 2a, BEFORE the force-MITM
         // check at step 2 — the YT request never reaches the path filter.
-        let group =
-            FrontingGroupResolved::from_config(&cfg.fronting_groups[0]).unwrap();
+        let group = FrontingGroupResolved::from_config(&cfg.fronting_groups[0]).unwrap();
         let groups = vec![Arc::new(group)];
         assert!(match_fronting_group("www.youtube.com", &groups).is_some());
         assert!(match_fronting_group("youtube.com", &groups).is_some());
@@ -5094,8 +5136,7 @@ mod tests {
             .relay_url_patterns
             .contains(&"youtube.com/youtubei/".to_string()));
 
-        let group =
-            FrontingGroupResolved::from_config(&cfg.fronting_groups[0]).unwrap();
+        let group = FrontingGroupResolved::from_config(&cfg.fronting_groups[0]).unwrap();
         let groups = vec![Arc::new(group)];
         // YT host doesn't match the unrelated group.
         assert!(match_fronting_group("www.youtube.com", &groups).is_none());
@@ -5152,7 +5193,10 @@ mod tests {
     #[test]
     fn url_matches_relay_pattern_empty_patterns_never_matches() {
         let empty: Vec<String> = vec![];
-        assert!(!url_matches_relay_pattern("https://www.youtube.com/", &empty));
+        assert!(!url_matches_relay_pattern(
+            "https://www.youtube.com/",
+            &empty
+        ));
     }
 
     #[test]
@@ -5252,7 +5296,10 @@ mod tests {
         // SNI-rewrite (so MITM can run for path inspection).
         let cfg = make_test_config("apps_script");
         let r = ResolvedRouting::from_config(&cfg, Mode::AppsScript);
-        assert_eq!(r.relay_url_patterns, vec!["youtube.com/youtubei/".to_string()]);
+        assert_eq!(
+            r.relay_url_patterns,
+            vec!["youtube.com/youtubei/".to_string()]
+        );
         assert_eq!(r.force_mitm_hosts, vec!["youtube.com".to_string()]);
         assert!(!r.youtube_via_relay_effective);
         assert!(!r.exit_node_full_mode_active);
@@ -5327,7 +5374,10 @@ mod tests {
         let cfg: crate::config::Config = serde_json::from_str(s).unwrap();
         let r = ResolvedRouting::from_config(&cfg, Mode::AppsScript);
         // Default `youtube.com/youtubei/` NOT prepended; user entry kept.
-        assert_eq!(r.relay_url_patterns, vec!["googleapis.com/api/".to_string()]);
+        assert_eq!(
+            r.relay_url_patterns,
+            vec!["googleapis.com/api/".to_string()]
+        );
         assert_eq!(r.force_mitm_hosts, vec!["googleapis.com".to_string()]);
         assert!(r.skipped_force_mitm_hosts.is_empty());
         assert!(r.youtube_via_relay_effective);
@@ -5418,7 +5468,10 @@ mod tests {
         assert!(!r.youtube_via_relay_effective);
         assert!(!r.exit_node_full_mode_active);
         // Default pattern still prepended.
-        assert_eq!(r.relay_url_patterns, vec!["youtube.com/youtubei/".to_string()]);
+        assert_eq!(
+            r.relay_url_patterns,
+            vec!["youtube.com/youtubei/".to_string()]
+        );
     }
 
     #[test]

@@ -65,7 +65,11 @@ fn slot_map() -> &'static Mutex<std::collections::HashMap<u64, Running>> {
 // ---------------------------------------------------------------------------
 
 extern "C" {
-    fn __android_log_write(prio: i32, tag: *const std::os::raw::c_char, text: *const std::os::raw::c_char) -> i32;
+    fn __android_log_write(
+        prio: i32,
+        tag: *const std::os::raw::c_char,
+        text: *const std::os::raw::c_char,
+    ) -> i32;
 }
 
 const ANDROID_LOG_INFO: i32 = 4;
@@ -85,8 +89,14 @@ struct LogcatWriter;
 impl std::io::Write for LogcatWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         // Skip empty writes — tracing occasionally flushes a bare "\n".
-        if buf.is_empty() { return Ok(0); }
-        let trimmed = if buf.ends_with(b"\n") { &buf[..buf.len() - 1] } else { buf };
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let trimmed = if buf.ends_with(b"\n") {
+            &buf[..buf.len() - 1]
+        } else {
+            buf
+        };
 
         // logcat side.
         let mut cstr = Vec::with_capacity(trimmed.len() + 1);
@@ -113,12 +123,16 @@ impl std::io::Write for LogcatWriter {
 
         Ok(buf.len())
     }
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogcatWriter {
     type Writer = LogcatWriter;
-    fn make_writer(&'a self) -> Self::Writer { LogcatWriter }
+    fn make_writer(&'a self) -> Self::Writer {
+        LogcatWriter
+    }
 }
 
 fn install_logging_once() {
@@ -166,13 +180,16 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_setDataDir(
     _class: JClass,
     path: JString,
 ) {
-    let _ = safe((), AssertUnwindSafe(|| {
-        install_logging_once();
-        let p = jstring_to_string(&mut env, &path);
-        if !p.is_empty() {
-            crate::data_dir::set_data_dir(PathBuf::from(p));
-        }
-    }));
+    let _ = safe(
+        (),
+        AssertUnwindSafe(|| {
+            install_logging_once();
+            let p = jstring_to_string(&mut env, &path);
+            if !p.is_empty() {
+                crate::data_dir::set_data_dir(PathBuf::from(p));
+            }
+        }),
+    );
 }
 
 /// `Native.startProxy(String configJson)` -> `long` handle (0 on failure).
@@ -184,74 +201,77 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_startProxy(
     _class: JClass,
     config_json: JString,
 ) -> jlong {
-    safe(0i64, AssertUnwindSafe(|| {
-        install_logging_once();
+    safe(
+        0i64,
+        AssertUnwindSafe(|| {
+            install_logging_once();
 
-        let json = jstring_to_string(&mut env, &config_json);
-        let config: Config = match serde_json::from_str(&json) {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::error!("android: invalid config json: {}", e);
-                return 0i64;
-            }
-        };
+            let json = jstring_to_string(&mut env, &config_json);
+            let config: Config = match serde_json::from_str(&json) {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!("android: invalid config json: {}", e);
+                    return 0i64;
+                }
+            };
 
-        // Try to build the runtime first — if allocation fails we want to
-        // know before spinning up anything stateful.
-        let rt = match tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .thread_name("mhrv-worker")
-            .build()
-        {
-            Ok(r) => r,
-            Err(e) => {
-                tracing::error!("android: tokio runtime build failed: {}", e);
-                return 0i64;
-            }
-        };
+            // Try to build the runtime first — if allocation fails we want to
+            // know before spinning up anything stateful.
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_all()
+                .thread_name("mhrv-worker")
+                .build()
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::error!("android: tokio runtime build failed: {}", e);
+                    return 0i64;
+                }
+            };
 
-        let base = crate::data_dir::data_dir();
-        let mitm = match MitmCertManager::new_in(&base) {
-            Ok(m) => m,
-            Err(e) => {
-                tracing::error!("android: MITM CA init failed: {}", e);
-                return 0i64;
-            }
-        };
-        let mitm = Arc::new(AsyncMutex::new(mitm));
+            let base = crate::data_dir::data_dir();
+            let mitm = match MitmCertManager::new_in(&base) {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!("android: MITM CA init failed: {}", e);
+                    return 0i64;
+                }
+            };
+            let mitm = Arc::new(AsyncMutex::new(mitm));
 
-        let server = match ProxyServer::new(&config, mitm) {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("android: ProxyServer::new failed: {}", e);
-                return 0i64;
-            }
-        };
+            let server = match ProxyServer::new(&config, mitm) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::error!("android: ProxyServer::new failed: {}", e);
+                    return 0i64;
+                }
+            };
 
-        // Grab the fronter Arc BEFORE we move `server` into the async task —
-        // so `statsJson(handle)` can read counters without cross-task plumbing.
-        let fronter = server.fronter();
+            // Grab the fronter Arc BEFORE we move `server` into the async task —
+            // so `statsJson(handle)` can read counters without cross-task plumbing.
+            let fronter = server.fronter();
 
-        let (tx, rx) = oneshot::channel::<()>();
+            let (tx, rx) = oneshot::channel::<()>();
 
-        rt.spawn(async move {
-            if let Err(e) = server.run(rx).await {
-                tracing::error!("android: proxy server exited: {}", e);
-            }
-        });
+            rt.spawn(async move {
+                if let Err(e) = server.run(rx).await {
+                    tracing::error!("android: proxy server exited: {}", e);
+                }
+            });
 
-        let handle = HANDLE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        slot_map().lock().unwrap().insert(
-            handle,
-            Running {
-                shutdown: Some(tx),
-                rt: Some(rt),
-                fronter,
-            },
-        );
-        handle as jlong
-    }))
+            let handle = HANDLE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            slot_map().lock().unwrap().insert(
+                handle,
+                Running {
+                    shutdown: Some(tx),
+                    rt: Some(rt),
+                    fronter,
+                },
+            );
+            handle as jlong
+        }),
+    )
 }
 
 /// `Native.stopProxy(long handle)` -> boolean. Idempotent: calling on an
@@ -271,24 +291,33 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_stopProxy(
     _class: JClass,
     handle: jlong,
 ) -> jboolean {
-    safe(JNI_FALSE, AssertUnwindSafe(|| {
-        let mut map = slot_map().lock().unwrap();
-        let Some(mut running) = map.remove(&(handle as u64)) else {
-            return JNI_FALSE;
-        };
-        if let Some(tx) = running.shutdown.take() {
-            let _ = tx.send(());
-        }
-        // Release the map lock BEFORE shutting the runtime down so concurrent
-        // JNI callers (stats queries, etc.) don't stall behind us.
-        drop(map);
-        if let Some(rt) = running.rt.take() {
-            tracing::info!("android: stopProxy handle={} — shutting runtime down", handle);
-            rt.shutdown_timeout(std::time::Duration::from_secs(5));
-            tracing::info!("android: stopProxy handle={} — runtime shutdown complete", handle);
-        }
-        JNI_TRUE
-    }))
+    safe(
+        JNI_FALSE,
+        AssertUnwindSafe(|| {
+            let mut map = slot_map().lock().unwrap();
+            let Some(mut running) = map.remove(&(handle as u64)) else {
+                return JNI_FALSE;
+            };
+            if let Some(tx) = running.shutdown.take() {
+                let _ = tx.send(());
+            }
+            // Release the map lock BEFORE shutting the runtime down so concurrent
+            // JNI callers (stats queries, etc.) don't stall behind us.
+            drop(map);
+            if let Some(rt) = running.rt.take() {
+                tracing::info!(
+                    "android: stopProxy handle={} — shutting runtime down",
+                    handle
+                );
+                rt.shutdown_timeout(std::time::Duration::from_secs(5));
+                tracing::info!(
+                    "android: stopProxy handle={} — runtime shutdown complete",
+                    handle
+                );
+            }
+            JNI_TRUE
+        }),
+    )
 }
 
 /// `Native.exportCa(String destPath)` -> boolean. Writes the MITM CA's
@@ -300,25 +329,28 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_exportCa(
     _class: JClass,
     dest: JString,
 ) -> jboolean {
-    safe(JNI_FALSE, AssertUnwindSafe(|| {
-        install_logging_once();
-        let dest_path = jstring_to_string(&mut env, &dest);
-        if dest_path.is_empty() {
-            return JNI_FALSE;
-        }
-        let base = crate::data_dir::data_dir();
-        if MitmCertManager::new_in(&base).is_err() {
-            return JNI_FALSE;
-        }
-        let src = base.join(CA_CERT_FILE);
-        match std::fs::copy(&src, &dest_path) {
-            Ok(_) => JNI_TRUE,
-            Err(e) => {
-                tracing::error!("android: CA export to {} failed: {}", dest_path, e);
-                JNI_FALSE
+    safe(
+        JNI_FALSE,
+        AssertUnwindSafe(|| {
+            install_logging_once();
+            let dest_path = jstring_to_string(&mut env, &dest);
+            if dest_path.is_empty() {
+                return JNI_FALSE;
             }
-        }
-    }))
+            let base = crate::data_dir::data_dir();
+            if MitmCertManager::new_in(&base).is_err() {
+                return JNI_FALSE;
+            }
+            let src = base.join(CA_CERT_FILE);
+            match std::fs::copy(&src, &dest_path) {
+                Ok(_) => JNI_TRUE,
+                Err(e) => {
+                    tracing::error!("android: CA export to {} failed: {}", dest_path, e);
+                    JNI_FALSE
+                }
+            }
+        }),
+    )
 }
 
 /// `Native.version()` -> String. Trivial smoke test for the JNI linkage.
@@ -328,7 +360,9 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_version<'a>(
     _class: JClass,
 ) -> jstring {
     let v = env!("CARGO_PKG_VERSION");
-    env.new_string(v).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    env.new_string(v)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// `Native.drainLogs()` -> String. Returns the full ring buffer as a single
@@ -340,15 +374,20 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_drainLogs<'a>(
     env: JNIEnv<'a>,
     _class: JClass,
 ) -> jstring {
-    let out = safe(String::new(), AssertUnwindSafe(|| {
-        let mut g = match log_ring().lock() {
-            Ok(g) => g,
-            Err(_) => return String::new(),
-        };
-        let lines: Vec<String> = g.drain(..).collect();
-        lines.join("\n")
-    }));
-    env.new_string(out).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    let out = safe(
+        String::new(),
+        AssertUnwindSafe(|| {
+            let mut g = match log_ring().lock() {
+                Ok(g) => g,
+                Err(_) => return String::new(),
+            };
+            let lines: Vec<String> = g.drain(..).collect();
+            lines.join("\n")
+        }),
+    );
+    env.new_string(out)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// `Native.checkUpdate()` -> String. Runs the same `update_check::check`
@@ -402,29 +441,38 @@ fn update_check_to_json(u: &crate::update_check::UpdateCheck) -> String {
     match u {
         crate::update_check::UpdateCheck::UpToDate { current, latest } => format!(
             r#"{{"kind":"upToDate","current":"{}","latest":"{}"}}"#,
-            esc(current), esc(latest),
+            esc(current),
+            esc(latest),
         ),
-        crate::update_check::UpdateCheck::UpdateAvailable { current, latest, release_url, asset } => {
+        crate::update_check::UpdateCheck::UpdateAvailable {
+            current,
+            latest,
+            release_url,
+            asset,
+        } => {
             let asset_fields = match asset {
                 Some(a) => format!(
                     r#","assetName":"{}","assetUrl":"{}","assetSize":{}"#,
-                    esc(&a.name), esc(&a.download_url), a.size_bytes,
+                    esc(&a.name),
+                    esc(&a.download_url),
+                    a.size_bytes,
                 ),
                 None => String::new(),
             };
             format!(
                 r#"{{"kind":"updateAvailable","current":"{}","latest":"{}","url":"{}"{}}}"#,
-                esc(current), esc(latest), esc(release_url), asset_fields,
+                esc(current),
+                esc(latest),
+                esc(release_url),
+                asset_fields,
             )
         }
-        crate::update_check::UpdateCheck::Offline(reason) => format!(
-            r#"{{"kind":"offline","reason":"{}"}}"#,
-            esc(reason),
-        ),
-        crate::update_check::UpdateCheck::Error(reason) => format!(
-            r#"{{"kind":"error","reason":"{}"}}"#,
-            esc(reason),
-        ),
+        crate::update_check::UpdateCheck::Offline(reason) => {
+            format!(r#"{{"kind":"offline","reason":"{}"}}"#, esc(reason),)
+        }
+        crate::update_check::UpdateCheck::Error(reason) => {
+            format!(r#"{{"kind":"error","reason":"{}"}}"#, esc(reason),)
+        }
     }
 }
 
@@ -492,12 +540,8 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_downloadAsset<'a>(
                     let sig_text = tokio::fs::read_to_string(&sig_path)
                         .await
                         .map_err(|e| format!("read signature: {}", e))?;
-                    crate::update_apply::verify_minisign_signature(
-                        pubkey,
-                        &dest_path,
-                        &sig_text,
-                    )
-                    .map_err(|e| format!("signature invalid: {}", e))?;
+                    crate::update_apply::verify_minisign_signature(pubkey, &dest_path, &sig_text)
+                        .map_err(|e| format!("signature invalid: {}", e))?;
                     let _ = tokio::fs::remove_file(&sig_path).await;
                     tracing::info!("android: minisign signature verified for {}", dest_s);
                 } else {
@@ -511,7 +555,12 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_downloadAsset<'a>(
             });
             match res {
                 Ok(bytes) => {
-                    tracing::info!("android: downloadAsset {} -> {} ({} bytes)", url_s, dest_s, bytes);
+                    tracing::info!(
+                        "android: downloadAsset {} -> {} ({} bytes)",
+                        url_s,
+                        dest_s,
+                        bytes
+                    );
                     format!(r#"{{"ok":true,"bytes":{}}}"#, bytes)
                 }
                 Err(e) => {
@@ -538,36 +587,41 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_testSni<'a>(
     google_ip: JString,
     sni: JString,
 ) -> jstring {
-    let result_json = safe(r#"{"ok":false,"error":"panic"}"#.to_string(), AssertUnwindSafe(|| {
-        install_logging_once();
-        let ip = jstring_to_string(&mut env, &google_ip);
-        let s = jstring_to_string(&mut env, &sni);
-        if ip.is_empty() || s.is_empty() {
-            return r#"{"ok":false,"error":"empty google_ip or sni"}"#.to_string();
-        }
-        let Some(rt) = one_shot_runtime() else {
-            return r#"{"ok":false,"error":"tokio init failed"}"#.to_string();
-        };
-        let probe = rt.block_on(crate::scan_sni::probe_one(&ip, &s));
-        match (probe.latency_ms, probe.error) {
-            (Some(ms), _) => {
-                tracing::info!("sni_probe: {} via {} ok in {}ms", s, ip, ms);
-                format!(r#"{{"ok":true,"latencyMs":{}}}"#, ms)
+    let result_json = safe(
+        r#"{"ok":false,"error":"panic"}"#.to_string(),
+        AssertUnwindSafe(|| {
+            install_logging_once();
+            let ip = jstring_to_string(&mut env, &google_ip);
+            let s = jstring_to_string(&mut env, &sni);
+            if ip.is_empty() || s.is_empty() {
+                return r#"{"ok":false,"error":"empty google_ip or sni"}"#.to_string();
             }
-            (None, Some(e)) => {
-                // Surface the reason in logcat too — otherwise users see a
-                // red dot in the UI with no path to diagnose. Common causes:
-                //   - "dns: ..."   -> system resolver can't reach DNS
-                //   - "connect: ..." -> TCP to google_ip:443 blocked
-                //   - "handshake: ..." -> TLS fail (cert, ALPN, etc.)
-                tracing::warn!("sni_probe: {} via {} FAIL: {}", s, ip, e);
-                let cleaned = e.replace('\\', "\\\\").replace('"', "\\\"");
-                format!(r#"{{"ok":false,"error":"{}"}}"#, cleaned)
+            let Some(rt) = one_shot_runtime() else {
+                return r#"{"ok":false,"error":"tokio init failed"}"#.to_string();
+            };
+            let probe = rt.block_on(crate::scan_sni::probe_one(&ip, &s));
+            match (probe.latency_ms, probe.error) {
+                (Some(ms), _) => {
+                    tracing::info!("sni_probe: {} via {} ok in {}ms", s, ip, ms);
+                    format!(r#"{{"ok":true,"latencyMs":{}}}"#, ms)
+                }
+                (None, Some(e)) => {
+                    // Surface the reason in logcat too — otherwise users see a
+                    // red dot in the UI with no path to diagnose. Common causes:
+                    //   - "dns: ..."   -> system resolver can't reach DNS
+                    //   - "connect: ..." -> TCP to google_ip:443 blocked
+                    //   - "handshake: ..." -> TLS fail (cert, ALPN, etc.)
+                    tracing::warn!("sni_probe: {} via {} FAIL: {}", s, ip, e);
+                    let cleaned = e.replace('\\', "\\\\").replace('"', "\\\"");
+                    format!(r#"{{"ok":false,"error":"{}"}}"#, cleaned)
+                }
+                _ => r#"{"ok":false,"error":"unknown"}"#.to_string(),
             }
-            _ => r#"{"ok":false,"error":"unknown"}"#.to_string(),
-        }
-    }));
-    env.new_string(result_json).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+        }),
+    );
+    env.new_string(result_json)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 /// `Native.statsJson(long handle)` -> String. Returns a JSON blob with the
@@ -582,20 +636,25 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_statsJson<'a>(
     _class: JClass,
     handle: jlong,
 ) -> jstring {
-    let out = safe(String::new(), AssertUnwindSafe(|| {
-        let map = match slot_map().lock() {
-            Ok(g) => g,
-            Err(_) => return String::new(),
-        };
-        let Some(running) = map.get(&(handle as u64)) else {
-            return String::new();
-        };
-        let Some(f) = running.fronter.as_ref() else {
-            return String::new();
-        };
-        f.snapshot_stats().to_json()
-    }));
-    env.new_string(out).map(|s| s.into_raw()).unwrap_or(std::ptr::null_mut())
+    let out = safe(
+        String::new(),
+        AssertUnwindSafe(|| {
+            let map = match slot_map().lock() {
+                Ok(g) => g,
+                Err(_) => return String::new(),
+            };
+            let Some(running) = map.get(&(handle as u64)) else {
+                return String::new();
+            };
+            let Some(f) = running.fronter.as_ref() else {
+                return String::new();
+            };
+            f.snapshot_stats().to_json()
+        }),
+    );
+    env.new_string(out)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
 }
 
 // ---------------------------------------------------------------------------
@@ -706,36 +765,39 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_runTun2proxy<'a>(
     cli_args: JString,
     tun_mtu: jni::sys::jint,
 ) -> jni::sys::jint {
-    safe(-1, AssertUnwindSafe(|| {
-        let args_str = jstring_to_string(&mut env, &cli_args);
-        tracing::info!("runTun2proxy: cli={}", args_str);
+    safe(
+        -1,
+        AssertUnwindSafe(|| {
+            let args_str = jstring_to_string(&mut env, &cli_args);
+            tracing::info!("runTun2proxy: cli={}", args_str);
 
-        unsafe {
-            use std::ffi::{CStr, CString};
+            unsafe {
+                use std::ffi::{CStr, CString};
 
-            let lib = CString::new("libtun2proxy.so").unwrap();
-            let handle = libc::dlopen(lib.as_ptr(), libc::RTLD_NOW);
-            if handle.is_null() {
-                let err = CStr::from_ptr(libc::dlerror());
-                tracing::error!("dlopen libtun2proxy.so failed: {:?}", err);
-                return -10;
-            }
+                let lib = CString::new("libtun2proxy.so").unwrap();
+                let handle = libc::dlopen(lib.as_ptr(), libc::RTLD_NOW);
+                if handle.is_null() {
+                    let err = CStr::from_ptr(libc::dlerror());
+                    tracing::error!("dlopen libtun2proxy.so failed: {:?}", err);
+                    return -10;
+                }
 
-            let sym = CString::new("tun2proxy_run_with_cli_args").unwrap();
-            let func = libc::dlsym(handle, sym.as_ptr());
-            if func.is_null() {
-                let err = CStr::from_ptr(libc::dlerror());
-                tracing::error!("dlsym tun2proxy_run_with_cli_args: {:?}", err);
+                let sym = CString::new("tun2proxy_run_with_cli_args").unwrap();
+                let func = libc::dlsym(handle, sym.as_ptr());
+                if func.is_null() {
+                    let err = CStr::from_ptr(libc::dlerror());
+                    tracing::error!("dlsym tun2proxy_run_with_cli_args: {:?}", err);
+                    libc::dlclose(handle);
+                    return -11;
+                }
+
+                type RunFn = unsafe extern "C" fn(*const std::ffi::c_char, u16, bool) -> i32;
+                let run: RunFn = std::mem::transmute(func);
+                let c_args = CString::new(args_str).unwrap();
+                let rc = run(c_args.as_ptr(), tun_mtu as u16, false);
                 libc::dlclose(handle);
-                return -11;
+                rc
             }
-
-            type RunFn = unsafe extern "C" fn(*const std::ffi::c_char, u16, bool) -> i32;
-            let run: RunFn = std::mem::transmute(func);
-            let c_args = CString::new(args_str).unwrap();
-            let rc = run(c_args.as_ptr(), tun_mtu as u16, false);
-            libc::dlclose(handle);
-            rc
-        }
-    }))
+        }),
+    )
 }

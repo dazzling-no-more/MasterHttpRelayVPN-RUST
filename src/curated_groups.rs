@@ -133,8 +133,7 @@ mod tests {
         let curated = curated_fronting_groups().expect("curated.json parses");
         let example_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("config.fronting-groups.example.json");
-        let example_cfg = Config::load(&example_path)
-            .expect("example file must load + validate");
+        let example_cfg = Config::load(&example_path).expect("example file must load + validate");
         assert_eq!(
             curated.len(),
             example_cfg.fronting_groups.len(),
