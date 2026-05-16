@@ -663,7 +663,23 @@ jobs:
           # `printf` rather than `echo`: preserves the secret body without
           # shell-specific escapes, while ensuring the file ends with a
           # newline for tools that expect line-oriented minisign keys.
-          printf '%s\n' "${MINISIGN_SECRET_KEY}" > "${KEY_FILE}"
+          #
+          # `tr -d '\r'` strips any CR characters carried over from the
+          # secret being uploaded from a Windows host (MINGW64's `<` redirect
+          # preserves CRLF bytes; `gh secret set` stores them verbatim). On a
+          # Linux CI runner those CRs end up inside the base64 payload of the
+          # secret-key file, garbling the ciphertext — rsign then fails
+          # decryption with the misleading "Wrong password for that key"
+          # because libsodium's crypto_secretbox_open can't tell ciphertext
+          # corruption from a key mismatch.
+          printf '%s\n' "${MINISIGN_SECRET_KEY}" | tr -d '\r' > "${KEY_FILE}"
+
+          # Diagnostic fingerprint — visible in the run log only as a sha256
+          # of the on-disk key file, so we can compare against `sha256sum
+          # rahgozar-update.key` (after `tr -d '\r'`) on the maintainer's
+          # box if signing fails. Reveals nothing about the key contents.
+          echo "key file fingerprint: $(sha256sum "${KEY_FILE}" | cut -d' ' -f1)"
+          echo "key file size: $(stat -c %s "${KEY_FILE}") bytes"
 
           # Trap to wipe the key on any exit (success, failure, signal).
           trap 'rm -f "${KEY_FILE}"' EXIT
