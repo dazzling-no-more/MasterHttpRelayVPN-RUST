@@ -817,33 +817,23 @@ jobs:
         with:
           fetch-depth: 0
 
-      # `actions/download-artifact@v4` has been intermittently flaking on
-      # this workflow with "5 retries exhausted" on a single artifact (~10
-      # of 13). Wrap it in a manual retry — usually the second attempt
-      # succeeds, the third nails any laggards. We use `gh run download`
-      # against the current run so we don't depend on the release page
-      # existing yet (it doesn't until the softprops step below runs).
-      - name: Download all build artifacts (with retries)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          mkdir -p dist
-          for attempt in 1 2 3; do
-            if gh run download "${GITHUB_RUN_ID}" --dir dist --repo "${GITHUB_REPOSITORY}"; then
-              echo "downloaded all artifacts on attempt $attempt"
-              # `gh run download` puts each artifact in its own subdir;
-              # flatten so downstream steps that expect dist/<file> work
-              # the same as `merge-multiple: true` did.
-              find dist -type f -mindepth 2 -exec mv -f {} dist/ \;
-              find dist -type d -empty -delete
-              ls -la dist/
-              exit 0
-            fi
-            echo "download attempt $attempt failed; retrying in 30s..."
-            sleep 30
-          done
-          echo "::error::failed to download artifacts after 3 attempts"
-          exit 1
+      # Pull every artifact that should land on the Release page. Filter
+      # to `rahgozar-*` and `minisign-*` so we skip the docker buildkit
+      # attestation artifact (`dazzling-no-more~rahgozar~XXX.dockerbuild`)
+      # — `gh run download` tried to extract it as zip and failed, then
+      # left half-extracted files around that blocked the retry with a
+      # "file exists" error. Identical fix to the sign job's earlier patch.
+      # `merge-multiple: true` flattens each artifact's subdir so the
+      # softprops uploader below sees files directly under `dist/`.
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: '{rahgozar-*,minisign-signatures}'
+          merge-multiple: true
+
+      - name: List downloaded artifacts
+        run: ls -la dist/
 
       # Compose the GitHub release body from `docs/changelog/v<ver>.md`
       # so the Releases page tells humans what actually changed —
