@@ -510,12 +510,12 @@ struct FormState {
     /// claude.ai / grok.com / x.com). Config-only — no UI editor yet.
     /// See `assets/exit_node/` for the generic exit-node handler.
     exit_node: rahgozar::config::ExitNodeConfig,
-    /// Verbatim passthrough buffer for any config.json key this build
-    /// doesn't model. Captured at load time from `Config::extras` and
-    /// re-emitted by [`to_config`] / `ConfigWire` so Save-config and
-    /// Save-as-profile preserve future / hand-edited fields — same
-    /// contract as Android's `MhrvConfig.extrasJson`.
-    extras: std::collections::BTreeMap<String, serde_json::Value>,
+    // (No raw `extras` field on FormState anymore — the
+    // `custom_params_buffer` below is the editor's source of truth,
+    // and [`to_config`] rebuilds `Config::extras` from it on save via
+    // [`build_extras_from_buffer`]. Load seeds the buffer via
+    // [`extras_to_buffer`], so round-trip semantics for unknown /
+    // future config.json keys are preserved.)
 
     // ── Carried-but-not-exposed modeled fields ──────────────────────
     // These are real fields in `Config` (so serde-deserialised at
@@ -536,6 +536,28 @@ struct FormState {
     /// keep them across UI saves.
     coalesce_step_ms: u16,
     coalesce_max_ms: u16,
+    /// Per-level colours for the Recent log panel. Stored as `#RRGGBB`
+    /// strings so they round-trip through the config file verbatim;
+    /// parsed to `egui::Color32` at render time via [`parse_hex_color`].
+    /// Empty string = compiled default (`DEFAULT_LOG_COLOR_*` in
+    /// `config.rs`). See feature #863.
+    log_color_info: String,
+    log_color_warn: String,
+    log_color_error: String,
+    /// Whether the colour-picker expander above the Recent log panel is
+    /// open. Pure UI state; never persisted.
+    log_color_editor_open: bool,
+
+    /// Live editor buffer for the "Custom parameters" key/value table.
+    /// Each entry is `(key, raw_json_text)`. Seeded from [`Config::extras`]
+    /// at load time and parsed back into `extras` on Save via
+    /// [`build_extras_from_buffer`]. Editor is the source of truth while
+    /// the form is open — `extras` on `FormState` is rebuilt from the
+    /// buffer in `to_config()`, so any user edits (incl. removed rows)
+    /// take effect on the next Save. Keys not present in the buffer
+    /// are dropped, matching the upstream feature request that the UI
+    /// be the authoritative editor for these fields.
+    custom_params_buffer: Vec<(String, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -652,13 +674,53 @@ fn load_form() -> (FormState, Option<String>) {
             auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
             request_timeout_secs: c.request_timeout_secs,
             exit_node: c.exit_node.clone(),
-            extras: c.extras.clone(),
+            // The editor buffer is the only persistent representation
+            // of `Config::extras` on the UI side — there's no longer
+            // a separate `FormState.extras` field. `to_config()` builds
+            // a fresh `extras` map from this buffer on each save via
+            // `build_extras_from_buffer`, so any UI edits (adds /
+            // removes / value changes) take effect on next save and
+            // hand-edited extras from config.json round-trip cleanly.
+            custom_params_buffer: extras_to_buffer(&c.extras),
             hosts_passthrough: c.hosts.clone(),
             enable_batching: c.enable_batching,
             coalesce_step_ms: c.coalesce_step_ms,
             coalesce_max_ms: c.coalesce_max_ms,
+            // Normalize on load — a malformed hex in config.json (typo,
+            // hand-edit, or an old build that wrote `red` instead of
+            // `#dc6e6e`) gets replaced with the compiled default so the
+            // form text field shows the same colour the renderer is
+            // actually using. Saving back then writes the normalized
+            // value, healing the file.
+            log_color_info: normalize_log_color(
+                &c.log_color_info,
+                rahgozar::config::DEFAULT_LOG_COLOR_INFO,
+            ),
+            log_color_warn: normalize_log_color(
+                &c.log_color_warn,
+                rahgozar::config::DEFAULT_LOG_COLOR_WARN,
+            ),
+            log_color_error: normalize_log_color(
+                &c.log_color_error,
+                rahgozar::config::DEFAULT_LOG_COLOR_ERROR,
+            ),
+            log_color_editor_open: false,
         }
     } else {
+        FormState::fresh_install_defaults()
+    };
+    (form, load_err)
+}
+
+impl FormState {
+    /// Build a FormState with the same hardcoded defaults shown to a
+    /// first-time user (no `config.json` on disk yet). Extracted from
+    /// the fresh-install branch of [`load_form`] so unit tests can
+    /// construct a deterministic FormState without touching the
+    /// user-data dir or CWD `config.json` — a test that calls
+    /// `load_form()` would otherwise pick up a developer's real
+    /// config and lose hermeticity.
+    fn fresh_install_defaults() -> Self {
         FormState {
             mode: "apps_script".into(),
             script_id: String::new(),
@@ -702,14 +764,17 @@ fn load_form() -> (FormState, Option<String>) {
             auto_blacklist_cooldown_secs: 120,
             request_timeout_secs: 30,
             exit_node: rahgozar::config::ExitNodeConfig::default(),
-            extras: std::collections::BTreeMap::new(),
+            custom_params_buffer: Vec::new(),
             hosts_passthrough: std::collections::HashMap::new(),
             enable_batching: false,
             coalesce_step_ms: 0,
             coalesce_max_ms: 0,
+            log_color_info: rahgozar::config::DEFAULT_LOG_COLOR_INFO.into(),
+            log_color_warn: rahgozar::config::DEFAULT_LOG_COLOR_WARN.into(),
+            log_color_error: rahgozar::config::DEFAULT_LOG_COLOR_ERROR.into(),
+            log_color_editor_open: false,
         }
-    };
-    (form, load_err)
+    }
 }
 
 /// Build the initial `sni_pool` list shown in the editor.
@@ -756,6 +821,71 @@ fn sni_pool_for_form(user: Option<&[String]>, front_domain: &str) -> Vec<SniRow>
     out
 }
 
+/// Wire-level keys that `Config` already models via named fields. The
+/// custom-parameters editor must refuse to add a row whose key appears
+/// here — `#[serde(flatten)]` would otherwise emit two top-level entries
+/// for the same name during save, and the loader's behaviour with
+/// duplicate keys is whatever `serde_json::Map` (last-write-wins) does,
+/// which lets a custom-parameter row silently override the form's value
+/// for the matching modeled field. Worse: a user who types `mode` as a
+/// custom key and a non-matching string as the value can produce a
+/// config file that `Config::validate()` then rejects, leaving the
+/// proxy unable to start. Pinned by [`modeled_keys_list_matches_wire`]
+/// against the live `ConfigWire` keyset so future Config additions
+/// must be added here too.
+const MODELED_CONFIG_KEYS: &[&str] = &[
+    "mode",
+    "google_ip",
+    "front_domain",
+    "script_id",
+    "script_ids",
+    "auth_key",
+    "listen_host",
+    "listen_port",
+    "socks5_port",
+    "log_level",
+    "log_color_info",
+    "log_color_warn",
+    "log_color_error",
+    "verify_ssl",
+    "hosts",
+    "enable_batching",
+    "upstream_socks5",
+    "parallel_relay",
+    "coalesce_step_ms",
+    "coalesce_max_ms",
+    "sni_hosts",
+    "fetch_ips_from_api",
+    "max_ips_to_scan",
+    "scan_batch_size",
+    "google_ip_validation",
+    "normalize_x_graphql",
+    "youtube_via_relay",
+    "relay_url_patterns",
+    "sabr_strip",
+    "passthrough_hosts",
+    "block_quic",
+    "disable_padding",
+    "force_http1",
+    "tunnel_doh",
+    "bypass_doh_hosts",
+    "block_doh",
+    "fronting_groups",
+    "auto_blacklist_strikes",
+    "auto_blacklist_window_secs",
+    "auto_blacklist_cooldown_secs",
+    "request_timeout_secs",
+    "exit_node",
+];
+
+/// True when `key` collides with a modeled Config field. Trimmed,
+/// case-sensitive — JSON object keys are case-sensitive and so is
+/// serde's flatten matcher, so we match the same.
+fn is_modeled_config_key(key: &str) -> bool {
+    let trimmed = key.trim();
+    MODELED_CONFIG_KEYS.iter().any(|k| *k == trimmed)
+}
+
 impl FormState {
     fn to_config(&self) -> Result<Config, String> {
         // `direct` and the legacy `google_only` alias both run without
@@ -785,6 +915,22 @@ impl FormState {
         if socks5_port == Some(listen_port) {
             return Err("HTTP and SOCKS5 ports must be different".into());
         }
+        // Refuse to save when a Custom-parameters row would shadow a
+        // built-in form field. Caught BEFORE we build the `Config` so
+        // the error message can point at the offending key by name;
+        // catching it later would lose the row context.
+        if let Some((k, _)) = self
+            .custom_params_buffer
+            .iter()
+            .find(|(k, _)| is_modeled_config_key(k))
+        {
+            return Err(format!(
+                "Custom parameter '{}' collides with a built-in field. \
+                 Remove the custom row or rename it — the form above already \
+                 controls this value.",
+                k.trim()
+            ));
+        }
         let ids: Vec<String> = self
             .script_id
             .split(|c: char| c == '\n' || c == ',')
@@ -809,6 +955,24 @@ impl FormState {
             listen_port,
             socks5_port,
             log_level: self.log_level.trim().to_string(),
+            // Normalize on save too: if the user typed an invalid hex
+            // in the editor (or never opened the editor and the loaded
+            // value was already bad), write the compiled default
+            // instead of a string the renderer will silently reject.
+            // This keeps the on-disk config consistent with what the
+            // log panel actually shows.
+            log_color_info: normalize_log_color(
+                &self.log_color_info,
+                rahgozar::config::DEFAULT_LOG_COLOR_INFO,
+            ),
+            log_color_warn: normalize_log_color(
+                &self.log_color_warn,
+                rahgozar::config::DEFAULT_LOG_COLOR_WARN,
+            ),
+            log_color_error: normalize_log_color(
+                &self.log_color_error,
+                rahgozar::config::DEFAULT_LOG_COLOR_ERROR,
+            ),
             verify_ssl: self.verify_ssl,
             // Round-tripped fields — preserve whatever was on disk
             // (or the user's hand-edits) instead of wiping to defaults.
@@ -913,12 +1077,95 @@ impl FormState {
             // / grok.com / x.com). Round-trip through FormState — config-only
             // editing for now, UI editor planned for v1.9.x desktop UI batch.
             exit_node: self.exit_node.clone(),
-            // Unknown / future config.json keys captured at load time.
-            // Cloned through so Save-config and Save-as-profile preserve
-            // every field, even those not modelled by this build.
-            extras: self.extras.clone(),
+            // Custom-parameters editor: the buffer is the authoritative
+            // source for `extras` on save. Rows with a blank key are
+            // dropped; values that don't parse as JSON are stored as
+            // plain strings so the user can type `false` and get a
+            // bool, or `cool string` and get a string without learning
+            // JSON quoting. See [`build_extras_from_buffer`] for the
+            // precise rules.
+            extras: build_extras_from_buffer(&self.custom_params_buffer),
         })
     }
+}
+
+/// Snapshot the loaded `extras` map into the editor buffer used by the
+/// "Custom parameters" section. Values are JSON-stringified so they
+/// round-trip cleanly through [`build_extras_from_buffer`]:
+///
+///   - bool / number / null / array / object → JSON form (`true`, `42`,
+///     `[1,2]`) so the parser on save infers the same type.
+///   - string whose inner text would NOT itself JSON-parse → bare text
+///     (`foo bar`), the friendly common case (no quote-typing required).
+///   - string whose inner text WOULD JSON-parse to a non-string (`"true"`,
+///     `"42"`, `"[1]"`) → emitted as a JSON string literal (`"true"`)
+///     so re-parsing yields a `Value::String` again instead of a
+///     bool/number/array. Without this, a user who stored the literal
+///     three-character string `"42"` would silently see it flip to a
+///     number on the next Save.
+fn extras_to_buffer(
+    extras: &std::collections::BTreeMap<String, serde_json::Value>,
+) -> Vec<(String, String)> {
+    extras
+        .iter()
+        .map(|(k, v)| {
+            let text = match v {
+                serde_json::Value::String(s) => {
+                    // Ambiguity check: if the bare inner text would be
+                    // valid JSON of any kind, parsing it back from the
+                    // editor would change its type. Escape via
+                    // `to_string` to force a JSON string literal.
+                    if serde_json::from_str::<serde_json::Value>(s).is_ok() {
+                        serde_json::to_string(s).unwrap_or_else(|_| s.clone())
+                    } else {
+                        s.clone()
+                    }
+                }
+                other => other.to_string(),
+            };
+            (k.clone(), text)
+        })
+        .collect()
+}
+
+/// Parse the "Custom parameters" editor buffer back into an extras map.
+///
+/// Rules per row:
+///   - Drop rows whose key is empty / whitespace-only.
+///   - Trim leading/trailing whitespace from the key before storing.
+///   - For the value, first try `serde_json::from_str` so `true`, `42`,
+///     `null`, `[1,2,3]`, `{"x":1}` all become typed JSON values. If
+///     that fails, store the raw text as a JSON string — this lets users
+///     type plain strings (`my host`) without learning to wrap them in
+///     `"..."`.
+///   - Later rows with the same key win, matching insertion-order
+///     intuition.
+///
+/// **Intentional non-fidelity vs `Config::extras`**: a JSON object key
+/// like `" key "` (with leading/trailing whitespace) or `""` (empty
+/// string) round-trips through `Config::extras` via serde with the
+/// whitespace preserved, but this editor will trim the surrounding
+/// space to `"key"` (or drop the row, for `""`). The trade-off is
+/// deliberate: a hand-typed editor row almost always has stray
+/// whitespace the user didn't mean to commit, and an empty-key row is
+/// a draft, not a configuration directive. Users who genuinely need a
+/// whitespace-padded JSON key should hand-edit `config.json` outside
+/// the UI; the load path's serde flatten preserves them on disk, and
+/// the next UI Save would normalise away the padding on round-trip.
+fn build_extras_from_buffer(
+    buffer: &[(String, String)],
+) -> std::collections::BTreeMap<String, serde_json::Value> {
+    let mut out = std::collections::BTreeMap::new();
+    for (k, v) in buffer {
+        let key = k.trim().to_string();
+        if key.is_empty() {
+            continue;
+        }
+        let value = serde_json::from_str::<serde_json::Value>(v.trim())
+            .unwrap_or_else(|_| serde_json::Value::String(v.clone()));
+        out.insert(key, value);
+    }
+    out
 }
 
 fn save_config(cfg: &Config) -> Result<PathBuf, String> {
@@ -946,6 +1193,15 @@ struct ConfigWire<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     socks5_port: Option<u16>,
     log_level: &'a str,
+    /// Log colours. Skipped when matching the compiled defaults so a
+    /// fresh config.json doesn't grow three extra keys most users will
+    /// never touch.
+    #[serde(skip_serializing_if = "is_default_log_color_info")]
+    log_color_info: &'a str,
+    #[serde(skip_serializing_if = "is_default_log_color_warn")]
+    log_color_warn: &'a str,
+    #[serde(skip_serializing_if = "is_default_log_color_error")]
+    log_color_error: &'a str,
     verify_ssl: bool,
     #[serde(skip_serializing_if = "std::collections::HashMap::is_empty")]
     hosts: &'a std::collections::HashMap<String, String>,
@@ -1067,6 +1323,19 @@ fn is_default_exit_node(en: &&rahgozar::config::ExitNodeConfig) -> bool {
         && (en.mode.is_empty() || en.mode == "selective")
 }
 
+/// Match the log-colour defaults case-insensitively so `#5AB464` and
+/// `#5ab464` both skip serialization. Empty strings are also treated as
+/// default since the load path normalizes empty → compiled default.
+fn is_default_log_color_info(s: &&str) -> bool {
+    s.is_empty() || s.eq_ignore_ascii_case(rahgozar::config::DEFAULT_LOG_COLOR_INFO)
+}
+fn is_default_log_color_warn(s: &&str) -> bool {
+    s.is_empty() || s.eq_ignore_ascii_case(rahgozar::config::DEFAULT_LOG_COLOR_WARN)
+}
+fn is_default_log_color_error(s: &&str) -> bool {
+    s.is_empty() || s.eq_ignore_ascii_case(rahgozar::config::DEFAULT_LOG_COLOR_ERROR)
+}
+
 fn is_false(b: &bool) -> bool {
     !*b
 }
@@ -1106,6 +1375,9 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             listen_port: c.listen_port,
             socks5_port: c.socks5_port,
             log_level: c.log_level.as_str(),
+            log_color_info: c.log_color_info.as_str(),
+            log_color_warn: c.log_color_warn.as_str(),
+            log_color_error: c.log_color_error.as_str(),
             verify_ssl: c.verify_ssl,
             hosts: &c.hosts,
             upstream_socks5: c.upstream_socks5.as_deref(),
@@ -1148,6 +1420,163 @@ const ACCENT: egui::Color32 = egui::Color32::from_rgb(70, 120, 180);
 const ACCENT_HOVER: egui::Color32 = egui::Color32::from_rgb(90, 145, 205);
 const OK_GREEN: egui::Color32 = egui::Color32::from_rgb(80, 180, 100);
 const ERR_RED: egui::Color32 = egui::Color32::from_rgb(220, 110, 110);
+
+/// Default text colour for log lines whose level we couldn't classify
+/// (DEBUG / TRACE / lines without a level token). Matches the panel's
+/// previous monospace text colour so the default visual is unchanged.
+const LOG_DEFAULT_TEXT: egui::Color32 = egui::Color32::from_gray(210);
+
+/// Tracing levels we colour. Per-level so users can pair any subset.
+#[derive(Copy, Clone, Eq, PartialEq, Debug)]
+enum LogLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+/// Classify a log line by the level token `tracing_subscriber::fmt`
+/// emits — it places the level immediately after the timestamp and
+/// before the message body, e.g.:
+///
+/// ```text
+/// 2025-05-16T10:00:00.123456Z  INFO starting up
+/// ```
+///
+/// We pick the **leftmost** level-shaped token in the line. The
+/// previous `contains(" LEVEL ")` chain checked each level in
+/// priority order, which meant an INFO line whose message mentions
+/// ` ERROR ` (e.g. `INFO  got ERROR response from upstream`) would be
+/// misclassified as ERROR — wrong colour, wrong urgency signal. The
+/// leftmost-token rule is correct because the formatter's level
+/// always precedes any in-message level mention.
+///
+/// Returns `None` for DEBUG / TRACE / unclassified lines so they
+/// render in the default colour.
+fn classify_log_line(line: &str) -> Option<LogLevel> {
+    let candidates: [(&str, LogLevel); 3] = [
+        (" ERROR ", LogLevel::Error),
+        (" WARN ", LogLevel::Warn),
+        (" INFO ", LogLevel::Info),
+    ];
+    let mut best: Option<(usize, LogLevel)> = None;
+    for (token, level) in candidates {
+        if let Some(pos) = line.find(token) {
+            best = match best {
+                Some((bp, _)) if pos >= bp => best,
+                _ => Some((pos, level)),
+            };
+        }
+    }
+    best.map(|(_, l)| l)
+}
+
+/// Parse a `#RRGGBB` / `RRGGBB` hex colour to `egui::Color32`. Returns
+/// `None` on any malformed input so the caller can fall back to a
+/// compiled default rather than panic on bad config.
+///
+/// Accepts exactly one optional leading `#` (the previous
+/// `trim_start_matches('#')` would silently swallow `##abcdef`, which
+/// then survives `normalize_log_color`'s round-trip with the leading
+/// `#` re-attached — confusing if the user expected strict validation).
+fn parse_hex_color(s: &str) -> Option<egui::Color32> {
+    let trimmed = s.trim();
+    let hex = match trimmed.strip_prefix('#') {
+        Some(rest) => rest,
+        None => trimmed,
+    };
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(egui::Color32::from_rgb(r, g, b))
+}
+
+/// Format an `egui::Color32` back to lowercase `#RRGGBB`. Used to write
+/// a colour picker's selection back into the `String` config field.
+fn color_to_hex(c: egui::Color32) -> String {
+    format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b())
+}
+
+/// Canonicalise a log-colour string to lowercase `#RRGGBB`, falling back
+/// to `default` for malformed input.
+///
+/// Used on both sides of the form lifecycle so the on-disk config and
+/// the rendered UI never disagree:
+///   - At load time, malformed `config.json` values get replaced with
+///     the compiled default so the form text field matches what the
+///     renderer is actually using.
+///   - At save time, the same normalisation runs again so a fresh Save
+///     can't write a stale bad hex back to disk just because the user
+///     never opened the colour editor.
+///   - Valid-but-non-canonical inputs (uppercase `#ABCDEF`, no-`#`
+///     `abcdef`, with-whitespace `  #abcdef  `) round-trip through
+///     `parse_hex_color` → `color_to_hex`, which always emits lowercase
+///     `#rrggbb`. That keeps the on-disk file stable across saves even
+///     when the user types in mixed case.
+fn normalize_log_color(value: &str, default: &str) -> String {
+    match parse_hex_color(value) {
+        Some(c) => color_to_hex(c),
+        None => default.into(),
+    }
+}
+
+/// One row in the per-level colour editor: a label, a swatch picker, an
+/// editable hex text input, and a Reset button. The swatch and the
+/// text are kept in sync — picking a colour writes the new hex back
+/// into `value`, and a hex edit updates the swatch on the next frame.
+fn log_color_row(ui: &mut egui::Ui, label: &str, value: &mut String, default_hex: &str) {
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [54.0, 18.0],
+            egui::Label::new(egui::RichText::new(label).monospace().size(11.0)),
+        );
+        // Swatch picker. Seed from the current text, write back on
+        // change. egui's color_edit_button_srgb edits an [r,g,b] in
+        // place; we mirror it from / to the hex string.
+        let mut rgb: [u8; 3] = match parse_hex_color(value) {
+            Some(c) => [c.r(), c.g(), c.b()],
+            // Bad text → seed picker from the default so the user can
+            // see a sensible starting point. The text field still
+            // shows the bad value until they edit it.
+            None => {
+                let d = parse_hex_color(default_hex).unwrap();
+                [d.r(), d.g(), d.b()]
+            }
+        };
+        if ui.color_edit_button_srgb(&mut rgb).changed() {
+            *value = color_to_hex(egui::Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+        }
+        ui.add_sized(
+            [110.0, 20.0],
+            egui::TextEdit::singleline(value).hint_text("#rrggbb"),
+        );
+        if ui
+            .small_button("reset")
+            .on_hover_text("Restore the compiled default for this level.")
+            .clicked()
+        {
+            *value = default_hex.into();
+        }
+        // Live preview of how a log line of this level would render.
+        if let Some(c) = parse_hex_color(value) {
+            ui.label(
+                egui::RichText::new("sample log line")
+                    .monospace()
+                    .size(11.0)
+                    .color(c),
+            );
+        } else {
+            ui.label(
+                egui::RichText::new("bad hex — reverts to default")
+                    .small()
+                    .italics()
+                    .color(egui::Color32::from_gray(150)),
+            );
+        }
+    });
+}
 
 /// Build the on-disk `fronting_groups` Vec from the live editor state.
 ///
@@ -2026,6 +2455,99 @@ impl eframe::App for App {
                 });
             });
 
+            // ── Custom parameters (advanced) ─────────────────────────────
+            // Editable key-value table backed by `Config::extras`. Lets
+            // power users add config.json fields the UI form doesn't
+            // model (e.g. flags shipped by a newer build, hand-edited
+            // tuning) and have them survive Save instead of being
+            // silently dropped. Collapsed by default so the form stays
+            // simple for the majority who don't need it. Feature #876.
+            ui.add_space(6.0);
+            egui::CollapsingHeader::new(format!(
+                "Custom parameters ({})",
+                self.form.custom_params_buffer.len(),
+            ))
+            .default_open(false)
+            .show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Extra config.json keys not covered by the form above. Values are \
+                         parsed as JSON when possible (`true`, `42`, `[1,2]`, `{\"a\":1}`) \
+                         and treated as plain strings otherwise. Save config persists them.",
+                    )
+                    .small()
+                    .color(egui::Color32::from_gray(150)),
+                );
+                ui.add_space(4.0);
+                let mut remove_idx: Option<usize> = None;
+                egui::Grid::new("custom_params_grid")
+                    .num_columns(3)
+                    .spacing([6.0, 4.0])
+                    .min_col_width(120.0)
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new("key").strong().small());
+                        ui.label(egui::RichText::new("value (JSON or text)").strong().small());
+                        ui.label("");
+                        ui.end_row();
+                        for (idx, (k, v)) in
+                            self.form.custom_params_buffer.iter_mut().enumerate()
+                        {
+                            // Highlight rows whose key collides with a
+                            // modeled field — `to_config()` will refuse
+                            // to save them, so surface the conflict in
+                            // the editor before the user hits Save.
+                            let collides = !k.trim().is_empty()
+                                && is_modeled_config_key(k);
+                            let mut key_edit = egui::TextEdit::singleline(k)
+                                // Hint must NOT name a modeled field
+                                // (the collision check below would
+                                // then reject the suggested example
+                                // on save). Use a generic future-key
+                                // shape instead.
+                                .hint_text("my_future_field")
+                                .desired_width(160.0);
+                            if collides {
+                                key_edit = key_edit.text_color(ERR_RED);
+                            }
+                            let key_resp = ui.add(key_edit);
+                            if collides {
+                                key_resp.on_hover_text(
+                                    "This name is already controlled by the form above. \
+                                     Save will fail until you rename or remove the row.",
+                                );
+                            }
+                            ui.add(
+                                egui::TextEdit::singleline(v)
+                                    .hint_text("true / 42 / hello / [1,2]")
+                                    .desired_width(f32::INFINITY),
+                            );
+                            if ui
+                                .small_button("✕")
+                                .on_hover_text("Remove this row.")
+                                .clicked()
+                            {
+                                remove_idx = Some(idx);
+                            }
+                            ui.end_row();
+                        }
+                    });
+                if let Some(i) = remove_idx {
+                    self.form.custom_params_buffer.remove(i);
+                }
+                ui.add_space(2.0);
+                if ui
+                    .small_button("+ add parameter")
+                    .on_hover_text(
+                        "Add a new key/value row. Empty rows are dropped on save.",
+                    )
+                    .clicked()
+                {
+                    self.form
+                        .custom_params_buffer
+                        .push((String::new(), String::new()));
+                }
+            });
+
             // ── Bottom of form: Save + config-path hint ───────────────────
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -2035,6 +2557,26 @@ impl eframe::App for App {
                             // Apply the new log level live so users don't have to
                             // restart for the combobox to take effect (#401).
                             apply_log_level(&self.form.log_level);
+                            // Pull the just-normalized log colours back
+                            // into the form so the colour-picker text
+                            // fields show exactly what we wrote to disk.
+                            // Without this, a bad hex entered by the
+                            // user persists in the editor (and reverts
+                            // to default at the renderer) — the file
+                            // is healed but the UI still claims it
+                            // isn't, which is confusing.
+                            self.form.log_color_info = normalize_log_color(
+                                &self.form.log_color_info,
+                                rahgozar::config::DEFAULT_LOG_COLOR_INFO,
+                            );
+                            self.form.log_color_warn = normalize_log_color(
+                                &self.form.log_color_warn,
+                                rahgozar::config::DEFAULT_LOG_COLOR_WARN,
+                            );
+                            self.form.log_color_error = normalize_log_color(
+                                &self.form.log_color_error,
+                                rahgozar::config::DEFAULT_LOG_COLOR_ERROR,
+                            );
                             // Invariant 2: `active = "name"` means the
                             // named profile's snapshot equals
                             // config.json. A regular Save config writes
@@ -2713,6 +3255,18 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 ui.label(egui::RichText::new("Recent log").strong());
                 ui.checkbox(&mut self.form.show_log, "show");
+                let colors_label = if self.form.log_color_editor_open {
+                    "colors ▾"
+                } else {
+                    "colors ▸"
+                };
+                if ui
+                    .small_button(colors_label)
+                    .on_hover_text("Customise the per-level log colours.")
+                    .clicked()
+                {
+                    self.form.log_color_editor_open = !self.form.log_color_editor_open;
+                }
                 if ui.small_button("save…")
                     .on_hover_text(
                         "Write every line in the log panel to a timestamped file in the \
@@ -2746,6 +3300,43 @@ impl eframe::App for App {
                     self.shared.state.lock().unwrap().log.clear();
                 }
             });
+            if self.form.log_color_editor_open {
+                egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(28, 30, 34))
+                    .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(50, 54, 60)))
+                    .rounding(4.0)
+                    .inner_margin(egui::Margin::same(6.0))
+                    .show(ui, |ui| {
+                        ui.label(
+                            egui::RichText::new(
+                                "Per-level colours. Pick a swatch or type a hex code \
+                                 (#RRGGBB). Save config to persist.",
+                            )
+                            .small()
+                            .color(egui::Color32::from_gray(150)),
+                        );
+                        ui.add_space(2.0);
+                        log_color_row(
+                            ui,
+                            "INFO",
+                            &mut self.form.log_color_info,
+                            rahgozar::config::DEFAULT_LOG_COLOR_INFO,
+                        );
+                        log_color_row(
+                            ui,
+                            "WARN",
+                            &mut self.form.log_color_warn,
+                            rahgozar::config::DEFAULT_LOG_COLOR_WARN,
+                        );
+                        log_color_row(
+                            ui,
+                            "ERROR",
+                            &mut self.form.log_color_error,
+                            rahgozar::config::DEFAULT_LOG_COLOR_ERROR,
+                        );
+                    });
+                ui.add_space(2.0);
+            }
             if self.form.show_log {
                 egui::Frame::none()
                     .fill(egui::Color32::from_rgb(22, 23, 26))
@@ -2769,10 +3360,45 @@ impl eframe::App for App {
                                             .italics(),
                                     );
                                 }
+                                // Resolve the user's colour preferences once
+                                // outside the line loop. `parse_hex_color`
+                                // falls back to the compiled default on bad
+                                // input so a typo in config.json doesn't
+                                // crash the UI — colours just revert.
+                                let c_info = parse_hex_color(&self.form.log_color_info)
+                                    .unwrap_or_else(|| {
+                                        parse_hex_color(
+                                            rahgozar::config::DEFAULT_LOG_COLOR_INFO,
+                                        )
+                                        .unwrap()
+                                    });
+                                let c_warn = parse_hex_color(&self.form.log_color_warn)
+                                    .unwrap_or_else(|| {
+                                        parse_hex_color(
+                                            rahgozar::config::DEFAULT_LOG_COLOR_WARN,
+                                        )
+                                        .unwrap()
+                                    });
+                                let c_err = parse_hex_color(&self.form.log_color_error)
+                                    .unwrap_or_else(|| {
+                                        parse_hex_color(
+                                            rahgozar::config::DEFAULT_LOG_COLOR_ERROR,
+                                        )
+                                        .unwrap()
+                                    });
                                 for line in log.iter() {
+                                    let color = match classify_log_line(line) {
+                                        Some(LogLevel::Info) => c_info,
+                                        Some(LogLevel::Warn) => c_warn,
+                                        Some(LogLevel::Error) => c_err,
+                                        None => LOG_DEFAULT_TEXT,
+                                    };
                                     ui.add(
                                         egui::Label::new(
-                                            egui::RichText::new(line).monospace().size(11.0),
+                                            egui::RichText::new(line)
+                                                .monospace()
+                                                .size(11.0)
+                                                .color(color),
                                         )
                                         .wrap(),
                                     );
@@ -4487,5 +5113,334 @@ mod tests {
         assert!(out.get("enable_batching").is_none());
         assert!(out.get("coalesce_step_ms").is_none());
         assert!(out.get("coalesce_max_ms").is_none());
+        // Log colours default — not emitted into the file unless changed.
+        assert!(out.get("log_color_info").is_none());
+        assert!(out.get("log_color_warn").is_none());
+        assert!(out.get("log_color_error").is_none());
+    }
+
+    /// Custom-parameters editor must round-trip every extras value type
+    /// across load → buffer → save without changing the JSON type. This
+    /// is the contract the feature request asks for: parameters added
+    /// to the UI table survive Save without flipping types.
+    #[test]
+    fn custom_params_buffer_round_trips_all_value_kinds() {
+        let mut extras = std::collections::BTreeMap::new();
+        extras.insert("force_http1".into(), serde_json::Value::Bool(true));
+        extras.insert(
+            "max_retries".into(),
+            serde_json::Value::Number(serde_json::Number::from(7)),
+        );
+        extras.insert(
+            "label".into(),
+            serde_json::Value::String("home network".into()),
+        );
+        // Ambiguous string: `"42"` looks like a number when bare. The
+        // buffer must escape it so re-parsing keeps it a string.
+        extras.insert(
+            "ambig_number".into(),
+            serde_json::Value::String("42".into()),
+        );
+        extras.insert(
+            "ambig_bool".into(),
+            serde_json::Value::String("true".into()),
+        );
+        extras.insert("list".into(), serde_json::json!([1, 2, 3]));
+        extras.insert("obj".into(), serde_json::json!({"a": 1, "b": "x"}));
+
+        let buf = extras_to_buffer(&extras);
+        let round = build_extras_from_buffer(&buf);
+        assert_eq!(
+            round, extras,
+            "round-trip must preserve every value verbatim"
+        );
+    }
+
+    /// Blank-key rows are dropped on save, matching the editor UX where
+    /// an empty row is treated as "draft, not yet committed". Without
+    /// this, hitting Add then Save would write a phantom `""` key.
+    #[test]
+    fn custom_params_blank_key_rows_dropped() {
+        let buf = vec![
+            ("".into(), "true".into()),
+            ("   ".into(), "ignored".into()),
+            ("real_key".into(), "5".into()),
+        ];
+        let out = build_extras_from_buffer(&buf);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.get("real_key"), Some(&serde_json::json!(5)));
+    }
+
+    /// Default log colours must survive a Config-load → ConfigWire
+    /// serialize round-trip cleanly (skipped from output as defaults).
+    /// And non-default colours must appear so the user's preference
+    /// persists. Mirrors the `block_quic` / `coalesce_*` round-trip
+    /// pattern above.
+    #[test]
+    fn log_color_fields_emit_only_when_non_default() {
+        let json = r##"{
+            "mode": "direct",
+            "log_color_info": "#00ff00",
+            "log_color_warn": "#e0a83a",
+            "log_color_error": "#ff0000"
+        }"##;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let wire = ConfigWire::from(&cfg);
+        let out = serde_json::to_value(&wire).unwrap();
+        // Non-default info / error → emitted verbatim.
+        assert_eq!(
+            out.get("log_color_info"),
+            Some(&serde_json::json!("#00ff00"))
+        );
+        assert_eq!(
+            out.get("log_color_error"),
+            Some(&serde_json::json!("#ff0000"))
+        );
+        // Warn matches the compiled default → skipped from the wire output.
+        assert!(out.get("log_color_warn").is_none());
+    }
+
+    /// `normalize_log_color` must replace bad input with the supplied
+    /// default, canonicalise valid input to lowercase `#rrggbb`, and
+    /// reject double-`#` prefixes. Pins the contract before the
+    /// wire-side healing behaviour below.
+    #[test]
+    fn normalize_log_color_canonicalizes_and_heals() {
+        // Canonical input → unchanged.
+        assert_eq!(normalize_log_color("#abcdef", "#dc6e6e"), "#abcdef");
+        // Empty / nonsense → default.
+        assert_eq!(normalize_log_color("", "#dc6e6e"), "#dc6e6e");
+        assert_eq!(normalize_log_color("red", "#dc6e6e"), "#dc6e6e");
+        assert_eq!(normalize_log_color("#12345", "#dc6e6e"), "#dc6e6e");
+        // Uppercase → lowercased so the file is stable across saves.
+        assert_eq!(normalize_log_color("#ABCDEF", "#dc6e6e"), "#abcdef");
+        // Surrounding whitespace tolerated.
+        assert_eq!(normalize_log_color("  #abcdef  ", "#dc6e6e"), "#abcdef",);
+        // No-`#` form → canonicalised with the `#` re-attached.
+        assert_eq!(normalize_log_color("abcdef", "#dc6e6e"), "#abcdef");
+        // Double-`#` was previously silently accepted (the old
+        // `trim_start_matches('#')` stripped both). It must now
+        // fail validation and fall back to the default.
+        assert_eq!(normalize_log_color("##abcdef", "#dc6e6e"), "#dc6e6e");
+        // Junk after a valid prefix → reject (length check covers it).
+        assert_eq!(normalize_log_color("#abcdefXX", "#dc6e6e"), "#dc6e6e");
+    }
+
+    /// Bad hex codes in config.json must not crash the UI — they should
+    /// silently fall back to the compiled defaults at render time.
+    /// `parse_hex_color` returns `None` on garbage; the render path
+    /// uses `unwrap_or_else(default)` so this can't panic.
+    #[test]
+    fn parse_hex_color_rejects_garbage() {
+        assert!(parse_hex_color("").is_none());
+        assert!(parse_hex_color("not a color").is_none());
+        assert!(parse_hex_color("#12345").is_none()); // 5 chars
+        assert!(parse_hex_color("#1234567").is_none()); // 7 chars
+        assert!(parse_hex_color("#gghhii").is_none()); // non-hex digits
+                                                       // Tightened from the previous `trim_start_matches('#')` impl:
+                                                       // double-`#` must NOT be silently accepted. This was the
+                                                       // review's `##abcdef` case.
+        assert!(parse_hex_color("##abcdef").is_none());
+        assert!(parse_hex_color("###abcdef").is_none());
+        // No-`#` short form is still accepted (matches what HTML
+        // `<input type=color>` produces and what color_to_hex emits
+        // without the `#` when passed unprefixed strings elsewhere).
+        assert!(parse_hex_color("abcdef").is_some());
+        // Sanity: the compiled defaults must themselves parse, otherwise
+        // the fallback `.unwrap()` in the render path would crash.
+        assert!(parse_hex_color(rahgozar::config::DEFAULT_LOG_COLOR_INFO).is_some());
+        assert!(parse_hex_color(rahgozar::config::DEFAULT_LOG_COLOR_WARN).is_some());
+        assert!(parse_hex_color(rahgozar::config::DEFAULT_LOG_COLOR_ERROR).is_some());
+    }
+
+    /// Modeled-key collision must be rejected at save time. Without
+    /// this gate a user could add `mode` (or any modeled field) as a
+    /// custom parameter and the flatten emit would shadow the form's
+    /// value during save → reload, silently overriding form state.
+    /// Pin every modeled key plus a known-non-modeled one to make
+    /// sure the rejection works AND legitimate extras still pass.
+    #[test]
+    fn custom_params_rejects_modeled_key_collisions() {
+        // Hermetic FormState — uses the same compiled defaults as a
+        // fresh install, rather than `load_form()` which would read
+        // the developer's real config.json from the user-data dir.
+        // We only care about `custom_params_buffer` here; `mode =
+        // "direct"` skips the script_id / auth_key requirement so the
+        // collision check is what fails the save, not missing creds.
+        let mut form = FormState::fresh_install_defaults();
+        form.mode = "direct".into();
+        // Sanity: a real custom key saves fine.
+        form.custom_params_buffer = vec![("my_future_field".into(), "true".into())];
+        form.to_config().expect("non-colliding key must save");
+
+        // Modeled-key collision → Err with a message naming the key.
+        for &key in MODELED_CONFIG_KEYS {
+            form.custom_params_buffer = vec![(key.into(), "anything".into())];
+            let err = form
+                .to_config()
+                .err()
+                .unwrap_or_else(|| panic!("expected save to fail for modeled key '{}'", key));
+            assert!(
+                err.contains(key),
+                "error must name the colliding key '{}', got: {}",
+                key,
+                err,
+            );
+        }
+
+        // Whitespace around a modeled key must still be caught — the
+        // editor trims on save so leading/trailing space cannot be a
+        // workaround.
+        form.custom_params_buffer = vec![("  mode  ".into(), "x".into())];
+        assert!(form.to_config().is_err());
+    }
+
+    /// MODELED_CONFIG_KEYS must stay in sync with the actual ConfigWire
+    /// keyset. The collision check uses this list, so a new field added
+    /// to Config without a corresponding MODELED_CONFIG_KEYS entry
+    /// would silently allow that field to be shadowed via the custom-
+    /// parameters editor. We extract the live key set from a fully-
+    /// populated ConfigWire serialization and assert it's a subset of
+    /// the constant — plus the constant has no entries that ConfigWire
+    /// can't actually emit.
+    #[test]
+    fn modeled_keys_list_matches_wire() {
+        // Populate every field with a non-default value so
+        // `skip_serializing_if` doesn't hide modeled keys from the
+        // emitted JSON.
+        let json = r##"{
+            "mode": "apps_script",
+            "google_ip": "1.2.3.4",
+            "front_domain": "x.example",
+            "script_id": "ID",
+            "script_ids": ["A","B"],
+            "auth_key": "K",
+            "listen_host": "127.0.0.1",
+            "listen_port": 8085,
+            "socks5_port": 8086,
+            "log_level": "debug",
+            "log_color_info": "#010203",
+            "log_color_warn": "#040506",
+            "log_color_error": "#070809",
+            "verify_ssl": false,
+            "hosts": {"h": "1.1.1.1"},
+            "enable_batching": true,
+            "upstream_socks5": "127.0.0.1:1",
+            "parallel_relay": 2,
+            "coalesce_step_ms": 25,
+            "coalesce_max_ms": 750,
+            "sni_hosts": ["a.example"],
+            "fetch_ips_from_api": true,
+            "max_ips_to_scan": 1,
+            "scan_batch_size": 1,
+            "google_ip_validation": false,
+            "normalize_x_graphql": true,
+            "youtube_via_relay": true,
+            "relay_url_patterns": ["a.example/p"],
+            "sabr_strip": true,
+            "passthrough_hosts": ["a.example"],
+            "block_quic": false,
+            "disable_padding": true,
+            "force_http1": true,
+            "tunnel_doh": true,
+            "bypass_doh_hosts": ["a.example"],
+            "block_doh": false,
+            "fronting_groups": [
+              {"name":"g","ip":"1.2.3.4","sni":"x.example","domains":["y.example"]}
+            ],
+            "auto_blacklist_strikes": 10,
+            "auto_blacklist_window_secs": 99,
+            "auto_blacklist_cooldown_secs": 999,
+            "request_timeout_secs": 31,
+            "exit_node": {
+              "enabled": true,
+              "relay_url": "https://a.example",
+              "psk": "K",
+              "hosts": ["b.example"],
+              "mode": "selective"
+            }
+        }"##;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let wire = ConfigWire::from(&cfg);
+        let out = serde_json::to_value(&wire).unwrap();
+        let wire_keys: std::collections::BTreeSet<&str> = out
+            .as_object()
+            .expect("wire serializes to object")
+            .keys()
+            .map(|s| s.as_str())
+            .collect();
+        let modeled: std::collections::BTreeSet<&str> =
+            MODELED_CONFIG_KEYS.iter().copied().collect();
+
+        // Every wire key must appear in MODELED_CONFIG_KEYS — otherwise
+        // the collision check silently allows shadowing.
+        for k in &wire_keys {
+            assert!(
+                modeled.contains(k),
+                "wire emits '{}' but MODELED_CONFIG_KEYS is missing it — \
+                 add the field to the constant in src/bin/ui.rs",
+                k,
+            );
+        }
+        // And every MODELED_CONFIG_KEYS entry must correspond to a real
+        // wire key (script_ids is an alias deserialise-only but it's
+        // here for the editor's collision check, so we allow it to be
+        // missing from the wire output).
+        for k in &modeled {
+            if *k == "script_ids" {
+                continue;
+            }
+            assert!(
+                wire_keys.contains(k),
+                "MODELED_CONFIG_KEYS lists '{}' but the wire never emits it — \
+                 the constant is stale",
+                k,
+            );
+        }
+    }
+
+    /// Line-classifier must (a) only match the level tokens at word
+    /// boundaries, not arbitrary substrings, AND (b) pick the
+    /// **leftmost** level-shaped token so an INFO line whose message
+    /// happens to mention ERROR / WARN doesn't get recoloured by the
+    /// later occurrence.
+    #[test]
+    fn log_level_classifier_matches_leftmost_word_boundary() {
+        assert_eq!(
+            classify_log_line("2025-05-16T10:00:00Z  INFO  starting up"),
+            Some(LogLevel::Info),
+        );
+        assert_eq!(
+            classify_log_line("2025-05-16T10:00:00Z  WARN  rate limit"),
+            Some(LogLevel::Warn),
+        );
+        assert_eq!(
+            classify_log_line("2025-05-16T10:00:00Z ERROR  fatal"),
+            Some(LogLevel::Error),
+        );
+        // Substring without the space-padded token = not a level.
+        assert_eq!(classify_log_line("debug: INFOrmation logged"), None);
+        // DEBUG / TRACE / unclassified → no recolour.
+        assert_eq!(classify_log_line("DEBUG step"), None);
+
+        // Leftmost wins — INFO line that mentions ERROR/WARN in the
+        // message body must stay green, not flip to red/yellow. This
+        // was the original review's regression: ` INFO  got ERROR
+        // response`.
+        assert_eq!(
+            classify_log_line("2025-05-16T10:00:00Z  INFO  got ERROR response from upstream"),
+            Some(LogLevel::Info),
+            "INFO line mentioning ' ERROR ' must stay INFO",
+        );
+        assert_eq!(
+            classify_log_line("2025-05-16T10:00:00Z  WARN  prior INFO event was suspicious"),
+            Some(LogLevel::Warn),
+            "WARN line mentioning ' INFO ' must stay WARN",
+        );
+        assert_eq!(
+            classify_log_line("2025-05-16T10:00:00Z ERROR  saw earlier WARN and INFO too"),
+            Some(LogLevel::Error),
+            "ERROR line mentioning ' WARN ' / ' INFO ' must stay ERROR",
+        );
     }
 }

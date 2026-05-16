@@ -85,6 +85,20 @@ pub struct Config {
     pub socks5_port: Option<u16>,
     #[serde(default = "default_log_level")]
     pub log_level: String,
+    /// Hex color (`#RRGGBB`) for INFO lines in the desktop UI's Recent log
+    /// panel. Empty string = compiled default green. Per-level colors are
+    /// independent so users with red/green colour-blindness can re-pair
+    /// any subset.
+    #[serde(default = "default_log_color_info")]
+    pub log_color_info: String,
+    /// Hex color (`#RRGGBB`) for WARN lines in the desktop UI's Recent log
+    /// panel. Empty string = compiled default amber.
+    #[serde(default = "default_log_color_warn")]
+    pub log_color_warn: String,
+    /// Hex color (`#RRGGBB`) for ERROR lines in the desktop UI's Recent log
+    /// panel. Empty string = compiled default red.
+    #[serde(default = "default_log_color_error")]
+    pub log_color_error: String,
     #[serde(default = "default_verify_ssl")]
     pub verify_ssl: bool,
     #[serde(default)]
@@ -675,6 +689,18 @@ fn default_listen_port() -> u16 {
 }
 fn default_log_level() -> String {
     "warn".into()
+}
+pub const DEFAULT_LOG_COLOR_INFO: &str = "#5ab464";
+pub const DEFAULT_LOG_COLOR_WARN: &str = "#e0a83a";
+pub const DEFAULT_LOG_COLOR_ERROR: &str = "#dc6e6e";
+fn default_log_color_info() -> String {
+    DEFAULT_LOG_COLOR_INFO.into()
+}
+fn default_log_color_warn() -> String {
+    DEFAULT_LOG_COLOR_WARN.into()
+}
+fn default_log_color_error() -> String {
+    DEFAULT_LOG_COLOR_ERROR.into()
 }
 fn default_verify_ssl() -> bool {
     true

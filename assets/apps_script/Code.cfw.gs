@@ -76,15 +76,26 @@ const AUTH_KEY = "CHANGE_ME_TO_A_STRONG_SECRET";
 // assets/cloudflare/worker.js. Must include the scheme.
 const WORKER_URL = "https://CHANGE_ME.workers.dev";
 
-// ── Sentinels — DO NOT EDIT ─────────────────────────────────
-// These two constants are NOT configuration. They are the literal
-// template-default values used by the fail-closed check in doPost so
-// that a forgotten edit (AUTH_KEY or WORKER_URL still set to the
-// placeholder) returns a loud error instead of silently accepting the
-// placeholder secret or POSTing to a bogus URL. Configure AUTH_KEY
-// and WORKER_URL above; leave these alone.
-const DEFAULT_AUTH_KEY = "CHANGE_ME_TO_A_STRONG_SECRET";
-const DEFAULT_WORKER_URL = "https://CHANGE_ME.workers.dev";
+// ═══════════════════════════════════════════════════════════════════
+//  ▸▸▸  SENTINELS — DO NOT EDIT  ◂◂◂
+//
+//  These constants are NOT configuration. They are the literal
+//  template-default values used by the fail-closed check in doPost so
+//  that a forgotten edit (AUTH_KEY or WORKER_URL still set to the
+//  placeholder) returns a loud error instead of silently accepting
+//  the placeholder secret or POSTing to a bogus URL.
+//
+//  IMPORTANT: each placeholder is reconstructed at runtime from two
+//  non-matching fragments. A naive find-replace of the AUTH_KEY (or
+//  WORKER_URL) literal at the top of this file would otherwise
+//  simultaneously overwrite the sentinel and silently disable the
+//  fail-closed check. Splitting the literal means the same find-
+//  replace leaves the sentinel intact and the guard keeps working.
+//  Do not "fix" this by collapsing the concatenation back into a
+//  single string literal.
+// ═══════════════════════════════════════════════════════════════════
+const DEFAULT_AUTH_KEY = "CHANGE_ME_" + "TO_A_STRONG_SECRET";
+const DEFAULT_WORKER_URL = "https://CHANGE_" + "ME.workers.dev";
 
 // Must match the Worker's MAX_BATCH_SIZE. Batches larger than this
 // are split into chunks of this size and dispatched via fetchAll —
@@ -121,13 +132,27 @@ function _decoyOrError(jsonBody) {
     .setMimeType(ContentService.MimeType.HTML);
 }
 
+// True when AUTH_KEY has been customised away from the shipped template
+// AND is not blank/whitespace. Centralised so doPost and the /quota
+// branch in doGet check the same invariant. Both halves matter
+// independently: the placeholder check stops anyone who reads this
+// file from using the relay; the blank check stops a misconfigured
+// `AUTH_KEY = ""` from matching `req.k: ""` (including the common
+// case of clients sending no key at all).
+function _isConfiguredAuthKey() {
+  if (typeof AUTH_KEY !== "string") return false;
+  var trimmed = AUTH_KEY.trim();
+  return trimmed.length > 0 && trimmed !== DEFAULT_AUTH_KEY;
+}
+
 function doPost(e) {
   try {
-    // Fail-closed if either constant is still the template default.
-    // Without this, a forgotten edit would either accept the placeholder
-    // secret as valid auth or POST to a literal "CHANGE_ME" URL — both
-    // are silent failure modes a deploy might miss. Surface them loud.
-    if (AUTH_KEY === DEFAULT_AUTH_KEY) {
+    // Fail-closed if AUTH_KEY is still the template default OR blank/
+    // whitespace, or WORKER_URL is unset. Without this, a forgotten
+    // edit would either accept the placeholder secret as valid auth,
+    // accept a blank `req.k`, or POST to a literal "CHANGE_ME" URL —
+    // all silent failure modes a deploy might miss. Surface them loud.
+    if (!_isConfiguredAuthKey()) {
       return _json({ e: "configure AUTH_KEY in Code.cfw.gs" });
     }
     if (WORKER_URL === DEFAULT_WORKER_URL) {
@@ -137,6 +162,13 @@ function doPost(e) {
     var req = JSON.parse(e.postData.contents);
     if (req.k !== AUTH_KEY) return _decoyOrError({ e: "unauthorized" });
 
+    // Quota probe: `{ k, op: "quota" }` → `{ remaining: N }`. The
+    // preferred quota path — auth key in the body rather than the URL
+    // (which `GET /exec/quota?k=…` leaks into history / logs).
+    if (req.op === "quota") {
+      return _json({ remaining: UrlFetchApp.getRemainingDailyQuota() });
+    }
+
     if (Array.isArray(req.q)) return _doBatch(req.q);
     return _doSingle(req);
   } catch (err) {
@@ -144,7 +176,30 @@ function doPost(e) {
   }
 }
 
+// Authenticated branch: `/exec/quota?k=<AUTH_KEY>` returns the remaining
+// `UrlFetchApp` daily quota as JSON.
+//
+// ⚠ SENSITIVE DIAGNOSTIC URL — the auth key is in the query string, so
+// hitting this endpoint from a browser leaks the secret into history,
+// server-side request logs, shared screenshots, and any URL copied to
+// chat / a ticket. Prefer the POST equivalent (`{k, op: "quota"}`) for
+// any non-throwaway use; this GET form is kept for ad-hoc curl from
+// the operator's own machine where the URL exposure is acceptable.
+//
+// The auth guard matters — otherwise scanners could fingerprint any
+// deployment as a rahgozar relay just by hitting /exec/quota, undoing
+// the bad-auth POST decoy. `_isConfiguredAuthKey()` covers both the
+// placeholder-still-set and blank-AUTH_KEY cases — see its docstring.
+// Wrong / missing key falls through to the same DECOY_HTML response.
+// Feature #921.
 function doGet(e) {
+  if (
+    e && e.pathInfo === "quota" &&
+    e.parameter && e.parameter.k === AUTH_KEY &&
+    _isConfiguredAuthKey()
+  ) {
+    return _json({ remaining: UrlFetchApp.getRemainingDailyQuota() });
+  }
   return ContentService
     .createTextOutput(DECOY_HTML)
     .setMimeType(ContentService.MimeType.HTML);

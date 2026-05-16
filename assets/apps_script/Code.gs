@@ -116,6 +116,26 @@ const DECOY_HTML =
   '<body><p>The script completed but did not return anything.</p>' +
   '</body></html>';
 
+// ═══════════════════════════════════════════════════════════════════
+//  ▸▸▸  SENTINELS — DO NOT EDIT  ◂◂◂
+//
+//  These constants are NOT configuration. They are the literal
+//  template-default values used by `_isConfiguredAuthKey()` to detect
+//  a deployment whose AUTH_KEY hasn't been changed from the shipped
+//  placeholder, so we can fail-closed instead of silently accepting
+//  the public-knowledge secret as valid auth.
+//
+//  IMPORTANT: the placeholder string is reconstructed at runtime from
+//  two non-matching fragments. A naive find-replace of the AUTH_KEY
+//  literal at the top of this file (e.g. "CHANGE_ME_TO_A_STRONG_SECRET"
+//  → "my-secret") would otherwise simultaneously overwrite this
+//  sentinel and silently disable the fail-closed check. Splitting the
+//  literal means the same find-replace leaves the sentinel intact and
+//  the guard keeps working. Do not "fix" this by collapsing the
+//  concatenation back into one string literal.
+// ═══════════════════════════════════════════════════════════════════
+const DEFAULT_AUTH_KEY = "CHANGE_ME_" + "TO_A_STRONG_SECRET";
+
 // ── Request Handlers ────────────────────────────────────────
 
 function _decoyOrError(jsonBody) {
@@ -125,10 +145,49 @@ function _decoyOrError(jsonBody) {
     .setMimeType(ContentService.MimeType.HTML);
 }
 
+// True when AUTH_KEY has been customised away from the shipped template
+// AND is not blank/whitespace. Centralised so every code path that
+// depends on AUTH_KEY being meaningful (doPost, /quota) checks the same
+// invariant.
+//
+// Both halves matter independently:
+//   - Placeholder check: anyone who reads this file knows the shipped
+//     value, so accepting it as auth opens the relay to the public.
+//   - Blank check: an empty AUTH_KEY would happily match `req.k: ""`,
+//     including the common case where a misconfigured client sends no
+//     key at all.
+function _isConfiguredAuthKey() {
+  if (typeof AUTH_KEY !== "string") return false;
+  var trimmed = AUTH_KEY.trim();
+  return trimmed.length > 0 && trimmed !== DEFAULT_AUTH_KEY;
+}
+
 function doPost(e) {
   try {
+    // Fail-closed BEFORE parsing if AUTH_KEY is still the template
+    // placeholder or blank — accepting the shipped secret would let
+    // anyone who reads this file use the deployment as a relay. Loud
+    // JSON error (rather than the bad-auth decoy) is deliberate: this
+    // is a setup error the operator needs to see, and `doPost` is
+    // never the casual-scanner entry point — `doGet` is. Mirrors
+    // Code.cfw.gs's fail-closed pattern.
+    if (!_isConfiguredAuthKey()) {
+      return _json({ e: "configure AUTH_KEY in Code.gs" });
+    }
+
     var req = JSON.parse(e.postData.contents);
     if (req.k !== AUTH_KEY) return _decoyOrError({ e: "unauthorized" });
+
+    // Quota probe: `{ k, op: "quota" }` → `{ remaining: N }`. This is
+    // the preferred quota path because the auth key travels in the
+    // request body, NOT the URL — unlike `GET /exec/quota?k=…` which
+    // leaks the secret into browser history, server logs, and any
+    // shared screenshot or copied link. The GET variant is kept for
+    // ad-hoc curl/browser-bar use but flagged as a sensitive
+    // diagnostic URL in the doGet comment below.
+    if (req.op === "quota") {
+      return _json({ remaining: UrlFetchApp.getRemainingDailyQuota() });
+    }
 
     // Batch mode: { k, q: [...] }
     if (Array.isArray(req.q)) return _doBatch(req.q);
@@ -147,7 +206,31 @@ function doPost(e) {
 // here which is a fine-enough decoy on its own, but explicitly returning
 // the same harmless placeholder makes the response identical to the
 // bad-auth POST decoy — one less fingerprint vector.
+//
+// One authenticated-only branch: `/exec/quota?k=<AUTH_KEY>` returns the
+// remaining `UrlFetchApp` daily quota as JSON (`{"remaining": N}`).
+//
+// ⚠ SENSITIVE DIAGNOSTIC URL — the auth key is in the query string, so
+// hitting this endpoint from a browser leaks the secret into history,
+// server-side request logs, shared screenshots, and any URL copied to
+// chat / a ticket. Prefer the POST equivalent (`{k, op: "quota"}`) for
+// any non-throwaway use; this GET form is kept for ad-hoc curl from
+// the operator's own machine where the URL exposure is acceptable.
+//
+// The auth guard matters — otherwise scanners could hit `/exec/quota`
+// and trivially fingerprint any deployment as a rahgozar relay,
+// undoing the bad-auth POST decoy. `_isConfiguredAuthKey()` covers
+// both the placeholder-still-set and blank-AUTH_KEY cases; see its
+// docstring above. Wrong / missing key falls through to the same
+// DECOY_HTML response. Feature #921.
 function doGet(e) {
+  if (
+    e && e.pathInfo === "quota" &&
+    e.parameter && e.parameter.k === AUTH_KEY &&
+    _isConfiguredAuthKey()
+  ) {
+    return _json({ remaining: UrlFetchApp.getRemainingDailyQuota() });
+  }
   return ContentService
     .createTextOutput(DECOY_HTML)
     .setMimeType(ContentService.MimeType.HTML);

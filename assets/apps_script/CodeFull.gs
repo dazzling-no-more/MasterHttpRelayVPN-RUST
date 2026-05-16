@@ -66,6 +66,16 @@ function _decoyOrError(jsonBody) {
     .setMimeType(ContentService.MimeType.HTML);
 }
 
+// True when AUTH_KEY has been customised away from the shipped template
+// AND is not blank/whitespace. Centralised so every code path that
+// depends on AUTH_KEY being meaningful (doPost, /quota) checks the
+// same invariant. See Code.gs for the per-half rationale.
+function _isConfiguredAuthKey() {
+  if (typeof AUTH_KEY !== "string") return false;
+  var trimmed = AUTH_KEY.trim();
+  return trimmed.length > 0 && trimmed !== DEFAULT_AUTH_KEY;
+}
+
 // Edge DNS cache. Plain UDP/53 queries normally traverse the full
 // client → GAS → tunnel-node → public resolver path, and the
 // trans-Atlantic round-trip dominates first-hop latency. When
@@ -111,12 +121,45 @@ const EDGE_DNS_MAX_KEY_LEN = 240;
 //   255 = ANY (resolvers handle it more correctly than we would)
 const EDGE_DNS_REFUSE_QTYPES = { 255: 1 };
 
+// ═══════════════════════════════════════════════════════════════════
+//  ▸▸▸  SENTINELS — DO NOT EDIT  ◂◂◂
+//
+//  These constants are NOT configuration. They are the literal
+//  template-default values used by `_isConfiguredAuthKey()` to detect
+//  a deployment whose AUTH_KEY hasn't been changed from the shipped
+//  placeholder, so we can fail-closed instead of silently accepting
+//  the public-knowledge secret as valid auth.
+//
+//  IMPORTANT: the placeholder string is reconstructed at runtime from
+//  two non-matching fragments. A naive find-replace of the AUTH_KEY
+//  literal at the top of this file (e.g. "CHANGE_ME_TO_A_STRONG_SECRET"
+//  → "my-secret") would otherwise simultaneously overwrite this
+//  sentinel and silently disable the fail-closed check. Splitting the
+//  literal means the same find-replace leaves the sentinel intact and
+//  the guard keeps working. Do not "fix" this by collapsing the
+//  concatenation back into one string literal.
+// ═══════════════════════════════════════════════════════════════════
+const DEFAULT_AUTH_KEY = "CHANGE_ME_" + "TO_A_STRONG_SECRET";
+
 // ========================== Entry point ==========================
 
 function doPost(e) {
   try {
+    // Fail-closed BEFORE parsing if AUTH_KEY is still the template
+    // placeholder or blank — see Code.gs::doPost for the rationale.
+    if (!_isConfiguredAuthKey()) {
+      return _json({ e: "configure AUTH_KEY in CodeFull.gs" });
+    }
+
     var req = JSON.parse(e.postData.contents);
     if (req.k !== AUTH_KEY) return _decoyOrError({ e: "unauthorized" });
+
+    // Quota probe: `{ k, op: "quota" }` → `{ remaining: N }`. The
+    // preferred quota path — auth key in the body rather than the URL
+    // (which `GET /exec/quota?k=…` leaks into history / logs).
+    if (req.op === "quota") {
+      return _json({ remaining: UrlFetchApp.getRemainingDailyQuota() });
+    }
 
     // Tunnel mode
     if (req.t) return _doTunnel(req);
@@ -483,7 +526,30 @@ function _respHeaders(resp) {
 // see if it ever GET-followed a redirect back onto /macros/.../exec
 // (decoy/no-json error path). ContentService keeps the doGet response
 // indistinguishable from a forgotten static-HTML web app.
+//
+// Authenticated branch: `/exec/quota?k=<AUTH_KEY>` returns the remaining
+// `UrlFetchApp` daily quota as JSON.
+//
+// ⚠ SENSITIVE DIAGNOSTIC URL — the auth key is in the query string, so
+// hitting this endpoint from a browser leaks the secret into history,
+// server-side request logs, shared screenshots, and any URL copied to
+// chat / a ticket. Prefer the POST equivalent (`{k, op: "quota"}`) for
+// any non-throwaway use; this GET form is kept for ad-hoc curl from
+// the operator's own machine where the URL exposure is acceptable.
+//
+// The auth guard matters — otherwise scanners could hit `/exec/quota`
+// and trivially fingerprint any deployment as a rahgozar relay.
+// `_isConfiguredAuthKey()` covers both the placeholder-still-set and
+// blank-AUTH_KEY cases; see its docstring above. Wrong / missing key
+// falls through to the same DECOY_HTML response. Feature #921.
 function doGet(e) {
+  if (
+    e && e.pathInfo === "quota" &&
+    e.parameter && e.parameter.k === AUTH_KEY &&
+    _isConfiguredAuthKey()
+  ) {
+    return _json({ remaining: UrlFetchApp.getRemainingDailyQuota() });
+  }
   return ContentService
     .createTextOutput(DECOY_HTML)
     .setMimeType(ContentService.MimeType.HTML);
