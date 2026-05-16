@@ -23,7 +23,6 @@ import java.net.InetAddress
  *     launch has a warm value even before auto-detection re-runs.
  */
 object NetworkDetect {
-
     /**
      * Resolve `www.google.com` and return the first IPv4 A record as a
      * dotted-quad string, or null if resolution failed. IPv6 is skipped —
@@ -31,14 +30,14 @@ object NetworkDetect {
      *
      * BLOCKING — call from a background coroutine (Dispatchers.IO).
      */
-    fun resolveGoogleIp(hostname: String = "www.google.com"): String? {
-        return try {
-            InetAddress.getAllByName(hostname)
+    fun resolveGoogleIp(hostname: String = "www.google.com"): String? =
+        try {
+            InetAddress
+                .getAllByName(hostname)
                 .filterIsInstance<Inet4Address>()
                 .firstOrNull()
                 ?.hostAddress
         } catch (_: Throwable) {
             null
         }
-    }
 }

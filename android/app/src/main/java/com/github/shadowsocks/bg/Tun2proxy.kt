@@ -22,7 +22,6 @@ package com.github.shadowsocks.bg
  * separately and load it explicitly here.
  */
 object Tun2proxy {
-
     init {
         System.loadLibrary("tun2proxy")
     }

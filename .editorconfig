@@ -1,0 +1,10 @@
+root = true
+
+[*.{kt,kts}]
+# Composables follow PascalCase by Compose convention. Without this, every
+# @Composable HomeScreen() / MainActivity() etc. trips standard:function-naming.
+ktlint_function_naming_ignore_when_annotated_with = Composable
+
+# Wildcard imports are idiomatic for Compose UI files that pull dozens of
+# symbols from one package. Disabled rather than expanded one-by-one.
+ktlint_standard_no-wildcard-imports = disabled

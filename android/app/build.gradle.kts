@@ -114,14 +114,15 @@ android {
     // standard build/ gitignore covers it without a carve-out under
     // src/main/assets/.
     sourceSets["main"].assets.srcDir(
-        layout.buildDirectory.dir("generated/curatedAssets")
+        layout.buildDirectory.dir("generated/curatedAssets"),
     )
 
     packaging {
-        resources.excludes += setOf(
-            "META-INF/AL2.0",
-            "META-INF/LGPL2.1",
-        )
+        resources.excludes +=
+            setOf(
+                "META-INF/AL2.0",
+                "META-INF/LGPL2.1",
+            )
     }
 }
 
@@ -201,8 +202,9 @@ fun normalizeTun2proxySo() {
     val jniLibsRoot = file("src/main/jniLibs")
     if (!jniLibsRoot.isDirectory) return
     jniLibsRoot.listFiles()?.filter { it.isDirectory }?.forEach { abiDir ->
-        val hashed = abiDir.listFiles { f -> f.name.matches(Regex("libtun2proxy-[0-9a-f]+\\.so")) }
-            ?: emptyArray()
+        val hashed =
+            abiDir.listFiles { f -> f.name.matches(Regex("libtun2proxy-[0-9a-f]+\\.so")) }
+                ?: emptyArray()
         val newest = hashed.maxByOrNull { it.lastModified() }
         if (newest != null) {
             val target = abiDir.resolve("libtun2proxy.so")
@@ -228,12 +230,20 @@ tasks.register<Exec>("cargoBuildDebug") {
     // `--release` below and accept the APK size.
     description = "Cross-compile rahgozar for all ABIs (release — same as cargoBuildRelease)"
     workingDir = rustCrateDir
-    commandLine(buildList<String> {
-        add("cargo"); add("ndk")
-        androidAbis.forEach { add("-t"); add(it) }
-        add("-o"); add(jniLibsDir.absolutePath)
-        add("build"); add("--release")
-    })
+    commandLine(
+        buildList<String> {
+            add("cargo")
+            add("ndk")
+            androidAbis.forEach {
+                add("-t")
+                add(it)
+            }
+            add("-o")
+            add(jniLibsDir.absolutePath)
+            add("build")
+            add("--release")
+        },
+    )
     doLast { normalizeTun2proxySo() }
 }
 
@@ -241,12 +251,20 @@ tasks.register<Exec>("cargoBuildRelease") {
     group = "build"
     description = "Cross-compile rahgozar for all ABIs (release)"
     workingDir = rustCrateDir
-    commandLine(buildList<String> {
-        add("cargo"); add("ndk")
-        androidAbis.forEach { add("-t"); add(it) }
-        add("-o"); add(jniLibsDir.absolutePath)
-        add("build"); add("--release")
-    })
+    commandLine(
+        buildList<String> {
+            add("cargo")
+            add("ndk")
+            androidAbis.forEach {
+                add("-t")
+                add(it)
+            }
+            add("-o")
+            add(jniLibsDir.absolutePath)
+            add("build")
+            add("--release")
+        },
+    )
     doLast { normalizeTun2proxySo() }
 }
 
@@ -284,7 +302,9 @@ tasks.configureEach {
         // hook, but preBuild also covers the lint/compile paths that
         // need the file present (lintDebug, etc.).
         "preBuild" -> dependsOn(syncFrontingGroupsAssets)
+
         "mergeDebugAssets",
-        "mergeReleaseAssets" -> dependsOn(syncFrontingGroupsAssets)
+        "mergeReleaseAssets",
+        -> dependsOn(syncFrontingGroupsAssets)
     }
 }

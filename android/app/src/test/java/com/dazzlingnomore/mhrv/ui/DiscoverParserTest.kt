@@ -18,11 +18,11 @@ import org.junit.Test
  * nothing or rendering an Error variant the user can't act on.
  */
 class DiscoverParserTest {
-
     @Test
     fun done_with_mix_of_ok_and_failed_rows() {
         // Canonical success payload — one reachable IP, one timed out.
-        val json = """
+        val json =
+            """
             {
               "hostname": "python.org",
               "ips": [
@@ -30,7 +30,7 @@ class DiscoverParserTest {
                 {"ip": "151.101.64.223", "ok": false, "error": "connect timeout"}
               ]
             }
-        """.trimIndent()
+            """.trimIndent()
         val s = parseDiscoverResult(json)
         assertTrue("expected Done, got $s", s is DiscoverState.Done)
         s as DiscoverState.Done
@@ -85,7 +85,8 @@ class DiscoverParserTest {
         // handles control chars + non-ASCII automatically, but
         // the parser still needs to receive the bytes correctly.
         // Persian, Chinese, and control-char (\n) in error text.
-        val json = """
+        val json =
+            """
             {
               "hostname": "x.test",
               "ips": [
@@ -94,7 +95,7 @@ class DiscoverParserTest {
                 {"ip": "3.3.3.3", "ok": false, "error": "line1\nline2"}
               ]
             }
-        """.trimIndent()
+            """.trimIndent()
         val s = parseDiscoverResult(json)
         assertTrue(s is DiscoverState.Done)
         s as DiscoverState.Done

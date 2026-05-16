@@ -12,7 +12,6 @@ package com.dazzlingnomore.mhrv
  * Thread-safe: the underlying Rust side guards its state with a mutex.
  */
 object Native {
-
     init {
         System.loadLibrary("rahgozar")
     }
@@ -64,7 +63,10 @@ object Native {
      *
      * BLOCKS (does a TLS handshake); call from a background dispatcher.
      */
-    external fun testSni(googleIp: String, sni: String): String
+    external fun testSni(
+        googleIp: String,
+        sni: String,
+    ): String
 
     /**
      * Ask GitHub's Releases API whether a newer version of rahgozar is
@@ -93,7 +95,10 @@ object Native {
      *
      * BLOCKS (large download); call from `Dispatchers.IO`.
      */
-    external fun downloadAsset(url: String, destPath: String): String
+    external fun downloadAsset(
+        url: String,
+        destPath: String,
+    ): String
 
     /**
      * Live traffic/usage counters for a running proxy handle. Returns a
@@ -175,5 +180,8 @@ object Native {
      * @param tunMtu TUN MTU (typically 1500)
      * @return 0 on normal shutdown, negative on error. BLOCKS.
      */
-    external fun runTun2proxy(cliArgs: String, tunMtu: Int): Int
+    external fun runTun2proxy(
+        cliArgs: String,
+        tunMtu: Int,
+    ): Int
 }

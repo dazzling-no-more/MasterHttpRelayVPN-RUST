@@ -2,9 +2,9 @@ package com.dazzlingnomore.mhrv
 
 import android.content.Context
 import android.util.Log
-import java.io.IOException
 import org.json.JSONException
 import org.json.JSONObject
+import java.io.IOException
 
 /**
  * Loader + merger for the curated fronting-group bundle shipped at
@@ -27,7 +27,10 @@ object CuratedGroups {
     private const val ASSET_PATH = "fronting-groups/curated.json"
 
     /** Result of [mergeInto], surfaced to the UI for snackbar text. */
-    data class MergeReport(val added: Int, val skipped: Int)
+    data class MergeReport(
+        val added: Int,
+        val skipped: Int,
+    )
 
     /**
      * Read the bundled curated.json from APK assets and parse the
@@ -40,19 +43,24 @@ object CuratedGroups {
      * button-tap.
      */
     fun loadCurated(ctx: Context): List<FrontingGroup>? {
-        val json = try {
-            ctx.assets.open(ASSET_PATH).bufferedReader().use { it.readText() }
-        } catch (e: IOException) {
-            Log.w(TAG, "asset $ASSET_PATH unreadable", e)
-            return null
-        }
+        val json =
+            try {
+                ctx.assets
+                    .open(ASSET_PATH)
+                    .bufferedReader()
+                    .use { it.readText() }
+            } catch (e: IOException) {
+                Log.w(TAG, "asset $ASSET_PATH unreadable", e)
+                return null
+            }
 
-        val arr = try {
-            JSONObject(json).optJSONArray("fronting_groups")
-        } catch (e: JSONException) {
-            Log.w(TAG, "asset $ASSET_PATH is not valid JSON", e)
-            return null
-        } ?: return null
+        val arr =
+            try {
+                JSONObject(json).optJSONArray("fronting_groups")
+            } catch (e: JSONException) {
+                Log.w(TAG, "asset $ASSET_PATH is not valid JSON", e)
+                return null
+            } ?: return null
 
         return buildList {
             for (i in 0 until arr.length()) {
@@ -61,12 +69,13 @@ object CuratedGroups {
                 val ip = g.optString("ip").trim()
                 val sni = g.optString("sni").trim()
                 val domArr = g.optJSONArray("domains") ?: continue
-                val domains = buildList {
-                    for (j in 0 until domArr.length()) {
-                        val d = domArr.optString(j).trim()
-                        if (d.isNotEmpty()) add(d)
+                val domains =
+                    buildList {
+                        for (j in 0 until domArr.length()) {
+                            val d = domArr.optString(j).trim()
+                            if (d.isNotEmpty()) add(d)
+                        }
                     }
-                }
                 if (name.isEmpty() || ip.isEmpty() || sni.isEmpty() || domains.isEmpty()) continue
                 add(FrontingGroup(name, ip, sni, domains))
             }

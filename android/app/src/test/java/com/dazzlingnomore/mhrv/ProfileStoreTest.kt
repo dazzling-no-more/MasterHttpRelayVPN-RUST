@@ -81,7 +81,8 @@ class ProfileStoreTest {
      */
     @Test
     fun applyProfile_preserves_unknown_fields_in_config_json() {
-        val futureSnapshot = """
+        val futureSnapshot =
+            """
             {
               "mode": "apps_script",
               "script_ids": ["A"],
@@ -96,10 +97,11 @@ class ProfileStoreTest {
               "request_timeout_secs": 45,
               "future_field_xyz": [1, 2, 3]
             }
-        """.trimIndent()
-        val written = """
+            """.trimIndent()
+        val written =
+            """
             {"active":"future","profiles":[{"name":"future","config":$futureSnapshot}]}
-        """.trimIndent()
+            """.trimIndent()
         profilesFile.writeText(written)
 
         val applied = ProfileStore.applyProfile(ctx, "future")
@@ -132,7 +134,8 @@ class ProfileStoreTest {
      */
     @Test
     fun mhrvconfig_toJson_preserves_unknown_fields() {
-        val originalJson = """
+        val originalJson =
+            """
             {
               "mode": "apps_script",
               "script_ids": ["A"],
@@ -141,7 +144,7 @@ class ProfileStoreTest {
               "request_timeout_secs": 99,
               "disable_padding": true
             }
-        """.trimIndent()
+            """.trimIndent()
         configFile.writeText(originalJson)
         val cfg = ConfigStore.load(ctx)
         // Round-trip via toJson — the path persist() takes on every edit.
@@ -159,9 +162,10 @@ class ProfileStoreTest {
      */
     @Test
     fun configstore_reads_rust_shaped_script_id_scalar() {
-        val rustScalar = """
+        val rustScalar =
+            """
             {"mode":"apps_script","script_id":"DESKTOP_ID","auth_key":"k"}
-        """.trimIndent()
+            """.trimIndent()
         configFile.writeText(rustScalar)
         val cfg = ConfigStore.load(ctx)
         assertEquals(1, cfg.appsScriptUrls.size)
@@ -171,9 +175,10 @@ class ProfileStoreTest {
 
     @Test
     fun configstore_reads_rust_shaped_script_id_array() {
-        val rustArray = """
+        val rustArray =
+            """
             {"mode":"apps_script","script_id":["A","B","C"],"auth_key":"k"}
-        """.trimIndent()
+            """.trimIndent()
         configFile.writeText(rustArray)
         val cfg = ConfigStore.load(ctx)
         assertEquals(3, cfg.appsScriptUrls.size)
@@ -183,9 +188,10 @@ class ProfileStoreTest {
     fun configstore_reads_both_script_id_and_script_ids_combined() {
         // Hand-edited config where someone added a key via "script_id"
         // and another via "script_ids". The union must be exposed.
-        val combined = """
+        val combined =
+            """
             {"mode":"apps_script","script_id":"X","script_ids":["Y","Z"],"auth_key":"k"}
-        """.trimIndent()
+            """.trimIndent()
         configFile.writeText(combined)
         val cfg = ConfigStore.load(ctx)
         assertEquals(3, cfg.appsScriptUrls.size)
@@ -215,12 +221,13 @@ class ProfileStoreTest {
 
     @Test
     fun upsert_writes_snapshot_to_live_config_json() {
-        val cfg = MhrvConfig(
-            mode = Mode.APPS_SCRIPT,
-            appsScriptUrls = listOf("A"),
-            authKey = "secret",
-            googleIp = "1.2.3.4",
-        )
+        val cfg =
+            MhrvConfig(
+                mode = Mode.APPS_SCRIPT,
+                appsScriptUrls = listOf("A"),
+                authKey = "secret",
+                googleIp = "1.2.3.4",
+            )
         val r = ProfileStore.upsert(ctx, "home", cfg)
         assertEquals(ProfileStore.MutationResult.Ok, r)
         assertTrue("config.json must be written by upsert", configFile.exists())
@@ -300,11 +307,12 @@ class ProfileStoreTest {
             "p",
             MhrvConfig(appsScriptUrls = listOf("first"), authKey = "k"),
         )
-        val r = ProfileStore.insertNew(
-            ctx,
-            "p",
-            MhrvConfig(appsScriptUrls = listOf("second"), authKey = "k"),
-        )
+        val r =
+            ProfileStore.insertNew(
+                ctx,
+                "p",
+                MhrvConfig(appsScriptUrls = listOf("second"), authKey = "k"),
+            )
         assertEquals(ProfileStore.MutationResult.Duplicate, r)
         val applied = ProfileStore.applyProfile(ctx, "p")
         assertTrue(applied is ProfileStore.ApplyResult.Ok)
@@ -339,7 +347,8 @@ class ProfileStoreTest {
      */
     @Test
     fun partial_malformed_profile_entry_surfaces_as_corrupt() {
-        val partial = """
+        val partial =
+            """
             {
               "active": "good",
               "profiles": [
@@ -347,7 +356,7 @@ class ProfileStoreTest {
                 {"name": "broken"}
               ]
             }
-        """.trimIndent()
+            """.trimIndent()
         profilesFile.writeText(partial)
         val r = ProfileStore.loadStrict(ctx)
         assertTrue(
@@ -358,14 +367,15 @@ class ProfileStoreTest {
 
     @Test
     fun partial_malformed_profile_name_surfaces_as_corrupt() {
-        val partial = """
+        val partial =
+            """
             {
               "active": "good",
               "profiles": [
                 {"name": "", "config": {"mode": "apps_script"}}
               ]
             }
-        """.trimIndent()
+            """.trimIndent()
         profilesFile.writeText(partial)
         val r = ProfileStore.loadStrict(ctx)
         assertTrue(r is ProfileStore.LoadResult.Corrupt)
@@ -378,7 +388,8 @@ class ProfileStoreTest {
      */
     @Test
     fun duplicate_names_surface_as_corrupt() {
-        val dup = """
+        val dup =
+            """
             {
               "active": "p",
               "profiles": [
@@ -386,7 +397,7 @@ class ProfileStoreTest {
                 {"name": "p", "config": {"mode": "full"}}
               ]
             }
-        """.trimIndent()
+            """.trimIndent()
         profilesFile.writeText(dup)
         val r = ProfileStore.loadStrict(ctx)
         assertTrue(
@@ -404,11 +415,12 @@ class ProfileStoreTest {
     fun mutations_refuse_to_overwrite_corrupt_profiles_file() {
         profilesFile.writeText("{ corrupt")
         val before = profilesFile.readText()
-        val r = ProfileStore.upsert(
-            ctx,
-            "p",
-            MhrvConfig(appsScriptUrls = listOf("A"), authKey = "k"),
-        )
+        val r =
+            ProfileStore.upsert(
+                ctx,
+                "p",
+                MhrvConfig(appsScriptUrls = listOf("A"), authKey = "k"),
+            )
         assertTrue(r is ProfileStore.MutationResult.CorruptOnDisk)
         assertEquals(before, profilesFile.readText())
     }
@@ -417,11 +429,12 @@ class ProfileStoreTest {
     fun corrupt_then_delete_corrupt_then_save_works() {
         profilesFile.writeText("{ corrupt")
         profilesFile.delete()
-        val r = ProfileStore.upsert(
-            ctx,
-            "p",
-            MhrvConfig(appsScriptUrls = listOf("A"), authKey = "k"),
-        )
+        val r =
+            ProfileStore.upsert(
+                ctx,
+                "p",
+                MhrvConfig(appsScriptUrls = listOf("A"), authKey = "k"),
+            )
         assertEquals(ProfileStore.MutationResult.Ok, r)
         assertEquals("p", ProfileStore.load(ctx).active)
     }
@@ -446,12 +459,13 @@ class ProfileStoreTest {
 
     @Test
     fun applyProfile_decoded_view_matches_snapshot_subset() {
-        val cfg = MhrvConfig(
-            mode = Mode.FULL,
-            appsScriptUrls = listOf("Z"),
-            authKey = "topsecret",
-            parallelRelay = 3,
-        )
+        val cfg =
+            MhrvConfig(
+                mode = Mode.FULL,
+                appsScriptUrls = listOf("Z"),
+                authKey = "topsecret",
+                parallelRelay = 3,
+            )
         ProfileStore.upsert(ctx, "fullmode", cfg)
         ConfigStore.save(ctx, MhrvConfig(mode = Mode.DIRECT))
         val applied = ProfileStore.applyProfile(ctx, "fullmode")
@@ -470,12 +484,13 @@ class ProfileStoreTest {
      */
     @Test
     fun applyProfile_refuses_runtime_invalid_snapshot() {
-        val bad = """
+        val bad =
+            """
             {
               "active": "bad",
               "profiles": [{"name": "bad", "config": {"mode": "apps_script"}}]
             }
-        """.trimIndent()
+            """.trimIndent()
         profilesFile.writeText(bad)
         // Plant a known-good live config so we can assert it's unchanged.
         ConfigStore.save(ctx, MhrvConfig(authKey = "preserve-me"))
@@ -497,12 +512,13 @@ class ProfileStoreTest {
      */
     @Test
     fun applyProfile_accepts_minimal_direct_snapshot() {
-        val ok = """
+        val ok =
+            """
             {
               "active": "",
               "profiles": [{"name": "d", "config": {"mode": "direct"}}]
             }
-        """.trimIndent()
+            """.trimIndent()
         profilesFile.writeText(ok)
         val r = ProfileStore.applyProfile(ctx, "d")
         assertTrue(
@@ -562,11 +578,12 @@ class ProfileStoreTest {
         File(configFile, "sentinel").writeText("x")
 
         try {
-            val r = ProfileStore.upsert(
-                ctx,
-                "home",
-                MhrvConfig(appsScriptUrls = listOf("NEW"), authKey = "new"),
-            )
+            val r =
+                ProfileStore.upsert(
+                    ctx,
+                    "home",
+                    MhrvConfig(appsScriptUrls = listOf("NEW"), authKey = "new"),
+                )
             assertEquals(ProfileStore.MutationResult.SaveFailed, r)
             // profiles.json must be UNCHANGED — the bug guard.
             assertEquals(profilesBefore, profilesFile.readText())
@@ -601,11 +618,12 @@ class ProfileStoreTest {
         File(tmp, "sentinel").writeText("x")
 
         try {
-            val r = ProfileStore.upsert(
-                ctx,
-                "home",
-                MhrvConfig(appsScriptUrls = listOf("NEW"), authKey = "new"),
-            )
+            val r =
+                ProfileStore.upsert(
+                    ctx,
+                    "home",
+                    MhrvConfig(appsScriptUrls = listOf("NEW"), authKey = "new"),
+                )
             assertEquals(ProfileStore.MutationResult.PartialConfigOnly, r)
 
             // config.json IS the new bytes — equivalent to a regular Save.

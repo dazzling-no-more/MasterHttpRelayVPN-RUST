@@ -5,7 +5,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
-/**
+/*
  * Config I/O. The source of truth is a JSON file in the app's files dir —
  * the Rust side parses the same file, so we don't maintain two schemas.
  *
@@ -17,6 +17,7 @@ import java.io.File
  *   - log level / verify_ssl / parallel_relay knobs
  * Anything else gets phone-appropriate defaults.
  */
+
 /**
  * How the foreground service exposes the proxy to the rest of the device.
  *
@@ -109,20 +110,16 @@ data class FrontingGroup(
 
 data class MhrvConfig(
     val mode: Mode = Mode.APPS_SCRIPT,
-
     val listenHost: String = "0.0.0.0",
     val listenPort: Int = 8080,
     val socks5Port: Int? = 1081,
-
     /** One Apps Script ID or deployment URL per entry. */
     val appsScriptUrls: List<String> = emptyList(),
     val authKey: String = "",
-
     val frontDomain: String = "www.google.com",
     /** Rotation pool of SNI hostnames; empty means "let Rust auto-expand". */
     val sniHosts: List<String> = emptyList(),
     val googleIp: String = "142.251.36.68",
-
     val verifySsl: Boolean = true,
     val logLevel: String = "info",
     val parallelRelay: Int = 1,
@@ -139,7 +136,6 @@ data class MhrvConfig(
     /** Block QUIC (UDP/443). QUIC over TCP tunnel causes meltdown. */
     val blockQuic: Boolean = true,
     val upstreamSocks5: String = "",
-
     /**
      * User-configured hostnames that bypass Apps Script relay entirely
      * and plain-TCP passthrough (via upstreamSocks5 if set). Each entry
@@ -149,7 +145,6 @@ data class MhrvConfig(
      * Issues #39, #127.
      */
     val passthroughHosts: List<String> = emptyList(),
-
     /**
      * Opt-out for the DoH bypass. The Rust default is to bypass DoH
      * traffic (chrome.cloudflare-dns.com, dns.google, etc.) directly
@@ -159,36 +154,30 @@ data class MhrvConfig(
      * keep DoH inside the tunnel. See `src/config.rs` `tunnel_doh`.
      */
     val tunnelDoh: Boolean = true,
-
     /**
      * Extra hostnames added to the built-in DoH default list. Same
      * matching shape as `passthroughHosts` (exact or leading-dot
      * suffix). Use to cover private / enterprise DoH endpoints.
      */
     val bypassDohHosts: List<String> = emptyList(),
-
     /**
      * When true, reject all connections to known DoH endpoints.
      * Browsers fall back to system DNS (tun2proxy virtual DNS — instant).
      * Takes priority over tunnel_doh / bypass_doh.
      */
     val blockDoh: Boolean = true,
-
     /** VPN_TUN (everything routed) vs PROXY_ONLY (user configures per-app). */
     val connectionMode: ConnectionMode = ConnectionMode.VPN_TUN,
-
     /** ALL / ONLY / EXCEPT — scope of app splitting inside VPN_TUN mode. */
     val splitMode: SplitMode = SplitMode.ALL,
     /** Package names used by ONLY and EXCEPT. Empty under ALL. */
     val splitApps: List<String> = emptyList(),
-
     /**
      * Route YouTube traffic through Apps Script relay instead of the
      * SNI-rewrite tunnel. Avoids Google SafeSearch-on-SNI / restricted
      * mode, but slower for video. Maps to Rust `youtube_via_relay`.
      */
     val youtubeViaRelay: Boolean = false,
-
     /**
      * SABR quality-track strip — opt-in (Rust `sabr_strip`, default
      * false after #977 testing). See `src/config.rs` `sabr_strip` for
@@ -196,7 +185,6 @@ data class MhrvConfig(
      * round-trip plumbing.
      */
     val sabrStrip: Boolean = false,
-
     /**
      * Path-pinned relay routing (Rust `relay_url_patterns`).
      * See `src/config.rs` `relay_url_patterns` for the full semantics —
@@ -205,10 +193,8 @@ data class MhrvConfig(
      * round-tripped so a hand-edited list survives Save.
      */
     val relayUrlPatterns: List<String> = emptyList(),
-
     /** UI language toggle. Non-Rust; honoured only by the Android wrapper. */
     val uiLang: UiLang = UiLang.AUTO,
-
     /**
      * Multi-edge fronting groups (Vercel, Fastly, AWS CloudFront, …).
      * Until v1.9.x the Android Save path silently dropped this field
@@ -218,7 +204,6 @@ data class MhrvConfig(
      * config that contains them. See `assets/fronting-groups/curated.json`.
      */
     val frontingGroups: List<FrontingGroup> = emptyList(),
-
     /**
      * Verbatim JSON for any config.json key this build doesn't model
      * (e.g. desktop-only `exit_node`, `request_timeout_secs`,
@@ -276,161 +261,187 @@ data class MhrvConfig(
     }
 
     fun toJson(): String {
-        val ids = appsScriptUrls
-            .map { extractId(it) }
-            .filter { it.isNotEmpty() }
-
-        val obj = JSONObject().apply {
-            // `mode` is required — without it serde errors with
-            // "missing field `mode`" and startProxy silently returns 0.
-            put("mode", when (mode) {
-                Mode.APPS_SCRIPT -> "apps_script"
-                Mode.DIRECT -> "direct"
-                Mode.FULL -> "full"
-            })
-            put("listen_host", listenHost)
-            put("listen_port", listenPort)
-            socks5Port?.let { put("socks5_port", it) }
-
-            // In direct mode these are unused by the Rust side, but we
-            // still persist whatever the user typed so flipping back to
-            // apps_script mode doesn't wipe their settings.
-            put("script_ids", JSONArray().apply { ids.forEach { put(it) } })
-            put("auth_key", authKey)
-
-            put("front_domain", frontDomain)
-            if (sniHosts.isNotEmpty()) {
-                put("sni_hosts", JSONArray().apply { sniHosts.forEach { put(it) } })
-            }
-            put("google_ip", googleIp)
-
-            put("verify_ssl", verifySsl)
-            put("log_level", logLevel)
-            put("parallel_relay", parallelRelay)
-            if (forceHttp1) put("force_http1", true)
-            if (coalesceStepMs != 10) put("coalesce_step_ms", coalesceStepMs)
-            if (coalesceMaxMs != 1000) put("coalesce_max_ms", coalesceMaxMs)
-            put("block_quic", blockQuic)
-            if (upstreamSocks5.isNotBlank()) {
-                put("upstream_socks5", upstreamSocks5.trim())
-            }
-            if (passthroughHosts.isNotEmpty()) {
-                put("passthrough_hosts", JSONArray().apply { passthroughHosts.forEach { put(it) } })
-            }
-            put("tunnel_doh", tunnelDoh)
-            put("block_doh", blockDoh)
-            if (youtubeViaRelay) put("youtube_via_relay", true)
-            // sabr_strip default is false on the Rust side (opt-in
-            // after #977); emit only when the user has explicitly
-            // enabled it so unchanged configs stay clean.
-            if (sabrStrip) put("sabr_strip", true)
-            // Trim/drop-empty/dedupe before serializing — same pattern
-            // as bypass_doh_hosts. Skip the key entirely when the user
-            // hasn't added any extras so we don't leak an empty array
-            // into otherwise-clean configs.
-            val cleanRelayUrlPatterns = relayUrlPatterns
-                .map { it.trim() }
+        val ids =
+            appsScriptUrls
+                .map { extractId(it) }
                 .filter { it.isNotEmpty() }
-                .distinct()
-            if (cleanRelayUrlPatterns.isNotEmpty()) {
-                put("relay_url_patterns", JSONArray().apply { cleanRelayUrlPatterns.forEach { put(it) } })
-            }
-            // Trim/drop-empty/dedupe before serializing — symmetric with the
-            // read-side normalization in loadFromJson(), so a user typing
-            // " doh.foo " or accidentally adding a duplicate doesn't end up
-            // in the saved JSON.
-            val cleanBypassDohHosts = bypassDohHosts
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-                .distinct()
-            if (cleanBypassDohHosts.isNotEmpty()) {
-                put("bypass_doh_hosts", JSONArray().apply { cleanBypassDohHosts.forEach { put(it) } })
-            }
 
-            // Phone-scoped scan defaults. We don't expose these in the UI
-            // because a phone isn't where you'd run a full /16 scan; users
-            // who need it can do that on the desktop UI and paste the IP.
-            put("fetch_ips_from_api", false)
-            put("max_ips_to_scan", 20)
+        val obj =
+            JSONObject().apply {
+                // `mode` is required — without it serde errors with
+                // "missing field `mode`" and startProxy silently returns 0.
+                put(
+                    "mode",
+                    when (mode) {
+                        Mode.APPS_SCRIPT -> "apps_script"
+                        Mode.DIRECT -> "direct"
+                        Mode.FULL -> "full"
+                    },
+                )
+                put("listen_host", listenHost)
+                put("listen_port", listenPort)
+                socks5Port?.let { put("socks5_port", it) }
 
-            // Fronting groups: the snake_case JSON shape must match the
-            // Rust-side `FrontingGroup` serde format exactly, otherwise
-            // the proxy will refuse to start with "missing field". The
-            // `domains` array is trimmed/de-duped at write time so a
-            // user pasting messy input doesn't poison the persisted
-            // form.
-            //
-            // Drop draft groups (no domains yet) at save time:
-            // `Config::validate()` in src/config.rs rejects empty
-            // `domains` lists with a hard error, so persisting them
-            // would make Native.startProxy() return 0. The UI keeps
-            // them visible so the user can still fill in domains;
-            // they survive into the saved file only once non-empty.
-            val savableGroups = frontingGroups.mapNotNull { g ->
-                val cleaned = g.domains
-                    .map { it.trim() }
-                    .filter { it.isNotEmpty() }
-                    .distinct()
-                if (cleaned.isEmpty()) null else g.copy(domains = cleaned)
-            }
-            if (savableGroups.isNotEmpty()) {
-                put("fronting_groups", JSONArray().apply {
-                    savableGroups.forEach { g ->
-                        put(JSONObject().apply {
-                            put("name", g.name)
-                            put("ip", g.ip)
-                            put("sni", g.sni)
-                            put("domains", JSONArray().apply {
-                                g.domains.forEach { put(it) }
-                            })
-                        })
+                // In direct mode these are unused by the Rust side, but we
+                // still persist whatever the user typed so flipping back to
+                // apps_script mode doesn't wipe their settings.
+                put("script_ids", JSONArray().apply { ids.forEach { put(it) } })
+                put("auth_key", authKey)
+
+                put("front_domain", frontDomain)
+                if (sniHosts.isNotEmpty()) {
+                    put("sni_hosts", JSONArray().apply { sniHosts.forEach { put(it) } })
+                }
+                put("google_ip", googleIp)
+
+                put("verify_ssl", verifySsl)
+                put("log_level", logLevel)
+                put("parallel_relay", parallelRelay)
+                if (forceHttp1) put("force_http1", true)
+                if (coalesceStepMs != 10) put("coalesce_step_ms", coalesceStepMs)
+                if (coalesceMaxMs != 1000) put("coalesce_max_ms", coalesceMaxMs)
+                put("block_quic", blockQuic)
+                if (upstreamSocks5.isNotBlank()) {
+                    put("upstream_socks5", upstreamSocks5.trim())
+                }
+                if (passthroughHosts.isNotEmpty()) {
+                    put("passthrough_hosts", JSONArray().apply { passthroughHosts.forEach { put(it) } })
+                }
+                put("tunnel_doh", tunnelDoh)
+                put("block_doh", blockDoh)
+                if (youtubeViaRelay) put("youtube_via_relay", true)
+                // sabr_strip default is false on the Rust side (opt-in
+                // after #977); emit only when the user has explicitly
+                // enabled it so unchanged configs stay clean.
+                if (sabrStrip) put("sabr_strip", true)
+                // Trim/drop-empty/dedupe before serializing — same pattern
+                // as bypass_doh_hosts. Skip the key entirely when the user
+                // hasn't added any extras so we don't leak an empty array
+                // into otherwise-clean configs.
+                val cleanRelayUrlPatterns =
+                    relayUrlPatterns
+                        .map { it.trim() }
+                        .filter { it.isNotEmpty() }
+                        .distinct()
+                if (cleanRelayUrlPatterns.isNotEmpty()) {
+                    put("relay_url_patterns", JSONArray().apply { cleanRelayUrlPatterns.forEach { put(it) } })
+                }
+                // Trim/drop-empty/dedupe before serializing — symmetric with the
+                // read-side normalization in loadFromJson(), so a user typing
+                // " doh.foo " or accidentally adding a duplicate doesn't end up
+                // in the saved JSON.
+                val cleanBypassDohHosts =
+                    bypassDohHosts
+                        .map { it.trim() }
+                        .filter { it.isNotEmpty() }
+                        .distinct()
+                if (cleanBypassDohHosts.isNotEmpty()) {
+                    put("bypass_doh_hosts", JSONArray().apply { cleanBypassDohHosts.forEach { put(it) } })
+                }
+
+                // Phone-scoped scan defaults. We don't expose these in the UI
+                // because a phone isn't where you'd run a full /16 scan; users
+                // who need it can do that on the desktop UI and paste the IP.
+                put("fetch_ips_from_api", false)
+                put("max_ips_to_scan", 20)
+
+                // Fronting groups: the snake_case JSON shape must match the
+                // Rust-side `FrontingGroup` serde format exactly, otherwise
+                // the proxy will refuse to start with "missing field". The
+                // `domains` array is trimmed/de-duped at write time so a
+                // user pasting messy input doesn't poison the persisted
+                // form.
+                //
+                // Drop draft groups (no domains yet) at save time:
+                // `Config::validate()` in src/config.rs rejects empty
+                // `domains` lists with a hard error, so persisting them
+                // would make Native.startProxy() return 0. The UI keeps
+                // them visible so the user can still fill in domains;
+                // they survive into the saved file only once non-empty.
+                val savableGroups =
+                    frontingGroups.mapNotNull { g ->
+                        val cleaned =
+                            g.domains
+                                .map { it.trim() }
+                                .filter { it.isNotEmpty() }
+                                .distinct()
+                        if (cleaned.isEmpty()) null else g.copy(domains = cleaned)
                     }
-                })
-            }
+                if (savableGroups.isNotEmpty()) {
+                    put(
+                        "fronting_groups",
+                        JSONArray().apply {
+                            savableGroups.forEach { g ->
+                                put(
+                                    JSONObject().apply {
+                                        put("name", g.name)
+                                        put("ip", g.ip)
+                                        put("sni", g.sni)
+                                        put(
+                                            "domains",
+                                            JSONArray().apply {
+                                                g.domains.forEach { put(it) }
+                                            },
+                                        )
+                                    },
+                                )
+                            }
+                        },
+                    )
+                }
 
-            // Android-only: surfaced in the UI dropdown. The Rust side
-            // doesn't read this key (serde ignores unknown fields), which
-            // is intentional — proxy-vs-TUN is a service-layer decision
-            // that belongs to the Android wrapper, not the crate.
-            put("connection_mode", when (connectionMode) {
-                ConnectionMode.VPN_TUN -> "vpn_tun"
-                ConnectionMode.PROXY_ONLY -> "proxy_only"
-            })
-            put("split_mode", when (splitMode) {
-                SplitMode.ALL -> "all"
-                SplitMode.ONLY -> "only"
-                SplitMode.EXCEPT -> "except"
-            })
-            if (splitApps.isNotEmpty()) {
-                put("split_apps", JSONArray().apply { splitApps.forEach { put(it) } })
-            }
-            put("ui_lang", when (uiLang) {
-                UiLang.AUTO -> "auto"
-                UiLang.FA -> "fa"
-                UiLang.EN -> "en"
-            })
+                // Android-only: surfaced in the UI dropdown. The Rust side
+                // doesn't read this key (serde ignores unknown fields), which
+                // is intentional — proxy-vs-TUN is a service-layer decision
+                // that belongs to the Android wrapper, not the crate.
+                put(
+                    "connection_mode",
+                    when (connectionMode) {
+                        ConnectionMode.VPN_TUN -> "vpn_tun"
+                        ConnectionMode.PROXY_ONLY -> "proxy_only"
+                    },
+                )
+                put(
+                    "split_mode",
+                    when (splitMode) {
+                        SplitMode.ALL -> "all"
+                        SplitMode.ONLY -> "only"
+                        SplitMode.EXCEPT -> "except"
+                    },
+                )
+                if (splitApps.isNotEmpty()) {
+                    put("split_apps", JSONArray().apply { splitApps.forEach { put(it) } })
+                }
+                put(
+                    "ui_lang",
+                    when (uiLang) {
+                        UiLang.AUTO -> "auto"
+                        UiLang.FA -> "fa"
+                        UiLang.EN -> "en"
+                    },
+                )
 
-            // Splice back any keys this build doesn't model (so they
-            // survive a load → edit → save round-trip and reach the
-            // native runtime, which IS the source of truth for them).
-            // We deliberately don't overwrite our modelled keys — if a
-            // future build models a field that's currently in extras,
-            // the new modelled value wins on the next save.
-            if (extrasJson.isNotBlank()) {
-                try {
-                    val ex = JSONObject(extrasJson)
-                    val it = ex.keys()
-                    while (it.hasNext()) {
-                        val k = it.next()
-                        if (!has(k)) put(k, ex.get(k))
+                // Splice back any keys this build doesn't model (so they
+                // survive a load → edit → save round-trip and reach the
+                // native runtime, which IS the source of truth for them).
+                // We deliberately don't overwrite our modelled keys — if a
+                // future build models a field that's currently in extras,
+                // the new modelled value wins on the next save.
+                if (extrasJson.isNotBlank()) {
+                    try {
+                        val ex = JSONObject(extrasJson)
+                        val it = ex.keys()
+                        while (it.hasNext()) {
+                            val k = it.next()
+                            if (!has(k)) put(k, ex.get(k))
+                        }
+                    } catch (_: Throwable) {
+                        // Malformed extras — drop. Captured-at-parse-time
+                        // extras should never be malformed; this guard is
+                        // for the synthetic-cfg path (decode()).
                     }
-                } catch (_: Throwable) {
-                    // Malformed extras — drop. Captured-at-parse-time
-                    // extras should never be malformed; this guard is
-                    // for the synthetic-cfg path (decode()).
                 }
             }
-        }
         return obj.toString(2)
     }
 
@@ -460,7 +471,10 @@ object ConfigStore {
      * existing file without a backup. On failure the previous
      * `config.json` is preserved untouched (or restored from `.bak`).
      */
-    fun save(ctx: Context, cfg: MhrvConfig): Boolean {
+    fun save(
+        ctx: Context,
+        cfg: MhrvConfig,
+    ): Boolean {
         val f = File(ctx.filesDir, FILE)
         val tmp = File(ctx.filesDir, "$FILE.tmp")
         return try {
@@ -482,20 +496,27 @@ object ConfigStore {
         val obj = JSONObject()
 
         // Always include essential fields.
-        obj.put("mode", when (cfg.mode) {
-            Mode.APPS_SCRIPT -> "apps_script"
-            Mode.DIRECT -> "direct"
-            Mode.FULL -> "full"
-        })
-        val ids = cfg.appsScriptUrls.mapNotNull { url ->
-            val marker = "/macros/s/"
-            val i = url.indexOf(marker)
-            if (i >= 0) {
-                var s = url.substring(i + marker.length)
-                val slash = s.indexOf('/'); if (slash >= 0) s = s.substring(0, slash)
-                s.trim().ifEmpty { null }
-            } else url.trim().ifEmpty { null }
-        }
+        obj.put(
+            "mode",
+            when (cfg.mode) {
+                Mode.APPS_SCRIPT -> "apps_script"
+                Mode.DIRECT -> "direct"
+                Mode.FULL -> "full"
+            },
+        )
+        val ids =
+            cfg.appsScriptUrls.mapNotNull { url ->
+                val marker = "/macros/s/"
+                val i = url.indexOf(marker)
+                if (i >= 0) {
+                    var s = url.substring(i + marker.length)
+                    val slash = s.indexOf('/')
+                    if (slash >= 0) s = s.substring(0, slash)
+                    s.trim().ifEmpty { null }
+                } else {
+                    url.trim().ifEmpty { null }
+                }
+            }
         if (ids.isNotEmpty()) obj.put("script_ids", JSONArray().apply { ids.forEach { put(it) } })
         if (cfg.authKey.isNotBlank()) obj.put("auth_key", cfg.authKey)
 
@@ -516,17 +537,19 @@ object ConfigStore {
         if (cfg.blockDoh != defaults.blockDoh) obj.put("block_doh", cfg.blockDoh)
         if (cfg.youtubeViaRelay != defaults.youtubeViaRelay) obj.put("youtube_via_relay", cfg.youtubeViaRelay)
         if (cfg.sabrStrip != defaults.sabrStrip) obj.put("sabr_strip", cfg.sabrStrip)
-        val cleanBypassDohHosts = cfg.bypassDohHosts
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .distinct()
+        val cleanBypassDohHosts =
+            cfg.bypassDohHosts
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .distinct()
         if (cleanBypassDohHosts.isNotEmpty()) {
             obj.put("bypass_doh_hosts", JSONArray().apply { cleanBypassDohHosts.forEach { put(it) } })
         }
-        val cleanRelayUrlPatterns = cfg.relayUrlPatterns
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .distinct()
+        val cleanRelayUrlPatterns =
+            cfg.relayUrlPatterns
+                .map { it.trim() }
+                .filter { it.isNotEmpty() }
+                .distinct()
         if (cleanRelayUrlPatterns.isNotEmpty()) {
             obj.put("relay_url_patterns", JSONArray().apply { cleanRelayUrlPatterns.forEach { put(it) } })
         }
@@ -535,48 +558,63 @@ object ConfigStore {
         // load. Same drop-empty-domains rule as toJson(). Domains are
         // trimmed + de-duped here so a sharer with messy input doesn't
         // push that mess across devices.
-        val savableGroups = cfg.frontingGroups.mapNotNull { g ->
-            val cleaned = g.domains
-                .map { it.trim() }
-                .filter { it.isNotEmpty() }
-                .distinct()
-            if (cleaned.isEmpty()) null else g.copy(domains = cleaned)
-        }
+        val savableGroups =
+            cfg.frontingGroups.mapNotNull { g ->
+                val cleaned =
+                    g.domains
+                        .map { it.trim() }
+                        .filter { it.isNotEmpty() }
+                        .distinct()
+                if (cleaned.isEmpty()) null else g.copy(domains = cleaned)
+            }
         if (savableGroups.isNotEmpty()) {
-            obj.put("fronting_groups", JSONArray().apply {
-                savableGroups.forEach { g ->
-                    put(JSONObject().apply {
-                        put("name", g.name)
-                        put("ip", g.ip)
-                        put("sni", g.sni)
-                        put("domains", JSONArray().apply { g.domains.forEach { put(it) } })
-                    })
-                }
-            })
+            obj.put(
+                "fronting_groups",
+                JSONArray().apply {
+                    savableGroups.forEach { g ->
+                        put(
+                            JSONObject().apply {
+                                put("name", g.name)
+                                put("ip", g.ip)
+                                put("sni", g.sni)
+                                put("domains", JSONArray().apply { g.domains.forEach { put(it) } })
+                            },
+                        )
+                    }
+                },
+            )
         }
 
         // Compress with DEFLATE then base64.
         val jsonBytes = obj.toString().toByteArray(Charsets.UTF_8)
-        val compressed = java.io.ByteArrayOutputStream().also { bos ->
-            java.util.zip.DeflaterOutputStream(bos).use { it.write(jsonBytes) }
-        }.toByteArray()
+        val compressed =
+            java.io
+                .ByteArrayOutputStream()
+                .also { bos ->
+                    java.util.zip
+                        .DeflaterOutputStream(bos)
+                        .use { it.write(jsonBytes) }
+                }.toByteArray()
 
-        val b64 = android.util.Base64.encodeToString(
-            compressed,
-            android.util.Base64.NO_WRAP or android.util.Base64.URL_SAFE,
-        )
+        val b64 =
+            android.util.Base64.encodeToString(
+                compressed,
+                android.util.Base64.NO_WRAP or android.util.Base64.URL_SAFE,
+            )
         return "$HASH_PREFIX$b64"
     }
 
     /** Try DEFLATE inflate; fall back to treating bytes as raw UTF-8
      *  (for backward compat with uncompressed exports). */
-    private fun inflateOrRaw(raw: ByteArray): String {
-        return try {
-            java.util.zip.InflaterInputStream(raw.inputStream()).bufferedReader().readText()
+    private fun inflateOrRaw(raw: ByteArray): String =
+        try {
+            java.util.zip
+                .InflaterInputStream(raw.inputStream())
+                .bufferedReader()
+                .readText()
         } catch (_: Throwable) {
             String(raw, Charsets.UTF_8)
         }
-    }
 
     /** Try to decode an encoded config string or raw JSON. Returns null on failure. */
     fun decode(encoded: String): MhrvConfig? {
@@ -586,7 +624,9 @@ object ConfigStore {
             return try {
                 val obj = JSONObject(trimmed)
                 if (!hasConfigShape(obj)) null else loadFromJson(obj)
-            } catch (_: Throwable) { null }
+            } catch (_: Throwable) {
+                null
+            }
         }
         // Try mhrv:// base64 encoded (possibly DEFLATE-compressed).
         val payload = if (trimmed.startsWith(HASH_PREFIX)) trimmed.removePrefix(HASH_PREFIX) else trimmed
@@ -606,7 +646,11 @@ object ConfigStore {
         val t = text.trim()
         if (t.startsWith(HASH_PREFIX)) return true
         if (t.startsWith("{")) {
-            return try { hasConfigShape(JSONObject(t)) } catch (_: Throwable) { false }
+            return try {
+                hasConfigShape(JSONObject(t))
+            } catch (_: Throwable) {
+                false
+            }
         }
         return false
     }
@@ -637,33 +681,50 @@ object ConfigStore {
      * Updating this set is a deliberate act — add a key here only
      * when [MhrvConfig] gains a real field for it.
      */
-    private val MODELLED_KEYS: Set<String> = setOf(
-        "mode",
-        "listen_host", "listen_port", "socks5_port",
-        // Both script_id (Rust output) and script_ids (legacy Android
-        // output) are read by us, so both belong in the "modelled" set
-        // — otherwise a Rust-shaped config would have its IDs end up
-        // in extras AND in the parsed appsScriptUrls, getting written
-        // out twice (once as the unmodelled passthrough, once as
-        // script_ids).
-        "script_id", "script_ids",
-        "auth_key",
-        "front_domain", "sni_hosts", "google_ip",
-        "verify_ssl", "log_level", "parallel_relay",
-        "force_http1",
-        "coalesce_step_ms", "coalesce_max_ms",
-        "block_quic", "upstream_socks5",
-        "passthrough_hosts",
-        "tunnel_doh", "bypass_doh_hosts", "block_doh",
-        "youtube_via_relay", "sabr_strip",
-        "relay_url_patterns",
-        "fronting_groups",
-        "connection_mode", "split_mode", "split_apps", "ui_lang",
-        // Phone-scoped scan defaults toJson() emits. Modelled so they
-        // don't round-trip into extras then collide with toJson's
-        // explicit puts.
-        "fetch_ips_from_api", "max_ips_to_scan",
-    )
+    private val MODELLED_KEYS: Set<String> =
+        setOf(
+            "mode",
+            "listen_host",
+            "listen_port",
+            "socks5_port",
+            // Both script_id (Rust output) and script_ids (legacy Android
+            // output) are read by us, so both belong in the "modelled" set
+            // — otherwise a Rust-shaped config would have its IDs end up
+            // in extras AND in the parsed appsScriptUrls, getting written
+            // out twice (once as the unmodelled passthrough, once as
+            // script_ids).
+            "script_id",
+            "script_ids",
+            "auth_key",
+            "front_domain",
+            "sni_hosts",
+            "google_ip",
+            "verify_ssl",
+            "log_level",
+            "parallel_relay",
+            "force_http1",
+            "coalesce_step_ms",
+            "coalesce_max_ms",
+            "block_quic",
+            "upstream_socks5",
+            "passthrough_hosts",
+            "tunnel_doh",
+            "bypass_doh_hosts",
+            "block_doh",
+            "youtube_via_relay",
+            "sabr_strip",
+            "relay_url_patterns",
+            "fronting_groups",
+            "connection_mode",
+            "split_mode",
+            "split_apps",
+            "ui_lang",
+            // Phone-scoped scan defaults toJson() emits. Modelled so they
+            // don't round-trip into extras then collide with toJson's
+            // explicit puts.
+            "fetch_ips_from_api",
+            "max_ips_to_scan",
+        )
 
     /**
      * Parse config from a JSON object — shared by [load] and [decode].
@@ -675,14 +736,19 @@ object ConfigStore {
         // Read deployment IDs from both `script_id` (Rust output) and
         // `script_ids` (legacy Android output). Each can be a scalar
         // string OR an array of strings.
-        val ids = buildList<String> {
-            addAll(readScriptIdList(obj, "script_id"))
-            addAll(readScriptIdList(obj, "script_ids"))
-        }.filter { it.isNotBlank() }.distinct()
+        val ids =
+            buildList<String> {
+                addAll(readScriptIdList(obj, "script_id"))
+                addAll(readScriptIdList(obj, "script_ids"))
+            }.filter { it.isNotBlank() }.distinct()
         val urls = ids.map { "https://script.google.com/macros/s/$it/exec" }
-        val sni = obj.optJSONArray("sni_hosts")?.let { arr ->
-            buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
-        }?.filter { it.isNotBlank() }.orEmpty()
+        val sni =
+            obj
+                .optJSONArray("sni_hosts")
+                ?.let { arr ->
+                    buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
+                }?.filter { it.isNotBlank() }
+                .orEmpty()
 
         // Capture anything we don't model into extras for passthrough
         // (raw-snapshot preservation invariant — the native runtime
@@ -696,14 +762,18 @@ object ConfigStore {
         val extrasStr = if (extras.length() > 0) extras.toString() else ""
 
         return MhrvConfig(
-            mode = when (obj.optString("mode", "apps_script")) {
-                "direct" -> Mode.DIRECT
-                // Deprecated alias kept forever for back-compat with
-                // configs written before the rename.
-                "google_only" -> Mode.DIRECT
-                "full" -> Mode.FULL
-                else -> Mode.APPS_SCRIPT
-            },
+            mode =
+                when (obj.optString("mode", "apps_script")) {
+                    "direct" -> Mode.DIRECT
+
+                    // Deprecated alias kept forever for back-compat with
+                    // configs written before the rename.
+                    "google_only" -> Mode.DIRECT
+
+                    "full" -> Mode.FULL
+
+                    else -> Mode.APPS_SCRIPT
+                },
             listenHost = obj.optString("listen_host", "0.0.0.0"),
             listenPort = obj.optInt("listen_port", 8080),
             socks5Port = obj.optInt("socks5_port", 1081).takeIf { it > 0 },
@@ -720,59 +790,84 @@ object ConfigStore {
             coalesceMaxMs = obj.optInt("coalesce_max_ms", 1000),
             blockQuic = obj.optBoolean("block_quic", true),
             upstreamSocks5 = obj.optString("upstream_socks5", ""),
-            passthroughHosts = obj.optJSONArray("passthrough_hosts")?.let { arr ->
-                buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
-            }?.filter { it.isNotBlank() }.orEmpty(),
+            passthroughHosts =
+                obj
+                    .optJSONArray("passthrough_hosts")
+                    ?.let { arr ->
+                        buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
+                    }?.filter { it.isNotBlank() }
+                    .orEmpty(),
             tunnelDoh = obj.optBoolean("tunnel_doh", true),
             blockDoh = obj.optBoolean("block_doh", true),
             youtubeViaRelay = obj.optBoolean("youtube_via_relay", false),
             sabrStrip = obj.optBoolean("sabr_strip", false),
-            bypassDohHosts = obj.optJSONArray("bypass_doh_hosts")?.let { arr ->
-                buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
-            }?.filter { it.isNotBlank() }.orEmpty(),
-            relayUrlPatterns = obj.optJSONArray("relay_url_patterns")?.let { arr ->
-                buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
-            }?.filter { it.isNotBlank() }.orEmpty(),
-            connectionMode = when (obj.optString("connection_mode", "vpn_tun")) {
-                "proxy_only" -> ConnectionMode.PROXY_ONLY
-                else -> ConnectionMode.VPN_TUN
-            },
-            splitMode = when (obj.optString("split_mode", "all")) {
-                "only" -> SplitMode.ONLY
-                "except" -> SplitMode.EXCEPT
-                else -> SplitMode.ALL
-            },
-            splitApps = obj.optJSONArray("split_apps")?.let { arr ->
-                buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
-            }?.filter { it.isNotBlank() }.orEmpty(),
-            uiLang = when (obj.optString("ui_lang", "auto")) {
-                "fa" -> UiLang.FA
-                "en" -> UiLang.EN
-                else -> UiLang.AUTO
-            },
-            frontingGroups = obj.optJSONArray("fronting_groups")?.let { arr ->
-                buildList {
-                    for (i in 0 until arr.length()) {
-                        val g = arr.optJSONObject(i) ?: continue
-                        val name = g.optString("name").trim()
-                        val ip = g.optString("ip").trim()
-                        val sni = g.optString("sni").trim()
-                        val domArr = g.optJSONArray("domains")
-                        val domains = if (domArr != null) {
-                            buildList {
-                                for (j in 0 until domArr.length()) {
-                                    val d = domArr.optString(j).trim()
-                                    if (d.isNotEmpty()) add(d)
-                                }
+            bypassDohHosts =
+                obj
+                    .optJSONArray("bypass_doh_hosts")
+                    ?.let { arr ->
+                        buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
+                    }?.filter { it.isNotBlank() }
+                    .orEmpty(),
+            relayUrlPatterns =
+                obj
+                    .optJSONArray("relay_url_patterns")
+                    ?.let { arr ->
+                        buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
+                    }?.filter { it.isNotBlank() }
+                    .orEmpty(),
+            connectionMode =
+                when (obj.optString("connection_mode", "vpn_tun")) {
+                    "proxy_only" -> ConnectionMode.PROXY_ONLY
+                    else -> ConnectionMode.VPN_TUN
+                },
+            splitMode =
+                when (obj.optString("split_mode", "all")) {
+                    "only" -> SplitMode.ONLY
+                    "except" -> SplitMode.EXCEPT
+                    else -> SplitMode.ALL
+                },
+            splitApps =
+                obj
+                    .optJSONArray("split_apps")
+                    ?.let { arr ->
+                        buildList { for (i in 0 until arr.length()) add(arr.optString(i)) }
+                    }?.filter { it.isNotBlank() }
+                    .orEmpty(),
+            uiLang =
+                when (obj.optString("ui_lang", "auto")) {
+                    "fa" -> UiLang.FA
+                    "en" -> UiLang.EN
+                    else -> UiLang.AUTO
+                },
+            frontingGroups =
+                obj
+                    .optJSONArray("fronting_groups")
+                    ?.let { arr ->
+                        buildList {
+                            for (i in 0 until arr.length()) {
+                                val g = arr.optJSONObject(i) ?: continue
+                                val name = g.optString("name").trim()
+                                val ip = g.optString("ip").trim()
+                                val sni = g.optString("sni").trim()
+                                val domArr = g.optJSONArray("domains")
+                                val domains =
+                                    if (domArr != null) {
+                                        buildList {
+                                            for (j in 0 until domArr.length()) {
+                                                val d = domArr.optString(j).trim()
+                                                if (d.isNotEmpty()) add(d)
+                                            }
+                                        }
+                                    } else {
+                                        emptyList()
+                                    }
+                                // Skip half-empty entries — same shape as the
+                                // Rust validator in src/config.rs would reject.
+                                if (name.isEmpty() || ip.isEmpty() || sni.isEmpty() || domains.isEmpty()) continue
+                                add(FrontingGroup(name, ip, sni, domains))
                             }
-                        } else emptyList()
-                        // Skip half-empty entries — same shape as the
-                        // Rust validator in src/config.rs would reject.
-                        if (name.isEmpty() || ip.isEmpty() || sni.isEmpty() || domains.isEmpty()) continue
-                        add(FrontingGroup(name, ip, sni, domains))
-                    }
-                }
-            }.orEmpty(),
+                        }
+                    }.orEmpty(),
             extrasJson = extrasStr,
         )
     }
@@ -786,7 +881,10 @@ object ConfigStore {
      * shapes interop with desktop. Returns an empty list if the key
      * is absent or shaped wrong.
      */
-    private fun readScriptIdList(obj: JSONObject, key: String): List<String> {
+    private fun readScriptIdList(
+        obj: JSONObject,
+        key: String,
+    ): List<String> {
         if (!obj.has(key)) return emptyList()
         // Array form first.
         obj.optJSONArray(key)?.let { arr ->
@@ -808,27 +906,28 @@ object ConfigStore {
  * Rust `domain_fronter` module — keep the lists in sync, or leave the
  * user's sniHosts empty and let Rust auto-expand.
  */
-val DEFAULT_SNI_POOL: List<String> = listOf(
-    "www.google.com",
-    "mail.google.com",
-    "drive.google.com",
-    "docs.google.com",
-    "calendar.google.com",
-    // accounts.google.com — originally listed as accounts.googl.com per
-    // issue #42, but googl.com is NOT in Google's GFE cert SAN so TLS
-    // validation fails with verify_ssl=true (PR #92). Replaced with
-    // accounts.google.com which is covered by the *.google.com wildcard.
-    "accounts.google.com",
-    // Issue #47: same DPI-passing behaviour on MCI / Samantel.
-    "scholar.google.com",
-    // Ported from upstream Python FRONT_SNI_POOL_GOOGLE (commit 57738ec);
-    // more rotation material for DPI-fingerprint spread and a couple of
-    // SNIs (maps/play) that pass DPI where shorter *.google.com names don't.
-    "maps.google.com",
-    "chat.google.com",
-    "translate.google.com",
-    "play.google.com",
-    "lens.google.com",
-    // Issue #75.
-    "chromewebstore.google.com",
-)
+val DEFAULT_SNI_POOL: List<String> =
+    listOf(
+        "www.google.com",
+        "mail.google.com",
+        "drive.google.com",
+        "docs.google.com",
+        "calendar.google.com",
+        // accounts.google.com — originally listed as accounts.googl.com per
+        // issue #42, but googl.com is NOT in Google's GFE cert SAN so TLS
+        // validation fails with verify_ssl=true (PR #92). Replaced with
+        // accounts.google.com which is covered by the *.google.com wildcard.
+        "accounts.google.com",
+        // Issue #47: same DPI-passing behaviour on MCI / Samantel.
+        "scholar.google.com",
+        // Ported from upstream Python FRONT_SNI_POOL_GOOGLE (commit 57738ec);
+        // more rotation material for DPI-fingerprint spread and a couple of
+        // SNIs (maps/play) that pass DPI where shorter *.google.com names don't.
+        "maps.google.com",
+        "chat.google.com",
+        "translate.google.com",
+        "play.google.com",
+        "lens.google.com",
+        // Issue #75.
+        "chromewebstore.google.com",
+    )

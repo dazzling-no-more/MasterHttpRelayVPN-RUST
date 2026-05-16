@@ -16,27 +16,29 @@ import org.junit.Test
  * tests; the JSON payload it wraps is the same code path covered below.
  */
 class ConfigStoreTest {
-    private val sampleGroups = listOf(
-        FrontingGroup(
-            name = "github-direct",
-            ip = "140.82.121.4",
-            sni = "github.com",
-            domains = listOf("gist.github.com"),
-        ),
-        FrontingGroup(
-            name = "vercel",
-            ip = "76.76.21.21",
-            sni = "react.dev",
-            domains = listOf("vercel.com", "vercel.app", "nextjs.org"),
-        ),
-    )
+    private val sampleGroups =
+        listOf(
+            FrontingGroup(
+                name = "github-direct",
+                ip = "140.82.121.4",
+                sni = "github.com",
+                domains = listOf("gist.github.com"),
+            ),
+            FrontingGroup(
+                name = "vercel",
+                ip = "76.76.21.21",
+                sni = "react.dev",
+                domains = listOf("vercel.com", "vercel.app", "nextjs.org"),
+            ),
+        )
 
     @Test
     fun frontingGroups_roundTripsThroughJson() {
-        val cfg = MhrvConfig(
-            mode = Mode.DIRECT,
-            frontingGroups = sampleGroups,
-        )
+        val cfg =
+            MhrvConfig(
+                mode = Mode.DIRECT,
+                frontingGroups = sampleGroups,
+            )
 
         val json = cfg.toJson()
         val parsed = ConfigStore.loadFromJson(JSONObject(json))
@@ -67,7 +69,8 @@ class ConfigStoreTest {
         // through if the user hand-edited config.json. The Rust validator
         // would reject them at startup; the Kotlin loader skips them on
         // read so the UI never sees broken state.
-        val raw = """
+        val raw =
+            """
             {
               "mode": "direct",
               "fronting_groups": [
@@ -80,7 +83,7 @@ class ConfigStoreTest {
                 {"name": "missing-fields"}
               ]
             }
-        """.trimIndent()
+            """.trimIndent()
 
         val parsed = ConfigStore.loadFromJson(JSONObject(raw))
 
@@ -94,7 +97,8 @@ class ConfigStoreTest {
         // happily round-trip if the loader weren't selective. This test
         // pins that the loader only reads fields it knows about — same
         // defense the Rust serde layer gives us automatically.
-        val raw = """
+        val raw =
+            """
             {
               "mode": "direct",
               "_comment": ["a", "b"],
@@ -103,7 +107,7 @@ class ConfigStoreTest {
                  "domains": ["d.example"]}
               ]
             }
-        """.trimIndent()
+            """.trimIndent()
 
         val parsed = ConfigStore.loadFromJson(JSONObject(raw))
 

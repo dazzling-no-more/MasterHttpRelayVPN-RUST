@@ -54,27 +54,33 @@ fun AppPickerDialog(
 
     LaunchedEffect(showSystem) {
         loading = true
-        apps = withContext(Dispatchers.IO) {
-            loadInstalledApps(ctx.packageManager, includeSystem = showSystem, ownPackage = ownPackage)
-        }
+        apps =
+            withContext(Dispatchers.IO) {
+                loadInstalledApps(ctx.packageManager, includeSystem = showSystem, ownPackage = ownPackage)
+            }
         loading = false
     }
 
-    val filtered: List<AppEntry> = remember(apps, query) {
-        val base = if (query.isBlank()) apps
-        else apps.filter {
-            it.label.contains(query, ignoreCase = true) ||
-                it.packageName.contains(query, ignoreCase = true)
+    val filtered: List<AppEntry> =
+        remember(apps, query) {
+            val base =
+                if (query.isBlank()) {
+                    apps
+                } else {
+                    apps.filter {
+                        it.label.contains(query, ignoreCase = true) ||
+                            it.packageName.contains(query, ignoreCase = true)
+                    }
+                }
+            // Pre-selected packages float to the top so the user can find what
+            // they already chose without scrolling the whole list. The sort
+            // key uses `initial` (the set passed when the dialog opened), not
+            // the live `selected` state — re-checking inside the dialog must
+            // not reorder rows under the user's finger. The new ordering takes
+            // effect the next time the dialog opens. Stable sort preserves
+            // the alphabetical-by-label order within each group.
+            base.sortedByDescending { it.packageName in initial }
         }
-        // Pre-selected packages float to the top so the user can find what
-        // they already chose without scrolling the whole list. The sort
-        // key uses `initial` (the set passed when the dialog opened), not
-        // the live `selected` state — re-checking inside the dialog must
-        // not reorder rows under the user's finger. The new ordering takes
-        // effect the next time the dialog opens. Stable sort preserves
-        // the alphabetical-by-label order within each group.
-        base.sortedByDescending { it.packageName in initial }
-    }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -86,9 +92,10 @@ fun AppPickerDialog(
                     onValueChange = { query = it },
                     label = { Text("Search") },
                     singleLine = true,
-                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
-                        imeAction = ImeAction.Search,
-                    ),
+                    keyboardOptions =
+                        androidx.compose.foundation.text.KeyboardOptions(
+                            imeAction = ImeAction.Search,
+                        ),
                     modifier = Modifier.fillMaxWidth(),
                 )
                 Row(
@@ -139,7 +146,11 @@ fun AppPickerDialog(
 }
 
 @Composable
-private fun AppRow(entry: AppEntry, checked: Boolean, onCheck: (Boolean) -> Unit) {
+private fun AppRow(
+    entry: AppEntry,
+    checked: Boolean,
+    onCheck: (Boolean) -> Unit,
+) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp),
@@ -158,7 +169,10 @@ private fun AppRow(entry: AppEntry, checked: Boolean, onCheck: (Boolean) -> Unit
     }
 }
 
-private data class AppEntry(val packageName: String, val label: String)
+private data class AppEntry(
+    val packageName: String,
+    val label: String,
+)
 
 private fun loadInstalledApps(
     pm: PackageManager,
@@ -168,8 +182,10 @@ private fun loadInstalledApps(
     // Only apps that have a launcher entry are user-visible — the rest
     // are content providers, platform helpers, etc. that the user would
     // never want to manually include/exclude.
-    val mainIntent = android.content.Intent(android.content.Intent.ACTION_MAIN)
-        .addCategory(android.content.Intent.CATEGORY_LAUNCHER)
+    val mainIntent =
+        android.content
+            .Intent(android.content.Intent.ACTION_MAIN)
+            .addCategory(android.content.Intent.CATEGORY_LAUNCHER)
     val resolved = pm.queryIntentActivities(mainIntent, 0)
     return resolved
         .asSequence()
@@ -179,17 +195,16 @@ private fun loadInstalledApps(
             // at service-start time; surfacing it in the picker would be
             // confusing and a selection would be silently overridden.
             if (info.packageName == ownPackage) return@filter false
-            val isSystem = (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0 &&
-                (info.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0
+            val isSystem =
+                (info.flags and ApplicationInfo.FLAG_SYSTEM) != 0 &&
+                    (info.flags and ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) == 0
             includeSystem || !isSystem
-        }
-        .distinctBy { it.packageName }
+        }.distinctBy { it.packageName }
         .map { info ->
             AppEntry(
                 packageName = info.packageName,
                 label = pm.getApplicationLabel(info).toString(),
             )
-        }
-        .sortedBy { it.label.lowercase() }
+        }.sortedBy { it.label.lowercase() }
         .toList()
 }

@@ -33,20 +33,31 @@ import java.io.File
  * from minisign verification in `Native.downloadAsset` for signed builds.
  */
 object UpdateInstaller {
-
     sealed class State {
         object Idle : State()
+
         object Checking : State()
+
         data class Available(
             val current: String,
             val latest: String,
             val releaseUrl: String,
             val asset: ApkAsset?,
         ) : State()
+
         object UpToDate : State()
-        data class Downloading(val pct: Int?) : State()
-        data class ReadyToInstall(val apk: File) : State()
-        data class Failed(val reason: String) : State()
+
+        data class Downloading(
+            val pct: Int?,
+        ) : State()
+
+        data class ReadyToInstall(
+            val apk: File,
+        ) : State()
+
+        data class Failed(
+            val reason: String,
+        ) : State()
     }
 
     data class ApkAsset(
@@ -56,7 +67,8 @@ object UpdateInstaller {
     )
 
     private fun safeUpdateAssetName(name: String): String =
-        name.substringAfterLast('/')
+        name
+            .substringAfterLast('/')
             .substringAfterLast('\\')
             .replace("..", "_")
             .replace(Regex("""[\p{Cntrl}]"""), "_")
@@ -71,15 +83,21 @@ object UpdateInstaller {
         return try {
             val obj = JSONObject(json)
             when (obj.optString("kind")) {
-                "upToDate" -> State.UpToDate
+                "upToDate" -> {
+                    State.UpToDate
+                }
+
                 "updateAvailable" -> {
-                    val asset = if (obj.has("assetUrl")) {
-                        ApkAsset(
-                            name = obj.optString("assetName"),
-                            url = obj.optString("assetUrl"),
-                            sizeBytes = obj.optLong("assetSize", 0L),
-                        )
-                    } else null
+                    val asset =
+                        if (obj.has("assetUrl")) {
+                            ApkAsset(
+                                name = obj.optString("assetName"),
+                                url = obj.optString("assetUrl"),
+                                sizeBytes = obj.optLong("assetSize", 0L),
+                            )
+                        } else {
+                            null
+                        }
                     State.Available(
                         current = obj.optString("current"),
                         latest = obj.optString("latest"),
@@ -87,9 +105,18 @@ object UpdateInstaller {
                         asset = asset,
                     )
                 }
-                "offline" -> State.Failed("Offline: ${obj.optString("reason", "")}")
-                "error" -> State.Failed("Update check failed: ${obj.optString("reason", "")}")
-                else -> State.Failed("Unrecognized check result")
+
+                "offline" -> {
+                    State.Failed("Offline: ${obj.optString("reason", "")}")
+                }
+
+                "error" -> {
+                    State.Failed("Update check failed: ${obj.optString("reason", "")}")
+                }
+
+                else -> {
+                    State.Failed("Unrecognized check result")
+                }
             }
         } catch (t: Throwable) {
             State.Failed("Bad check JSON: ${t.message}")
@@ -103,7 +130,10 @@ object UpdateInstaller {
      * `xml/file_paths.xml`), so the resulting File can be turned into a
      * content:// URI without further setup.
      */
-    suspend fun downloadApk(ctx: Context, asset: ApkAsset): State =
+    suspend fun downloadApk(
+        ctx: Context,
+        asset: ApkAsset,
+    ): State =
         withContext(Dispatchers.IO) {
             try {
                 val updatesDir = File(ctx.cacheDir, "updates").apply { mkdirs() }
@@ -161,22 +191,26 @@ object UpdateInstaller {
      * we have no programmatic callback, but if the install succeeds the
      * OS replaces our process and the user lands back in the new build.
      */
-    fun launchInstaller(ctx: Context, apk: File) {
+    fun launchInstaller(
+        ctx: Context,
+        apk: File,
+    ) {
         val authority = "${ctx.packageName}.fileprovider"
         val uri: Uri = FileProvider.getUriForFile(ctx, authority, apk)
-        val intent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, "application/vnd.android.package-archive")
-            // FLAG_ACTIVITY_NEW_TASK is required when starting from a
-            // non-Activity context (we may be invoked from a coroutine
-            // launched out of a Composable's scope, where the caller is
-            // already an Activity, but the flag is harmless either way
-            // and required if the OS routes through any non-Activity
-            // intermediary).
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            // Without this the receiving installer can't read the APK
-            // through the FileProvider URI.
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
+        val intent =
+            Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                // FLAG_ACTIVITY_NEW_TASK is required when starting from a
+                // non-Activity context (we may be invoked from a coroutine
+                // launched out of a Composable's scope, where the caller is
+                // already an Activity, but the flag is harmless either way
+                // and required if the OS routes through any non-Activity
+                // intermediary).
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                // Without this the receiving installer can't read the APK
+                // through the FileProvider URI.
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
         ctx.startActivity(intent)
     }
 
@@ -187,13 +221,12 @@ object UpdateInstaller {
      * should route the user to that settings page via
      * `openUnknownSourcesSettings` before retrying.
      */
-    fun canInstallUnknownApps(ctx: Context): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+    fun canInstallUnknownApps(ctx: Context): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             ctx.packageManager.canRequestPackageInstalls()
         } else {
             true
         }
-    }
 
     /**
      * Open the system "Install unknown apps" page for our package, so
@@ -202,12 +235,13 @@ object UpdateInstaller {
      */
     fun openUnknownSourcesSettings(ctx: Context) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val intent = Intent(
-                Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
-                Uri.parse("package:${ctx.packageName}"),
-            ).apply {
-                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            }
+            val intent =
+                Intent(
+                    Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+                    Uri.parse("package:${ctx.packageName}"),
+                ).apply {
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
             ctx.startActivity(intent)
         }
     }

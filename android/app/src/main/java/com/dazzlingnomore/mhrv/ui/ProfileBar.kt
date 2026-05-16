@@ -68,16 +68,24 @@ fun ProfileBar(
     // an empty state — the "load failure is loud" invariant.
     var refresh by remember { mutableIntStateOf(0) }
     val loadResult = remember(refresh, cfg) { ProfileStore.loadStrict(ctx) }
-    val state = when (loadResult) {
-        is ProfileStore.LoadResult.Ok -> loadResult.state
-        is ProfileStore.LoadResult.Missing -> loadResult.state
-        is ProfileStore.LoadResult.Corrupt ->
-            // Fall through to empty for the selector — we'll show a
-            // corruption banner below so the user knows what's going
-            // on. We still gate writes via the existing CorruptOnDisk
-            // MutationResult so we never clobber the bad file.
-            ProfileStore.State(active = "", profiles = emptyList())
-    }
+    val state =
+        when (loadResult) {
+            is ProfileStore.LoadResult.Ok -> {
+                loadResult.state
+            }
+
+            is ProfileStore.LoadResult.Missing -> {
+                loadResult.state
+            }
+
+            is ProfileStore.LoadResult.Corrupt -> {
+                // Fall through to empty for the selector — we'll show a
+                // corruption banner below so the user knows what's going
+                // on. We still gate writes via the existing CorruptOnDisk
+                // MutationResult so we never clobber the bad file.
+                ProfileStore.State(active = "", profiles = emptyList())
+            }
+        }
     val corrupt = loadResult is ProfileStore.LoadResult.Corrupt
 
     var menuOpen by remember { mutableStateOf(false) }
@@ -162,9 +170,11 @@ fun ProfileBar(
                                             }
                                             onConfigChange(r.cfg)
                                             refresh++
-                                            onSnackbar(ctx.getString(
-                                                R.string.snack_profile_switched, p.name))
+                                            onSnackbar(
+                                                ctx.getString(R.string.snack_profile_switched, p.name),
+                                            )
                                         }
+
                                         is ProfileStore.ApplyResult.PartialConfigOnly -> {
                                             // Live config IS the new profile —
                                             // reload the form — but tell the
@@ -175,13 +185,17 @@ fun ProfileBar(
                                             }
                                             onConfigChange(r.cfg)
                                             refresh++
-                                            onSnackbar(ctx.getString(
-                                                R.string.snack_profile_switched_partial, p.name))
+                                            onSnackbar(
+                                                ctx.getString(R.string.snack_profile_switched_partial, p.name),
+                                            )
                                         }
+
                                         is ProfileStore.ApplyResult.NotFound,
-                                        is ProfileStore.ApplyResult.Failed -> {
-                                            onSnackbar(ctx.getString(
-                                                R.string.snack_profile_switch_failed, p.name))
+                                        is ProfileStore.ApplyResult.Failed,
+                                        -> {
+                                            onSnackbar(
+                                                ctx.getString(R.string.snack_profile_switch_failed, p.name),
+                                            )
                                         }
                                     }
                                 }
@@ -294,13 +308,17 @@ private fun SaveAsProfileDialog(
                     Button(
                         enabled = trimmed.isNotEmpty(),
                         onClick = {
-                            val result = if (exists) {
-                                ProfileStore.upsert(ctx, trimmed, cfg)
-                            } else {
-                                ProfileStore.insertNew(ctx, trimmed, cfg)
-                            }
+                            val result =
+                                if (exists) {
+                                    ProfileStore.upsert(ctx, trimmed, cfg)
+                                } else {
+                                    ProfileStore.insertNew(ctx, trimmed, cfg)
+                                }
                             when (result) {
-                                ProfileStore.MutationResult.Ok -> onSaved(trimmed)
+                                ProfileStore.MutationResult.Ok -> {
+                                    onSaved(trimmed)
+                                }
+
                                 ProfileStore.MutationResult.PartialConfigOnly -> {
                                     // config.json was written (live
                                     // config IS the new form bytes,
@@ -311,20 +329,25 @@ private fun SaveAsProfileDialog(
                                     // retry to capture the profile.
                                     error = ctx.getString(R.string.profile_err_partial_config_only)
                                 }
+
                                 ProfileStore.MutationResult.Duplicate,
                                 ProfileStore.MutationResult.EmptyName,
                                 ProfileStore.MutationResult.NotFound,
-                                ProfileStore.MutationResult.SaveFailed ->
+                                ProfileStore.MutationResult.SaveFailed,
+                                -> {
                                     error = ctx.getString(R.string.profile_err_save_failed)
-                                is ProfileStore.MutationResult.CorruptOnDisk ->
+                                }
+
+                                is ProfileStore.MutationResult.CorruptOnDisk -> {
                                     error = ctx.getString(R.string.profile_err_corrupt_on_disk)
+                                }
                             }
                         },
                     ) {
                         Text(
                             stringResource(
-                                if (exists) R.string.btn_overwrite else R.string.btn_save
-                            )
+                                if (exists) R.string.btn_overwrite else R.string.btn_save,
+                            ),
                         )
                     }
                 }
@@ -356,9 +379,14 @@ private fun ManageProfilesDialog(
                 onOk()
                 onMutated()
             }
-            is ProfileStore.MutationResult.CorruptOnDisk ->
+
+            is ProfileStore.MutationResult.CorruptOnDisk -> {
                 error = ctx.getString(R.string.profile_err_corrupt_on_disk)
-            else -> error = ctx.getString(fallbackErrKey)
+            }
+
+            else -> {
+                error = ctx.getString(fallbackErrKey)
+            }
         }
     }
 
@@ -367,9 +395,10 @@ private fun ManageProfilesDialog(
             Column(
                 // Cap the dialog height so 20+ profiles don't push the
                 // Close button off-screen; the inner list scrolls.
-                modifier = Modifier
-                    .padding(20.dp)
-                    .heightIn(max = 480.dp),
+                modifier =
+                    Modifier
+                        .padding(20.dp)
+                        .heightIn(max = 480.dp),
                 verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 Text(
@@ -393,99 +422,105 @@ private fun ManageProfilesDialog(
                 // keeps the Close row pinned to the bottom.
                 val scroll = rememberScrollState()
                 Column(
-                    modifier = Modifier
-                        .weight(1f, fill = false)
-                        .verticalScroll(scroll),
+                    modifier =
+                        Modifier
+                            .weight(1f, fill = false)
+                            .verticalScroll(scroll),
                     verticalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                for (p in state.profiles) {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    ) {
-                        val isActive = p.name == state.active
-                        Text(
-                            if (isActive) "●" else "  ",
-                            color = if (isActive) MaterialTheme.colorScheme.primary
-                                    else MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.width(16.dp),
-                        )
-                        if (renamingName == p.name) {
-                            OutlinedTextField(
-                                value = renameBuf,
-                                onValueChange = { renameBuf = it },
-                                singleLine = true,
-                                modifier = Modifier.weight(1f),
-                            )
-                            TextButton(onClick = {
-                                applyResult(
-                                    ProfileStore.rename(ctx, p.name, renameBuf),
-                                    R.string.profile_err_rename_failed,
-                                    onOk = {
-                                        renamingName = null
-                                        renameBuf = ""
+                    for (p in state.profiles) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            val isActive = p.name == state.active
+                            Text(
+                                if (isActive) "●" else "  ",
+                                color =
+                                    if (isActive) {
+                                        MaterialTheme.colorScheme.primary
+                                    } else {
+                                        MaterialTheme.colorScheme.onSurfaceVariant
                                     },
-                                )
-                            }) { Text(stringResource(R.string.btn_ok)) }
-                            TextButton(onClick = {
-                                renamingName = null
-                                renameBuf = ""
-                                error = null
-                            }) { Text(stringResource(R.string.btn_cancel)) }
-                        } else if (pendingDeleteName == p.name) {
-                            // Two-step delete: profile data may be the
-                            // user's only saved copy, so we don't take
-                            // it out on a single accidental tap.
-                            Text(
-                                text = stringResource(R.string.confirm_delete_profile, p.name),
-                                color = MaterialTheme.colorScheme.error,
-                                style = MaterialTheme.typography.bodySmall,
-                                modifier = Modifier.weight(1f),
+                                modifier = Modifier.width(16.dp),
                             )
-                            Button(
-                                onClick = {
+                            if (renamingName == p.name) {
+                                OutlinedTextField(
+                                    value = renameBuf,
+                                    onValueChange = { renameBuf = it },
+                                    singleLine = true,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                TextButton(onClick = {
                                     applyResult(
-                                        ProfileStore.delete(ctx, p.name),
-                                        R.string.profile_err_delete_failed,
-                                        onOk = { pendingDeleteName = null },
+                                        ProfileStore.rename(ctx, p.name, renameBuf),
+                                        R.string.profile_err_rename_failed,
+                                        onOk = {
+                                            renamingName = null
+                                            renameBuf = ""
+                                        },
                                     )
-                                },
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = MaterialTheme.colorScheme.error,
-                                    contentColor = MaterialTheme.colorScheme.onError,
-                                ),
-                            ) { Text(stringResource(R.string.btn_confirm_delete)) }
-                            TextButton(onClick = {
-                                pendingDeleteName = null
-                                error = null
-                            }) { Text(stringResource(R.string.btn_cancel)) }
-                        } else {
-                            Text(
-                                p.name,
-                                style = MaterialTheme.typography.bodyMedium,
-                                modifier = Modifier.weight(1f),
-                            )
-                            TextButton(onClick = {
-                                renamingName = p.name
-                                renameBuf = p.name
-                                error = null
-                            }) { Text(stringResource(R.string.btn_rename)) }
-                            TextButton(onClick = {
-                                val target = ProfileStore.uniqueCopyName(state, p.name)
-                                applyResult(
-                                    ProfileStore.duplicate(ctx, p.name, target),
-                                    R.string.profile_err_duplicate_failed,
+                                }) { Text(stringResource(R.string.btn_ok)) }
+                                TextButton(onClick = {
+                                    renamingName = null
+                                    renameBuf = ""
+                                    error = null
+                                }) { Text(stringResource(R.string.btn_cancel)) }
+                            } else if (pendingDeleteName == p.name) {
+                                // Two-step delete: profile data may be the
+                                // user's only saved copy, so we don't take
+                                // it out on a single accidental tap.
+                                Text(
+                                    text = stringResource(R.string.confirm_delete_profile, p.name),
+                                    color = MaterialTheme.colorScheme.error,
+                                    style = MaterialTheme.typography.bodySmall,
+                                    modifier = Modifier.weight(1f),
                                 )
-                            }) { Text(stringResource(R.string.btn_duplicate)) }
-                            TextButton(onClick = {
-                                // Arm the confirm row instead of deleting.
-                                pendingDeleteName = p.name
-                                error = null
-                            }) { Text(stringResource(R.string.btn_delete)) }
+                                Button(
+                                    onClick = {
+                                        applyResult(
+                                            ProfileStore.delete(ctx, p.name),
+                                            R.string.profile_err_delete_failed,
+                                            onOk = { pendingDeleteName = null },
+                                        )
+                                    },
+                                    colors =
+                                        ButtonDefaults.buttonColors(
+                                            containerColor = MaterialTheme.colorScheme.error,
+                                            contentColor = MaterialTheme.colorScheme.onError,
+                                        ),
+                                ) { Text(stringResource(R.string.btn_confirm_delete)) }
+                                TextButton(onClick = {
+                                    pendingDeleteName = null
+                                    error = null
+                                }) { Text(stringResource(R.string.btn_cancel)) }
+                            } else {
+                                Text(
+                                    p.name,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    modifier = Modifier.weight(1f),
+                                )
+                                TextButton(onClick = {
+                                    renamingName = p.name
+                                    renameBuf = p.name
+                                    error = null
+                                }) { Text(stringResource(R.string.btn_rename)) }
+                                TextButton(onClick = {
+                                    val target = ProfileStore.uniqueCopyName(state, p.name)
+                                    applyResult(
+                                        ProfileStore.duplicate(ctx, p.name, target),
+                                        R.string.profile_err_duplicate_failed,
+                                    )
+                                }) { Text(stringResource(R.string.btn_duplicate)) }
+                                TextButton(onClick = {
+                                    // Arm the confirm row instead of deleting.
+                                    pendingDeleteName = p.name
+                                    error = null
+                                }) { Text(stringResource(R.string.btn_delete)) }
+                            }
                         }
                     }
-                }
                 } // end scrolling Column
                 Row {
                     Spacer(Modifier.weight(1f))

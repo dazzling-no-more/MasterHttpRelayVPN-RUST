@@ -17,8 +17,8 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.ErrorOutline
 import androidx.compose.material.icons.filled.ExpandLess
 import androidx.compose.material.icons.filled.ExpandMore
-import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.HourglassBottom
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -27,6 +27,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
@@ -35,21 +36,20 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.dazzlingnomore.mhrv.CaInstall
 import com.dazzlingnomore.mhrv.ConfigStore
+import com.dazzlingnomore.mhrv.ConnectionMode
 import com.dazzlingnomore.mhrv.CuratedGroups
 import com.dazzlingnomore.mhrv.DEFAULT_SNI_POOL
 import com.dazzlingnomore.mhrv.FrontingGroup
 import com.dazzlingnomore.mhrv.MhrvConfig
 import com.dazzlingnomore.mhrv.Mode
 import com.dazzlingnomore.mhrv.Native
-import com.dazzlingnomore.mhrv.ProfileStore
-import com.dazzlingnomore.mhrv.ConnectionMode
 import com.dazzlingnomore.mhrv.NetworkDetect
+import com.dazzlingnomore.mhrv.ProfileStore
 import com.dazzlingnomore.mhrv.R
 import com.dazzlingnomore.mhrv.SplitMode
 import com.dazzlingnomore.mhrv.UiLang
 import com.dazzlingnomore.mhrv.UpdateInstaller
 import com.dazzlingnomore.mhrv.VpnState
-import androidx.compose.ui.res.stringResource
 import com.dazzlingnomore.mhrv.ui.theme.ErrRed
 import com.dazzlingnomore.mhrv.ui.theme.OkGreen
 import kotlinx.coroutines.Dispatchers
@@ -67,13 +67,19 @@ import org.json.JSONObject
  */
 sealed class CaInstallOutcome {
     object Installed : CaInstallOutcome()
+
     /**
      * Cert not found in the AndroidCAStore after the Settings activity
      * returned. Carries an optional downloadPath so the snackbar can tell
      * the user where the file landed (Downloads or app-private external).
      */
-    data class NotInstalled(val downloadPath: String?) : CaInstallOutcome()
-    data class Failed(val message: String) : CaInstallOutcome()
+    data class NotInstalled(
+        val downloadPath: String?,
+    ) : CaInstallOutcome()
+
+    data class Failed(
+        val message: String,
+    ) : CaInstallOutcome()
 }
 
 /**
@@ -102,6 +108,7 @@ fun HomeScreen(
     // Persisted form state. Any edit writes back to disk immediately —
     // cheap at this write rate, avoids "I tapped Start before saving" bugs.
     var cfg by remember { mutableStateOf(ConfigStore.load(ctx)) }
+
     fun persist(new: MhrvConfig) {
         // In-memory state goes through unconditionally so the form
         // doesn't snap back to old bytes mid-edit. Disk state is
@@ -143,9 +150,10 @@ fun HomeScreen(
     LaunchedEffect(autoUpdateChecked) {
         if (autoUpdateChecked) return@LaunchedEffect
         autoUpdateChecked = true
-        val json = withContext(Dispatchers.IO) {
-            runCatching { Native.checkUpdate() }.getOrNull()
-        }
+        val json =
+            withContext(Dispatchers.IO) {
+                runCatching { Native.checkUpdate() }.getOrNull()
+            }
         val state = UpdateInstaller.parseCheckResult(json)
         if (state is UpdateInstaller.State.Available) {
             offerInstall(ctx, scope, snackbar, state)
@@ -184,20 +192,30 @@ fun HomeScreen(
     // after showing so a recomposition doesn't re-trigger it.
     LaunchedEffect(caOutcome) {
         val o = caOutcome ?: return@LaunchedEffect
-        val msg = when (o) {
-            is CaInstallOutcome.Installed ->
-                "Certificate installed ✓"
-            is CaInstallOutcome.NotInstalled -> buildString {
-                append("Certificate not yet installed.")
-                if (!o.downloadPath.isNullOrBlank()) {
-                    append(" Saved to ${o.downloadPath}. ")
-                    append("In Settings, search for \"CA certificate\" and install from there — NOT \"VPN & app user certificate\" or \"Wi-Fi\".")
-                } else {
-                    append(" Tap Install again to retry.")
+        val msg =
+            when (o) {
+                is CaInstallOutcome.Installed -> {
+                    "Certificate installed ✓"
+                }
+
+                is CaInstallOutcome.NotInstalled -> {
+                    buildString {
+                        append("Certificate not yet installed.")
+                        if (!o.downloadPath.isNullOrBlank()) {
+                            append(" Saved to ${o.downloadPath}. ")
+                            append(
+                                "In Settings, search for \"CA certificate\" and install from there — NOT \"VPN & app user certificate\" or \"Wi-Fi\".",
+                            )
+                        } else {
+                            append(" Tap Install again to retry.")
+                        }
+                    }
+                }
+
+                is CaInstallOutcome.Failed -> {
+                    o.message
                 }
             }
-            is CaInstallOutcome.Failed -> o.message
-        }
         snackbar.showSnackbar(msg, withDismissAction = true)
         onCaOutcomeConsumed()
     }
@@ -216,21 +234,23 @@ fun HomeScreen(
                     // glance; a flag icon alone would be ambiguous.
                     TextButton(
                         onClick = {
-                            val next = when (cfg.uiLang) {
-                                UiLang.AUTO -> UiLang.FA
-                                UiLang.FA -> UiLang.EN
-                                UiLang.EN -> UiLang.AUTO
-                            }
+                            val next =
+                                when (cfg.uiLang) {
+                                    UiLang.AUTO -> UiLang.FA
+                                    UiLang.FA -> UiLang.EN
+                                    UiLang.EN -> UiLang.AUTO
+                                }
                             persist(cfg.copy(uiLang = next))
                             onLangChange(next)
                         },
                     ) {
                         Text(
-                            text = when (cfg.uiLang) {
-                                UiLang.AUTO -> "AUTO"
-                                UiLang.FA -> "FA"
-                                UiLang.EN -> "EN"
-                            },
+                            text =
+                                when (cfg.uiLang) {
+                                    UiLang.AUTO -> "AUTO"
+                                    UiLang.FA -> "FA"
+                                    UiLang.EN -> "EN"
+                                },
                             style = MaterialTheme.typography.labelSmall,
                         )
                     }
@@ -242,9 +262,10 @@ fun HomeScreen(
                             if (checking) return@TextButton
                             checking = true
                             scope.launch {
-                                val json = withContext(Dispatchers.IO) {
-                                    runCatching { Native.checkUpdate() }.getOrNull()
-                                }
+                                val json =
+                                    withContext(Dispatchers.IO) {
+                                        runCatching { Native.checkUpdate() }.getOrNull()
+                                    }
                                 val state = UpdateInstaller.parseCheckResult(json)
                                 if (state is UpdateInstaller.State.Available) {
                                     offerInstall(ctx, scope, snackbar, state)
@@ -260,9 +281,13 @@ fun HomeScreen(
                         modifier = Modifier.padding(end = 4.dp),
                     ) {
                         Text(
-                            text = if (checking) stringResource(R.string.tb_check_update_checking)
-                                   else stringResource(R.string.tb_version_prefix) +
-                                        runCatching { Native.version() }.getOrDefault("?"),
+                            text =
+                                if (checking) {
+                                    stringResource(R.string.tb_check_update_checking)
+                                } else {
+                                    stringResource(R.string.tb_version_prefix) +
+                                        runCatching { Native.version() }.getOrDefault("?")
+                                },
                             style = MaterialTheme.typography.labelMedium,
                         )
                     }
@@ -272,11 +297,12 @@ fun HomeScreen(
         snackbarHost = { SnackbarHost(snackbar) },
     ) { inner ->
         Column(
-            modifier = Modifier
-                .padding(inner)
-                .fillMaxSize()
-                .verticalScroll(rememberScrollState())
-                .padding(16.dp),
+            modifier =
+                Modifier
+                    .padding(inner)
+                    .fillMaxSize()
+                    .verticalScroll(rememberScrollState())
+                    .padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
             // Config import/export bar — paste from clipboard + export + QR.
@@ -341,9 +367,10 @@ fun HomeScreen(
                             // explicit "Auto-detect" button above.
                             var updated = cfg
                             if (updated.googleIp.isBlank()) {
-                                val fresh = withContext(Dispatchers.IO) {
-                                    NetworkDetect.resolveGoogleIp()
-                                }
+                                val fresh =
+                                    withContext(Dispatchers.IO) {
+                                        NetworkDetect.resolveGoogleIp()
+                                    }
                                 if (!fresh.isNullOrBlank()) {
                                     updated = updated.copy(googleIp = fresh)
                                 }
@@ -358,17 +385,22 @@ fun HomeScreen(
                         }
                     }
                 },
-                enabled = (isVpnRunning ||
-                    cfg.mode == Mode.DIRECT ||
-                    (cfg.hasDeploymentId && cfg.authKey.isNotBlank())) && !transitioning,
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isVpnRunning) ErrRed else OkGreen,
-                    contentColor = androidx.compose.ui.graphics.Color.White,
-                    disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
-                ),
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 52.dp),
+                enabled =
+                    (
+                        isVpnRunning ||
+                            cfg.mode == Mode.DIRECT ||
+                            (cfg.hasDeploymentId && cfg.authKey.isNotBlank())
+                    ) && !transitioning,
+                colors =
+                    ButtonDefaults.buttonColors(
+                        containerColor = if (isVpnRunning) ErrRed else OkGreen,
+                        contentColor = androidx.compose.ui.graphics.Color.White,
+                        disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant,
+                    ),
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 52.dp),
             ) {
                 Text(
                     when {
@@ -429,9 +461,10 @@ fun HomeScreen(
                         SelectionContainer(modifier = Modifier.weight(1f)) {
                             Text(
                                 upstream,
-                                style = MaterialTheme.typography.bodyMedium.copy(
-                                    fontFamily = FontFamily.Monospace,
-                                ),
+                                style =
+                                    MaterialTheme.typography.bodyMedium.copy(
+                                        fontFamily = FontFamily.Monospace,
+                                    ),
                                 color = if (proxyOnly) OkGreen else MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
@@ -460,8 +493,9 @@ fun HomeScreen(
             // (no IDs/key yet) so the form is immediately discoverable.
             CollapsibleSection(
                 title = stringResource(R.string.sec_apps_script_relay),
-                initiallyExpanded = appsScriptEnabled &&
-                    (cfg.appsScriptUrls.isEmpty() || cfg.authKey.isBlank()),
+                initiallyExpanded =
+                    appsScriptEnabled &&
+                        (cfg.appsScriptUrls.isEmpty() || cfg.authKey.isBlank()),
             ) {
                 DeploymentIdsField(
                     urls = cfg.appsScriptUrls,
@@ -521,9 +555,10 @@ fun HomeScreen(
             TextButton(
                 onClick = {
                     scope.launch {
-                        val fresh = withContext(Dispatchers.IO) {
-                            NetworkDetect.resolveGoogleIp()
-                        }
+                        val fresh =
+                            withContext(Dispatchers.IO) {
+                                NetworkDetect.resolveGoogleIp()
+                            }
                         if (!fresh.isNullOrBlank()) {
                             var updated = cfg
                             if (fresh != updated.googleIp) {
@@ -651,20 +686,20 @@ fun HomeScreen(
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text(
                         "rahgozar creates a local certificate authority so it can decrypt " +
-                        "and re-encrypt HTTPS traffic before tunnelling it through the Apps " +
-                        "Script relay. Without this CA installed as trusted, apps will show " +
-                        "certificate errors."
+                            "and re-encrypt HTTPS traffic before tunnelling it through the Apps " +
+                            "Script relay. Without this CA installed as trusted, apps will show " +
+                            "certificate errors.",
                     )
                     Text(
                         "On Android 11+ the system removed the inline install path, so " +
-                        "tapping Install will: (1) save a PEM copy to Downloads/mhrv-ca.crt, " +
-                        "(2) open the Settings app.\n\n" +
-                        "Inside Settings, tap the search bar and type \"CA certificate\". " +
-                        "Open the result labelled \"CA certificate\" (NOT \"VPN & app user " +
-                        "certificate\" or \"Wi-Fi certificate\"). Pick mhrv-ca.crt from " +
-                        "Downloads when prompted. If you don't have a screen lock, Android " +
-                        "will ask you to add one first — that's an OS requirement for " +
-                        "installing any user CA."
+                            "tapping Install will: (1) save a PEM copy to Downloads/mhrv-ca.crt, " +
+                            "(2) open the Settings app.\n\n" +
+                            "Inside Settings, tap the search bar and type \"CA certificate\". " +
+                            "Open the result labelled \"CA certificate\" (NOT \"VPN & app user " +
+                            "certificate\" or \"Wi-Fi certificate\"). Pick mhrv-ca.crt from " +
+                            "Downloads when prompted. If you don't have a screen lock, Android " +
+                            "will ask you to add one first — that's an OS requirement for " +
+                            "installing any user CA.",
                     )
                     if (fp != null) {
                         Text("Subject: ${cn ?: "(unknown)"}", style = MaterialTheme.typography.labelMedium)
@@ -676,7 +711,7 @@ fun HomeScreen(
                     } else {
                         Text(
                             "Could not read the CA cert yet. Tap Start once so the " +
-                            "proxy generates it, then come back.",
+                                "proxy generates it, then come back.",
                             color = MaterialTheme.colorScheme.error,
                         )
                     }
@@ -768,7 +803,11 @@ private fun AppSplittingEditor(
 }
 
 @Composable
-private fun SplitModeRow(label: String, selected: Boolean, onClick: () -> Unit) {
+private fun SplitModeRow(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         modifier = Modifier.fillMaxWidth(),
@@ -796,10 +835,11 @@ private fun ConnectionModeDropdown(
 ) {
     val labelVpn = stringResource(R.string.mode_vpn_tun)
     val labelProxy = stringResource(R.string.mode_proxy_only)
-    val currentLabel = when (mode) {
-        ConnectionMode.VPN_TUN -> labelVpn
-        ConnectionMode.PROXY_ONLY -> labelProxy
-    }
+    val currentLabel =
+        when (mode) {
+            ConnectionMode.VPN_TUN -> labelVpn
+            ConnectionMode.PROXY_ONLY -> labelProxy
+        }
     var expanded by remember { mutableStateOf(false) }
 
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -840,12 +880,16 @@ private fun ConnectionModeDropdown(
         // signing up for in each mode — especially important for
         // PROXY_ONLY, where "tap Connect" alone doesn't route anything
         // until they set the Wi-Fi proxy themselves.
-        val help = when (mode) {
-            ConnectionMode.VPN_TUN ->
-                stringResource(R.string.help_mode_vpn_tun)
-            ConnectionMode.PROXY_ONLY ->
-                stringResource(R.string.help_mode_proxy_only, httpPort, socks5Port)
-        }
+        val help =
+            when (mode) {
+                ConnectionMode.VPN_TUN -> {
+                    stringResource(R.string.help_mode_vpn_tun)
+                }
+
+                ConnectionMode.PROXY_ONLY -> {
+                    stringResource(R.string.help_mode_proxy_only, httpPort, socks5Port)
+                }
+            }
         Text(
             help,
             style = MaterialTheme.typography.labelSmall,
@@ -974,11 +1018,12 @@ private fun ModeDropdown(
     val labelApps = "Apps Script (MITM)"
     val labelDirect = "Direct (no relay)"
     val labelFull = "Full tunnel (no cert)"
-    val currentLabel = when (mode) {
-        Mode.APPS_SCRIPT -> labelApps
-        Mode.DIRECT -> labelDirect
-        Mode.FULL -> labelFull
-    }
+    val currentLabel =
+        when (mode) {
+            Mode.APPS_SCRIPT -> labelApps
+            Mode.DIRECT -> labelDirect
+            Mode.FULL -> labelFull
+        }
     var expanded by remember { mutableStateOf(false) }
 
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -1000,27 +1045,42 @@ private fun ModeDropdown(
             ) {
                 DropdownMenuItem(
                     text = { Text(labelApps) },
-                    onClick = { onChange(Mode.APPS_SCRIPT); expanded = false },
+                    onClick = {
+                        onChange(Mode.APPS_SCRIPT)
+                        expanded = false
+                    },
                 )
                 DropdownMenuItem(
                     text = { Text(labelDirect) },
-                    onClick = { onChange(Mode.DIRECT); expanded = false },
+                    onClick = {
+                        onChange(Mode.DIRECT)
+                        expanded = false
+                    },
                 )
                 DropdownMenuItem(
                     text = { Text(labelFull) },
-                    onClick = { onChange(Mode.FULL); expanded = false },
+                    onClick = {
+                        onChange(Mode.FULL)
+                        expanded = false
+                    },
                 )
             }
         }
 
-        val help = when (mode) {
-            Mode.APPS_SCRIPT ->
-                "Full DPI bypass through your deployed Apps Script relay."
-            Mode.DIRECT ->
-                "SNI-rewrite tunnel only — no relay. Reach *.google.com (and any configured fronting_groups) directly. Useful as a bootstrap to open script.google.com and deploy Code.gs."
-            Mode.FULL ->
-                "All traffic tunneled end-to-end through Apps Script + remote tunnel node. No certificate needed."
-        }
+        val help =
+            when (mode) {
+                Mode.APPS_SCRIPT -> {
+                    "Full DPI bypass through your deployed Apps Script relay."
+                }
+
+                Mode.DIRECT -> {
+                    "SNI-rewrite tunnel only — no relay. Reach *.google.com (and any configured fronting_groups) directly. Useful as a bootstrap to open script.google.com and deploy Code.gs."
+                }
+
+                Mode.FULL -> {
+                    "All traffic tunneled end-to-end through Apps Script + remote tunnel node. No certificate needed."
+                }
+            }
         Text(
             help,
             style = MaterialTheme.typography.labelSmall,
@@ -1042,9 +1102,16 @@ private fun ModeDropdown(
 
 private sealed class ProbeState {
     object Idle : ProbeState()
+
     object InFlight : ProbeState()
-    data class Ok(val latencyMs: Int) : ProbeState()
-    data class Err(val message: String) : ProbeState()
+
+    data class Ok(
+        val latencyMs: Int,
+    ) : ProbeState()
+
+    data class Err(
+        val message: String,
+    ) : ProbeState()
 }
 
 @Composable
@@ -1057,30 +1124,36 @@ private fun SniPoolEditor(
     // Build the displayed list: union of the default pool + the config's
     // sniHosts + the current front_domain. Order: front_domain first,
     // defaults, then user customs. Deduped.
-    val displayed: List<String> = remember(cfg) {
-        val seen = linkedSetOf<String>()
-        if (cfg.frontDomain.isNotBlank()) seen.add(cfg.frontDomain.trim())
-        DEFAULT_SNI_POOL.forEach { seen.add(it) }
-        cfg.sniHosts.forEach { if (it.isNotBlank()) seen.add(it.trim()) }
-        seen.toList()
-    }
+    val displayed: List<String> =
+        remember(cfg) {
+            val seen = linkedSetOf<String>()
+            if (cfg.frontDomain.isNotBlank()) seen.add(cfg.frontDomain.trim())
+            DEFAULT_SNI_POOL.forEach { seen.add(it) }
+            cfg.sniHosts.forEach { if (it.isNotBlank()) seen.add(it.trim()) }
+            seen.toList()
+        }
 
     // A host is enabled if it appears in cfg.sniHosts. Empty sniHosts
     // means "let Rust auto-expand" — we reflect that as "default pool
     // enabled, customs not".
-    val enabledSet: Set<String> = remember(cfg.sniHosts) {
-        if (cfg.sniHosts.isNotEmpty()) cfg.sniHosts.toSet()
-        else DEFAULT_SNI_POOL.toSet() + setOfNotNull(cfg.frontDomain.takeIf { it.isNotBlank() })
-    }
+    val enabledSet: Set<String> =
+        remember(cfg.sniHosts) {
+            if (cfg.sniHosts.isNotEmpty()) {
+                cfg.sniHosts.toSet()
+            } else {
+                DEFAULT_SNI_POOL.toSet() + setOfNotNull(cfg.frontDomain.takeIf { it.isNotBlank() })
+            }
+        }
 
     val probeState = remember { mutableStateMapOf<String, ProbeState>() }
 
     fun probe(sni: String) {
         probeState[sni] = ProbeState.InFlight
         scope.launch {
-            val json = withContext(Dispatchers.IO) {
-                runCatching { Native.testSni(cfg.googleIp, sni) }.getOrNull()
-            }
+            val json =
+                withContext(Dispatchers.IO) {
+                    runCatching { Native.testSni(cfg.googleIp, sni) }.getOrNull()
+                }
             probeState[sni] = parseProbeResult(json)
         }
     }
@@ -1099,12 +1172,13 @@ private fun SniPoolEditor(
                 enabled = enabled,
                 state = probeState[sni] ?: ProbeState.Idle,
                 onToggle = { nowEnabled ->
-                    val next = if (nowEnabled) {
-                        (cfg.sniHosts.takeIf { it.isNotEmpty() } ?: emptyList()) + sni
-                    } else {
-                        val current = if (cfg.sniHosts.isNotEmpty()) cfg.sniHosts else enabledSet.toList()
-                        current.filter { it != sni }
-                    }
+                    val next =
+                        if (nowEnabled) {
+                            (cfg.sniHosts.takeIf { it.isNotEmpty() } ?: emptyList()) + sni
+                        } else {
+                            val current = if (cfg.sniHosts.isNotEmpty()) cfg.sniHosts else enabledSet.toList()
+                            current.filter { it != sni }
+                        }
                     onChange(cfg.copy(sniHosts = next.distinct()))
                 },
                 onTest = { probe(sni) },
@@ -1139,9 +1213,11 @@ private fun SniPoolEditor(
                     // Tokenise on any whitespace, comma, or semicolon so one
                     // Add click absorbs a pasted list. Deduplicate within
                     // the paste before merging into the existing list.
-                    val tokens = custom.split(Regex("[\\s,;]+"))
-                        .map { it.trim() }
-                        .filter { it.isNotEmpty() }
+                    val tokens =
+                        custom
+                            .split(Regex("[\\s,;]+"))
+                            .map { it.trim() }
+                            .filter { it.isNotEmpty() }
                     if (tokens.isNotEmpty()) {
                         val base = cfg.sniHosts.takeIf { it.isNotEmpty() } ?: enabledSet.toList()
                         val next = (base + tokens).distinct()
@@ -1204,18 +1280,21 @@ private fun SniRow(
 private fun ProbeBadge(state: ProbeState) {
     when (state) {
         is ProbeState.Idle -> {}
+
         is ProbeState.InFlight -> {
             CircularProgressIndicator(
                 modifier = Modifier.size(14.dp),
                 strokeWidth = 2.dp,
             )
         }
+
         is ProbeState.Ok -> {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 // Same green the desktop UI uses for OK status (OK_GREEN
                 // in src/bin/ui.rs line 510) — kept in sync via Theme.kt.
                 Icon(
-                    Icons.Default.CheckCircle, null,
+                    Icons.Default.CheckCircle,
+                    null,
                     tint = OkGreen,
                     modifier = Modifier.size(16.dp),
                 )
@@ -1223,9 +1302,11 @@ private fun ProbeBadge(state: ProbeState) {
                 Text("${state.latencyMs} ms", style = MaterialTheme.typography.labelSmall)
             }
         }
+
         is ProbeState.Err -> {
             Icon(
-                Icons.Default.ErrorOutline, state.message,
+                Icons.Default.ErrorOutline,
+                state.message,
                 tint = MaterialTheme.colorScheme.error,
                 modifier = Modifier.size(16.dp),
             )
@@ -1272,17 +1353,19 @@ private fun offerInstall(
             return@launch
         }
 
-        val msg = ctx.getString(
-            R.string.snack_update_available,
-            state.current,
-            state.latest,
-        )
-        val result = snackbar.showSnackbar(
-            message = msg,
-            actionLabel = ctx.getString(R.string.btn_install),
-            withDismissAction = true,
-            duration = SnackbarDuration.Indefinite,
-        )
+        val msg =
+            ctx.getString(
+                R.string.snack_update_available,
+                state.current,
+                state.latest,
+            )
+        val result =
+            snackbar.showSnackbar(
+                message = msg,
+                actionLabel = ctx.getString(R.string.btn_install),
+                withDismissAction = true,
+                duration = SnackbarDuration.Indefinite,
+            )
         if (result != SnackbarResult.ActionPerformed) return@launch
 
         if (!UpdateInstaller.canInstallUnknownApps(ctx)) {
@@ -1299,21 +1382,23 @@ private fun offerInstall(
         // no dismiss button, the only way to release that suspension is
         // a sibling coroutine cancelling/replacing it — running the
         // download on the same coroutine would deadlock here.
-        val snackJob = scope.launch {
-            snackbar.showSnackbar(
-                ctx.getString(
-                    R.string.snack_update_downloading,
-                    asset.sizeBytes.toDouble() / 1_048_576.0,
-                ),
-                withDismissAction = false,
-                duration = SnackbarDuration.Indefinite,
-            )
-        }
-        val dl = try {
-            UpdateInstaller.downloadApk(ctx, asset)
-        } finally {
-            snackJob.cancel()
-        }
+        val snackJob =
+            scope.launch {
+                snackbar.showSnackbar(
+                    ctx.getString(
+                        R.string.snack_update_downloading,
+                        asset.sizeBytes.toDouble() / 1_048_576.0,
+                    ),
+                    withDismissAction = false,
+                    duration = SnackbarDuration.Indefinite,
+                )
+            }
+        val dl =
+            try {
+                UpdateInstaller.downloadApk(ctx, asset)
+            } finally {
+                snackJob.cancel()
+            }
         when (dl) {
             is UpdateInstaller.State.ReadyToInstall -> {
                 runCatching { UpdateInstaller.launchInstaller(ctx, dl.apk) }
@@ -1327,9 +1412,11 @@ private fun offerInstall(
                         )
                     }
             }
+
             is UpdateInstaller.State.Failed -> {
                 snackbar.showSnackbar(dl.reason, withDismissAction = true)
             }
+
             else -> { /* unreachable for downloadApk's return type */ }
         }
     }
@@ -1346,16 +1433,28 @@ private fun summarizeUpdateCheck(json: String?): String {
     return try {
         val obj = JSONObject(json)
         when (obj.optString("kind")) {
-            "upToDate" -> "Up to date (running v${obj.optString("current")})"
+            "upToDate" -> {
+                "Up to date (running v${obj.optString("current")})"
+            }
+
             "updateAvailable" -> {
                 val cur = obj.optString("current")
                 val latest = obj.optString("latest")
                 val url = obj.optString("url")
                 "Update available: v$cur → v$latest   $url"
             }
-            "offline" -> "Offline: ${obj.optString("reason", "no details")}"
-            "error" -> "Check failed: ${obj.optString("reason", "no details")}"
-            else -> "Check failed (unknown response)"
+
+            "offline" -> {
+                "Offline: ${obj.optString("reason", "no details")}"
+            }
+
+            "error" -> {
+                "Check failed: ${obj.optString("reason", "no details")}"
+            }
+
+            else -> {
+                "Check failed (unknown response)"
+            }
         }
     } catch (_: Throwable) {
         "Check failed (bad json)"
@@ -1413,12 +1512,23 @@ private fun parseProbeResult(json: String?): ProbeState {
  */
 internal sealed class DiscoverState {
     object Idle : DiscoverState()
+
     /** Probe is running. Kept so the UI can show "Discovering <hostname>…". */
-    data class InFlight(val hostname: String) : DiscoverState()
+    data class InFlight(
+        val hostname: String,
+    ) : DiscoverState()
+
     /** Top-level failure (bad input, DNS timeout, etc.). */
-    data class Error(val hostname: String, val message: String) : DiscoverState()
+    data class Error(
+        val hostname: String,
+        val message: String,
+    ) : DiscoverState()
+
     /** DNS resolved; per-IP probe results follow. */
-    data class Done(val hostname: String, val ips: List<DiscoveredIp>) : DiscoverState()
+    data class Done(
+        val hostname: String,
+        val ips: List<DiscoveredIp>,
+    ) : DiscoverState()
 }
 
 /** One probed IP from a `DiscoverState.Done`. `internal` for the same reason. */
@@ -1450,17 +1560,18 @@ internal fun parseDiscoverResult(json: String?): DiscoverState {
             return DiscoverState.Error(hostname, topErr)
         }
         val arr = obj.optJSONArray("ips") ?: return DiscoverState.Error(hostname, "no ips in response")
-        val ips = buildList {
-            for (i in 0 until arr.length()) {
-                val r = arr.optJSONObject(i) ?: continue
-                val ip = r.optString("ip", "")
-                if (ip.isBlank()) continue
-                val ok = r.optBoolean("ok", false)
-                val latency = if (r.has("latencyMs")) r.optInt("latencyMs") else null
-                val err = r.optString("error", "").takeIf { it.isNotBlank() }
-                add(DiscoveredIp(ip = ip, ok = ok, latencyMs = latency, error = err))
+        val ips =
+            buildList {
+                for (i in 0 until arr.length()) {
+                    val r = arr.optJSONObject(i) ?: continue
+                    val ip = r.optString("ip", "")
+                    if (ip.isBlank()) continue
+                    val ok = r.optBoolean("ok", false)
+                    val latency = if (r.has("latencyMs")) r.optInt("latencyMs") else null
+                    val err = r.optString("error", "").takeIf { it.isNotBlank() }
+                    add(DiscoveredIp(ip = ip, ok = ok, latencyMs = latency, error = err))
+                }
             }
-        }
         DiscoverState.Done(hostname, ips)
     } catch (t: Throwable) {
         DiscoverState.Error("", t.message ?: "parse failed")
@@ -1490,13 +1601,13 @@ private fun FrontingGroupsEditor(
         // every edit so a backgrounded app doesn't lose unsaved changes.
         cfg.frontingGroups.forEachIndexed { idx, g ->
             Column(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(
-                        MaterialTheme.colorScheme.surfaceVariant,
-                        RoundedCornerShape(8.dp),
-                    )
-                    .padding(8.dp),
+                modifier =
+                    Modifier
+                        .fillMaxWidth()
+                        .background(
+                            MaterialTheme.colorScheme.surfaceVariant,
+                            RoundedCornerShape(8.dp),
+                        ).padding(8.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp),
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1517,9 +1628,10 @@ private fun FrontingGroupsEditor(
                 }
                 Text(
                     "${g.ip}  via  ${g.sni}",
-                    style = MaterialTheme.typography.labelSmall.copy(
-                        fontFamily = FontFamily.Monospace,
-                    ),
+                    style =
+                        MaterialTheme.typography.labelSmall.copy(
+                            fontFamily = FontFamily.Monospace,
+                        ),
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
                 // Draft warning: surface that Save will drop this group so
@@ -1544,12 +1656,15 @@ private fun FrontingGroupsEditor(
                     value = domainsText,
                     onValueChange = { v ->
                         domainsText = v
-                        val parsed = v.split('\n', ',')
-                            .map { it.trim() }
-                            .filter { it.isNotEmpty() }
-                        val next = cfg.frontingGroups.toMutableList().apply {
-                            this[idx] = g.copy(domains = parsed)
-                        }
+                        val parsed =
+                            v
+                                .split('\n', ',')
+                                .map { it.trim() }
+                                .filter { it.isNotEmpty() }
+                        val next =
+                            cfg.frontingGroups.toMutableList().apply {
+                                this[idx] = g.copy(domains = parsed)
+                            }
                         onChange(cfg.copy(frontingGroups = next))
                     },
                     placeholder = { Text(stringResource(R.string.fronting_hint_domains)) },
@@ -1563,7 +1678,9 @@ private fun FrontingGroupsEditor(
                 Text(
                     stringResource(R.string.fronting_edge_mismatch_warning),
                     style = MaterialTheme.typography.labelSmall,
-                    color = androidx.compose.ui.graphics.Color(0xFFDCB464),
+                    color =
+                        androidx.compose.ui.graphics
+                            .Color(0xFFDCB464),
                 )
             }
         }
@@ -1583,9 +1700,10 @@ private fun FrontingGroupsEditor(
                 if (h.isEmpty()) return@Button
                 discover = DiscoverState.InFlight(h)
                 scope.launch {
-                    val json = withContext(Dispatchers.IO) {
-                        runCatching { Native.discoverFront(h) }.getOrNull()
-                    }
+                    val json =
+                        withContext(Dispatchers.IO) {
+                            runCatching { Native.discoverFront(h) }.getOrNull()
+                        }
                     discover = parseDiscoverResult(json)
                 }
             },
@@ -1593,14 +1711,20 @@ private fun FrontingGroupsEditor(
             modifier = Modifier.align(Alignment.End),
         ) {
             Text(
-                if (inFlight) stringResource(R.string.btn_discovering)
-                else stringResource(R.string.btn_discover),
+                if (inFlight) {
+                    stringResource(R.string.btn_discovering)
+                } else {
+                    stringResource(R.string.btn_discover)
+                },
             )
         }
 
         // Discover result panel.
         when (val s = discover) {
-            is DiscoverState.Idle -> Unit
+            is DiscoverState.Idle -> {
+                Unit
+            }
+
             is DiscoverState.InFlight -> {
                 Text(
                     stringResource(R.string.fronting_discovering_fmt, s.hostname),
@@ -1608,6 +1732,7 @@ private fun FrontingGroupsEditor(
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+
             is DiscoverState.Error -> {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text(
@@ -1622,6 +1747,7 @@ private fun FrontingGroupsEditor(
                     ) { Text(stringResource(R.string.btn_dismiss)) }
                 }
             }
+
             is DiscoverState.Done -> {
                 val okCount = s.ips.count { it.ok }
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -1656,16 +1782,21 @@ private fun FrontingGroupsEditor(
                         Spacer(Modifier.width(6.dp))
                         Text(
                             r.ip,
-                            style = MaterialTheme.typography.labelSmall.copy(
-                                fontFamily = FontFamily.Monospace,
-                            ),
+                            style =
+                                MaterialTheme.typography.labelSmall.copy(
+                                    fontFamily = FontFamily.Monospace,
+                                ),
                         )
                         Spacer(Modifier.width(6.dp))
                         Text(
                             when {
-                                r.ok && r.latencyMs != null ->
+                                r.ok && r.latencyMs != null -> {
                                     stringResource(R.string.fronting_latency_ms_fmt, r.latencyMs)
-                                else -> r.error ?: ""
+                                }
+
+                                else -> {
+                                    r.error ?: ""
+                                }
                             },
                             style = MaterialTheme.typography.labelSmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
@@ -1679,27 +1810,33 @@ private fun FrontingGroupsEditor(
                                     // group names).
                                     val base = s.hostname
                                     val existing = cfg.frontingGroups.map { it.name }.toSet()
-                                    val name = if (base !in existing) base else {
-                                        var n = 2
-                                        var candidate = "$base-$n"
-                                        while (candidate in existing) {
-                                            n++
-                                            candidate = "$base-$n"
+                                    val name =
+                                        if (base !in existing) {
+                                            base
+                                        } else {
+                                            var n = 2
+                                            var candidate = "$base-$n"
+                                            while (candidate in existing) {
+                                                n++
+                                                candidate = "$base-$n"
+                                            }
+                                            candidate
                                         }
-                                        candidate
-                                    }
-                                    val next = cfg.frontingGroups + FrontingGroup(
-                                        name = name,
-                                        ip = r.ip,
-                                        sni = s.hostname,
-                                        domains = emptyList(),
-                                    )
+                                    val next =
+                                        cfg.frontingGroups +
+                                            FrontingGroup(
+                                                name = name,
+                                                ip = r.ip,
+                                                sni = s.hostname,
+                                                domains = emptyList(),
+                                            )
                                     onChange(cfg.copy(frontingGroups = next))
-                                    Toast.makeText(
-                                        ctx,
-                                        ctx.getString(R.string.fronting_group_added_fmt, s.hostname),
-                                        Toast.LENGTH_SHORT,
-                                    ).show()
+                                    Toast
+                                        .makeText(
+                                            ctx,
+                                            ctx.getString(R.string.fronting_group_added_fmt, s.hostname),
+                                            Toast.LENGTH_SHORT,
+                                        ).show()
                                     hostname = ""
                                     discover = DiscoverState.Idle
                                 },
@@ -1808,7 +1945,7 @@ private fun AdvancedSettings(
                 value = cfg.parallelRelay.toFloat(),
                 onValueChange = { onChange(cfg.copy(parallelRelay = it.toInt().coerceIn(1, 5))) },
                 valueRange = 1f..5f,
-                steps = 3,  // yields 1,2,3,4,5 positions
+                steps = 3, // yields 1,2,3,4,5 positions
             )
             Text(
                 stringResource(R.string.adv_parallel_relay_help),
@@ -1943,23 +2080,25 @@ private fun AdvancedSettings(
                 onClick = {
                     val curated = CuratedGroups.loadCurated(ctx)
                     if (curated == null) {
-                        Toast.makeText(
-                            ctx,
-                            ctx.getString(R.string.toast_curated_load_failed),
-                            Toast.LENGTH_LONG,
-                        ).show()
+                        Toast
+                            .makeText(
+                                ctx,
+                                ctx.getString(R.string.toast_curated_load_failed),
+                                Toast.LENGTH_LONG,
+                            ).show()
                     } else {
                         val (merged, report) = CuratedGroups.mergeInto(cfg.frontingGroups, curated)
                         onChange(cfg.copy(frontingGroups = merged))
-                        Toast.makeText(
-                            ctx,
-                            ctx.getString(
-                                R.string.toast_curated_loaded,
-                                report.added,
-                                report.skipped,
-                            ),
-                            Toast.LENGTH_LONG,
-                        ).show()
+                        Toast
+                            .makeText(
+                                ctx,
+                                ctx.getString(
+                                    R.string.toast_curated_loaded,
+                                    report.added,
+                                    report.skipped,
+                                ),
+                                Toast.LENGTH_LONG,
+                            ).show()
                     }
                 },
                 modifier = Modifier.fillMaxWidth(),
@@ -1986,9 +2125,10 @@ private fun LiveLogPane() {
     // section is collapsed (cheap), so re-expanding shows fresh tail.
     LaunchedEffect(Unit) {
         while (true) {
-            val blob = withContext(Dispatchers.IO) {
-                runCatching { Native.drainLogs() }.getOrNull()
-            }
+            val blob =
+                withContext(Dispatchers.IO) {
+                    runCatching { Native.drainLogs() }.getOrNull()
+                }
             if (!blob.isNullOrEmpty()) {
                 blob.split("\n").forEach { if (it.isNotBlank()) lines.add(it) }
                 // Cap the visible list so we don't grow unboundedly.
@@ -2014,11 +2154,12 @@ private fun LiveLogPane() {
                 enabled = lines.isNotEmpty(),
                 onClick = {
                     clipboard.setText(AnnotatedString(lines.joinToString("\n")))
-                    Toast.makeText(
-                        ctx,
-                        ctx.getString(R.string.snack_logs_copied),
-                        Toast.LENGTH_SHORT,
-                    ).show()
+                    Toast
+                        .makeText(
+                            ctx,
+                            ctx.getString(R.string.snack_logs_copied),
+                            Toast.LENGTH_SHORT,
+                        ).show()
                 },
             ) { Text(stringResource(R.string.btn_copy)) }
             TextButton(onClick = { lines.clear() }) { Text(stringResource(R.string.btn_clear)) }
@@ -2137,17 +2278,22 @@ private fun UsageTodayCard() {
         // Drop any stale snapshot from a previous run.
         statsJson = ""
         while (true) {
-            statsJson = withContext(Dispatchers.IO) {
-                runCatching { Native.statsJson(handle) }.getOrDefault("")
-            }
+            statsJson =
+                withContext(Dispatchers.IO) {
+                    runCatching { Native.statsJson(handle) }.getOrDefault("")
+                }
             delay(1000)
         }
     }
 
-    val obj = remember(statsJson) {
-        if (statsJson.isBlank()) null
-        else runCatching { JSONObject(statsJson) }.getOrNull()
-    }
+    val obj =
+        remember(statsJson) {
+            if (statsJson.isBlank()) {
+                null
+            } else {
+                runCatching { JSONObject(statsJson) }.getOrNull()
+            }
+        }
     // Still booting / not an apps-script config — stay silent.
     if (obj == null) return
 
@@ -2155,9 +2301,12 @@ private fun UsageTodayCard() {
     val todayBytes = obj.optLong("today_bytes", 0L)
     val todayKey = obj.optString("today_key", "")
     val resetSecs = obj.optLong("today_reset_secs", 0L)
-    val pct = if (freeQuotaPerDay > 0) {
-        (todayCalls.toDouble() / freeQuotaPerDay) * 100.0
-    } else 0.0
+    val pct =
+        if (freeQuotaPerDay > 0) {
+            (todayCalls.toDouble() / freeQuotaPerDay) * 100.0
+        } else {
+            0.0
+        }
 
     val ctx = LocalContext.current
 
@@ -2174,12 +2323,13 @@ private fun UsageTodayCard() {
 
             UsageRow(
                 label = stringResource(R.string.label_calls_today),
-                value = stringResource(
-                    R.string.usage_calls_of_quota,
-                    todayCalls.toInt(),
-                    freeQuotaPerDay,
-                    pct,
-                ),
+                value =
+                    stringResource(
+                        R.string.usage_calls_of_quota,
+                        todayCalls.toInt(),
+                        freeQuotaPerDay,
+                        pct,
+                    ),
             )
             UsageRow(
                 label = stringResource(R.string.label_bytes_today),
@@ -2191,11 +2341,12 @@ private fun UsageTodayCard() {
             )
             UsageRow(
                 label = stringResource(R.string.label_resets_in),
-                value = stringResource(
-                    R.string.usage_resets_hm,
-                    (resetSecs / 3600).toInt(),
-                    ((resetSecs / 60) % 60).toInt(),
-                ),
+                value =
+                    stringResource(
+                        R.string.usage_resets_hm,
+                        (resetSecs / 3600).toInt(),
+                        ((resetSecs / 60) % 60).toInt(),
+                    ),
             )
 
             Spacer(Modifier.height(4.dp))
@@ -2204,10 +2355,11 @@ private fun UsageTodayCard() {
                     // Open the Google-side Apps Script quota dashboard in
                     // the user's browser. Uses ACTION_VIEW with a https://
                     // URI — the OS picks whatever default browser is set.
-                    val intent = android.content.Intent(
-                        android.content.Intent.ACTION_VIEW,
-                        android.net.Uri.parse("https://script.google.com/home/usage"),
-                    )
+                    val intent =
+                        android.content.Intent(
+                            android.content.Intent.ACTION_VIEW,
+                            android.net.Uri.parse("https://script.google.com/home/usage"),
+                        )
                     intent.addFlags(android.content.Intent.FLAG_ACTIVITY_NEW_TASK)
                     runCatching { ctx.startActivity(intent) }
                 },
@@ -2225,7 +2377,10 @@ private fun UsageTodayCard() {
 }
 
 @Composable
-private fun UsageRow(label: String, value: String) {
+private fun UsageRow(
+    label: String,
+    value: String,
+) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.SpaceBetween,

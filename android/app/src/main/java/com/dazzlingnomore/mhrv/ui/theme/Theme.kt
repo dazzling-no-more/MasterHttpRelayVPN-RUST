@@ -8,7 +8,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 
-/**
+/*
  * Visual theme tuned to match the desktop `rahgozar-ui` eframe UI pixel-for-pixel
  * where Compose semantics allow. The canonical source lives in `src/bin/ui.rs`
  * — these constants are the same `egui::Color32` values, re-expressed as
@@ -28,6 +28,7 @@ import androidx.compose.ui.unit.dp
 // ACCENT / ACCENT_HOVER
 val AccentBlue = Color(0xFF4678B4)
 val AccentHover = Color(0xFF5A91CD)
+
 // OK_GREEN / ERR_RED
 val OkGreen = Color(0xFF50B464)
 val ErrRed = Color(0xFFDC6E6E)
@@ -45,33 +46,27 @@ val TextPrimary = Color(0xFFC8C8C8)
 val TextSecondary = Color(0xFF8C8C8C)
 val TextLabel = Color(0xFFB4B4B4)
 
-private val MhrvDark = darkColorScheme(
-    primary = AccentBlue,
-    onPrimary = Color.White,
-    primaryContainer = AccentHover,
-    onPrimaryContainer = Color.White,
-
-    secondary = OkGreen,
-    onSecondary = Color.Black,
-
-    tertiary = OkGreen,
-    onTertiary = Color.Black,
-
-    error = ErrRed,
-    onError = Color.White,
-
-    background = BgDark,
-    onBackground = TextPrimary,
-
-    surface = CardFill,
-    onSurface = TextPrimary,
-
-    surfaceVariant = CardFill,
-    onSurfaceVariant = TextSecondary,
-
-    outline = CardStroke,
-    outlineVariant = CardStroke,
-)
+private val MhrvDark =
+    darkColorScheme(
+        primary = AccentBlue,
+        onPrimary = Color.White,
+        primaryContainer = AccentHover,
+        onPrimaryContainer = Color.White,
+        secondary = OkGreen,
+        onSecondary = Color.Black,
+        tertiary = OkGreen,
+        onTertiary = Color.Black,
+        error = ErrRed,
+        onError = Color.White,
+        background = BgDark,
+        onBackground = TextPrimary,
+        surface = CardFill,
+        onSurface = TextPrimary,
+        surfaceVariant = CardFill,
+        onSurfaceVariant = TextSecondary,
+        outline = CardStroke,
+        outlineVariant = CardStroke,
+    )
 
 /**
  * Material3 consumes Shapes through component defaults (Button uses
@@ -79,13 +74,14 @@ private val MhrvDark = darkColorScheme(
  * tight rounded-rectangles keeps the whole app visually consistent with
  * the desktop's squared-off controls instead of Material's default pills.
  */
-private val MhrvShapes = Shapes(
-    extraSmall = RoundedCornerShape(4.dp),
-    small = RoundedCornerShape(4.dp),
-    medium = RoundedCornerShape(6.dp),
-    large = RoundedCornerShape(6.dp),
-    extraLarge = RoundedCornerShape(8.dp),
-)
+private val MhrvShapes =
+    Shapes(
+        extraSmall = RoundedCornerShape(4.dp),
+        small = RoundedCornerShape(4.dp),
+        medium = RoundedCornerShape(6.dp),
+        large = RoundedCornerShape(6.dp),
+        extraLarge = RoundedCornerShape(8.dp),
+    )
 
 @Composable
 fun MhrvTheme(content: @Composable () -> Unit) {

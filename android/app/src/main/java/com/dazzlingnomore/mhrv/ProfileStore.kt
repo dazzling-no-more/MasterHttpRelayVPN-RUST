@@ -62,6 +62,7 @@ object ProfileStore {
         val profiles: List<Profile>,
     ) {
         fun find(name: String): Profile? = profiles.firstOrNull { it.name == name }
+
         fun names(): List<String> = profiles.map { it.name }
     }
 
@@ -72,9 +73,18 @@ object ProfileStore {
      * user's recoverable data with an empty file.
      */
     sealed class LoadResult {
-        data class Ok(val state: State) : LoadResult()
-        data class Missing(val state: State) : LoadResult()
-        data class Corrupt(val raw: String?, val cause: Throwable) : LoadResult()
+        data class Ok(
+            val state: State,
+        ) : LoadResult()
+
+        data class Missing(
+            val state: State,
+        ) : LoadResult()
+
+        data class Corrupt(
+            val raw: String?,
+            val cause: Throwable,
+        ) : LoadResult()
     }
 
     /** Strict load: distinguishes missing vs unreadable vs parsed. */
@@ -83,11 +93,12 @@ object ProfileStore {
         if (!f.exists()) {
             return LoadResult.Missing(State(active = "", profiles = emptyList()))
         }
-        val text = try {
-            f.readText()
-        } catch (e: Throwable) {
-            return LoadResult.Corrupt(raw = null, cause = e)
-        }
+        val text =
+            try {
+                f.readText()
+            } catch (e: Throwable) {
+                return LoadResult.Corrupt(raw = null, cause = e)
+            }
         if (text.isBlank()) {
             return LoadResult.Ok(State(active = "", profiles = emptyList()))
         }
@@ -105,11 +116,12 @@ object ProfileStore {
      * that are about to write should use [loadStrict] and refuse to
      * save over a corrupt file.
      */
-    fun load(ctx: Context): State = when (val r = loadStrict(ctx)) {
-        is LoadResult.Ok -> r.state
-        is LoadResult.Missing -> r.state
-        is LoadResult.Corrupt -> State(active = "", profiles = emptyList())
-    }
+    fun load(ctx: Context): State =
+        when (val r = loadStrict(ctx)) {
+            is LoadResult.Ok -> r.state
+            is LoadResult.Missing -> r.state
+            is LoadResult.Corrupt -> State(active = "", profiles = emptyList())
+        }
 
     /**
      * Save the in-memory state. Returns true on success.
@@ -127,7 +139,10 @@ object ProfileStore {
      * window where neither file exists if the subsequent rename
      * fails.
      */
-    fun save(ctx: Context, state: State): Boolean {
+    fun save(
+        ctx: Context,
+        state: State,
+    ): Boolean {
         val f = File(ctx.filesDir, FILE)
         val tmp = File(ctx.filesDir, "$FILE.tmp")
         return try {
@@ -141,8 +156,10 @@ object ProfileStore {
 
     /** Public wrapper around [atomicReplace] so ConfigStore can share
      *  the same safe replace pattern without duplicating the logic. */
-    internal fun atomicReplacePublic(source: File, target: File): Boolean =
-        atomicReplace(source, target)
+    internal fun atomicReplacePublic(
+        source: File,
+        target: File,
+    ): Boolean = atomicReplace(source, target)
 
     /** Replace `target` with `source` atomically. See [save] for the
      *  fallback rationale on minSdk 24/25.
@@ -152,7 +169,10 @@ object ProfileStore {
      *  silently "fix" by renaming the dir aside. The caller (e.g.
      *  ConfigStore.save) returns failure so the UI surfaces the
      *  problem instead of papering over it. */
-    private fun atomicReplace(source: File, target: File): Boolean {
+    private fun atomicReplace(
+        source: File,
+        target: File,
+    ): Boolean {
         if (!source.exists()) return false
         if (target.exists() && target.isDirectory) {
             android.util.Log.w(
@@ -190,7 +210,10 @@ object ProfileStore {
 
     /** Backup-restore replace pattern for older Android.
      *  Also refuses directory targets (same rationale as [atomicReplace]). */
-    private fun replaceWithBackup(source: File, target: File): Boolean {
+    private fun replaceWithBackup(
+        source: File,
+        target: File,
+    ): Boolean {
         if (target.exists() && target.isDirectory) {
             source.delete()
             return false
@@ -234,17 +257,25 @@ object ProfileStore {
      *  profiles.json didn't" (PartialConfigOnly). */
     sealed class MutationResult {
         object Ok : MutationResult()
+
         object EmptyName : MutationResult()
+
         object Duplicate : MutationResult()
+
         object NotFound : MutationResult()
+
         object SaveFailed : MutationResult()
+
         /** config.json was written successfully but the subsequent
          *  profiles.json write failed. The live config is the new
          *  bytes (equivalent to a Save config), but no profile entry
          *  was added/updated. Caller should warn the user and offer
          *  to retry the profile-write step. */
         object PartialConfigOnly : MutationResult()
-        data class CorruptOnDisk(val cause: Throwable) : MutationResult()
+
+        data class CorruptOnDisk(
+            val cause: Throwable,
+        ) : MutationResult()
     }
 
     /**
@@ -263,10 +294,19 @@ object ProfileStore {
      *     when available.
      */
     sealed class ApplyResult {
-        data class Ok(val cfg: MhrvConfig) : ApplyResult()
-        data class PartialConfigOnly(val cfg: MhrvConfig) : ApplyResult()
+        data class Ok(
+            val cfg: MhrvConfig,
+        ) : ApplyResult()
+
+        data class PartialConfigOnly(
+            val cfg: MhrvConfig,
+        ) : ApplyResult()
+
         object NotFound : ApplyResult()
-        data class Failed(val reason: String) : ApplyResult()
+
+        data class Failed(
+            val reason: String,
+        ) : ApplyResult()
     }
 
     /**
@@ -286,19 +326,24 @@ object ProfileStore {
      *     `profiles.json` active-pointer save failed. The dropdown's
      *     active marker on disk is stale.
      */
-    fun applyProfile(ctx: Context, name: String): ApplyResult {
-        val state = when (val r = loadStrict(ctx)) {
-            is LoadResult.Ok -> r.state
-            is LoadResult.Missing -> return ApplyResult.NotFound
-            is LoadResult.Corrupt -> return ApplyResult.Failed("profiles.json is corrupt")
-        }
+    fun applyProfile(
+        ctx: Context,
+        name: String,
+    ): ApplyResult {
+        val state =
+            when (val r = loadStrict(ctx)) {
+                is LoadResult.Ok -> r.state
+                is LoadResult.Missing -> return ApplyResult.NotFound
+                is LoadResult.Corrupt -> return ApplyResult.Failed("profiles.json is corrupt")
+            }
         val p = state.find(name) ?: return ApplyResult.NotFound
 
-        val raw = try {
-            JSONObject(p.configJson).toString(2)
-        } catch (e: Throwable) {
-            return ApplyResult.Failed("snapshot is not valid JSON: ${e.message}")
-        }
+        val raw =
+            try {
+                JSONObject(p.configJson).toString(2)
+            } catch (e: Throwable) {
+                return ApplyResult.Failed("snapshot is not valid JSON: ${e.message}")
+            }
         // Runtime-shape validation: refuse to write a snapshot the
         // native runtime would reject (missing/unknown mode, or
         // missing deployment ID / auth_key for apps_script/full).
@@ -307,8 +352,9 @@ object ProfileStore {
         // Config::load then errors out on. Decode is permissive (it
         // tolerates a missing mode by defaulting to apps_script),
         // so we re-check on the decoded result.
-        val cfg = ConfigStore.decode(p.configJson)
-            ?: return ApplyResult.Failed("snapshot did not decode into MhrvConfig")
+        val cfg =
+            ConfigStore.decode(p.configJson)
+                ?: return ApplyResult.Failed("snapshot did not decode into MhrvConfig")
         val shapeErr = validateRuntimeShape(JSONObject(p.configJson), cfg)
         if (shapeErr != null) {
             return ApplyResult.Failed("snapshot would not pass runtime validation: $shapeErr")
@@ -318,13 +364,14 @@ object ProfileStore {
         //    nothing changed.
         val cfgFile = File(ctx.filesDir, "config.json")
         val cfgTmp = File(ctx.filesDir, "config.json.tmp")
-        val cfgOk = try {
-            cfgTmp.writeText(raw)
-            atomicReplace(cfgTmp, cfgFile)
-        } catch (_: Throwable) {
-            cfgTmp.delete()
-            false
-        }
+        val cfgOk =
+            try {
+                cfgTmp.writeText(raw)
+                atomicReplace(cfgTmp, cfgFile)
+            } catch (_: Throwable) {
+                cfgTmp.delete()
+                false
+            }
         if (!cfgOk) return ApplyResult.Failed("could not write config.json")
 
         // 2. Try to move the active pointer. If this fails, surface
@@ -341,7 +388,10 @@ object ProfileStore {
     /** Compatibility shim for callers that only need the cfg or null.
      *  New code should call [applyProfile] directly and pattern-match
      *  on [ApplyResult] so the partial-success case isn't swallowed. */
-    fun applyProfileOrNull(ctx: Context, name: String): MhrvConfig? =
+    fun applyProfileOrNull(
+        ctx: Context,
+        name: String,
+    ): MhrvConfig? =
         when (val r = applyProfile(ctx, name)) {
             is ApplyResult.Ok -> r.cfg
             is ApplyResult.PartialConfigOnly -> r.cfg
@@ -362,20 +412,26 @@ object ProfileStore {
      * land would leave the profile entry pointing at bytes no file
      * on disk matched.
      */
-    fun upsert(ctx: Context, name: String, cfg: MhrvConfig): MutationResult {
+    fun upsert(
+        ctx: Context,
+        name: String,
+        cfg: MhrvConfig,
+    ): MutationResult {
         val trimmed = name.trim()
         if (trimmed.isEmpty()) return MutationResult.EmptyName
-        val state = when (val r = loadStrict(ctx)) {
-            is LoadResult.Ok -> r.state
-            is LoadResult.Missing -> r.state
-            is LoadResult.Corrupt -> return MutationResult.CorruptOnDisk(r.cause)
-        }
+        val state =
+            when (val r = loadStrict(ctx)) {
+                is LoadResult.Ok -> r.state
+                is LoadResult.Missing -> r.state
+                is LoadResult.Corrupt -> return MutationResult.CorruptOnDisk(r.cause)
+            }
         val snapshot = cfg.toJson()
-        val newList = if (state.find(trimmed) != null) {
-            state.profiles.map { if (it.name == trimmed) Profile(trimmed, snapshot) else it }
-        } else {
-            state.profiles + Profile(trimmed, snapshot)
-        }
+        val newList =
+            if (state.find(trimmed) != null) {
+                state.profiles.map { if (it.name == trimmed) Profile(trimmed, snapshot) else it }
+            } else {
+                state.profiles + Profile(trimmed, snapshot)
+            }
         val newState = State(active = trimmed, profiles = newList)
         // Step 1: live config first. If this fails, nothing changed.
         if (!ConfigStore.save(ctx, cfg)) return MutationResult.SaveFailed
@@ -387,38 +443,50 @@ object ProfileStore {
 
     /** Insert a new profile, refusing to overwrite an existing one of
      *  the same name. Same write-order + outcome semantics as [upsert]. */
-    fun insertNew(ctx: Context, name: String, cfg: MhrvConfig): MutationResult {
+    fun insertNew(
+        ctx: Context,
+        name: String,
+        cfg: MhrvConfig,
+    ): MutationResult {
         val trimmed = name.trim()
         if (trimmed.isEmpty()) return MutationResult.EmptyName
-        val state = when (val r = loadStrict(ctx)) {
-            is LoadResult.Ok -> r.state
-            is LoadResult.Missing -> r.state
-            is LoadResult.Corrupt -> return MutationResult.CorruptOnDisk(r.cause)
-        }
+        val state =
+            when (val r = loadStrict(ctx)) {
+                is LoadResult.Ok -> r.state
+                is LoadResult.Missing -> r.state
+                is LoadResult.Corrupt -> return MutationResult.CorruptOnDisk(r.cause)
+            }
         if (state.find(trimmed) != null) return MutationResult.Duplicate
-        val newState = State(
-            active = trimmed,
-            profiles = state.profiles + Profile(trimmed, cfg.toJson()),
-        )
+        val newState =
+            State(
+                active = trimmed,
+                profiles = state.profiles + Profile(trimmed, cfg.toJson()),
+            )
         if (!ConfigStore.save(ctx, cfg)) return MutationResult.SaveFailed
         if (!save(ctx, newState)) return MutationResult.PartialConfigOnly
         return MutationResult.Ok
     }
 
     /** Rename. The active pointer moves if it was pointing at `from`. */
-    fun rename(ctx: Context, from: String, to: String): MutationResult {
+    fun rename(
+        ctx: Context,
+        from: String,
+        to: String,
+    ): MutationResult {
         val toTrimmed = to.trim()
         if (toTrimmed.isEmpty()) return MutationResult.EmptyName
-        val state = when (val r = loadStrict(ctx)) {
-            is LoadResult.Ok -> r.state
-            is LoadResult.Missing -> return MutationResult.NotFound
-            is LoadResult.Corrupt -> return MutationResult.CorruptOnDisk(r.cause)
-        }
+        val state =
+            when (val r = loadStrict(ctx)) {
+                is LoadResult.Ok -> r.state
+                is LoadResult.Missing -> return MutationResult.NotFound
+                is LoadResult.Corrupt -> return MutationResult.CorruptOnDisk(r.cause)
+            }
         if (state.find(from) == null) return MutationResult.NotFound
         if (from != toTrimmed && state.find(toTrimmed) != null) return MutationResult.Duplicate
-        val newList = state.profiles.map {
-            if (it.name == from) Profile(toTrimmed, it.configJson) else it
-        }
+        val newList =
+            state.profiles.map {
+                if (it.name == from) Profile(toTrimmed, it.configJson) else it
+            }
         val newActive = if (state.active == from) toTrimmed else state.active
         return if (save(ctx, State(active = newActive, profiles = newList))) {
             MutationResult.Ok
@@ -434,12 +502,16 @@ object ProfileStore {
      * user's config is the wrong call here. The user can explicitly
      * switch to a different profile if they want.
      */
-    fun delete(ctx: Context, name: String): MutationResult {
-        val state = when (val r = loadStrict(ctx)) {
-            is LoadResult.Ok -> r.state
-            is LoadResult.Missing -> return MutationResult.NotFound
-            is LoadResult.Corrupt -> return MutationResult.CorruptOnDisk(r.cause)
-        }
+    fun delete(
+        ctx: Context,
+        name: String,
+    ): MutationResult {
+        val state =
+            when (val r = loadStrict(ctx)) {
+                is LoadResult.Ok -> r.state
+                is LoadResult.Missing -> return MutationResult.NotFound
+                is LoadResult.Corrupt -> return MutationResult.CorruptOnDisk(r.cause)
+            }
         val idx = state.profiles.indexOfFirst { it.name == name }
         if (idx < 0) return MutationResult.NotFound
         // Remove only the first match — duplicate names are rejected at
@@ -459,20 +531,26 @@ object ProfileStore {
 
     /** Duplicate. Non-destructive: does NOT change the active pointer
      *  or touch `config.json`. */
-    fun duplicate(ctx: Context, from: String, to: String): MutationResult {
+    fun duplicate(
+        ctx: Context,
+        from: String,
+        to: String,
+    ): MutationResult {
         val toTrimmed = to.trim()
         if (toTrimmed.isEmpty()) return MutationResult.EmptyName
-        val state = when (val r = loadStrict(ctx)) {
-            is LoadResult.Ok -> r.state
-            is LoadResult.Missing -> return MutationResult.NotFound
-            is LoadResult.Corrupt -> return MutationResult.CorruptOnDisk(r.cause)
-        }
+        val state =
+            when (val r = loadStrict(ctx)) {
+                is LoadResult.Ok -> r.state
+                is LoadResult.Missing -> return MutationResult.NotFound
+                is LoadResult.Corrupt -> return MutationResult.CorruptOnDisk(r.cause)
+            }
         val src = state.find(from) ?: return MutationResult.NotFound
         if (state.find(toTrimmed) != null) return MutationResult.Duplicate
-        val newState = State(
-            active = state.active,
-            profiles = state.profiles + Profile(toTrimmed, src.configJson),
-        )
+        val newState =
+            State(
+                active = state.active,
+                profiles = state.profiles + Profile(toTrimmed, src.configJson),
+            )
         return if (save(ctx, newState)) MutationResult.Ok else MutationResult.SaveFailed
     }
 
@@ -487,13 +565,16 @@ object ProfileStore {
      * other mutations).
      */
     fun clearActiveIfAny(ctx: Context) {
-        val state = when (val r = loadStrict(ctx)) {
-            is LoadResult.Ok -> r.state
-            // Missing file: nothing to clear, no need to materialize one.
-            is LoadResult.Missing -> return
-            // Corrupt: never overwrite.
-            is LoadResult.Corrupt -> return
-        }
+        val state =
+            when (val r = loadStrict(ctx)) {
+                is LoadResult.Ok -> r.state
+
+                // Missing file: nothing to clear, no need to materialize one.
+                is LoadResult.Missing -> return
+
+                // Corrupt: never overwrite.
+                is LoadResult.Corrupt -> return
+            }
         if (state.active.isEmpty()) return
         save(ctx, state.copy(active = ""))
     }
@@ -514,7 +595,10 @@ object ProfileStore {
      *     deployment ID (under either `script_id` or `script_ids`)
      *     AND a non-empty, non-placeholder `auth_key`.
      */
-    private fun validateRuntimeShape(raw: JSONObject, decoded: MhrvConfig): String? {
+    private fun validateRuntimeShape(
+        raw: JSONObject,
+        decoded: MhrvConfig,
+    ): String? {
         val mode = raw.optString("mode", "")
         if (mode.isBlank()) return "missing required field `mode`"
         when (mode) {
@@ -527,14 +611,21 @@ object ProfileStore {
                     return "$mode mode requires a non-placeholder auth_key"
                 }
             }
+
             "direct", "google_only" -> { /* no relay creds required */ }
-            else -> return "unknown mode '$mode'"
+
+            else -> {
+                return "unknown mode '$mode'"
+            }
         }
         return null
     }
 
     /** Pick a unique "name (copy)" / "name (copy 2)" etc. for a duplicate. */
-    fun uniqueCopyName(state: State, base: String): String {
+    fun uniqueCopyName(
+        state: State,
+        base: String,
+    ): String {
         var candidate = "$base (copy)"
         var n = 2
         while (state.find(candidate) != null) {
@@ -564,13 +655,15 @@ object ProfileStore {
         if (!obj.has("profiles")) {
             return State(active = active, profiles = emptyList())
         }
-        val arr = obj.optJSONArray("profiles")
-            ?: throw IllegalStateException("`profiles` key is not an array")
+        val arr =
+            obj.optJSONArray("profiles")
+                ?: throw IllegalStateException("`profiles` key is not an array")
         val out = mutableListOf<Profile>()
         val seen = HashSet<String>(arr.length())
         for (i in 0 until arr.length()) {
-            val p = arr.optJSONObject(i)
-                ?: throw IllegalStateException("profiles[$i] is not an object")
+            val p =
+                arr.optJSONObject(i)
+                    ?: throw IllegalStateException("profiles[$i] is not an object")
             val name = p.optString("name", "")
             if (name.isBlank()) {
                 throw IllegalStateException("profiles[$i] has empty/missing name")
@@ -582,8 +675,9 @@ object ProfileStore {
             if (!seen.add(name)) {
                 throw IllegalStateException("profiles[$i] ('$name'): duplicate profile name")
             }
-            val cfg = p.optJSONObject("config")
-                ?: throw IllegalStateException("profiles[$i] ('$name') has no config object")
+            val cfg =
+                p.optJSONObject("config")
+                    ?: throw IllegalStateException("profiles[$i] ('$name') has no config object")
             out.add(Profile(name = name, configJson = cfg.toString()))
         }
         return State(active = active, profiles = out)
@@ -601,14 +695,15 @@ object ProfileStore {
         for (p in state.profiles) {
             val item = JSONObject()
             item.put("name", p.name)
-            val cfg = try {
-                JSONObject(p.configJson)
-            } catch (e: Throwable) {
-                throw IllegalStateException(
-                    "profile '${p.name}' has malformed config snapshot",
-                    e,
-                )
-            }
+            val cfg =
+                try {
+                    JSONObject(p.configJson)
+                } catch (e: Throwable) {
+                    throw IllegalStateException(
+                        "profile '${p.name}' has malformed config snapshot",
+                        e,
+                    )
+                }
             item.put("config", cfg)
             arr.put(item)
         }

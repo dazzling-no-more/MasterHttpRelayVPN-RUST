@@ -77,6 +77,26 @@ if [ "${#rust_files[@]}" -gt 0 ]; then
   fi
 fi
 
+# ktlint on staged Kotlin files. JAR is downloaded by scripts/install-hooks.sh
+# into .git/hooks-cache/ (per-clone, gitignored automatically via .git/).
+kt_files=()
+for f in "${staged[@]:-}"; do
+  [ -z "$f" ] && continue
+  case "$f" in *.kt|*.kts) kt_files+=("$f");; esac
+done
+
+if [ "${#kt_files[@]}" -gt 0 ]; then
+  ktlint_jar="$(git rev-parse --show-toplevel)/.git/hooks-cache/ktlint.jar"
+  if [ ! -f "$ktlint_jar" ]; then
+    yellow "! ktlint jar missing - run scripts/install-hooks.sh to download it"
+  elif ! command -v java >/dev/null 2>&1; then
+    yellow "! java not in PATH - skipping ktlint check"
+  elif ! java -jar "$ktlint_jar" --log-level=error "${kt_files[@]}"; then
+    red "x ktlint failed. Auto-fix with: java -jar .git/hooks-cache/ktlint.jar -F ${kt_files[*]}"
+    fail=1
+  fi
+fi
+
 if [ "$fail" -ne 0 ]; then
   red ""
   red "pre-commit checks failed."

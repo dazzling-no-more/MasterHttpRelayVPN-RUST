@@ -12,10 +12,11 @@ import org.junit.Test
  * user's hand-edited group survives the curated bundle being applied.
  */
 class CuratedGroupsTest {
-    private val curated = listOf(
-        FrontingGroup("vercel", "76.76.21.21", "react.dev", listOf("vercel.com")),
-        FrontingGroup("fastly", "151.101.0.223", "pypi.org", listOf("reddit.com")),
-    )
+    private val curated =
+        listOf(
+            FrontingGroup("vercel", "76.76.21.21", "react.dev", listOf("vercel.com")),
+            FrontingGroup("fastly", "151.101.0.223", "pypi.org", listOf("reddit.com")),
+        )
 
     @Test
     fun emptyExisting_addsAllCurated() {
@@ -28,12 +29,13 @@ class CuratedGroupsTest {
 
     @Test
     fun nameCollision_preservesUserEntry() {
-        val userVercel = FrontingGroup(
-            name = "vercel",
-            ip = "1.2.3.4",
-            sni = "user-edited.example",
-            domains = listOf("user.example"),
-        )
+        val userVercel =
+            FrontingGroup(
+                name = "vercel",
+                ip = "1.2.3.4",
+                sni = "user-edited.example",
+                domains = listOf("user.example"),
+            )
         val (merged, report) = CuratedGroups.mergeInto(listOf(userVercel), curated)
 
         assertEquals(1, report.added)
@@ -59,20 +61,23 @@ class CuratedGroupsTest {
         val (_, paddedReport) = CuratedGroups.mergeInto(listOf(userPadded), curated)
         assertEquals(
             "Trim should be applied before case-insensitive compare",
-            1, paddedReport.skipped,
+            1,
+            paddedReport.skipped,
         )
     }
 
     @Test
     fun mergeIsPure_doesNotMutateCallerList() {
-        val existing = mutableListOf(
-            FrontingGroup("user-only", "10.0.0.1", "x", listOf("x.example")),
-        )
+        val existing =
+            mutableListOf(
+                FrontingGroup("user-only", "10.0.0.1", "x", listOf("x.example")),
+            )
         val before = existing.toList()
         CuratedGroups.mergeInto(existing, curated)
         assertEquals(
             "mergeInto must not mutate the caller-supplied existing list",
-            before, existing,
+            before,
+            existing,
         )
     }
 }

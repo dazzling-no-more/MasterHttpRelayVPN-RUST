@@ -30,7 +30,6 @@ import java.util.concurrent.atomic.AtomicBoolean
  * device still gets routed through us.
  */
 class MhrvVpnService : VpnService() {
-
     private var tun: ParcelFileDescriptor? = null
     private var proxyHandle: Long = 0L
     private var tun2proxyThread: Thread? = null
@@ -48,7 +47,11 @@ class MhrvVpnService : VpnService() {
     // no-op.
     private val tornDown = AtomicBoolean(false)
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    override fun onStartCommand(
+        intent: Intent?,
+        flags: Int,
+        startId: Int,
+    ): Int {
         Log.i(TAG, "onStartCommand action=${intent?.action ?: "<null>"} startId=$startId")
         return when (intent?.action) {
             ACTION_STOP -> {
@@ -58,7 +61,9 @@ class MhrvVpnService : VpnService() {
                 // (e.g. a dozen in-flight Apps Script requests stuck in
                 // their 30s timeout). The service itself stays alive until
                 // stopSelf + the background thread below finish.
-                try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (t: Throwable) {
+                try {
+                    stopForeground(STOP_FOREGROUND_REMOVE)
+                } catch (t: Throwable) {
                     Log.w(TAG, "stopForeground: ${t.message}")
                 }
                 // Teardown can block on native shutdown (rt.shutdown_timeout
@@ -71,6 +76,7 @@ class MhrvVpnService : VpnService() {
                 }, "mhrv-teardown").start()
                 START_NOT_STICKY
             }
+
             else -> {
                 startEverything()
                 START_STICKY
@@ -110,7 +116,10 @@ class MhrvVpnService : VpnService() {
         val needsCreds = cfg.mode != Mode.DIRECT
         if (needsCreds && (!cfg.hasDeploymentId || cfg.authKey.isBlank())) {
             Log.e(TAG, "Config is incomplete — deployment ID + auth key required for ${cfg.mode}")
-            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
+            try {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } catch (_: Throwable) {
+            }
             stopSelf()
             return
         }
@@ -123,14 +132,20 @@ class MhrvVpnService : VpnService() {
         // app looks stuck in a half-configured state.
         if (proxyHandle != 0L) {
             Log.w(TAG, "startEverything: stale proxyHandle=$proxyHandle; stopping old proxy first")
-            try { Native.stopProxy(proxyHandle) } catch (_: Throwable) {}
+            try {
+                Native.stopProxy(proxyHandle)
+            } catch (_: Throwable) {
+            }
             proxyHandle = 0L
         }
 
         proxyHandle = Native.startProxy(cfg.toJson())
         if (proxyHandle == 0L) {
             Log.e(TAG, "Native.startProxy returned 0 — see logcat tag rahgozar")
-            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
+            try {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } catch (_: Throwable) {
+            }
             stopSelf()
             return
         }
@@ -163,13 +178,14 @@ class MhrvVpnService : VpnService() {
         //      outbound to google_ip loops back through the TUN forever.
         //    - setBlocking(false): we're going to hand the fd to tun2proxy,
         //      which does its own async I/O.
-        val builder = Builder()
-            .setSession("rahgozar")
-            .setMtu(MTU)
-            .addAddress("10.0.0.2", 32)
-            .addRoute("0.0.0.0", 0)
-            .addDnsServer("1.1.1.1")
-            .setBlocking(false)
+        val builder =
+            Builder()
+                .setSession("rahgozar")
+                .setMtu(MTU)
+                .addAddress("10.0.0.2", 32)
+                .addRoute("0.0.0.0", 0)
+                .addDnsServer("1.1.1.1")
+                .setBlocking(false)
 
         // Apply user-chosen app splitting. The VpnService API treats
         // addAllowedApplication and addDisallowedApplication as mutually
@@ -194,16 +210,18 @@ class MhrvVpnService : VpnService() {
                     Log.w(TAG, "addDisallowedApplication(self) failed: ${e.message}")
                 }
             }
+
             SplitMode.ONLY -> {
                 if (cfg.splitApps.isEmpty()) {
                     Log.w(TAG, "ONLY mode with empty splitApps list — no app would get the VPN; falling back to ALL")
                     try {
                         builder.addDisallowedApplication(packageName)
-                    } catch (_: Throwable) {}
+                    } catch (_: Throwable) {
+                    }
                 } else {
                     var allowed = 0
                     for (pkg in cfg.splitApps) {
-                        if (pkg == packageName) continue  // can't tunnel ourselves
+                        if (pkg == packageName) continue // can't tunnel ourselves
                         try {
                             builder.addAllowedApplication(pkg)
                             allowed++
@@ -215,10 +233,12 @@ class MhrvVpnService : VpnService() {
                         Log.w(TAG, "ONLY mode had no usable apps — falling back to ALL")
                         try {
                             builder.addDisallowedApplication(packageName)
-                        } catch (_: Throwable) {}
+                        } catch (_: Throwable) {
+                        }
                     }
                 }
             }
+
             SplitMode.EXCEPT -> {
                 try {
                     builder.addDisallowedApplication(packageName)
@@ -226,26 +246,32 @@ class MhrvVpnService : VpnService() {
                     Log.w(TAG, "addDisallowedApplication(self) failed: ${e.message}")
                 }
                 for (pkg in cfg.splitApps) {
-                    if (pkg == packageName) continue  // already self-excluded above
-                    try { builder.addDisallowedApplication(pkg) } catch (e: Throwable) {
+                    if (pkg == packageName) continue // already self-excluded above
+                    try {
+                        builder.addDisallowedApplication(pkg)
+                    } catch (e: Throwable) {
                         Log.w(TAG, "addDisallowedApplication($pkg) failed: ${e.message}")
                     }
                 }
             }
         }
 
-        val parcelFd = try {
-            builder.establish()
-        } catch (t: Throwable) {
-            Log.e(TAG, "VpnService.establish() failed: ${t.message}")
-            null
-        }
+        val parcelFd =
+            try {
+                builder.establish()
+            } catch (t: Throwable) {
+                Log.e(TAG, "VpnService.establish() failed: ${t.message}")
+                null
+            }
 
         if (parcelFd == null) {
             Log.e(TAG, "establish() returned null — is VPN permission granted?")
             Native.stopProxy(proxyHandle)
             proxyHandle = 0L
-            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
+            try {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } catch (_: Throwable) {
+            }
             stopSelf()
             return
         }
@@ -261,25 +287,27 @@ class MhrvVpnService : VpnService() {
         tun2proxyRunning.set(true)
         // Use tun2proxy_run_with_cli_args C API via dlsym — gives full
         // CLI flexibility including --udpgw-server, no fork needed.
-        val cliArgs = buildString {
-            append("tun2proxy")
-            append(" --proxy socks5://127.0.0.1:$socks5Port")
-            append(" --tun-fd $detachedFd")
-            append(" --dns virtual")
-            append(" --verbosity info")
-            append(" --close-fd-on-drop true")
-            if (cfg.mode == Mode.FULL) append(" --udpgw-server $UDPGW_MAGIC_DEST")
-        }
-        val worker = Thread({
-            try {
-                val rc = Native.runTun2proxy(cliArgs, MTU)
-                Log.i(TAG, "tun2proxy exited rc=$rc")
-            } catch (t: Throwable) {
-                Log.e(TAG, "tun2proxy crashed: ${t.message}", t)
-            } finally {
-                tun2proxyRunning.set(false)
+        val cliArgs =
+            buildString {
+                append("tun2proxy")
+                append(" --proxy socks5://127.0.0.1:$socks5Port")
+                append(" --tun-fd $detachedFd")
+                append(" --dns virtual")
+                append(" --verbosity info")
+                append(" --close-fd-on-drop true")
+                if (cfg.mode == Mode.FULL) append(" --udpgw-server $UDPGW_MAGIC_DEST")
             }
-        }, "tun2proxy")
+        val worker =
+            Thread({
+                try {
+                    val rc = Native.runTun2proxy(cliArgs, MTU)
+                    Log.i(TAG, "tun2proxy exited rc=$rc")
+                } catch (t: Throwable) {
+                    Log.e(TAG, "tun2proxy crashed: ${t.message}", t)
+                } finally {
+                    tun2proxyRunning.set(false)
+                }
+            }, "tun2proxy")
         try {
             worker.start()
             tun2proxyThread = worker
@@ -298,7 +326,10 @@ class MhrvVpnService : VpnService() {
             }
             Native.stopProxy(proxyHandle)
             proxyHandle = 0L
-            try { stopForeground(STOP_FOREGROUND_REMOVE) } catch (_: Throwable) {}
+            try {
+                stopForeground(STOP_FOREGROUND_REMOVE)
+            } catch (_: Throwable) {
+            }
             stopSelf()
             return
         }
@@ -378,7 +409,7 @@ class MhrvVpnService : VpnService() {
         Log.i(
             TAG,
             "teardown: begin caller=${Thread.currentThread().name} " +
-            "(tun2proxy running=${tun2proxyRunning.get()}, proxyHandle=$proxyHandle)",
+                "(tun2proxy running=${tun2proxyRunning.get()}, proxyHandle=$proxyHandle)",
         )
 
         // 1. Stop the Rust proxy FIRST. Closing the SOCKS5 listener is
@@ -389,7 +420,9 @@ class MhrvVpnService : VpnService() {
         proxyHandle = 0L
         if (handle != 0L) {
             Log.i(TAG, "teardown: stopping proxy handle=$handle")
-            try { Native.stopProxy(handle) } catch (t: Throwable) {
+            try {
+                Native.stopProxy(handle)
+            } catch (t: Throwable) {
                 Log.e(TAG, "Native.stopProxy threw: ${t.message}", t)
             }
         }
@@ -400,12 +433,18 @@ class MhrvVpnService : VpnService() {
         //    blocked on something other than its upstream socket read.
         //    Bounded so a hung JNI call can't stall teardown.
         if (tun2proxyRunning.get()) {
-            val stopper = Thread({
-                try { Tun2proxy.stop() } catch (t: Throwable) {
-                    Log.w(TAG, "Tun2proxy.stop: ${t.message}")
-                }
-            }, "mhrv-tun2proxy-stop").apply { start() }
-            try { stopper.join(2_000) } catch (_: InterruptedException) {}
+            val stopper =
+                Thread({
+                    try {
+                        Tun2proxy.stop()
+                    } catch (t: Throwable) {
+                        Log.w(TAG, "Tun2proxy.stop: ${t.message}")
+                    }
+                }, "mhrv-tun2proxy-stop").apply { start() }
+            try {
+                stopper.join(2_000)
+            } catch (_: InterruptedException) {
+            }
             if (stopper.isAlive) {
                 Log.w(TAG, "Tun2proxy.stop did not return within 2s — proceeding")
             }
@@ -417,7 +456,9 @@ class MhrvVpnService : VpnService() {
         //    run(). The call is kept only to null the field cleanly on
         //    paths that never reached detachFd (PROXY_ONLY, or an
         //    establish() that failed mid-builder).
-        try { tun?.close() } catch (t: Throwable) {
+        try {
+            tun?.close()
+        } catch (t: Throwable) {
             Log.w(TAG, "tun.close: ${t.message}")
         }
         tun = null
@@ -427,7 +468,8 @@ class MhrvVpnService : VpnService() {
         //    headroom for tun2proxy's internal close path to drain.
         try {
             tun2proxyThread?.join(4_000)
-        } catch (_: InterruptedException) {}
+        } catch (_: InterruptedException) {
+        }
         val stillAlive = tun2proxyThread?.isAlive == true
         tun2proxyThread = null
         if (stillAlive) {
@@ -457,32 +499,39 @@ class MhrvVpnService : VpnService() {
         Log.i(TAG, "onDestroy done")
     }
 
-    private fun buildNotif(httpPort: Int, socks5Port: Int): Notification {
+    private fun buildNotif(
+        httpPort: Int,
+        socks5Port: Int,
+    ): Notification {
         val mgr = getSystemService(NotificationManager::class.java)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val ch = NotificationChannel(
-                CHANNEL_ID,
-                "rahgozar",
-                NotificationManager.IMPORTANCE_LOW,
-            ).apply {
-                description = "Status of the rahgozar VPN"
-                setShowBadge(false)
-            }
+            val ch =
+                NotificationChannel(
+                    CHANNEL_ID,
+                    "rahgozar",
+                    NotificationManager.IMPORTANCE_LOW,
+                ).apply {
+                    description = "Status of the rahgozar VPN"
+                    setShowBadge(false)
+                }
             mgr.createNotificationChannel(ch)
         }
-        val openIntent = PendingIntent.getActivity(
-            this,
-            0,
-            Intent(this, MainActivity::class.java),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        val stopIntent = PendingIntent.getService(
-            this,
-            1,
-            Intent(this, MhrvVpnService::class.java).setAction(ACTION_STOP),
-            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
-        )
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val openIntent =
+            PendingIntent.getActivity(
+                this,
+                0,
+                Intent(this, MainActivity::class.java),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+        val stopIntent =
+            PendingIntent.getService(
+                this,
+                1,
+                Intent(this, MhrvVpnService::class.java).setAction(ACTION_STOP),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+        return NotificationCompat
+            .Builder(this, CHANNEL_ID)
             .setContentTitle("rahgozar VPN is active")
             .setContentText("HTTP 127.0.0.1:$httpPort  ·  SOCKS5 127.0.0.1:$socks5Port")
             .setSmallIcon(android.R.drawable.presence_online)

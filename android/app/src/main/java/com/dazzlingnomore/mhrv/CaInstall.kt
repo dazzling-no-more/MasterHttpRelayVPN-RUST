@@ -56,8 +56,13 @@ object CaInstall {
     fun readDer(ctx: Context): ByteArray? {
         val f = caFile(ctx)
         if (!f.exists()) return null
-        val raw = try { f.readBytes() } catch (_: Throwable) { return null }
-        return pemToDer(raw) ?: raw  // fall back to treating it as DER
+        val raw =
+            try {
+                f.readBytes()
+            } catch (_: Throwable) {
+                return null
+            }
+        return pemToDer(raw) ?: raw // fall back to treating it as DER
     }
 
     /** SHA-256 fingerprint of the CA cert (over DER bytes). */
@@ -67,8 +72,7 @@ object CaInstall {
     }
 
     /** Pretty-print a fingerprint like "AA:BB:CC:...". */
-    fun fingerprintHex(bytes: ByteArray): String =
-        bytes.joinToString(":") { "%02X".format(it) }
+    fun fingerprintHex(bytes: ByteArray): String = bytes.joinToString(":") { "%02X".format(it) }
 
     /**
      * Build the KeyChain install intent. The intent launches the system
@@ -78,7 +82,8 @@ object CaInstall {
      */
     fun buildInstallIntent(ctx: Context): Intent? {
         val der = readDer(ctx) ?: return null
-        return KeyChain.createInstallIntent()
+        return KeyChain
+            .createInstallIntent()
             .putExtra(KeyChain.EXTRA_CERTIFICATE, der)
             .putExtra(KeyChain.EXTRA_NAME, CA_FRIENDLY_NAME)
     }
@@ -97,7 +102,10 @@ object CaInstall {
      * Returns a human-readable location string ("Downloads/mhrv-ca.crt" or
      * the filesystem path) on success, null on failure.
      */
-    fun saveToDownloads(ctx: Context, displayName: String = "mhrv-ca.crt"): String? {
+    fun saveToDownloads(
+        ctx: Context,
+        displayName: String = "mhrv-ca.crt",
+    ): String? {
         val der = readDer(ctx) ?: return null
         // Rewrap as PEM so users can open the file in a text editor and
         // verify it's a cert before trusting it — also, the system cert
@@ -118,32 +126,43 @@ object CaInstall {
                 val f = File(dir, displayName)
                 f.writeBytes(pem)
                 f.absolutePath
-            } catch (_: Throwable) { null }
+            } catch (_: Throwable) {
+                null
+            }
         }
     }
 
-    private fun saveViaMediaStore(ctx: Context, displayName: String, bytes: ByteArray): Boolean? {
+    private fun saveViaMediaStore(
+        ctx: Context,
+        displayName: String,
+        bytes: ByteArray,
+    ): Boolean? {
         val resolver = ctx.contentResolver
-        val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
-            put(MediaStore.MediaColumns.MIME_TYPE, "application/x-x509-ca-cert")
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+        val values =
+            ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+                put(MediaStore.MediaColumns.MIME_TYPE, "application/x-x509-ca-cert")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                }
             }
-        }
         // Delete any previous copy with the same name before inserting, so
         // we don't accumulate `mhrv-ca (1).crt`, `mhrv-ca (2).crt` on repeat
         // installs (MediaStore appends suffixes instead of overwriting).
         try {
             val sel = "${MediaStore.MediaColumns.DISPLAY_NAME}=?"
             resolver.delete(MediaStore.Downloads.EXTERNAL_CONTENT_URI, sel, arrayOf(displayName))
-        } catch (_: Throwable) { /* best-effort */ }
+        } catch (_: Throwable) {
+            // best-effort
+        }
 
         val uri = resolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values) ?: return null
         return try {
             resolver.openOutputStream(uri)?.use { it.write(bytes) } ?: return null
             true
-        } catch (_: Throwable) { null }
+        } catch (_: Throwable) {
+            null
+        }
     }
 
     /**
@@ -166,8 +185,9 @@ object CaInstall {
      * Settings" with a Close button and no forward path. Google
      * intentionally removed the inline install flow in that release.
      */
-    fun buildSettingsIntent(): Intent = Intent(Settings.ACTION_SETTINGS)
-        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    fun buildSettingsIntent(): Intent =
+        Intent(Settings.ACTION_SETTINGS)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
 
     /**
      * True iff a CA with this SHA-256 fingerprint lives in the
@@ -183,11 +203,18 @@ object CaInstall {
             while (aliases.hasMoreElements()) {
                 val alias = aliases.nextElement()
                 val cert = ks.getCertificate(alias) ?: continue
-                val encoded = try { cert.encoded } catch (_: Throwable) { continue }
+                val encoded =
+                    try {
+                        cert.encoded
+                    } catch (_: Throwable) {
+                        continue
+                    }
                 if (sha256(encoded).contentEquals(targetFingerprint)) return true
             }
             false
-        } catch (_: Throwable) { false }
+        } catch (_: Throwable) {
+            false
+        }
     }
 
     /** Subject CN of the exported CA, for display. */
@@ -196,13 +223,14 @@ object CaInstall {
         return try {
             val cf = CertificateFactory.getInstance("X.509")
             val cert = cf.generateCertificate(der.inputStream()) as java.security.cert.X509Certificate
-            val dn = cert.subjectX500Principal.name  // RFC 2253, CN=foo,O=bar
+            val dn = cert.subjectX500Principal.name // RFC 2253, CN=foo,O=bar
             Regex("""CN=([^,]+)""").find(dn)?.groupValues?.get(1)
-        } catch (_: Throwable) { null }
+        } catch (_: Throwable) {
+            null
+        }
     }
 
-    private fun sha256(data: ByteArray): ByteArray =
-        MessageDigest.getInstance("SHA-256").digest(data)
+    private fun sha256(data: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(data)
 
     /**
      * Rewrap DER bytes as PEM. We intentionally produce a textual cert —
@@ -221,13 +249,23 @@ object CaInstall {
      * payload between -----BEGIN CERTIFICATE----- markers.
      */
     private fun pemToDer(bytes: ByteArray): ByteArray? {
-        val s = try { bytes.toString(Charsets.US_ASCII) } catch (_: Throwable) { return null }
-        if (!s.contains("BEGIN CERTIFICATE")) return null  // caller falls back to treating as DER
-        val body = s
-            .substringAfter("-----BEGIN CERTIFICATE-----", "")
-            .substringBefore("-----END CERTIFICATE-----", "")
-            .replace(Regex("\\s+"), "")
+        val s =
+            try {
+                bytes.toString(Charsets.US_ASCII)
+            } catch (_: Throwable) {
+                return null
+            }
+        if (!s.contains("BEGIN CERTIFICATE")) return null // caller falls back to treating as DER
+        val body =
+            s
+                .substringAfter("-----BEGIN CERTIFICATE-----", "")
+                .substringBefore("-----END CERTIFICATE-----", "")
+                .replace(Regex("\\s+"), "")
         if (body.isEmpty()) return null
-        return try { Base64.decode(body, Base64.DEFAULT) } catch (_: Throwable) { null }
+        return try {
+            Base64.decode(body, Base64.DEFAULT)
+        } catch (_: Throwable) {
+            null
+        }
     }
 }

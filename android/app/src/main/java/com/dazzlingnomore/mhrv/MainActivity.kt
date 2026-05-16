@@ -2,18 +2,17 @@ package com.dazzlingnomore.mhrv
 
 import android.Manifest
 import android.app.Activity
+import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.net.VpnService
 import android.os.Build
 import android.os.Bundle
-import android.content.Context
-import android.content.res.Configuration
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
-import androidx.appcompat.app.AppCompatActivity
-import java.util.Locale
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -24,9 +23,9 @@ import androidx.core.content.ContextCompat
 import com.dazzlingnomore.mhrv.ui.CaInstallOutcome
 import com.dazzlingnomore.mhrv.ui.HomeScreen
 import com.dazzlingnomore.mhrv.ui.theme.MhrvTheme
+import java.util.Locale
 
 // UiLang is in the outer package namespace already.
-
 
 // AppCompatActivity (not plain ComponentActivity) because it's what picks
 // up AppCompatDelegate.setApplicationLocales() and swaps per-activity
@@ -34,7 +33,6 @@ import com.dazzlingnomore.mhrv.ui.theme.MhrvTheme
 // top — setContent / rememberLauncherForActivityResult live on
 // ComponentActivity and AppCompatActivity inherits from it.
 class MainActivity : AppCompatActivity() {
-
     override fun attachBaseContext(newBase: Context) {
         // Force the persisted ui_lang into the Activity's Configuration
         // before it's constructed. AppCompatDelegate.setApplicationLocales
@@ -46,18 +44,22 @@ class MainActivity : AppCompatActivity() {
         // internally before the setApplicationLocales API existed. This
         // path is reliable across all Android versions we support.
         val cfg = ConfigStore.load(newBase)
-        val tag = when (cfg.uiLang) {
-            UiLang.FA -> "fa"
-            UiLang.EN -> "en"
-            UiLang.AUTO -> null
-        }
-        val wrapped = if (tag != null) {
-            val config = Configuration(newBase.resources.configuration)
-            val locale = Locale.forLanguageTag(tag)
-            Locale.setDefault(locale)
-            config.setLocale(locale)
-            newBase.createConfigurationContext(config)
-        } else newBase
+        val tag =
+            when (cfg.uiLang) {
+                UiLang.FA -> "fa"
+                UiLang.EN -> "en"
+                UiLang.AUTO -> null
+            }
+        val wrapped =
+            if (tag != null) {
+                val config = Configuration(newBase.resources.configuration)
+                val locale = Locale.forLanguageTag(tag)
+                Locale.setDefault(locale)
+                config.setLocale(locale)
+                newBase.createConfigurationContext(config)
+            } else {
+                newBase
+            }
         super.attachBaseContext(wrapped)
     }
 
@@ -70,7 +72,8 @@ class MainActivity : AppCompatActivity() {
         // service still runs, it just won't surface a notification.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(
-                    this, Manifest.permission.POST_NOTIFICATIONS,
+                    this,
+                    Manifest.permission.POST_NOTIFICATIONS,
                 ) != PackageManager.PERMISSION_GRANTED
             ) {
                 ActivityCompat.requestPermissions(
@@ -105,19 +108,19 @@ class MainActivity : AppCompatActivity() {
         pendingDeepLinkConfig.value = cfg
     }
 
-
     @Composable
     private fun AppRoot() {
         // The system VpnService.prepare() returns an Intent if the user
         // hasn't approved VPN access yet; if null, we're already approved
         // and can start directly.
-        val vpnPrepareLauncher = rememberLauncherForActivityResult(
-            ActivityResultContracts.StartActivityForResult(),
-        ) { result ->
-            if (result.resultCode == Activity.RESULT_OK) {
-                startVpnService()
+        val vpnPrepareLauncher =
+            rememberLauncherForActivityResult(
+                ActivityResultContracts.StartActivityForResult(),
+            ) { result ->
+                if (result.resultCode == Activity.RESULT_OK) {
+                    startVpnService()
+                }
             }
-        }
 
         // CA install flow. We hold the fingerprint of the cert we fired the
         // intent with so we can look it up in AndroidCAStore after the
@@ -132,18 +135,20 @@ class MainActivity : AppCompatActivity() {
         var pendingDownloadPath by remember { mutableStateOf<String?>(null) }
         var caOutcome by remember { mutableStateOf<CaInstallOutcome?>(null) }
 
-        val installCaLauncher = rememberLauncherForActivityResult(
-            ActivityResultContracts.StartActivityForResult(),
-        ) { _ ->
-            val fp = pendingFingerprint
-            caOutcome = when {
-                fp == null -> CaInstallOutcome.Failed("Internal error: no fingerprint")
-                CaInstall.isInstalled(fp) -> CaInstallOutcome.Installed
-                else -> CaInstallOutcome.NotInstalled(pendingDownloadPath)
+        val installCaLauncher =
+            rememberLauncherForActivityResult(
+                ActivityResultContracts.StartActivityForResult(),
+            ) { _ ->
+                val fp = pendingFingerprint
+                caOutcome =
+                    when {
+                        fp == null -> CaInstallOutcome.Failed("Internal error: no fingerprint")
+                        CaInstall.isInstalled(fp) -> CaInstallOutcome.Installed
+                        else -> CaInstallOutcome.NotInstalled(pendingDownloadPath)
+                    }
+                pendingFingerprint = null
+                pendingDownloadPath = null
             }
-            pendingFingerprint = null
-            pendingDownloadPath = null
-        }
 
         HomeScreen(
             // MainActivity's onStart is intentionally dumb: it only
@@ -200,8 +205,9 @@ class MainActivity : AppCompatActivity() {
                 // OS-wide VPN grant and the user approved it deliberately.
                 // Revoking it would force a re-prompt on next Start, which
                 // is worse UX.
-                val stopAction = Intent(this, MhrvVpnService::class.java)
-                    .setAction(MhrvVpnService.ACTION_STOP)
+                val stopAction =
+                    Intent(this, MhrvVpnService::class.java)
+                        .setAction(MhrvVpnService.ACTION_STOP)
                 startService(stopAction)
             },
             onInstallCaConfirmed = {
@@ -221,9 +227,10 @@ class MainActivity : AppCompatActivity() {
                     pendingDownloadPath = downloadPath
                     installCaLauncher.launch(CaInstall.buildSettingsIntent())
                 } else {
-                    caOutcome = CaInstallOutcome.Failed(
-                        "Couldn't read the CA cert. Tap Start once so the proxy creates it, then try again.",
-                    )
+                    caOutcome =
+                        CaInstallOutcome.Failed(
+                            "Couldn't read the CA cert. Tap Start once so the proxy creates it, then try again.",
+                        )
                 }
             },
             caOutcome = caOutcome,
@@ -234,16 +241,20 @@ class MainActivity : AppCompatActivity() {
                 // recreate() the activity to take effect immediately — otherwise
                 // the user would have to swipe the app away and reopen it for
                 // RTL/LTR to swap.
-                val tag = when (lang) {
-                    UiLang.FA -> "fa"
-                    UiLang.EN -> "en"
-                    UiLang.AUTO -> ""
-                }
+                val tag =
+                    when (lang) {
+                        UiLang.FA -> "fa"
+                        UiLang.EN -> "en"
+                        UiLang.AUTO -> ""
+                    }
                 androidx.appcompat.app.AppCompatDelegate.setApplicationLocales(
-                    if (tag.isEmpty())
-                        androidx.core.os.LocaleListCompat.getEmptyLocaleList()
-                    else
-                        androidx.core.os.LocaleListCompat.forLanguageTags(tag),
+                    if (tag.isEmpty()) {
+                        androidx.core.os.LocaleListCompat
+                            .getEmptyLocaleList()
+                    } else {
+                        androidx.core.os.LocaleListCompat
+                            .forLanguageTags(tag)
+                    },
                 )
                 // AppCompatDelegate triggers recreate internally on API 33+
                 // via the per-app language OS setting, but on older API
@@ -261,6 +272,7 @@ class MainActivity : AppCompatActivity() {
 
     companion object {
         private const val REQ_NOTIF = 42
+
         /** Deep link config waiting for user confirmation. Read by ConfigSharingBar. */
         val pendingDeepLinkConfig = mutableStateOf<MhrvConfig?>(null)
     }

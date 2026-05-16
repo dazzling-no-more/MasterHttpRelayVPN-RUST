@@ -26,26 +26,27 @@ import org.junit.Test
  * the dependency is required, not optional.
  */
 class ConfigStoreFrontingGroupsTest {
-
     @Test
     fun toJson_includes_fronting_groups_in_canonical_shape() {
-        val cfg = MhrvConfig(
-            mode = Mode.DIRECT,
-            frontingGroups = listOf(
-                FrontingGroup(
-                    name = "fastly",
-                    ip = "151.101.0.223",
-                    sni = "python.org",
-                    domains = listOf("reddit.com", "github.com"),
-                ),
-                FrontingGroup(
-                    name = "akamai",
-                    ip = "2.22.151.143",
-                    sni = "www.bbc.com",
-                    domains = listOf("microsoft.com"),
-                ),
-            ),
-        )
+        val cfg =
+            MhrvConfig(
+                mode = Mode.DIRECT,
+                frontingGroups =
+                    listOf(
+                        FrontingGroup(
+                            name = "fastly",
+                            ip = "151.101.0.223",
+                            sni = "python.org",
+                            domains = listOf("reddit.com", "github.com"),
+                        ),
+                        FrontingGroup(
+                            name = "akamai",
+                            ip = "2.22.151.143",
+                            sni = "www.bbc.com",
+                            domains = listOf("microsoft.com"),
+                        ),
+                    ),
+            )
         val parsed = JSONObject(cfg.toJson())
         // Field name MUST be snake_case `fronting_groups` to match
         // serde's deserialization on the Rust side. Don't rename.
@@ -75,17 +76,19 @@ class ConfigStoreFrontingGroupsTest {
         // configuration) but the serializer must filter them out
         // before they reach disk / Native.startProxy. This test
         // pins that filter.
-        val cfg = MhrvConfig(
-            mode = Mode.DIRECT,
-            frontingGroups = listOf(
-                // Draft — no domains. Must be dropped.
-                FrontingGroup(name = "draft", ip = "1.2.3.4", sni = "x.test", domains = emptyList()),
-                // Draft via whitespace-only entries. Must be dropped.
-                FrontingGroup(name = "whitespace", ip = "5.6.7.8", sni = "y.test", domains = listOf(" ", "\t", "")),
-                // Real. Must survive.
-                FrontingGroup(name = "real", ip = "9.9.9.9", sni = "z.test", domains = listOf("site.test")),
-            ),
-        )
+        val cfg =
+            MhrvConfig(
+                mode = Mode.DIRECT,
+                frontingGroups =
+                    listOf(
+                        // Draft — no domains. Must be dropped.
+                        FrontingGroup(name = "draft", ip = "1.2.3.4", sni = "x.test", domains = emptyList()),
+                        // Draft via whitespace-only entries. Must be dropped.
+                        FrontingGroup(name = "whitespace", ip = "5.6.7.8", sni = "y.test", domains = listOf(" ", "\t", "")),
+                        // Real. Must survive.
+                        FrontingGroup(name = "real", ip = "9.9.9.9", sni = "z.test", domains = listOf("site.test")),
+                    ),
+            )
         val parsed = JSONObject(cfg.toJson())
         val groups = parsed.getJSONArray("fronting_groups")
         assertEquals("only real group should survive", 1, groups.length())
@@ -111,17 +114,19 @@ class ConfigStoreFrontingGroupsTest {
         // shared loadFromJson, check the result matches input. This
         // pins both the encoder AND the decoder; a drift on either
         // side breaks this test.
-        val original = MhrvConfig(
-            mode = Mode.DIRECT,
-            frontingGroups = listOf(
-                FrontingGroup(
-                    name = "vercel",
-                    ip = "76.76.21.21",
-                    sni = "react.dev",
-                    domains = listOf("vercel.com", "vercel.app", "nextjs.org"),
-                ),
-            ),
-        )
+        val original =
+            MhrvConfig(
+                mode = Mode.DIRECT,
+                frontingGroups =
+                    listOf(
+                        FrontingGroup(
+                            name = "vercel",
+                            ip = "76.76.21.21",
+                            sni = "react.dev",
+                            domains = listOf("vercel.com", "vercel.app", "nextjs.org"),
+                        ),
+                    ),
+            )
         val json = original.toJson()
         val reloaded = ConfigStore.decode(json)
         assertTrue("decode returned null on valid JSON", reloaded != null)
@@ -141,7 +146,8 @@ class ConfigStoreFrontingGroupsTest {
         // clear message; for the Android UI we want to keep the
         // app launchable even on a partially-corrupted config so
         // the user can fix it.
-        val json = """
+        val json =
+            """
             {
               "mode": "direct",
               "fronting_groups": [
@@ -151,7 +157,7 @@ class ConfigStoreFrontingGroupsTest {
                 {"name": "no-sni", "ip": "4.4.4.4", "domains": ["d.test"]}
               ]
             }
-        """.trimIndent()
+            """.trimIndent()
         val reloaded = ConfigStore.decode(json)
         assertTrue(reloaded != null)
         val groups = reloaded!!.frontingGroups

@@ -8,6 +8,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ContentPaste
@@ -25,14 +26,13 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
+import com.dazzlingnomore.mhrv.ConfigStore
+import com.dazzlingnomore.mhrv.MhrvConfig
+import com.dazzlingnomore.mhrv.R
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import com.journeyapps.barcodescanner.ScanContract
 import com.journeyapps.barcodescanner.ScanOptions
-import com.dazzlingnomore.mhrv.ConfigStore
-import com.dazzlingnomore.mhrv.MhrvConfig
-import androidx.compose.foundation.text.selection.SelectionContainer
-import com.dazzlingnomore.mhrv.R
 import kotlinx.coroutines.launch
 
 // =========================================================================
@@ -68,16 +68,17 @@ fun ConfigSharingBar(
     var pendingImport by remember { mutableStateOf<MhrvConfig?>(null) }
 
     // QR scanner launcher — fires the ZXing embedded scanner activity.
-    val scanLauncher = rememberLauncherForActivityResult(ScanContract()) { result ->
-        val scanned = result.contents ?: return@rememberLauncherForActivityResult
-        val decoded = ConfigStore.decode(scanned)
-        if (decoded != null) {
-            pendingImport = decoded
-            showImportConfirm = true
-        } else {
-            scope.launch { onSnackbar(ctx.getString(R.string.snack_invalid_config)) }
+    val scanLauncher =
+        rememberLauncherForActivityResult(ScanContract()) { result ->
+            val scanned = result.contents ?: return@rememberLauncherForActivityResult
+            val decoded = ConfigStore.decode(scanned)
+            if (decoded != null) {
+                pendingImport = decoded
+                showImportConfirm = true
+            } else {
+                scope.launch { onSnackbar(ctx.getString(R.string.snack_invalid_config)) }
+            }
         }
-    }
 
     // --- Export + Paste + Scan row ---
     Row(
@@ -108,12 +109,13 @@ fun ConfigSharingBar(
         }
         OutlinedButton(
             onClick = {
-                val opts = ScanOptions().apply {
-                    setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                    setPrompt("Scan mhrv config QR code")
-                    setBeepEnabled(false)
-                    setOrientationLocked(true)
-                }
+                val opts =
+                    ScanOptions().apply {
+                        setDesiredBarcodeFormats(ScanOptions.QR_CODE)
+                        setPrompt("Scan mhrv config QR code")
+                        setBeepEnabled(false)
+                        setOrientationLocked(true)
+                    }
                 scanLauncher.launch(opts)
             },
         ) {
@@ -130,9 +132,10 @@ fun ConfigSharingBar(
         Dialog(onDismissRequest = { showExportDialog = false }) {
             Card(modifier = Modifier.padding(16.dp)) {
                 Column(
-                    modifier = Modifier
-                        .padding(24.dp)
-                        .verticalScroll(rememberScrollState()),
+                    modifier =
+                        Modifier
+                            .padding(24.dp)
+                            .verticalScroll(rememberScrollState()),
                     horizontalAlignment = Alignment.CenterHorizontally,
                     verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
@@ -192,24 +195,28 @@ fun ConfigSharingBar(
                     ) {
                         OutlinedButton(onClick = {
                             // Save QR bitmap to cache dir and share both image + text.
-                            val intent = if (qrBitmap != null) {
-                                val file = java.io.File(ctx.cacheDir, "mhrv-config-qr.png")
-                                file.outputStream().use { qrBitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
-                                val uri = androidx.core.content.FileProvider.getUriForFile(
-                                    ctx, "${ctx.packageName}.fileprovider", file
-                                )
-                                android.content.Intent(android.content.Intent.ACTION_SEND).apply {
-                                    type = "image/png"
-                                    putExtra(android.content.Intent.EXTRA_STREAM, uri)
-                                    putExtra(android.content.Intent.EXTRA_TEXT, encoded)
-                                    addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                            val intent =
+                                if (qrBitmap != null) {
+                                    val file = java.io.File(ctx.cacheDir, "mhrv-config-qr.png")
+                                    file.outputStream().use { qrBitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
+                                    val uri =
+                                        androidx.core.content.FileProvider.getUriForFile(
+                                            ctx,
+                                            "${ctx.packageName}.fileprovider",
+                                            file,
+                                        )
+                                    android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                                        type = "image/png"
+                                        putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                                        putExtra(android.content.Intent.EXTRA_TEXT, encoded)
+                                        addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                    }
+                                } else {
+                                    android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                                        type = "text/plain"
+                                        putExtra(android.content.Intent.EXTRA_TEXT, encoded)
+                                    }
                                 }
-                            } else {
-                                android.content.Intent(android.content.Intent.ACTION_SEND).apply {
-                                    type = "text/plain"
-                                    putExtra(android.content.Intent.EXTRA_TEXT, encoded)
-                                }
-                            }
                             ctx.startActivity(android.content.Intent.createChooser(intent, "Share config"))
                         }) {
                             Icon(Icons.Default.Share, null, modifier = Modifier.size(18.dp))
@@ -255,18 +262,20 @@ private fun ImportConfirmDialog(
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
 ) {
-    val ids = cfg.appsScriptUrls.mapNotNull { url ->
-        val marker = "/macros/s/"
-        val i = url.indexOf(marker)
-        val raw = if (i >= 0) url.substring(i + marker.length).substringBefore("/") else url
-        raw.trim().takeIf { it.isNotEmpty() }
-    }
+    val ids =
+        cfg.appsScriptUrls.mapNotNull { url ->
+            val marker = "/macros/s/"
+            val i = url.indexOf(marker)
+            val raw = if (i >= 0) url.substring(i + marker.length).substringBefore("/") else url
+            raw.trim().takeIf { it.isNotEmpty() }
+        }
     val preview = ids.take(3).joinToString("\n") { "  ${it.take(20)}…" }
-    val modeLabel = when (cfg.mode) {
-        com.dazzlingnomore.mhrv.Mode.APPS_SCRIPT -> "apps_script"
-        com.dazzlingnomore.mhrv.Mode.DIRECT -> "direct"
-        com.dazzlingnomore.mhrv.Mode.FULL -> "full"
-    }
+    val modeLabel =
+        when (cfg.mode) {
+            com.dazzlingnomore.mhrv.Mode.APPS_SCRIPT -> "apps_script"
+            com.dazzlingnomore.mhrv.Mode.DIRECT -> "direct"
+            com.dazzlingnomore.mhrv.Mode.FULL -> "full"
+        }
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -301,8 +310,11 @@ private fun ImportConfirmDialog(
 // QR code generation
 // =========================================================================
 
-private fun generateQr(content: String, size: Int): Bitmap? {
-    return try {
+private fun generateQr(
+    content: String,
+    size: Int,
+): Bitmap? =
+    try {
         val writer = QRCodeWriter()
         val matrix = writer.encode(content, BarcodeFormat.QR_CODE, size, size)
         val bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.RGB_565)
@@ -315,5 +327,3 @@ private fun generateQr(content: String, size: Int): Bitmap? {
     } catch (_: Throwable) {
         null // Config too large for QR
     }
-}
-

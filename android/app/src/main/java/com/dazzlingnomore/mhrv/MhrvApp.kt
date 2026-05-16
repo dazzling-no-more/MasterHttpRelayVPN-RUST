@@ -30,15 +30,19 @@ class MhrvApp : Application() {
         // selected), without us having to thread it through every
         // composable.
         val cfg = ConfigStore.load(this)
-        val tag = when (cfg.uiLang) {
-            UiLang.FA -> "fa"
-            UiLang.EN -> "en"
-            UiLang.AUTO -> ""  // empty list = follow system locale
-        }
+        val tag =
+            when (cfg.uiLang) {
+                UiLang.FA -> "fa"
+                UiLang.EN -> "en"
+                UiLang.AUTO -> "" // empty list = follow system locale
+            }
         Log.i(APP_TAG, "applying ui_lang=${cfg.uiLang} (tag='$tag')")
         AppCompatDelegate.setApplicationLocales(
-            if (tag.isEmpty()) LocaleListCompat.getEmptyLocaleList()
-            else LocaleListCompat.forLanguageTags(tag),
+            if (tag.isEmpty()) {
+                LocaleListCompat.getEmptyLocaleList()
+            } else {
+                LocaleListCompat.forLanguageTags(tag)
+            },
         )
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
@@ -53,7 +57,8 @@ class MhrvApp : Application() {
                     "uncaught on thread=${thread.name} (id=${thread.id}): ${throwable.message}",
                     throwable,
                 )
-            } catch (_: Throwable) { }
+            } catch (_: Throwable) {
+            }
             // Let the default handler still terminate the process and
             // show the system "app closed" dialog — we just wanted to
             // get a log line out the door first.
