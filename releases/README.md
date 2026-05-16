@@ -2,11 +2,11 @@
 
 This folder contains the prebuilt binaries from the latest release, committed directly to the repository for users who cannot reach the GitHub Releases page.
 
-Current version: **v2.0.0**
+Current version: **v2.0.1**
 
 | File | Platform | Contents |
 |---|---|---|
-| `rahgozar-android-universal-v1.9.25.apk` | Android 7.0+ (all ABIs) | Universal APK — arm64-v8a, armeabi-v7a, x86_64, x86 in one file |
+| `rahgozar-android-universal-v2.0.1.apk` | Android 7.0+ (all ABIs) | Universal APK — arm64-v8a, armeabi-v7a, x86_64, x86 in one file |
 | `rahgozar-linux-amd64.tar.gz` | Linux x86_64 | `rahgozar`, `rahgozar-ui`, `run.sh` |
 | `rahgozar-linux-arm64.tar.gz` | Linux aarch64 | `rahgozar`, `run.sh` (CLI only) |
 | `rahgozar-raspbian-armhf.tar.gz` | Raspberry Pi / ARMv7 hardfloat | `rahgozar`, `run.sh` (CLI only) |
@@ -45,7 +45,7 @@ Extract `rahgozar-windows-amd64.zip`, then double-click `run.bat` inside the ext
 
 ### Android
 
-Copy `rahgozar-android-universal-v1.9.25.apk` to your phone, tap it from the Files app, and allow "Install unknown apps" for whichever app is opening the APK (Files, Chrome, etc.). See [the Android guide](../docs/android.md) for the full walk-through of the first-run steps (Apps Script deployment, MITM CA install, VPN permission, SNI tester).
+Copy `rahgozar-android-universal-v2.0.1.apk` to your phone, tap it from the Files app, and allow "Install unknown apps" for whichever app is opening the APK (Files, Chrome, etc.). See [the Android guide](../docs/android.md) for the full walk-through of the first-run steps (Apps Script deployment, MITM CA install, VPN permission, SNI tester).
 
 See the [main README](../README.md) for desktop setup (Apps Script deployment, config, browser proxy settings).
 
@@ -55,7 +55,7 @@ See the [main README](../README.md) for desktop setup (Apps Script deployment, c
 
 این پوشه شامل فایل‌های آخرین نسخه است و مستقیماً در ریپو قرار گرفته برای کاربرانی که به صفحهٔ GitHub Releases دسترسی ندارند.
 
-نسخهٔ فعلی: **v2.0.0**
+نسخهٔ فعلی: **v2.0.1**
 
 ### دانلود از طریق ZIP
 
@@ -73,6 +73,6 @@ cd rahgozar-macos-arm64
 
 **ویندوز:** فایل `rahgozar-windows-amd64.zip` را extract کنید و داخل پوشه روی `run.bat` دو بار کلیک کنید (UAC را قبول کنید تا گواهی MITM نصب شود).
 
-**اندروید:** فایل `rahgozar-android-universal-v1.9.25.apk` را روی گوشی کپی کنید، از Files app روی آن tap کنید و اجازهٔ "نصب برنامه‌های ناشناس" را بدهید. راهنمای کامل شروع به کار (دیپلوی Apps Script، نصب CA، اجازهٔ VPN، تستر SNI) در [راهنمای اندروید](../docs/android.md) هست.
+**اندروید:** فایل `rahgozar-android-universal-v2.0.1.apk` را روی گوشی کپی کنید، از Files app روی آن tap کنید و اجازهٔ "نصب برنامه‌های ناشناس" را بدهید. راهنمای کامل شروع به کار (دیپلوی Apps Script، نصب CA، اجازهٔ VPN، تستر SNI) در [راهنمای اندروید](../docs/android.md) هست.
 
 برای راه‌اندازی کامل دسکتاپ (دیپلوی Apps Script، config، تنظیم proxy مرورگر) به [README اصلی](../README.md) مراجعه کنید.
