@@ -36,7 +36,10 @@
 // secret. The wrapper imports the handler from exit_node.ts directly,
 // so changing the constant in exit_node.ts is all you need.
 
-import handler from "./exit_node.ts";
+import exitNode from "./exit_node.ts";
+
+const handler =
+  typeof exitNode === "function" ? exitNode : exitNode.fetch.bind(exitNode);
 
 // Deno (preferred)
 if (typeof (globalThis as any).Deno !== "undefined") {
