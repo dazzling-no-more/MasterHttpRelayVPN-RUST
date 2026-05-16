@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod bot_block;
 pub mod cache;
 pub mod cdn_discover;
 pub mod cert_installer;

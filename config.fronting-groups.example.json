@@ -1,6 +1,35 @@
 {
-  "_comment": "Domain coverage mirrors assets/fronting-groups/curated.json (the bundle the UI Load curated fronting groups button installs). Edit IPs in-place if a group stops working - re-resolve sni with nslookup/dig and replace. The trailing github-direct / github-content-direct groups are alternate IP routes for gist.github.com / objects-origin.githubusercontent.com; the proxy uses first-match so they only activate if the leading group fails to resolve.",
+  "_comment": "Domain coverage mirrors assets/fronting-groups/curated.json (the bundle the UI Load curated fronting groups button installs). Edit IPs in-place if a group stops working - re-resolve sni with nslookup/dig and replace. The github-* groups appear before fastly because fastly's `githubusercontent.com` suffix would otherwise eat `objects-origin.githubusercontent.com` under first-match-wins; pinned by `curated_groups::tests::curated_bundle_parses`. Each domain is covered by exactly one group — `match_fronting_group` is single-shot and returns the first match, so duplicate routes never get tried as fallbacks (a dial failure surfaces the error rather than iterating).",
+  "mode": "direct",
   "fronting_groups": [
+    {
+      "name": "github-central",
+      "ip": "140.82.113.21",
+      "sni": "central.github.com",
+      "domains": [
+        "objects-origin.githubusercontent.com",
+        "api.individual.githubcopilot.com",
+        "glb-db52c2cf8be544.github.com",
+        "api.githubcopilot.com"
+      ]
+    },
+    {
+      "name": "github-alive",
+      "ip": "140.82.112.26",
+      "sni": "alive.github.com",
+      "domains": [
+        "alive.github.com",
+        "live.github.com"
+      ]
+    },
+    {
+      "name": "github",
+      "ip": "140.82.121.3",
+      "sni": "github.com",
+      "domains": [
+        "gist.github.com"
+      ]
+    },
     {
       "name": "vercel",
       "ip": "216.230.84.193",
@@ -65,6 +94,7 @@
         "githubusercontent.com",
         "pinimg.com",
         "pinterest.com",
+        "pypi.org",
         "redd.it",
         "reddit.app.link",
         "reddit.com",
@@ -95,55 +125,11 @@
       ]
     },
     {
-      "name": "github-central",
-      "ip": "140.82.113.21",
-      "sni": "central.github.com",
-      "domains": [
-        "objects-origin.githubusercontent.com",
-        "api.individual.githubcopilot.com",
-        "glb-db52c2cf8be544.github.com",
-        "api.githubcopilot.com"
-      ]
-    },
-    {
-      "name": "github-alive",
-      "ip": "140.82.112.26",
-      "sni": "alive.github.com",
-      "domains": [
-        "alive.github.com",
-        "live.github.com"
-      ]
-    },
-    {
-      "name": "github",
-      "ip": "140.82.121.3",
-      "sni": "github.com",
-      "domains": [
-        "gist.github.com"
-      ]
-    },
-    {
       "name": "pubmed",
       "ip": "34.107.134.59",
       "sni": "pubmed.ncbi.nlm.nih.gov",
       "domains": [
         "pmc.ncbi.nlm.nih.gov"
-      ]
-    },
-    {
-      "name": "github-direct",
-      "ip": "140.82.121.4",
-      "sni": "github.com",
-      "domains": [
-        "gist.github.com"
-      ]
-    },
-    {
-      "name": "github-content-direct",
-      "ip": "140.82.121.6",
-      "sni": "central.github.com",
-      "domains": [
-        "objects-origin.githubusercontent.com"
       ]
     }
   ]

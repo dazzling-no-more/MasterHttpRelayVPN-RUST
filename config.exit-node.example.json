@@ -1,5 +1,5 @@
 {
-  "_comment": "Example config for using rahgozar with an exit-node deployment to bypass Cloudflare anti-bot blocks on chatgpt.com / claude.ai / grok.com / x.com. See assets/exit_node/README.md for the deployment walkthrough.",
+  "_comment": "Example config for using rahgozar with an exit-node deployment to bypass datacenter-IP bot-blocks. Cloudflare (chatgpt.com / claude.ai / grok.com / x.com) and Akamai (unity.com and similar) both flag Apps Script's outbound Google datacenter IPs; the exit node fixes both. See assets/exit_node/README.md for the deployment walkthrough.",
   "mode": "apps_script",
   "google_ip": "216.239.38.120",
   "front_domain": "www.google.com",
@@ -21,7 +21,7 @@
     "psk": "PUT_YOUR_EXIT_NODE_PSK_HERE",
     "_comment_mode": "selective: only `hosts` route via exit node (recommended). full: every request routes via exit node (slower, ~250-500ms extra hop).",
     "mode": "selective",
-    "_comment_hosts": "Hostnames to route through the exit node. Matches exact OR dot-anchored suffix (chatgpt.com covers api.chatgpt.com etc.). Extend for any CF-anti-bot blocked sites you need.",
+    "_comment_hosts": "Hostnames to route through the exit node. Matches exact OR dot-anchored suffix (chatgpt.com covers api.chatgpt.com etc.). Extend for any datacenter-IP-blocked sites you need (rahgozar logs a hint when it detects an Akamai / Cloudflare bot-block response).",
     "hosts": [
       "chatgpt.com",
       "claude.ai",
@@ -29,7 +29,8 @@
       "grok.com",
       "openai.com",
       "aistudio.google.com",
-      "ai.google.dev"
+      "ai.google.dev",
+      "unity.com"
     ]
   }
 }

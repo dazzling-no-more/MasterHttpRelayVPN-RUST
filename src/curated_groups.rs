@@ -77,17 +77,59 @@ mod tests {
             !groups.is_empty(),
             "curated bundle should ship at least one group"
         );
-        // github-direct must come before fastly, otherwise fastly's
-        // `githubusercontent.com` suffix would eat
-        // `objects-origin.githubusercontent.com` before
-        // github-content-direct gets to claim it.
+        // github-central owns `objects-origin.githubusercontent.com`.
+        // It must come before fastly, otherwise fastly's
+        // `githubusercontent.com` suffix entry would eat the request
+        // under first-match-wins (`match_fronting_group` returns the
+        // first matching group and never retries the rest on dial
+        // failure).
         let pos = |n: &str| groups.iter().position(|g| g.name == n);
-        let github_content = pos("github-content-direct").expect("github-content-direct present");
+        let github_central = pos("github-central").expect("github-central present");
         let fastly = pos("fastly").expect("fastly present");
         assert!(
-            github_content < fastly,
-            "github-content-direct must precede fastly for first-match-wins"
+            github_central < fastly,
+            "github-central must precede fastly for first-match-wins"
         );
+    }
+
+    /// Sentinel coverage test: each of these hostnames is a
+    /// documented user-facing curated route. PR #1191's expansion
+    /// accidentally dropped `pypi.org` from fastly's domain list (it
+    /// stayed only as the group's `sni`), so users running through
+    /// the curated bundle saw pypi.org fall back to the relay
+    /// instead of the direct Fastly edge. Pin the routes here so a
+    /// similar accidental drop fails CI loudly instead of shipping.
+    #[test]
+    fn curated_covers_user_facing_routes() {
+        let groups = curated_fronting_groups().expect("curated.json parses");
+        let all_domains: std::collections::HashSet<&str> = groups
+            .iter()
+            .flat_map(|g| g.domains.iter().map(String::as_str))
+            .collect();
+        for expected in &[
+            // Fastly users
+            "pypi.org",
+            "www.python.org",
+            "reddit.com",
+            "github.io",
+            "githubusercontent.com",
+            // Vercel users
+            "nextjs.org",
+            "vercel.com",
+            // GitHub-direct routes
+            "gist.github.com",
+            "objects-origin.githubusercontent.com",
+            "alive.github.com",
+            // Other curated edges
+            "netlify.app",
+            "pmc.ncbi.nlm.nih.gov",
+        ] {
+            assert!(
+                all_domains.contains(expected),
+                "curated bundle must cover `{}` — regressions here usually mean an edit dropped a domain (see PR #1191 / pypi.org)",
+                expected,
+            );
+        }
     }
 
     #[test]

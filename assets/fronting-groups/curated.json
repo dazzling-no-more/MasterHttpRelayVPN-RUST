@@ -1,42 +1,65 @@
 {
   "_comment": [
     "Curated fronting groups derived from patterniha/MITM-DomainFronting",
-    "(https://github.com/patterniha/MITM-DomainFronting). The Xray config",
-    "in that project ships a tested set of (sni, edge, member-domain)",
-    "tuples for Vercel, Fastly, AWS CloudFront, and direct-to-GitHub paths.",
+    "(https://github.com/patterniha/MITM-DomainFronting) plus the",
+    "subsequent expansions tracked in config.fronting-groups.example.json",
+    "(PR #1191: vercel/fastly expansion + github-central/alive/gist/pubmed).",
     "This file is the same data, restructured for rahgozar's `fronting_groups`",
     "config shape. See docs/fronting-groups.md.",
     "",
     "Edge IPs rotate. If a group stops working, re-resolve `sni`",
     "(`nslookup <sni>` or `dig +short <sni>`) and replace the IP in-place.",
-    "Order matters — first group whose `domains` list matches wins, so the",
-    "more-specific GitHub-direct groups appear before fastly (which would",
-    "otherwise eat `*.githubusercontent.com` via suffix match).",
+    "Order matters — github-* groups precede fastly because fastly's",
+    "`githubusercontent.com` suffix would otherwise eat",
+    "`objects-origin.githubusercontent.com` under first-match-wins; pinned",
+    "by `curated_groups::tests::curated_bundle_parses`. Each domain is",
+    "covered by exactly one group — `match_fronting_group` is single-shot",
+    "and returns the first match, so duplicate routes never get tried as",
+    "fallbacks (a dial failure surfaces the error rather than iterating).",
     "",
     "The `_comment` key is ignored by the deserializer (Config doesn't use",
-    "`deny_unknown_fields`)."
+    "`deny_unknown_fields`).",
+    "",
+    "Must stay structurally identical (same groups in the same order with",
+    "matching name / ip / sni / domains) to config.fronting-groups.example.json's",
+    "`fronting_groups` array — `curated_groups::tests::example_file_mirrors_curated_bundle`",
+    "pins this so the CLI example and the UI's Load curated fronting groups",
+    "button can't drift. Formatting and ordering of unrelated top-level keys",
+    "(`_comment`, `mode`, etc.) are not part of the contract."
   ],
   "fronting_groups": [
     {
-      "name": "github-direct",
-      "ip": "140.82.121.4",
+      "name": "github-central",
+      "ip": "140.82.113.21",
+      "sni": "central.github.com",
+      "domains": [
+        "objects-origin.githubusercontent.com",
+        "api.individual.githubcopilot.com",
+        "glb-db52c2cf8be544.github.com",
+        "api.githubcopilot.com"
+      ]
+    },
+    {
+      "name": "github-alive",
+      "ip": "140.82.112.26",
+      "sni": "alive.github.com",
+      "domains": [
+        "alive.github.com",
+        "live.github.com"
+      ]
+    },
+    {
+      "name": "github",
+      "ip": "140.82.121.3",
       "sni": "github.com",
       "domains": [
         "gist.github.com"
       ]
     },
     {
-      "name": "github-content-direct",
-      "ip": "140.82.121.6",
-      "sni": "central.github.com",
-      "domains": [
-        "objects-origin.githubusercontent.com"
-      ]
-    },
-    {
       "name": "vercel",
-      "ip": "76.76.21.21",
-      "sni": "react.dev",
+      "ip": "216.230.84.193",
+      "sni": "nextjs.org",
       "domains": [
         "ai-sdk.dev",
         "cursor.com",
@@ -71,7 +94,7 @@
     },
     {
       "name": "fastly",
-      "ip": "151.101.0.223",
+      "ip": "151.101.128.223",
       "sni": "pypi.org",
       "domains": [
         "buzzfeed.com",
@@ -111,17 +134,28 @@
         "redditstatic.com",
         "redditstatus.com",
         "www.fastly.com",
+        "www.pinterest.com",
         "www.python.org",
         "xtls.github.io"
       ]
     },
     {
-      "name": "cloudfront",
-      "ip": "75.2.60.5",
+      "name": "amazon-cloudfront",
+      "ip": "3.33.186.135",
       "sni": "kubernetes.io",
       "domains": [
+        "bitballoon.com",
         "netlify.app",
-        "netlify.com"
+        "netlify.com",
+        "netlifystatus.com"
+      ]
+    },
+    {
+      "name": "pubmed",
+      "ip": "34.107.134.59",
+      "sni": "pubmed.ncbi.nlm.nih.gov",
+      "domains": [
+        "pmc.ncbi.nlm.nih.gov"
       ]
     }
   ]

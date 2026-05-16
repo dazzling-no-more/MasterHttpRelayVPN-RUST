@@ -2441,6 +2441,20 @@ impl DomainFronter {
         // here, matching what Google actually billed to quota.
         self.record_today(bytes.len() as u64);
 
+        // Centralised bot-block detection. Every Apps Script response
+        // that returns bytes to a caller — buffered MITM, plain-HTTP
+        // relay, parallel-range probes, individual range chunks —
+        // passes through here. Hooking in once at this layer keeps it
+        // off the exit-node short-circuit path (which returns earlier
+        // in `relay()` and *should* skip detection: a block via the
+        // user's own exit node is a different problem class) and off
+        // cache/coalesce returns (the original fetch already ran).
+        // Dedup'd per-host inside `bot_block` so noisy multi-asset
+        // page loads don't spam the log.
+        if let Some(host) = extract_host(url) {
+            crate::bot_block::note_if_blocked(&host, &bytes);
+        }
+
         if let Some(k) = cache_key_opt {
             if let Some(ttl) = parse_ttl(&bytes, url) {
                 tracing::debug!("cache store: {} ttl={}s", url, ttl.as_secs());
