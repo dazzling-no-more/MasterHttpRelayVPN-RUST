@@ -483,28 +483,50 @@ jobs:
         with:
           targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
 
-      # cargo-ndk: glue between cargo and the NDK's clang. Upstream
-      # pre-installed this on its self-hosted runners under /usr/local/bin;
-      # on github-hosted we install it from crates.io per-run. ~30 s cold,
-      # cached on subsequent runs via Swatinem/rust-cache below.
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --locked
-
-      # Cache cargo + target/ across Android release builds. Four cargo-ndk
-      # release builds back-to-back with LTO is where the cold cost comes
-      # from; rust-cache brings warm runs down to ~3–4 min from ~9 min cold.
-      # cache-bin: false — see the rationale on the matrix build job above.
-      # On top of that, `cargo-ndk` lives in /usr/local/bin/ on our runners
-      # (not $CARGO_HOME/bin), specifically so rust-cache's default bin
-      # pruning can't delete it.
+      # Cache cargo + target/ FIRST, so the cargo-ndk install below can hit
+      # a warm $CARGO_HOME/bin instead of rebuilding. Four cargo-ndk release
+      # builds back-to-back with LTO is where the cold cost comes from;
+      # rust-cache brings warm runs down to ~3–4 min from ~9 min cold.
+      #
+      # cache-bin: true (the default) so $CARGO_HOME/bin/cargo-ndk lives in
+      # the cache. Upstream's comment about needing cache-bin: false applied
+      # to their self-hosted runner where rustup itself lived under
+      # $CARGO_HOME/bin and would get pruned — on GitHub-hosted runners
+      # rustup is under /usr/share/rustup, so bin-pruning is harmless.
       - uses: Swatinem/rust-cache@v2
         with:
           key: android-universal
-          cache-bin: "false"
           # cargo-ndk writes into `target/<android-triple>/release/`, all
           # four of which we want to cache.
           workspaces: |
             . -> target
+
+      # cargo-ndk: glue between cargo and the NDK's clang. taiki-e's
+      # install-action downloads a precompiled binary from the project's
+      # releases instead of `cargo install` compiling from source — drops
+      # this step from ~1 min cold to <10 s. On cache hit from rust-cache
+      # above, the binary is already in $CARGO_HOME/bin and install-action
+      # is a no-op.
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      # Cache Gradle's downloaded distribution + dependency JARs. Gradle
+      # itself doesn't ship with the runner image, so a cold run downloads
+      # ~50 MB of Gradle + ~200 MB of Android Gradle Plugin transitive
+      # deps from Maven Central / Google Maven — ~1-2 min per release.
+      # Key the cache on the gradle wrapper version + any gradle script
+      # changes; on hit, ~/.gradle/caches/modules-2 is restored verbatim
+      # and Gradle resolves dependencies from disk in seconds.
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle*', 'android/**/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
 
       # `./gradlew :app:assembleRelease` triggers cargoBuildRelease first
       # which invokes cargo-ndk with all four targets, then Gradle packages
