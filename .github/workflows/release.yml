@@ -673,12 +673,17 @@ jobs:
           for f in dist/*.tar.gz dist/*.zip dist/*.apk; do
             [ -f "$f" ] || continue
             echo "::group::sign $(basename "$f")"
-            # `-W` = no password prompt (read from RSIGN_PASSWORD env)
+            # rsign reads the key's password from `$RSIGN_PASSWORD` by
+            # default (no flag needed). Earlier this used `-W`, but in
+            # rsign2 `-W` on the sign side means "the key is NOT password-
+            # protected, skip decryption entirely" — and our keys ARE
+            # passphrase-protected, so `-W` made decryption fail with
+            # "Wrong password for that key" before the env var was even
+            # consulted.
             # `-x <out>` = write the signature to a specific path so it
             # lands as `<asset>.minisig` instead of rsign's default
             # next-to-binary location.
             rsign sign \
-              -W \
               -s "${KEY_FILE}" \
               -x "${f}.minisig" \
               "$f"
