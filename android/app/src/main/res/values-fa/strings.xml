@@ -72,6 +72,12 @@
     <string name="adv_log_level">log_level</string>
     <string name="adv_parallel_relay">parallel_relay: %1$d</string>
     <string name="adv_parallel_relay_help">تعداد درخواست‌های موازی هر بار. ۱ عادی است؛ روی لینک‌های با افت، ۲-۳ را امتحان کنید.</string>
+    <string name="adv_block_quic">مسدود کردن QUIC</string>
+    <string name="adv_block_quic_help">UDP/۴۴۳ را drop می‌کند تا مرورگرها به TCP/HTTPS برگردند. عبور QUIC از تونل TCP باعث meltdown می‌شود.</string>
+    <string name="adv_block_doh">مسدود کردن DoH</string>
+    <string name="adv_block_doh_help">درخواست‌های DoH مرورگر را رد می‌کند — مرورگر به DNS سیستم (از طریق tun2proxy، فوری) برمی‌گردد. حدود ۱.۵ ثانیه در هر resolve صرفه‌جویی می‌شود.</string>
+    <string name="adv_bypass_doh">دور زدن DoH</string>
+    <string name="adv_bypass_doh_help">درخواست‌های DoH مرورگر مستقیم ارسال می‌شود، نه از داخل تونل. DNS سریع‌تر — query ها همچنان رمزنگاری‌شده‌اند.</string>
     <string name="adv_upstream_socks5">upstream_socks5 (اختیاری)</string>
     <string name="adv_upstream_socks5_help">اگر تنظیم شود، ترافیک خروجی از این SOCKS5 رد می‌شود. خالی بگذارید برای اتصال مستقیم.</string>
 

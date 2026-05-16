@@ -72,6 +72,12 @@
     <string name="adv_log_level">log_level</string>
     <string name="adv_parallel_relay">parallel_relay: %1$d</string>
     <string name="adv_parallel_relay_help">Fan-out per request. 1 is normal; bump to 2-3 on lossy links.</string>
+    <string name="adv_block_quic">Block QUIC</string>
+    <string name="adv_block_quic_help">Drop UDP/443 so browsers use TCP/HTTPS. QUIC over TCP tunnel causes meltdown.</string>
+    <string name="adv_block_doh">Block DoH</string>
+    <string name="adv_block_doh_help">Reject browser DoH — forces instant system DNS via tun2proxy. Saves ~1.5s per domain lookup.</string>
+    <string name="adv_bypass_doh">Bypass DoH</string>
+    <string name="adv_bypass_doh_help">Send browser DoH direct, not through tunnel. Faster DNS — queries are still encrypted.</string>
     <string name="adv_upstream_socks5">upstream_socks5 (optional)</string>
     <string name="adv_upstream_socks5_help">If set, route upstream via this SOCKS5. Leave blank for direct.</string>
 

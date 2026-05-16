@@ -1961,11 +1961,11 @@ private fun AdvancedSettings(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    "Block QUIC",
+                    stringResource(R.string.adv_block_quic),
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Text(
-                    "Drop UDP/443 so browsers use TCP/HTTPS. QUIC over TCP tunnel causes meltdown.",
+                    stringResource(R.string.adv_block_quic_help),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -1983,11 +1983,11 @@ private fun AdvancedSettings(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    "Block DoH",
+                    stringResource(R.string.adv_block_doh),
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Text(
-                    "Reject browser DoH — forces instant system DNS via tun2proxy. Saves ~1.5s per domain lookup.",
+                    stringResource(R.string.adv_block_doh_help),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -2005,11 +2005,11 @@ private fun AdvancedSettings(
         ) {
             Column(modifier = Modifier.weight(1f)) {
                 Text(
-                    "Bypass DoH",
+                    stringResource(R.string.adv_bypass_doh),
                     style = MaterialTheme.typography.bodyMedium,
                 )
                 Text(
-                    "Send browser DoH direct, not through tunnel. Faster DNS — queries are still encrypted.",
+                    stringResource(R.string.adv_bypass_doh_help),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

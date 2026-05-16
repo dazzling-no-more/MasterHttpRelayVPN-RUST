@@ -471,9 +471,6 @@ struct FormState {
     /// No UI control; round-tripped so a hand-edited `false` survives Save.
     sabr_strip: bool,
     passthrough_hosts: Vec<String>,
-    /// Round-tripped from config.json so the UI's save path doesn't
-    /// drop the user's setting. Not currently exposed as a UI control;
-    /// users edit `block_quic` directly in `config.json` (Issue #213).
     block_quic: bool,
     /// Round-tripped from config.json. Not exposed as a UI control —
     /// users edit `disable_padding` directly when needed (Issue #391).
@@ -860,9 +857,6 @@ impl FormState {
             // Similarly config-only for now; round-trips through the
             // file so the UI doesn't drop the user's entries on save.
             passthrough_hosts: self.passthrough_hosts.clone(),
-            // Issue #213: block_quic is config-only for now (no UI
-            // control yet). Round-trip through the file so save
-            // doesn't drop a user-set true.
             block_quic: self.block_quic,
             // Issue #391: disable_padding is config-only for now.
             // Round-trip preserves the user's choice.
