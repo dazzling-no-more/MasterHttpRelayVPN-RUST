@@ -763,7 +763,23 @@ jobs:
   # (DigitalOcean, Hetzner, Oracle Free Tier) offer arm64 instances at
   # half price, and the binary works on both.
   tunnel-docker:
-    needs: build
+    # No `needs:` on purpose. tunnel-node is a separate crate; the docker
+    # image is built from ./tunnel-node source via its own Dockerfile and
+    # consumes zero artifacts from the desktop build matrix. Previously
+    # this job had `needs: build`, which idled it for ~14 min (until the
+    # slowest matrix job — windows-amd64 cold — finished) before docker
+    # buildx could even start, lengthening every release by ~10 min for
+    # no real dependency reason.
+    #
+    # The `release` job still has `needs: [build, android, sign]`, so a
+    # failed build matrix still blocks the GitHub Releases page from
+    # being created. The only thing this change decouples is whether the
+    # `ghcr.io/.../rahgozar-tunnel-node:v<ver>` tag can advance when the
+    # desktop binaries fail to build. Acceptable: tunnel-node consumers
+    # (VPS operators running `docker run ghcr.io/.../rahgozar-tunnel-node`)
+    # are a different audience from desktop users, and the recovery path
+    # (workflow_dispatch on the existing tag to retry the failed pieces)
+    # republishes the docker tag atomically with the rest.
     runs-on: ubuntu-latest
     permissions:
       contents: read
