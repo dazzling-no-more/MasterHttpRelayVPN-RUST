@@ -68,17 +68,18 @@ if (typeof (globalThis as any).Deno !== "undefined") {
 // Bun
 else if (typeof (globalThis as any).Bun !== "undefined") {
   const Bun = (globalThis as any).Bun;
-  const port = Number(process.env.PORT ?? 8443);
-  const hostname = process.env.HOST ?? "0.0.0.0";
+  const proc = (globalThis as any).process;
+  const port = Number(proc.env.PORT ?? 8443);
+  const hostname = proc.env.HOST ?? "0.0.0.0";
 
   Bun.serve({
     port,
     hostname,
     fetch: handler,
-    tls: process.env.CERT_FILE && process.env.KEY_FILE
+    tls: proc.env.CERT_FILE && proc.env.KEY_FILE
       ? {
-          cert: Bun.file(process.env.CERT_FILE),
-          key: Bun.file(process.env.KEY_FILE),
+          cert: Bun.file(proc.env.CERT_FILE),
+          key: Bun.file(proc.env.KEY_FILE),
         }
       : undefined,
   });
@@ -86,15 +87,29 @@ else if (typeof (globalThis as any).Bun !== "undefined") {
 }
 // Node 22+ — uses the built-in `node:http` module + globalThis.Request/Response
 else if (typeof (globalThis as any).process !== "undefined") {
-  const { createServer } = await import("node:http");
-  const port = Number(process.env.PORT ?? 8443);
-  const hostname = process.env.HOST ?? "0.0.0.0";
+  const proc = (globalThis as any).process;
+  // @ts-ignore — node:http is resolved at runtime; not typed without @types/node
+  const { createServer } = (await import("node:http")) as any;
+  const port = Number(proc.env.PORT ?? 8443);
+  const hostname = proc.env.HOST ?? "0.0.0.0";
 
-  createServer(async (req, res) => {
-    // Build a web-standard Request from Node's IncomingMessage.
+  createServer(async (req: any, res: any) => {
+    // Build a web-standard Request from Node's IncomingMessage. Manual
+    // concat instead of Node's Buffer.concat so we don't depend on the
+    // Buffer global (this file typechecks without @types/node).
     const chunks: Uint8Array[] = [];
     for await (const c of req) chunks.push(c as Uint8Array);
-    const body = chunks.length ? Buffer.concat(chunks) : undefined;
+    let body: Uint8Array<ArrayBuffer> | undefined;
+    if (chunks.length) {
+      let total = 0;
+      for (const c of chunks) total += c.length;
+      body = new Uint8Array(total);
+      let off = 0;
+      for (const c of chunks) {
+        body.set(c, off);
+        off += c.length;
+      }
+    }
 
     const url = `http://${req.headers.host ?? hostname}${req.url ?? "/"}`;
     const webReq = new Request(url, {

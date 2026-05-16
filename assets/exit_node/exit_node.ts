@@ -78,7 +78,7 @@ const STRIP_HEADERS = new Set([
   "via",
 ]);
 
-function decodeBase64ToBytes(input: string): Uint8Array {
+function decodeBase64ToBytes(input: string): Uint8Array<ArrayBuffer> {
   const bin = atob(input);
   const out = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
@@ -178,7 +178,7 @@ export default async function (req: Request): Promise<Response> {
       // Malformed URL — let the fetch below 400.
     }
 
-    let payload: Uint8Array | undefined;
+    let payload: Uint8Array<ArrayBuffer> | undefined;
     if (typeof b64 === "string" && b64.length > 0) {
       payload = decodeBase64ToBytes(b64);
     }
