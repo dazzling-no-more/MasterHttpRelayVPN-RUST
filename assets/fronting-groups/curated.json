@@ -4,7 +4,7 @@
     "(https://github.com/patterniha/MITM-DomainFronting). The Xray config",
     "in that project ships a tested set of (sni, edge, member-domain)",
     "tuples for Vercel, Fastly, AWS CloudFront, and direct-to-GitHub paths.",
-    "This file is the same data, restructured for mhrv-rs's `fronting_groups`",
+    "This file is the same data, restructured for rahgozar's `fronting_groups`",
     "config shape. See docs/fronting-groups.md.",
     "",
     "Edge IPs rotate. If a group stops working, re-resolve `sni`",

@@ -2,13 +2,13 @@
  * MHR-CFW Exit Worker — Cloudflare Workers companion to Code.cfw.gs.
  *
  * Architecture (alternative backend, opt-in):
- *   mhrv-rs → Apps Script (Code.cfw.gs) → THIS Worker → target site
+ *   rahgozar → Apps Script (Code.cfw.gs) → THIS Worker → target site
  *
  * Apps Script in this configuration is a thin relay: it authenticates
- * the inbound request from mhrv-rs, then forwards to this Worker. The
+ * the inbound request from rahgozar, then forwards to this Worker. The
  * Worker does the actual outbound fetch(es), base64-encodes the body,
  * and returns the same JSON envelope shape the standard Code.gs would
- * have returned. The mhrv-rs client is unaware that the work happened
+ * have returned. The rahgozar client is unaware that the work happened
  * on Cloudflare — same `{u, m, h, b, ct, r}` request, same `{s, h, b}`
  * response.
  *
@@ -21,7 +21,7 @@
  * `UrlFetchApp.fetchAll(N worker calls)` to fan out an N-URL batch,
  * which costs N quota — same as the standard Code.gs. With it,
  * Code.cfw.gs does ONE fetch to this Worker (1 quota) and we fan out
- * inside the Worker via Promise.all. For a typical mhrv-rs batch of
+ * inside the Worker via Promise.all. For a typical rahgozar batch of
  * 5-30 URLs that's a 5-30x reduction in GAS daily quota.
  *
  * Why bother:
@@ -34,7 +34,7 @@
  *     + base64 + header munging.
  *   - With the batch shape (above), Apps Script *UrlFetchApp count*
  *     quota also stretches roughly Nx for an N-URL batch — typically
- *     5-30x for mhrv-rs.
+ *     5-30x for rahgozar.
  *
  * What this does NOT change:
  *   - Cloudflare anti-bot challenges on the destination. The exit IP
@@ -48,7 +48,7 @@
  *     mode (Code.gs) for YouTube-heavy use.
  *   - The 30s wall now applies to the *slowest URL in the batch*
  *     because Promise.all only resolves once every fetch finishes.
- *     mhrv-rs already retries failed batch items individually, so a
+ *     rahgozar already retries failed batch items individually, so a
  *     single slow target degrades to a per-item timeout rather than
  *     a hard failure — but it's a real behavioural difference vs the
  *     per-URL wall under the standard Code.gs path.
@@ -57,7 +57,7 @@
  *   1. Cloudflare dashboard → Workers & Pages → Create → Hello World
  *   2. Edit code → delete the template, paste this entire file
  *   3. Change AUTH_KEY below to the same value you set in Code.cfw.gs
- *      AND in your mhrv-rs config.json (auth_key). All three must match.
+ *      AND in your rahgozar config.json (auth_key). All three must match.
  *   4. Deploy. Note the *.workers.dev URL; paste it into Code.cfw.gs as
  *      WORKER_URL.
  *
@@ -93,7 +93,7 @@ const RELAY_HOP_HEADER = "x-relay-hop";
 
 // Soft cap on batch size. Cloudflare Workers allow up to 50
 // subrequests per invocation on the free tier (1000 on paid). We
-// keep a margin for retries and internal CF traffic. mhrv-rs's
+// keep a margin for retries and internal CF traffic. rahgozar's
 // typical batches are 5-30 URLs so this is rarely the binding limit.
 //
 // **Must match `WORKER_BATCH_CHUNK` in Code.cfw.gs.** If the GAS side
@@ -182,7 +182,7 @@ export default {
     }
     if (result.e) {
       // Per-item validation errors get HTTP 400 in single mode so
-      // mhrv-rs sees the same shape as in standard Code.gs ("bad url"
+      // rahgozar sees the same shape as in standard Code.gs ("bad url"
       // etc are already client-error-coded there).
       return json(result, 400);
     }
@@ -278,7 +278,7 @@ async function processOne(item, selfHost) {
 
   // Note: Headers.forEach delivers keys lowercased per the Fetch
   // spec, whereas Code.gs's getAllHeaders preserves the origin's
-  // casing. mhrv-rs treats headers case-insensitively, but anything
+  // casing. rahgozar treats headers case-insensitively, but anything
   // downstream that does a case-sensitive string compare will see
   // a backend-dependent difference. There is no Workers API to
   // recover the origin casing, so we accept the divergence.

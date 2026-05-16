@@ -1,5 +1,5 @@
 {
-  "_comment": "Example config for using mhrv-rs with an exit-node deployment to bypass Cloudflare anti-bot blocks on chatgpt.com / claude.ai / grok.com / x.com. See assets/exit_node/README.md for the deployment walkthrough.",
+  "_comment": "Example config for using rahgozar with an exit-node deployment to bypass Cloudflare anti-bot blocks on chatgpt.com / claude.ai / grok.com / x.com. See assets/exit_node/README.md for the deployment walkthrough.",
   "mode": "apps_script",
   "google_ip": "216.239.38.120",
   "front_domain": "www.google.com",

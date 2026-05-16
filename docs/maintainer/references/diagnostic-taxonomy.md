@@ -2,7 +2,7 @@
 
 ## What this is
 
-Multiple distinct conditions cause Apps Script (or our own scripts on Apps Script) to return an HTML body that mhrv-rs's batch parser sees as `bad response: no json in batch response: <body prefix>`. Through user reports and iteration we've narrowed the body strings to **6 candidate causes**. Distinguishing them requires both client-side detection (string-match on body content) and server-side disambiguation (`DIAGNOSTIC_MODE` flag in Code.gs).
+Multiple distinct conditions cause Apps Script (or our own scripts on Apps Script) to return an HTML body that rahgozar's batch parser sees as `bad response: no json in batch response: <body prefix>`. Through user reports and iteration we've narrowed the body strings to **6 candidate causes**. Distinguishing them requires both client-side detection (string-match on body content) and server-side disambiguation (`DIAGNOSTIC_MODE` flag in Code.gs).
 
 This taxonomy is the post-mortem evolution of v1.8.0 → v1.8.1 → v1.8.2 → v1.8.3 detection. v1.8.1 falsely asserted "AUTH_KEY mismatch" on body match; v1.8.2 softened to enumerate 4 candidates; v1.8.3 added the Persian-localized cause and the Workspace landing HTML cause for account-flagged deployments — bringing the count to 6.
 
@@ -53,7 +53,7 @@ This taxonomy is the post-mortem evolution of v1.8.0 → v1.8.1 → v1.8.2 → v
 
 ### 4. Iran ISP-side response truncation
 
-**Body**: typically truncated mid-stream — the body that arrives at mhrv-rs is missing the trailing JSON envelope. The early bytes look like a valid Apps Script response prefix but the request was cut by an ISP-side TCP RST mid-flight.
+**Body**: typically truncated mid-stream — the body that arrives at rahgozar is missing the trailing JSON envelope. The early bytes look like a valid Apps Script response prefix but the request was cut by an ISP-side TCP RST mid-flight.
 
 **Source**: Iran's ISP infrastructure (especially TCI/مخابرات) actively RST-injects on TLS connections to specific Google IPs (the #313 pattern).
 

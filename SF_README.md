@@ -1,4 +1,4 @@
-# Quick Start — mhrv-rs
+# Quick Start — rahgozar
 
 A short, plain-language version. For the deep technical guide, see the [full README](README.md).
 
@@ -16,17 +16,17 @@ A free way to bypass internet censorship by routing your traffic through your ow
 
 - A Google account (free, the regular one).
 - 5–10 minutes the first time.
-- The mhrv-rs app — Windows, Mac, Linux, or Android. [Download here](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases/latest).
+- The rahgozar app — Windows, Mac, Linux, or Android. [Download here](https://github.com/dazzling-no-more/rahgozar/releases/latest).
 
 ### The 3 steps
 
 **1. Set up the relay in your Google account (one-time).**
 Go to <https://script.google.com>, sign in, click **New project**. Delete the sample code, paste in the [Code.gs file from this repo](assets/apps_script/Code.gs), change `AUTH_KEY = "..."` to a password only you know. Click **Deploy → New deployment → Web app**, set "Execute as: Me", "Who has access: Anyone". Copy the long ID from the URL — that's your **Deployment ID**.
 
-> Can't reach `script.google.com` because it's blocked? Run mhrv-rs first in `direct` mode (use [`config.direct.example.json`](config.direct.example.json)). It only relays Google sites (plus any [fronting_groups](docs/fronting-groups.md) you've configured) and lets you reach the Apps Script editor through the bypass tunnel. Do step 1 in your browser, then switch back to normal mode. (`direct` was named `google_only` before v1.9 — the old name still works.)
+> Can't reach `script.google.com` because it's blocked? Run rahgozar first in `direct` mode (use [`config.direct.example.json`](config.direct.example.json)). It only relays Google sites (plus any [fronting_groups](docs/fronting-groups.md) you've configured) and lets you reach the Apps Script editor through the bypass tunnel. Do step 1 in your browser, then switch back to normal mode. (`direct` was named `google_only` before v1.9 — the old name still works.)
 
-**2. Install and run mhrv-rs.**
-Download the package for your system from [Releases](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases/latest) and unzip it.
+**2. Install and run rahgozar.**
+Download the package for your system from [Releases](https://github.com/dazzling-no-more/rahgozar/releases/latest) and unzip it.
 
 | If you have | Do this |
 |---|---|
@@ -39,6 +39,7 @@ The first run asks for your password — only to install a small local certifica
 
 **3. Paste your details and connect.**
 In the app, paste:
+
 - **Deployment ID** — from step 1
 - **Auth key** — the password you put in `Code.gs`
 
@@ -61,19 +62,28 @@ Your Apps Script deployment isn't responding. Go back to <https://script.google.
 Free Google accounts get **20,000 relay requests per day**. The desktop and Android apps show a "Usage today" card with how many you've used. Add multiple Deployment IDs (one per line in the UI, or a JSON array in `config.json`) — each ID has its own quota and they're rotated automatically. You can also click "View quota on Google" to see the official number on Google's dashboard.
 
 **App says it's connected but websites don't load?**
+
 - Open the **SNI pool** section and click **Test all**. If everything fails, your `google_ip` value is unreachable from your network — click **Auto-detect google_ip** to fix.
 - Make sure you actually installed the certificate (the password prompt on first run). If you skipped it, click **Install MITM certificate** again.
 
 ### Want more detail?
 
 - [Full English README](README.md#setup-guide) — every config option, full tunnel mode, OpenWRT, diagnostics, security notes
-- [Issue tracker](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues) — search before opening a new one; lots of common questions are already answered
+- [Issue tracker](https://github.com/dazzling-no-more/rahgozar/issues) — and the larger [upstream archive on therealaleph/MasterHttpRelayVPN-RUST](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues) where most of the project's history lives. Search before opening a new one; lots of common questions are already answered
 
-### Support
+### Support these projects
 
-This project is free and run by volunteers. If it helped you and you can spare anything: **[❤️ sh1n.org/donate](https://sh1n.org/donate)**
+**rahgozar takes no donations.** This fork only exists to keep users covered while upstream is inactive — the substantive engineering happened in three upstream projects. If this software helped you, send support there directly:
+
+- **[@masterking32](https://github.com/masterking32)** — original Python project (`MasterHttpRelayVPN`). Sponsor on GitHub.
+- **[@therealaleph](https://github.com/therealaleph)** — Rust port author (`mhrv-rs`). **[❤️ sh1n.org/donate](https://sh1n.org/donate)**
+- **[@patterniha](https://github.com/patterniha)** — MITM-DomainFronting (the fronting-groups concept). Sponsor on GitHub.
+
+Starring those three upstream repos also signals their work is worth keeping alive. See the [full Credits section](README.md#credits) for the lineage.
 
 ---
+
+<div dir="rtl">
 
 ## راهنمای خلاصه فارسی
 
@@ -87,17 +97,17 @@ This project is free and run by volunteers. If it helped you and you can spare a
 
 - یک حساب گوگل معمولی (رایگان).
 - بار اول ۵ تا ۱۰ دقیقه وقت.
-- برنامهٔ mhrv-rs برای ویندوز / مک / لینوکس / اندروید — [از اینجا دانلود کنید](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases/latest).
+- برنامهٔ rahgozar برای ویندوز / مک / لینوکس / اندروید — [از اینجا دانلود کنید](https://github.com/dazzling-no-more/rahgozar/releases/latest).
 
 ### سه مرحله
 
 **۱. ساخت ریله در حساب گوگل (فقط یک بار).**
 به <https://script.google.com> بروید، وارد حساب گوگل شوید و روی **New project** بزنید. کد پیش‌فرض را پاک کنید و محتوای [فایل Code.gs](assets/apps_script/Code.gs) همین مخزن را در آن جای‌گذاری کنید. خط `AUTH_KEY = "..."` را به یک رمز دلخواه که فقط خودتان می‌دانید تغییر دهید. سپس **Deploy → New deployment → Web app** را بزنید، گزینهٔ "Execute as: Me" و "Who has access: Anyone" را انتخاب کنید. آی‌دی طولانی توی URL را کپی کنید — این **Deployment ID** شماست.
 
-> اگر `script.google.com` خودش بسته است، اول mhrv-rs را در حالت `direct` اجرا کنید (از [`config.direct.example.json`](config.direct.example.json) استفاده کنید). این حالت فقط سایت‌های گوگل (به علاوهٔ هر [fronting_groups](docs/fronting-groups.md) که تنظیم کرده باشید) را تونل می‌کند تا بتوانید به ویرایشگر Apps Script برسید. مرحلهٔ ۱ را در مرورگر انجام دهید و بعد به حالت معمولی برگردید. (نام قبلی این حالت `google_only` بود — همچنان پذیرفته می‌شود.)
+> اگر `script.google.com` خودش بسته است، اول rahgozar را در حالت `direct` اجرا کنید (از [`config.direct.example.json`](config.direct.example.json) استفاده کنید). این حالت فقط سایت‌های گوگل (به علاوهٔ هر [fronting_groups](docs/fronting-groups.md) که تنظیم کرده باشید) را تونل می‌کند تا بتوانید به ویرایشگر Apps Script برسید. مرحلهٔ ۱ را در مرورگر انجام دهید و بعد به حالت معمولی برگردید. (نام قبلی این حالت `google_only` بود — همچنان پذیرفته می‌شود.)
 
-**۲. نصب و اجرای mhrv-rs.**
-بستهٔ مخصوص سیستم خودتان را از [بخش Releases](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases/latest) دانلود کنید و از حالت فشرده در بیاورید.
+**۲. نصب و اجرای rahgozar.**
+بستهٔ مخصوص سیستم خودتان را از [بخش Releases](https://github.com/dazzling-no-more/rahgozar/releases/latest) دانلود کنید و از حالت فشرده در بیاورید.
 
 | سیستم | کاری که باید بکنید |
 |---|---|
@@ -110,8 +120,9 @@ This project is free and run by volunteers. If it helped you and you can spare a
 
 **۳. مشخصاتتان را وارد کنید و وصل شوید.**
 در برنامه این دو را وارد کنید:
-- **Deployment ID** — از مرحلهٔ ۱
-- **Auth key (کلید احراز)** — همان رمزی که در `Code.gs` گذاشتید
+
+- مقدار **Deployment ID** — از مرحلهٔ ۱
+- مقدار **Auth key (کلید احراز)** — همان رمزی که در `Code.gs` گذاشتید
 
 روی **اتصال** (در اندروید) یا **Start** (در دسکتاپ) بزنید. تمام شد. مرورگر، تلگرام و بقیهٔ برنامه‌ها مثل قبل کار می‌کنند.
 
@@ -119,14 +130,14 @@ This project is free and run by volunteers. If it helped you and you can spare a
 
 ### مشکلات رایج (اکثر کاربران حداقل یکی از این‌ها را می‌بینند)
 
-**ویدیوهای یوتیوب «محدود» نشان داده می‌شوند یا کامنت‌ها دیده نمی‌شوند؟ ([#61](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues/61))**
+**ویدیوهای یوتیوب «محدود» نشان داده می‌شوند یا کامنت‌ها دیده نمی‌شوند؟**
 در بخش Advanced دسکتاپ گزینهٔ **«Send YouTube through relay (no SNI rewrite)»** را روشن کنید، یا در `config.json` مقدار `youtube_via_relay: true` بگذارید. در این حالت یوتیوب از مسیر ریلهٔ Apps Script رد می‌شود و فیلتر SafeSearch-on-SNI گوگل دور می‌خورد. تریدآف: ویدیو کمی کندتر و مصرف از سهمیهٔ روزانه.
 
 **روی سایت‌های پشت Cloudflare loop «Verify you are human» می‌خورد؟**
 این مشکل در این ابزار قابل حل نیست. هر درخواست Apps Script از یک IP متفاوت دیتاسنتر گوگل خارج می‌شود و کوکی challenge کلودفلر به یک IP خاص قفل است — درخواست بعدی از IP دیگر دوباره چالش می‌خورد. سایت‌هایی که فقط یک‌بار در ابتدای session چک می‌کنند درست کار می‌کنند. سایت‌هایی که هر صفحه چک می‌کنند، نه.
 
 **در مرورگر «504 Relay timeout» نشان می‌دهد؟**
-Apps Script شما پاسخ نمی‌دهد. به <https://script.google.com> برگردید، **Deploy → Manage deployments → Edit (آیکن مداد)** را بزنید، گزینهٔ "Version" را روی **New version** بگذارید و Deploy کنید. **آی‌دی جدید** Deployment را کپی کنید و در برنامه جای‌گذاری کنید.
+یعنی Apps Script شما پاسخ نمی‌دهد. به <https://script.google.com> برگردید، **Deploy → Manage deployments → Edit (آیکن مداد)** را بزنید، گزینهٔ "Version" را روی **New version** بگذارید و Deploy کنید. **آی‌دی جدید** Deployment را کپی کنید و در برنامه جای‌گذاری کنید.
 
 **سهمیهٔ روزانه تمام شده؟**
 هر حساب گوگل رایگان روزانه **۲۰٬۰۰۰ درخواست ریله** دارد. کارت «مصرف امروز» در دسکتاپ و اندروید مقدار مصرف فعلی را نشان می‌دهد. می‌توانید چند Deployment ID (هر کدام در یک خط، یا به‌صورت JSON array در `config.json`) اضافه کنید — هر آی‌دی سهمیهٔ خودش را دارد و به‌صورت چرخشی استفاده می‌شوند. دکمهٔ «مشاهدهٔ سهمیه در گوگل» شما را به داشبورد رسمی گوگل می‌برد.
@@ -140,6 +151,14 @@ Apps Script شما پاسخ نمی‌دهد. به <https://script.google.com> ب
 - [راهنمای کامل فارسی](README.md#راهنمای-فارسی) — همهٔ گزینه‌های پیکربندی، حالت تونل کامل، OpenWRT، تشخیص خطا، نکات امنیتی
 - [بخش Issues](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues) — قبل از ساخت issue جدید جست‌وجو کنید؛ خیلی از سؤالات رایج جواب داده شده‌اند
 
-### حمایت از پروژه
+### حمایت از این پروژه‌ها
 
-این پروژه رایگان و توسط داوطلبان نگه‌داری می‌شود. اگر کمکتان کرد و چیزی از دستتان برمی‌آید: **[❤️ sh1n.org/donate](https://sh1n.org/donate)**
+**رهگذر هیچ کمک مالی نمی‌گیرد.** این فورک فقط برای پوشش کاربران در دورانی که بالادست غیرفعال است وجود دارد — مهندسی اصلی در سه پروژهٔ بالادست انجام شده. اگر این نرم‌افزار به شما کمک کرد، لطفاً مستقیماً از آن‌ها حمایت کنید:
+
+- در GitHub Sponsors از **[@masterking32](https://github.com/masterking32)** — نویسندهٔ پروژهٔ اصلی پایتون (`MasterHttpRelayVPN`).
+- در **[❤️ sh1n.org/donate](https://sh1n.org/donate)** برای **[@therealaleph](https://github.com/therealaleph)** — نویسندهٔ پورت Rust (`mhrv-rs`).
+- در GitHub Sponsors از **[@patterniha](https://github.com/patterniha)** — نویسندهٔ MITM-DomainFronting (ایدهٔ گروه‌های fronting).
+
+ستاره دادن به این سه ریپوی بالادست هم نشان می‌دهد کارشان ارزش زنده ماندن دارد. برای جزئیات کامل، [بخش اعتبار در راهنمای بلند](README.md#اعتبار) را ببینید.
+
+</div>

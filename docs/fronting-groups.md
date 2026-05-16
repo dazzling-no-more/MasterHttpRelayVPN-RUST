@@ -1,6 +1,6 @@
 # Multi-edge fronting groups
 
-The default mhrv-rs SNI-rewrite path targets Google's edge: TLS goes out
+The default rahgozar SNI-rewrite path targets Google's edge: TLS goes out
 with `SNI=www.google.com` to a Google IP, the inner `Host` header (after
 the local MITM CA terminates the browser's TLS) names the real
 destination, and Google's frontend routes by `Host`. That's how
@@ -115,7 +115,7 @@ edge you've configured, two things happen, both bad:
 
 2. **UX failure.** The edge has no backend for your-domain, so it
    returns its default 404 / wrong-tenant page. The site appears
-   "broken via mhrv-rs" but works fine over a normal connection,
+   "broken via rahgozar" but works fine over a normal connection,
    which is confusing to debug.
 
 **Verify before listing.** A simple check: if `dig +short your-domain
@@ -124,7 +124,7 @@ the IPs differ, your-domain is hosted somewhere else and listing it
 will leak. This is also why the upstream MITM-DomainFronting Xray
 config uses `verifyPeerCertByName` with an explicit SAN allowlist —
 it's a second guard against accidentally fronting unrelated domains
-through the same edge. mhrv-rs leaves verification to rustls + the
+through the same edge. rahgozar leaves verification to rustls + the
 SNI you send; the leak guard is "you, the operator, listing only
 domains you've verified."
 
@@ -176,4 +176,4 @@ MasterHttpRelayVPN demonstrated for Google's edge. The Vercel +
 Fastly extension and the matching Xray config came from
 [@patterniha]'s [MITM-DomainFronting](https://github.com/patterniha/MITM-DomainFronting)
 project — this `fronting_groups` field is a Rust port of that idea
-into mhrv-rs's existing dispatcher.
+into rahgozar's existing dispatcher.

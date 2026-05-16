@@ -5,10 +5,10 @@
  * a Cloudflare Worker. Apps Script becomes a thin auth-and-forward
  * relay; Cloudflare does the work and pays the latency.
  *
- *   mhrv-rs ──► Apps Script (this file) ──► Cloudflare Worker ──► target
+ *   rahgozar ──► Apps Script (this file) ──► Cloudflare Worker ──► target
  *               ▲ inbound auth & batch     ▲ outbound fetch + base64
  *
- * Wire protocol with mhrv-rs is identical to Code.gs:
+ * Wire protocol with rahgozar is identical to Code.gs:
  *   1. Single:  POST { k, m, u, h, b, ct, r }       → { s, h, b }
  *   2. Batch:   POST { k, q: [{m,u,h,b,ct,r}, ...] } → { q: [{s,h,b}, ...] }
  *      Both shapes are forwarded to the Worker as one POST per call
@@ -30,7 +30,7 @@
  *   + Apps Script *UrlFetchApp count* quota stretches roughly Nx for
  *     an N-URL batch because the batch is sent as a small number of
  *     POSTs to the Worker (one per chunk of WORKER_BATCH_CHUNK URLs),
- *     not fanned out per-URL via fetchAll. For mhrv-rs's typical
+ *     not fanned out per-URL via fetchAll. For rahgozar's typical
  *     5-30 URL batches that's 1 GAS call (vs N under standard
  *     Code.gs). Single non-batched requests still count 1:1.
  *   - YouTube long-form streaming gets WORSE. Apps Script allows
@@ -39,7 +39,7 @@
  *     standard Code.gs (apps_script mode).
  *   - Batch mode now has a per-batch wall, not per-URL: Promise.all
  *     resolves only when every fetch finishes, so the slowest URL
- *     dominates. mhrv-rs already retries failed batch items
+ *     dominates. rahgozar already retries failed batch items
  *     individually, so failure modes are graceful, but it's a real
  *     behavioural change vs Code.gs's per-URL fetchAll wall.
  *   - Cloudflare anti-bot challenges on destination sites can be
@@ -54,13 +54,13 @@
  *   2. Note the *.workers.dev URL of that Worker.
  *   3. Open https://script.google.com → New project, delete default code.
  *   4. Paste THIS entire file.
- *   5. Set AUTH_KEY (must match the Worker's AUTH_KEY and your mhrv-rs
+ *   5. Set AUTH_KEY (must match the Worker's AUTH_KEY and your rahgozar
  *      config's auth_key — all three identical).
  *   6. Set WORKER_URL to your *.workers.dev URL (must include https://).
  *   7. Deploy → New deployment → Web app
  *      Execute as: Me   |   Who has access: Anyone
- *   8. Copy the Deployment ID into mhrv-rs config.json as "script_id".
- *      mhrv-rs does not need to know about Cloudflare; it talks to
+ *   8. Copy the Deployment ID into rahgozar config.json as "script_id".
+ *      rahgozar does not need to know about Cloudflare; it talks to
  *      Apps Script the same way it always has.
  *
  * CHANGE THESE TWO CONSTANTS BELOW.
@@ -242,14 +242,14 @@ function _doSingle(req) {
  * order. Multiple chunks fire in parallel via UrlFetchApp.fetchAll.
  *
  * Quota cost: ceil(N / WORKER_BATCH_CHUNK) GAS UrlFetchApp calls for
- * an N-URL batch. For typical mhrv-rs batches of 5-30 URLs this is
+ * an N-URL batch. For typical rahgozar batches of 5-30 URLs this is
  * exactly 1 call (vs N under standard Code.gs's fetchAll). Larger
  * batches gracefully degrade to a few calls instead of failing under
  * the Worker's own MAX_BATCH_SIZE soft cap.
  *
  * Bad-URL items are filtered locally so the Worker only sees valid
  * inputs, then re-interleaved into the result array in original order
- * so mhrv-rs's batch-index assumptions hold.
+ * so rahgozar's batch-index assumptions hold.
  */
 function _doBatch(items) {
   var validItems = [];
@@ -281,7 +281,7 @@ function _doBatch(items) {
     // muteHttpExceptions covers HTTP-level errors. Network-level
     // failures (DNS, TLS, connection timeout to *.workers.dev) still
     // throw — catch and convert to per-chunk `{e}` errors that get
-    // spread across each chunk's slots. mhrv-rs's per-item retry
+    // spread across each chunk's slots. rahgozar's per-item retry
     // then handles them individually instead of getting the decoy
     // HTML page from the doPost outer catch. See _doSingle for why
     // the probe-defence argument doesn't apply post-auth.
@@ -308,7 +308,7 @@ function _doBatch(items) {
         }
       } else {
         // Per-chunk failure (worker error, parse failure, auth, etc).
-        // Spread the same error to every slot in this chunk so mhrv-rs
+        // Spread the same error to every slot in this chunk so rahgozar
         // retries each item individually rather than masking the
         // failure. Other chunks are unaffected.
         var slotErr = (parsed && parsed.e)
@@ -337,7 +337,7 @@ function _doBatch(items) {
 
 /**
  * Parse the Worker's JSON envelope. Worker errors come back as
- * `{e: "..."}` — pass them through to the client unchanged so mhrv-rs
+ * `{e: "..."}` — pass them through to the client unchanged so rahgozar
  * sees the same error-shape it would for a direct-fetch failure in
  * Code.gs. On HTTP errors from the Worker itself (auth failure, 5xx,
  * etc.), wrap into `{e}` so the client gets a useful message instead

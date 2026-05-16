@@ -6,17 +6,17 @@ Current version: **v2.0.0**
 
 | File | Platform | Contents |
 |---|---|---|
-| `mhrv-rs-android-universal-v1.9.25.apk` | Android 7.0+ (all ABIs) | Universal APK — arm64-v8a, armeabi-v7a, x86_64, x86 in one file |
-| `mhrv-rs-linux-amd64.tar.gz` | Linux x86_64 | `mhrv-rs`, `mhrv-rs-ui`, `run.sh` |
-| `mhrv-rs-linux-arm64.tar.gz` | Linux aarch64 | `mhrv-rs`, `run.sh` (CLI only) |
-| `mhrv-rs-raspbian-armhf.tar.gz` | Raspberry Pi / ARMv7 hardfloat | `mhrv-rs`, `run.sh` (CLI only) |
-| `mhrv-rs-macos-amd64.tar.gz` | macOS Intel | `mhrv-rs`, `mhrv-rs-ui`, `run.sh`, `run.command` |
-| `mhrv-rs-macos-amd64-app.zip` | macOS Intel | `mhrv-rs.app` bundle (double-click from Finder) |
-| `mhrv-rs-macos-arm64.tar.gz` | macOS Apple Silicon | `mhrv-rs`, `mhrv-rs-ui`, `run.sh`, `run.command` |
-| `mhrv-rs-macos-arm64-app.zip` | macOS Apple Silicon | `mhrv-rs.app` bundle (double-click from Finder) |
-| `mhrv-rs-windows-amd64.zip` | Windows x86_64 | `mhrv-rs.exe`, `mhrv-rs-ui.exe`, `run.bat` |
-| `mhrv-rs-linux-musl-amd64.tar.gz` | OpenWRT / Alpine x86_64 | static `mhrv-rs` + `mhrv-rs.init` (procd) |
-| `mhrv-rs-linux-musl-arm64.tar.gz` | OpenWRT / Alpine aarch64 | static `mhrv-rs` + `mhrv-rs.init` (procd) |
+| `rahgozar-android-universal-v1.9.25.apk` | Android 7.0+ (all ABIs) | Universal APK — arm64-v8a, armeabi-v7a, x86_64, x86 in one file |
+| `rahgozar-linux-amd64.tar.gz` | Linux x86_64 | `rahgozar`, `rahgozar-ui`, `run.sh` |
+| `rahgozar-linux-arm64.tar.gz` | Linux aarch64 | `rahgozar`, `run.sh` (CLI only) |
+| `rahgozar-raspbian-armhf.tar.gz` | Raspberry Pi / ARMv7 hardfloat | `rahgozar`, `run.sh` (CLI only) |
+| `rahgozar-macos-amd64.tar.gz` | macOS Intel | `rahgozar`, `rahgozar-ui`, `run.sh`, `run.command` |
+| `rahgozar-macos-amd64-app.zip` | macOS Intel | `rahgozar.app` bundle (double-click from Finder) |
+| `rahgozar-macos-arm64.tar.gz` | macOS Apple Silicon | `rahgozar`, `rahgozar-ui`, `run.sh`, `run.command` |
+| `rahgozar-macos-arm64-app.zip` | macOS Apple Silicon | `rahgozar.app` bundle (double-click from Finder) |
+| `rahgozar-windows-amd64.zip` | Windows x86_64 | `rahgozar.exe`, `rahgozar-ui.exe`, `run.bat` |
+| `rahgozar-linux-musl-amd64.tar.gz` | OpenWRT / Alpine x86_64 | static `rahgozar` + `rahgozar.init` (procd) |
+| `rahgozar-linux-musl-arm64.tar.gz` | OpenWRT / Alpine aarch64 | static `rahgozar` + `rahgozar.init` (procd) |
 
 ## Download via git clone
 
@@ -34,18 +34,18 @@ Go to [github.com/therealaleph/MasterHttpRelayVPN-RUST](https://github.com/there
 ### Linux / macOS
 
 ```sh
-tar xzf mhrv-rs-macos-arm64.tar.gz
-cd mhrv-rs-macos-arm64        # or wherever the archive extracted to
+tar xzf rahgozar-macos-arm64.tar.gz
+cd rahgozar-macos-arm64        # or wherever the archive extracted to
 ./run.sh                      # or ./run.command on macOS (double-click in Finder)
 ```
 
 ### Windows
 
-Extract `mhrv-rs-windows-amd64.zip`, then double-click `run.bat` inside the extracted folder (accept the UAC prompt so the MITM CA can be installed).
+Extract `rahgozar-windows-amd64.zip`, then double-click `run.bat` inside the extracted folder (accept the UAC prompt so the MITM CA can be installed).
 
 ### Android
 
-Copy `mhrv-rs-android-universal-v1.9.25.apk` to your phone, tap it from the Files app, and allow "Install unknown apps" for whichever app is opening the APK (Files, Chrome, etc.). See [the Android guide](../docs/android.md) for the full walk-through of the first-run steps (Apps Script deployment, MITM CA install, VPN permission, SNI tester).
+Copy `rahgozar-android-universal-v1.9.25.apk` to your phone, tap it from the Files app, and allow "Install unknown apps" for whichever app is opening the APK (Files, Chrome, etc.). See [the Android guide](../docs/android.md) for the full walk-through of the first-run steps (Apps Script deployment, MITM CA install, VPN permission, SNI tester).
 
 See the [main README](../README.md) for desktop setup (Apps Script deployment, config, browser proxy settings).
 
@@ -66,13 +66,13 @@ See the [main README](../README.md) for desktop setup (Apps Script deployment, c
 **لینوکس / مک:**
 
 ```sh
-tar xzf mhrv-rs-macos-arm64.tar.gz
-cd mhrv-rs-macos-arm64
+tar xzf rahgozar-macos-arm64.tar.gz
+cd rahgozar-macos-arm64
 ./run.sh                      # در مک می‌توانید روی run.command هم از Finder دو بار کلیک کنید
 ```
 
-**ویندوز:** فایل `mhrv-rs-windows-amd64.zip` را extract کنید و داخل پوشه روی `run.bat` دو بار کلیک کنید (UAC را قبول کنید تا گواهی MITM نصب شود).
+**ویندوز:** فایل `rahgozar-windows-amd64.zip` را extract کنید و داخل پوشه روی `run.bat` دو بار کلیک کنید (UAC را قبول کنید تا گواهی MITM نصب شود).
 
-**اندروید:** فایل `mhrv-rs-android-universal-v1.9.25.apk` را روی گوشی کپی کنید، از Files app روی آن tap کنید و اجازهٔ "نصب برنامه‌های ناشناس" را بدهید. راهنمای کامل شروع به کار (دیپلوی Apps Script، نصب CA، اجازهٔ VPN، تستر SNI) در [راهنمای اندروید](../docs/android.md) هست.
+**اندروید:** فایل `rahgozar-android-universal-v1.9.25.apk` را روی گوشی کپی کنید، از Files app روی آن tap کنید و اجازهٔ "نصب برنامه‌های ناشناس" را بدهید. راهنمای کامل شروع به کار (دیپلوی Apps Script، نصب CA، اجازهٔ VPN، تستر SNI) در [راهنمای اندروید](../docs/android.md) هست.
 
 برای راه‌اندازی کامل دسکتاپ (دیپلوی Apps Script، config، تنظیم proxy مرورگر) به [README اصلی](../README.md) مراجعه کنید.

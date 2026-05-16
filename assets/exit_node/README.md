@@ -9,7 +9,7 @@ Google's datacenter IP space, so for sites like:
 - **claude.ai**
 - **grok.com / x.com**
 
-…mhrv-rs's normal apps_script-mode path returns errors like `Relay
+…rahgozar's normal apps_script-mode path returns errors like `Relay
 error: json: key must be a string at line 2 column 1` or `502 Relay
 error` because Code.gs is wrapping a CF challenge HTML page that the
 client can't parse as relay JSON.
@@ -22,7 +22,7 @@ and the destination, so the request chain becomes:
 Browser ─┐                                                ┌─→ Destination
          │                                                │   (chatgpt.com)
          ▼                                                │
-    mhrv-rs                                               │
+    rahgozar                                               │
        │                                                  │
        │  TLS to Google IP, SNI=www.google.com (DPI cover)│
        ▼                                                  │
@@ -43,7 +43,7 @@ comes back.
 **Important property preserved:** the user-side leg (Iran ISP →
 Apps Script) is unchanged. The ISP only sees TLS to a Google IP — the
 second hop happens entirely inside Apps Script's outbound, invisible
-from the user's network. The DPI evasion property mhrv-rs is built
+from the user's network. The DPI evasion property rahgozar is built
 around stays intact.
 
 ## Setup
@@ -65,7 +65,7 @@ on any platform with a serverless-fetch runtime.
    relay.
 2. **Deploy** to your chosen host (see options below).
 3. **Copy the public URL** of the deployed handler.
-4. **In `mhrv-rs` config.json**, add an `exit_node` block:
+4. **In `rahgozar` config.json**, add an `exit_node` block:
    ```json
    "exit_node": {
      "enabled": true,
@@ -75,10 +75,10 @@ on any platform with a serverless-fetch runtime.
      "hosts": ["chatgpt.com", "claude.ai", "x.com", "grok.com", "openai.com"]
    }
    ```
-5. **Restart mhrv-rs** (Disconnect + Connect, or kill + restart the
+5. **Restart rahgozar** (Disconnect + Connect, or kill + restart the
    binary).
 6. **Test** — open `chatgpt.com` or `grok.com` from a browser pointed
-   at mhrv-rs's proxy. You should see the real login page, not a CF
+   at rahgozar's proxy. You should see the real login page, not a CF
    challenge.
 
 A complete example config is at
@@ -111,7 +111,7 @@ ideal.
 ## Behaviour on failure
 
 If the exit node is unreachable, returns 5xx, or returns a malformed
-response, mhrv-rs **automatically falls back to the regular Apps
+response, rahgozar **automatically falls back to the regular Apps
 Script relay**. The log shows a `warn: exit node failed for ... —
 falling back to direct Apps Script` line. The CF-affected sites then
 fail (CF challenge), but every other site keeps working — a downed
@@ -127,7 +127,7 @@ public open proxy. Treat it like a password:
 - **Don't share publicly.** Anyone with both the URL and the PSK can
   use the deployment as their own proxy and burn your runtime quota.
 - **Rotate** if you suspect a leak. Change the PSK in the deployed
-  source, redeploy, then update `psk` in `mhrv-rs` config.json and
+  source, redeploy, then update `psk` in `rahgozar` config.json and
   restart.
 
 The script also includes a **loop guard** (refuses to fetch its own
@@ -176,7 +176,7 @@ IP space is on CF's bot blocklist. Workarounds: try a different host
 - [Persian (راهنمای فارسی)](README.fa.md) version of this doc
 - [`exit_node.ts`](exit_node.ts) — the handler source (with hardening)
 - [`config.exit-node.example.json`](../../config.exit-node.example.json)
-  — complete example mhrv-rs config
+  — complete example rahgozar config
 - Issue [#382](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues/382)
   — canonical thread tracking Cloudflare anti-bot
 - Issue [#309](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues/309)

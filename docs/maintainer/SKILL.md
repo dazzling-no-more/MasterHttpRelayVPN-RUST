@@ -1,12 +1,12 @@
-# mhrv-rs maintenance
+# rahgozar maintenance
 
 This document encodes the project context, recurring patterns, and conventions needed to ship code, triage issues, and respond to users effectively. It is the entry point to the broader knowledge base in `references/`.
 
 ## Why this matters
 
-mhrv-rs is **infrastructure for circumvention**. The bulk of the userbase is in Iran — under one of the world's heaviest internet censorship regimes — using this tool to reach YouTube, Wikipedia, Telegram, GitHub, news sites, banking, and (critically) to communicate with family abroad. A non-trivial fraction of users are in Russia, China, Belarus, and other censored networks, but Iran dominates the issue tracker.
+rahgozar is **infrastructure for circumvention**. The bulk of the userbase is in Iran — under one of the world's heaviest internet censorship regimes — using this tool to reach YouTube, Wikipedia, Telegram, GitHub, news sites, banking, and (critically) to communicate with family abroad. A non-trivial fraction of users are in Russia, China, Belarus, and other censored networks, but Iran dominates the issue tracker.
 
-The architecture's importance is the architecture itself: by routing traffic through Google Apps Script, the user's ISP only sees encrypted HTTPS to Google IPs (`216.239.38.120` etc.) — the exact same fingerprint as `www.google.com`. ISPs that block conventional VPNs are forced to either let mhrv-rs through or break Google access for the entire country. This asymmetry is what makes the project work, and it shapes every architectural decision.
+The architecture's importance is the architecture itself: by routing traffic through Google Apps Script, the user's ISP only sees encrypted HTTPS to Google IPs (`216.239.38.120` etc.) — the exact same fingerprint as `www.google.com`. ISPs that block conventional VPNs are forced to either let rahgozar through or break Google access for the entire country. This asymmetry is what makes the project work, and it shapes every architectural decision.
 
 When responding to a Persian-language issue, the responder is often the only English-speaking maintainer the reporter has access to. Be clear, generous, and specific. When shipping a release, you're shipping it to people for whom the alternative is not "use a different tool" but "lose internet access". This drives the project's bias toward shipping over polish, toward backwards-compatible defaults, and toward documenting workarounds even when the proper fix is months away.
 

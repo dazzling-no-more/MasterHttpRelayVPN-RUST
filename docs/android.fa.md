@@ -1,6 +1,6 @@
 <div dir="rtl">
 
-# برنامهٔ اندروید mhrv-rs
+# برنامهٔ اندروید rahgozar
 
 راهنمای کامل نصب و راه‌اندازی برنامهٔ اندروید: نصب، تنظیمات اولیه، رفع اشکال و محدودیت‌های شناخته‌شده.
 
@@ -32,7 +32,7 @@
 VpnService TUN  ──► tun2proxy (داخل فرایند)
                         │
                         ▼
-                SOCKS5 محلی  ──► dispatcher در mhrv-rs
+                SOCKS5 محلی  ──► dispatcher در rahgozar
                                       │
                     ┌─────────────────┤
                     ▼                 ▼
@@ -57,14 +57,14 @@ VpnService TUN  ──► tun2proxy (داخل فرایند)
 | **قفل صفحه** | PIN، الگو، رمز، یا بیومتریک + `fallback`. **الزام اندروید برای نصب گواهی کاربری است.** بعد از نصب می‌توانید برش دارید؛ گواهی معتبر باقی می‌ماند |
 | **مصرف داده** | حدود ۵ مگابایت برای APK، سپس حدود ۲ مگابایت سربار به ازای هر گیگابایت مرور وب (`base64` و بسته‌بندی `JSON`) |
 
-> **نکتهٔ دامنهٔ کار.** `mhrv-rs` از طریق `Apps Script` رله می‌کند. همین است که ابزار را ارزان و در برابر `DPI` مقاوم می‌سازد، ولی همین هم [محدودیت‌های بخش پایین](#محدودیت‌های-شناخته‌شده) را تحمیل می‌کند. اگر می‌خواهید با یک `VPN` واقعی (`WireGuard`/`Tailscale`/`OpenVPN`) مقایسه کنید، اول آن بخش را بخوانید.
+> **نکتهٔ دامنهٔ کار.** `rahgozar` از طریق `Apps Script` رله می‌کند. همین است که ابزار را ارزان و در برابر `DPI` مقاوم می‌سازد، ولی همین هم [محدودیت‌های بخش پایین](#محدودیت‌های-شناخته‌شده) را تحمیل می‌کند. اگر می‌خواهید با یک `VPN` واقعی (`WireGuard`/`Tailscale`/`OpenVPN`) مقایسه کنید، اول آن بخش را بخوانید.
 
 ---
 
 ## ۱. نصب APK
 
 ۱. در مرورگر گوشی به <https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases/latest> بروید.
-۲. فایل `mhrv-rs-android-universal-v*.apk` را دانلود کنید.
+۲. فایل `rahgozar-android-universal-v*.apk` را دانلود کنید.
 ۳. روی نوتیفیکیشن دانلود ضربه بزنید تا `installer` باز شود.
 ۴. وقتی اندروید پرسید **«Allow this source to install apps?»**:
    - روی **Settings** بزنید
@@ -72,7 +72,7 @@ VpnService TUN  ──► tun2proxy (داخل فرایند)
    - **← Back** → **Install**
 ۵. بعد از اتمام نصب روی **Open** بزنید.
 
-> اگر اندروید با پیام «App not installed» رد کرد: نسخهٔ قدیمی با کلید امضای متفاوتی نصب است. `Settings → Apps → mhrv-rs → Uninstall` بزنید و دوباره امتحان کنید. (از v1.0.2 به بعد این یک‌باره است — به‌روزرسانی‌ها با کلید ثابت امضا می‌شوند.)
+> اگر اندروید با پیام «App not installed» رد کرد: نسخهٔ قدیمی با کلید امضای متفاوتی نصب است. `Settings → Apps → rahgozar → Uninstall` بزنید و دوباره امتحان کنید. (از v1.0.2 به بعد این یک‌باره است — به‌روزرسانی‌ها با کلید ثابت امضا می‌شوند.)
 
 ---
 
@@ -145,7 +145,7 @@ VpnService TUN  ──► tun2proxy (داخل فرایند)
 | ❌ `connect timeout` روی بعضی | آن `SNI`های خاص در شبکهٔ شما `DPI-filtered` هستند | تیک آن‌ها را بردارید؛ `pool` فقط از موارد تیک‌دار استفاده می‌کند |
 | ❌ `dns: ...` | دستگاه اصلاً `www.google.com` را `resolve` نمی‌کند | Wi-Fi / Airplane mode را بررسی کنید |
 
-اگر `Auto-detect` هم زدید و باز همه `fail` شد، شبکهٔ شما کل `Google edge` را مسدود کرده — `mhrv-rs` از پسش بر نمی‌آید.
+اگر `Auto-detect` هم زدید و باز همه `fail` شد، شبکهٔ شما کل `Google edge` را مسدود کرده — `rahgozar` از پسش بر نمی‌آید.
 
 ---
 
@@ -167,7 +167,7 @@ VpnService TUN  ──► tun2proxy (داخل فرایند)
 
 ۶. اندروید هشدار می‌دهد **«Your network may be monitored by an unknown third party»**. ما هستیم. **Install anyway** بزنید.
 ۷. **Downloads** را انتخاب کنید → روی `mhrv-ca.crt` بزنید. یک اسم دوستانه بدهید (یا پیش‌فرض را قبول کنید). **OK**.
-۸. به برنامهٔ `mhrv-rs` برگردید. یک `snackbar` پایین تأیید می‌کند **Certificate installed ✓** — برنامه با مقایسهٔ `fingerprint` در `AndroidCAStore` مطمئن می‌شود نصب شده.
+۸. به برنامهٔ `rahgozar` برگردید. یک `snackbar` پایین تأیید می‌کند **Certificate installed ✓** — برنامه با مقایسهٔ `fingerprint` در `AndroidCAStore` مطمئن می‌شود نصب شده.
 
    اگر گفت «not yet installed»، مرحلهٔ ۵ را دوباره انجام دهید.
 
@@ -183,7 +183,7 @@ VpnService TUN  ──► tun2proxy (داخل فرایند)
 ## ۶. اجرای تونل
 
 ۱. **Start** را بزنید.
-۲. اندروید دیالوگ مجوز `VPN` را نشان می‌دهد: *«mhrv-rs wants to set up a VPN connection...»*. **OK**.
+۲. اندروید دیالوگ مجوز `VPN` را نشان می‌دهد: *«rahgozar wants to set up a VPN connection...»*. **OK**.
 ۳. آیکون کلید در `status bar` ظاهر می‌شود. این یعنی `VPN` فعال است.
 ۴. `Chrome` را باز کنید. برای تست فشار سنگین: `https://www.cloudflare.com`، `https://yahoo.com`، `https://discord.com` — همه باید عادی `load` شوند.
 
@@ -248,7 +248,7 @@ VpnService TUN  ──► tun2proxy (داخل فرایند)
 
 ### اکثر برنامه‌های غیر مرورگری به گواهی کاربری اعتماد نمی‌کنند
 
-به‌طور پیش‌فرض، برنامه‌های اندروید از اعتماد به `CA`های کاربری `opt-out` می‌کنند (پیش‌فرض `Network Security Config` از `Android 7` به بعد). برنامه‌های بانکی، `Netflix`، `Spotify`، اکثر پیام‌رسان‌ها — همه از `mhrv-rs` با خطای `cert` رد می‌شوند. `TUN` ترافیکشان را به ما می‌فرستد؛ آن‌ها `leaf` ما را رد می‌کنند. فقط برنامه‌هایی که صریحاً `opt-in` کرده‌اند (مرورگرها، `curl`، بعضی ابزارهای توسعه‌دهنده) کار می‌کنند. این محدودیت کلی `MITM proxy` است.
+به‌طور پیش‌فرض، برنامه‌های اندروید از اعتماد به `CA`های کاربری `opt-out` می‌کنند (پیش‌فرض `Network Security Config` از `Android 7` به بعد). برنامه‌های بانکی، `Netflix`، `Spotify`، اکثر پیام‌رسان‌ها — همه از `rahgozar` با خطای `cert` رد می‌شوند. `TUN` ترافیکشان را به ما می‌فرستد؛ آن‌ها `leaf` ما را رد می‌کنند. فقط برنامه‌هایی که صریحاً `opt-in` کرده‌اند (مرورگرها، `curl`، بعضی ابزارهای توسعه‌دهنده) کار می‌کنند. این محدودیت کلی `MITM proxy` است.
 
 ---
 
@@ -292,8 +292,8 @@ adb logcat -d | grep -E "MhrvVpnService|mhrv_rs|mhrv-crash|tun2proxy" > mhrv.log
 
 ## حذف برنامه
 
-۱. `Settings → Apps → mhrv-rs → Uninstall`.
-۲. اختیاری: حذف `CA MITM` — `Settings → Security → Encryption & credentials → User credentials → mhrv-rs MITM CA → Remove`. (اگر مسیر منو پیدا نمی‌شود، در `Settings` عبارت `user credentials` را جست‌وجو کنید.)
+۱. `Settings → Apps → rahgozar → Uninstall`.
+۲. اختیاری: حذف `CA MITM` — `Settings → Security → Encryption & credentials → User credentials → rahgozar MITM CA → Remove`. (اگر مسیر منو پیدا نمی‌شود، در `Settings` عبارت `user credentials` را جست‌وجو کنید.)
 ۳. پروفایل `VPN` هنگام `uninstall` خودکار باطل می‌شود — چیزی نیست که جداگانه پاک کنید.
 
 </div>

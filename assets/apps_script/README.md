@@ -1,6 +1,6 @@
 # Apps Script source
 
-Three deploy-ready Apps Script files live here. They all speak the same `{k, m, u, h, b, ct, r}` wire protocol with `mhrv-rs`, so the client just points its `script_id` at whichever deployment you want — no mode change required.
+Three deploy-ready Apps Script files live here. They all speak the same `{k, m, u, h, b, ct, r}` wire protocol with `rahgozar`, so the client just points its `script_id` at whichever deployment you want — no mode change required.
 
 ## Variants and origins
 
@@ -15,4 +15,4 @@ Three deploy-ready Apps Script files live here. They all speak the same `{k, m, 
 
 ## What you must edit before deploying
 
-For every variant: change `AUTH_KEY` from its placeholder to a strong secret, and use that same string in your `mhrv-rs` config's `auth_key`. `Code.cfw.gs` additionally requires setting `WORKER_URL` to your deployed Cloudflare Worker URL; `CodeFull.gs` additionally requires `TUNNEL_SERVER_URL` and `TUNNEL_AUTH_KEY` for the tunnel-node leg.
+For every variant: change `AUTH_KEY` from its placeholder to a strong secret, and use that same string in your `rahgozar` config's `auth_key`. `Code.cfw.gs` additionally requires setting `WORKER_URL` to your deployed Cloudflare Worker URL; `CodeFull.gs` additionally requires `TUNNEL_SERVER_URL` and `TUNNEL_AUTH_KEY` for the tunnel-node leg.

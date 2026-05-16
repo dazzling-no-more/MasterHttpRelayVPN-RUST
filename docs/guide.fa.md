@@ -1,6 +1,6 @@
 <div dir="rtl">
 
-# mhrv-rs — راهنمای کامل
+# rahgozar — راهنمای کامل
 
 این نسخهٔ کامل و فنی است — همهٔ گزینه‌های کانفیگ، همهٔ حالت‌های پیشرفته، همهٔ راه‌های رفع اشکال. برای راه‌اندازی ۵ دقیقه‌ای، [README اصلی](../README.md) را ببین.
 
@@ -37,7 +37,7 @@
         |
         | HTTP proxy (8085)  یا  SOCKS5 (8086)
         v
-mhrv-rs (محلی)
+rahgozar (محلی)
         |
         | TLS به IP گوگل، SNI = www.google.com
         v                       ^
@@ -61,7 +61,7 @@ DPI سانسورگر فقط SNI داخل TLS را می‌بیند و اجازه 
 
 لینوکس (x86_64، aarch64)، مک (x86_64، aarch64)، ویندوز (x86_64)، **اندروید ۷.۰ به بالا** (APK جهانی شامل arm64، armv7، x86_64، x86). فایل‌های آماده در [صفحهٔ releases](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases).
 
-**اندروید:** فایل `mhrv-rs-android-universal-v*.apk` را دانلود کن. راهنمای کامل در [docs/android.fa.md](android.fa.md) (فارسی) یا [docs/android.md](android.md) (انگلیسی). نسخهٔ اندروید همان `mhrv-rs` Rust دسکتاپ را اجرا می‌کند (از طریق JNI) به‌علاوهٔ پل TUN با `tun2proxy` تا تمام برنامه‌های دستگاه بدون نیاز به تنظیم per-app از پروکسی رد شوند.
+**اندروید:** فایل `rahgozar-android-universal-v*.apk` را دانلود کن. راهنمای کامل در [docs/android.fa.md](android.fa.md) (فارسی) یا [docs/android.md](android.md) (انگلیسی). نسخهٔ اندروید همان `rahgozar` Rust دسکتاپ را اجرا می‌کند (از طریق JNI) به‌علاوهٔ پل TUN با `tun2proxy` تا تمام برنامه‌های دستگاه بدون نیاز به تنظیم per-app از پروکسی رد شوند.
 
 > **نکتهٔ مهم اندروید (issueهای [#74](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues/74) و [#81](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues/81)):** TUN تمام ترافیک IP را می‌گیرد، اما HTTPS از برنامه‌های third-party فقط برای برنامه‌هایی کار می‌کند که به CAهای نصب‌شدهٔ کاربر اعتماد می‌کنند. از اندروید ۷ به بعد، برنامه‌ها باید با `networkSecurityConfig` صراحتاً اعلام کنند. **کروم و فایرفاکس می‌کنند**؛ **تلگرام، واتس‌اَپ، اینستاگرام، یوتیوب، برنامه‌های بانکی، بازی‌ها** نمی‌کنند. برای آن‌ها: حالت `PROXY_ONLY` و در داخل برنامه `127.0.0.1:1081` (SOCKS5)، یا حالت `google_only` (بدون CA، فقط سرویس‌های گوگل)، یا `upstream_socks5` به یک VPS خارجی. این طراحی امنیتی اندروید است نه باگ این برنامه.
 
@@ -71,13 +71,13 @@ DPI سانسورگر فقط SNI داخل TLS را می‌بیند و اجازه 
 
 | فایل | کاربرد |
 |---|---|
-| `mhrv-rs` / `mhrv-rs.exe` | CLI. استفادهٔ headless، سرور، اتوماسیون. روی مک / ویندوز بدون وابستگی سیستمی. |
-| `mhrv-rs-ui` / `mhrv-rs-ui.exe` | UI دسکتاپ (egui). فرم کانفیگ، دکمه‌های Start / Stop / Test، آمار زنده، پنل log. |
+| `rahgozar` / `rahgozar.exe` | CLI. استفادهٔ headless، سرور، اتوماسیون. روی مک / ویندوز بدون وابستگی سیستمی. |
+| `rahgozar-ui` / `rahgozar-ui.exe` | UI دسکتاپ (egui). فرم کانفیگ، دکمه‌های Start / Stop / Test، آمار زنده، پنل log. |
 | `run.sh` / `run.command` / `run.bat` | راه‌انداز پلتفرم: گواهی MITM را نصب می‌کند (نیاز به sudo / admin) و UI را باز می‌کند. در اولین اجرا از این استفاده کن. |
 
-آرشیوهای مک شامل `mhrv-rs.app` (در `*-app.zip`) هم هستند — در Finder دو بار کلیک کن. یک‌بار `mhrv-rs --install-cert` یا `run.command` را اجرا کن تا CA نصب شود.
+آرشیوهای مک شامل `rahgozar.app` (در `*-app.zip`) هم هستند — در Finder دو بار کلیک کن. یک‌بار `rahgozar --install-cert` یا `run.command` را اجرا کن تا CA نصب شود.
 
-<p align="center"><img src="ui-screenshot.png" alt="UI دسکتاپ mhrv-rs شامل فرم کانفیگ، آمار ترافیک زنده، دکمه‌های Start/Stop/Test و پنل log" width="420"></p>
+<p align="center"><img src="ui-screenshot.png" alt="UI دسکتاپ rahgozar شامل فرم کانفیگ، آمار ترافیک زنده، دکمه‌های Start/Stop/Test و پنل log" width="420"></p>
 
 UI لینوکس به این کتابخانه‌ها نیاز دارد: `libxkbcommon`, `libwayland-client`, `libxcb`, `libgl`, `libx11`, `libgtk-3`. روی اکثر توزیع‌های دسکتاپی از قبل نصب‌اند؛ روی سیستم headless یا با package manager نصب کن یا از CLI استفاده کن.
 
@@ -85,9 +85,9 @@ UI لینوکس به این کتابخانه‌ها نیاز دارد: `libxkbco
 
 کانفیگ و گواهی MITM در دایرکتوری user-data سیستم‌عامل قرار می‌گیرند:
 
-- مک: `~/Library/Application Support/mhrv-rs/`
-- لینوکس: `~/.config/mhrv-rs/`
-- ویندوز: `%APPDATA%\mhrv-rs\`
+- مک: `~/Library/Application Support/rahgozar/`
+- لینوکس: `~/.config/rahgozar/`
+- ویندوز: `%APPDATA%\rahgozar\`
 
 داخل آن دایرکتوری:
 
@@ -104,27 +104,27 @@ CLI همچنین برای سازگاری با راه‌اندازی‌های ق�
 
 یک نسخهٔ جایگزین در [`assets/apps_script/Code.cfw.gs`](../assets/apps_script/Code.cfw.gs) به‌همراه [`assets/cloudflare/worker.js`](../assets/cloudflare/worker.js) وجود دارد که Apps Script را به یک رلهٔ نازک تبدیل می‌کند و کار `fetch` واقعی را به یک Cloudflare Worker که خودت دیپلوی می‌کنی می‌سپارد. **سود روز اول:** کاهش تأخیر (~۱۰ تا ۵۰ میلی‌ثانیه روی لبهٔ CF در مقابل ۲۵۰ تا ۵۰۰ میلی‌ثانیه Apps Script — برای مرور وب و تلگرام محسوس).
 
-سهمیهٔ روزانهٔ ۲۰٬۰۰۰ `UrlFetchApp` را کاهش **نمی‌دهد**، چون امروز mhrv-rs همیشه درخواست تک‌URL می‌فرستد؛ مسیر دسته‌ای روی GAS+Worker سیم‌کشی شده (`ceil(N/40)` سهمیه به‌ازای دستهٔ N) ولی هیچ کلاینتی فعلاً تولیدش نمی‌کند.
+سهمیهٔ روزانهٔ ۲۰٬۰۰۰ `UrlFetchApp` را کاهش **نمی‌دهد**، چون امروز rahgozar همیشه درخواست تک‌URL می‌فرستد؛ مسیر دسته‌ای روی GAS+Worker سیم‌کشی شده (`ceil(N/40)` سهمیه به‌ازای دستهٔ N) ولی هیچ کلاینتی فعلاً تولیدش نمی‌کند.
 
 **مبادلات:**
 - ویدیوی طولانی یوتیوب بدتر است (دیوار ۳۰ ثانیه به جای ۶ دقیقه)
 - ضدبات Cloudflare را حل نمی‌کند
 - **با `mode: "full"` سازگار نیست** (پشتیبانی tunnel-ops ندارد → برای واتس‌اَپ / مسنجرها روی اندروید Full mode کمک نمی‌کند)
 
-راهنمای کامل و جدول مبادلات در [`assets/cloudflare/README.fa.md`](../assets/cloudflare/README.fa.md). در mhrv-rs هیچ تنظیمی تغییر نمی‌کند — همان `mode: "apps_script"`، همان `script_id`، همان `auth_key`.
+راهنمای کامل و جدول مبادلات در [`assets/cloudflare/README.fa.md`](../assets/cloudflare/README.fa.md). در rahgozar هیچ تنظیمی تغییر نمی‌کند — همان `mode: "apps_script"`، همان `script_id`، همان `auth_key`.
 
 ### حالت direct
 
-اگر ISP تو از قبل Apps Script (یا کل گوگل) را مسدود کرده، باید مرحلهٔ ۱ **اول** موفق شود — قبل از این‌که رله‌ای داشته باشی. mhrv-rs یک حالت `direct` دقیقاً برای این دارد — فقط تونل بازنویسی SNI، بدون رلهٔ Apps Script. (قبل از v1.9 نام `google_only` داشت — نام قدیمی هم پذیرفته می‌شود.)
+اگر ISP تو از قبل Apps Script (یا کل گوگل) را مسدود کرده، باید مرحلهٔ ۱ **اول** موفق شود — قبل از این‌که رله‌ای داشته باشی. rahgozar یک حالت `direct` دقیقاً برای این دارد — فقط تونل بازنویسی SNI، بدون رلهٔ Apps Script. (قبل از v1.9 نام `google_only` داشت — نام قدیمی هم پذیرفته می‌شود.)
 
-۱. فایل اجرایی را دانلود کن (طبق [مرحلهٔ ۲ در README](../README.md#مرحلهٔ-۲--دانلود-mhrv-rs))
+۱. فایل اجرایی را دانلود کن (طبق [مرحلهٔ ۲ در README](../README.md#مرحلهٔ-۲--دانلود-rahgozar))
 ۲. فایل [`config.direct.example.json`](../config.direct.example.json) را در کنار فایل اجرا با نام `config.json` کپی کن — نه `script_id` نیاز است نه `auth_key`
-۳. `mhrv-rs serve` را اجرا کن و HTTP proxy مرورگرت را روی `127.0.0.1:8085` بگذار
+۳. `rahgozar serve` را اجرا کن و HTTP proxy مرورگرت را روی `127.0.0.1:8085` بگذار
 ۴. در حالت `direct`، پروکسی فقط `*.google.com`، `*.youtube.com` و سایر میزبان‌های لبهٔ گوگل (به‌علاوهٔ هر [`fronting_groups`](fronting-groups.md) که تنظیم کرده باشی) را از تونل بازنویسی SNI رد می‌کند. بقیه راو می‌رود — هنوز رله‌ای در کار نیست.
 ۵. حالا مرحلهٔ ۱ را در مرورگر انجام بده (اتصال به `script.google.com` با SNI فرونت می‌شود). `Code.gs` را دیپلوی کن، Deployment ID را کپی کن.
 ۶. در UI / اپ اندروید / یا با ویرایش `config.json`، حالت را به `apps_script` برگردان، Deployment ID و auth key را پیست کن، و دوباره استارت کن.
 
-برای بررسی دسترسی قبل از استارت پروکسی: `mhrv-rs test-sni` دامنه‌های `*.google.com` را مستقیم تست می‌کند و فقط به `google_ip` و `front_domain` نیاز دارد.
+برای بررسی دسترسی قبل از استارت پروکسی: `rahgozar test-sni` دامنه‌های `*.google.com` را مستقیم تست می‌کند و فقط به `google_ip` و `front_domain` نیاز دارد.
 
 ## مرجع CLI
 
@@ -148,13 +148,13 @@ CLI همچنین برای سازگاری با راه‌اندازی‌های ق�
 سپس:
 
 ```bash
-./mhrv-rs                   # اجرای پروکسی (پیش‌فرض)
-./mhrv-rs test              # تست یک درخواست کامل
-./mhrv-rs scan-ips          # رتبه‌بندی IPهای گوگل بر اساس سرعت
-./mhrv-rs test-sni          # تست نام‌های SNI روی google_ip
-./mhrv-rs --install-cert    # نصب مجدد گواهی
-./mhrv-rs --remove-cert     # حذف کامل: trust store + پوشهٔ ca/
-./mhrv-rs --help
+./rahgozar                   # اجرای پروکسی (پیش‌فرض)
+./rahgozar test              # تست یک درخواست کامل
+./rahgozar scan-ips          # رتبه‌بندی IPهای گوگل بر اساس سرعت
+./rahgozar test-sni          # تست نام‌های SNI روی google_ip
+./rahgozar --install-cert    # نصب مجدد گواهی
+./rahgozar --remove-cert     # حذف کامل: trust store + پوشهٔ ca/
+./rahgozar --help
 ```
 
 `--remove-cert` گواهی را از trust store سیستم پاک می‌کند، با بررسی نام تأیید می‌کند که حذف انجام شد، و پوشهٔ `ca/` روی دیسک را حذف می‌کند. پاک‌سازی NSS (فایرفاکس و کروم لینوکس) best-effort است: اگر `certutil` نباشد یا یکی از مرورگرها پایگاه داده NSS را قفل کرده باشد، ابزار راهنمای پاک‌سازی دستی نشان می‌دهد. `config.json` و دیپلوی Apps Script دست‌نخورده می‌مانند، پس CA تازه نیازی به دیپلوی مجدد `Code.gs` ندارد.
@@ -187,11 +187,11 @@ CLI همچنین برای سازگاری با راه‌اندازی‌های ق�
 
 رلهٔ Apps Script فقط HTTP request/response می‌فهمد، پس پروتکل‌های غیر-HTTP (MTProto تلگرام، IMAP، SSH، TCP خام) نمی‌توانند از آن رد شوند. بدون چیز دیگری، این جریان‌ها به fallback مستقیم TCP می‌خورند — یعنی واقعاً tunnel نشده‌اند، و ISP که تلگرام را بسته همچنان می‌بندد.
 
-**راه‌حل:** یک [xray](https://github.com/XTLS/Xray-core) (یا v2ray / sing-box) محلی با outbound VLESS / Trojan / Shadowsocks به VPS شخصی خودت اجرا کن، و mhrv-rs را با فیلد **Upstream SOCKS5** (یا کلید `upstream_socks5`) به SOCKS5 inbound آن xray وصل کن. وقتی تنظیم شد، جریان‌های TCP خام که از SOCKS5 listener mhrv-rs می‌آیند به xray → تونل واقعی زنجیر می‌شوند.
+**راه‌حل:** یک [xray](https://github.com/XTLS/Xray-core) (یا v2ray / sing-box) محلی با outbound VLESS / Trojan / Shadowsocks به VPS شخصی خودت اجرا کن، و rahgozar را با فیلد **Upstream SOCKS5** (یا کلید `upstream_socks5`) به SOCKS5 inbound آن xray وصل کن. وقتی تنظیم شد، جریان‌های TCP خام که از SOCKS5 listener rahgozar می‌آیند به xray → تونل واقعی زنجیر می‌شوند.
 
 ```
 تلگرام  ┐                                                    ┌─ Apps Script ── HTTP/HTTPS
-        ├─ SOCKS5 :8086 ─┤ mhrv-rs ├─ بازنویسی SNI ───────── google.com, youtube.com, …
+        ├─ SOCKS5 :8086 ─┤ rahgozar ├─ بازنویسی SNI ───────── google.com, youtube.com, …
 مرورگر  ┘                                                    └─ upstream SOCKS5 ─ xray ── VLESS ── VPS تو   (تلگرام، IMAP، SSH، TCP خام)
 ```
 
@@ -211,7 +211,7 @@ HTTP / HTTPS مثل قبل از Apps Script می‌رود (تغییری نمی�
 
 ### تأثیر تعداد Deployment
 
-هر دور بَچ Apps Script حدود ۲ ثانیه طول می‌کشد. در Full mode، mhrv-rs یک **مالتی‌پلکسر بَچ پیپلاین‌شده** اجرا می‌کند که چند بَچ همزمان می‌فرستد بدون اینکه منتظر پاسخ قبلی بماند. هر Deployment ID (= یک حساب گوگل) حوضچهٔ همزمانی مخصوص خودش با **۳۰ درخواست فعال** دارد — مطابق سقف اجرای همزمان Apps Script per-account.
+هر دور بَچ Apps Script حدود ۲ ثانیه طول می‌کشد. در Full mode، rahgozar یک **مالتی‌پلکسر بَچ پیپلاین‌شده** اجرا می‌کند که چند بَچ همزمان می‌فرستد بدون اینکه منتظر پاسخ قبلی بماند. هر Deployment ID (= یک حساب گوگل) حوضچهٔ همزمانی مخصوص خودش با **۳۰ درخواست فعال** دارد — مطابق سقف اجرای همزمان Apps Script per-account.
 
 ```
 حداکثر همزمانی = ۳۰ × تعداد Deployment IDها
@@ -269,7 +269,7 @@ HTTP / HTTPS مثل قبل از Apps Script می‌رود (تغییری نمی�
 
 ## اشتراک‌گذاری هات‌اسپات
 
-mhrv-rs به‌طور پیش‌فرض روی `0.0.0.0` گوش می‌دهد، پس هر دستگاه روی همان شبکه می‌تواند ازش استفاده کند. سناریوی رایج: اشتراک تونل از گوشی اندروید به آیفون / آیپد / لپ‌تاپ از هات‌اسپات:
+rahgozar به‌طور پیش‌فرض روی `0.0.0.0` گوش می‌دهد، پس هر دستگاه روی همان شبکه می‌تواند ازش استفاده کند. سناریوی رایج: اشتراک تونل از گوشی اندروید به آیفون / آیپد / لپ‌تاپ از هات‌اسپات:
 
 ۱. **اندروید:** هات‌اسپات موبایل را روشن کن + اپ را استارت کن
 ۲. **دستگاه دیگر:** به Wi-Fi هات‌اسپات اندروید وصل شو
@@ -295,31 +295,31 @@ HTTP proxy سیستم را روی `192.168.43.1:8080` بگذار، یا per-app 
 
 ```sh
 # از کامپیوتری که به روترت دسترسی دارد:
-scp mhrv-rs root@192.168.1.1:/usr/bin/mhrv-rs
-scp mhrv-rs.init root@192.168.1.1:/etc/init.d/mhrv-rs
-scp config.json root@192.168.1.1:/etc/mhrv-rs/config.json
+scp rahgozar root@192.168.1.1:/usr/bin/rahgozar
+scp rahgozar.init root@192.168.1.1:/etc/init.d/rahgozar
+scp config.json root@192.168.1.1:/etc/rahgozar/config.json
 
 # روی روتر (ssh):
-chmod +x /usr/bin/mhrv-rs /etc/init.d/mhrv-rs
-/etc/init.d/mhrv-rs enable
-/etc/init.d/mhrv-rs start
-logread -e mhrv-rs -f       # تمام لاگ
+chmod +x /usr/bin/rahgozar /etc/init.d/rahgozar
+/etc/init.d/rahgozar enable
+/etc/init.d/rahgozar start
+logread -e rahgozar -f       # تمام لاگ
 ```
 
-دستگاه‌های LAN HTTP proxy را روی IP روتر (پورت پیش‌فرض `8085`) یا SOCKS5 روی `<router-ip>:8086` تنظیم می‌کنند. در `/etc/mhrv-rs/config.json` مقدار `listen_host` را به `0.0.0.0` بگذار تا روتر اتصال LAN را بپذیرد.
+دستگاه‌های LAN HTTP proxy را روی IP روتر (پورت پیش‌فرض `8085`) یا SOCKS5 روی `<router-ip>:8086` تنظیم می‌کنند. در `/etc/rahgozar/config.json` مقدار `listen_host` را به `0.0.0.0` بگذار تا روتر اتصال LAN را بپذیرد.
 
 مصرف حافظه ~۱۵–۲۰ مگابایت — روی هر روتری با ۱۲۸ مگابایت RAM به بالا اجرا می‌شود. UI روی musl نیست (روترها headlessاند).
 
 ## ابزارهای تشخیص
 
-- **`mhrv-rs test`** — یک درخواست از طریق رله می‌فرستد، موفقیت / تأخیر گزارش می‌دهد. اولین کاری که باید بکنی وقتی چیزی خراب است — جدا می‌کند "رله سالم است" از "کانفیگ کلاینت غلط است".
-- **`mhrv-rs scan-ips`** — تست TLS موازی روی ۲۸ IP frontend شناخته‌شدهٔ گوگل، مرتب‌شده بر اساس تأخیر. بهترین را در `google_ip` بگذار. UI همان را پشت دکمهٔ **scan** دارد.
-- **`mhrv-rs test-sni`** — تست TLS موازی هر نام SNI در pool روی `google_ip`. می‌گوید کدام نام‌ها از DPI ISP رد می‌شوند. UI در پنجرهٔ **SNI pool…** همان را با چک‌باکس، دکمهٔ **Test** هر ردیف، و **Keep ✓ only** برای trim خودکار دارد.
+- **`rahgozar test`** — یک درخواست از طریق رله می‌فرستد، موفقیت / تأخیر گزارش می‌دهد. اولین کاری که باید بکنی وقتی چیزی خراب است — جدا می‌کند "رله سالم است" از "کانفیگ کلاینت غلط است".
+- **`rahgozar scan-ips`** — تست TLS موازی روی ۲۸ IP frontend شناخته‌شدهٔ گوگل، مرتب‌شده بر اساس تأخیر. بهترین را در `google_ip` بگذار. UI همان را پشت دکمهٔ **scan** دارد.
+- **`rahgozar test-sni`** — تست TLS موازی هر نام SNI در pool روی `google_ip`. می‌گوید کدام نام‌ها از DPI ISP رد می‌شوند. UI در پنجرهٔ **SNI pool…** همان را با چک‌باکس، دکمهٔ **Test** هر ردیف، و **Keep ✓ only** برای trim خودکار دارد.
 - **آمار دوره‌ای** هر ۶۰ ثانیه در سطح `info` لاگ می‌شود (تماس‌های رله، نرخ hit کش، بایت رله شده، اسکریپت‌های فعال در مقابل blacklisted). UI آن را زنده نشان می‌دهد.
 
 ### ویرایشگر SNI pool
 
-به‌طور پیش‌فرض mhrv-rs بین `{www, mail, drive, docs, calendar}.google.com` روی TLS خروجی به `google_ip` می‌چرخد، تا اثر انگشت ترافیک یکنواخت نباشد. بعضی‌ها ممکن است محلی مسدود شوند (مثلاً `mail.google.com` در ایران چند بار هدف بوده).
+به‌طور پیش‌فرض rahgozar بین `{www, mail, drive, docs, calendar}.google.com` روی TLS خروجی به `google_ip` می‌چرخد، تا اثر انگشت ترافیک یکنواخت نباشد. بعضی‌ها ممکن است محلی مسدود شوند (مثلاً `mail.google.com` در ایران چند بار هدف بوده).
 
 یا:
 
@@ -332,7 +332,7 @@ logread -e mhrv-rs -f       # تمام لاگ
 }
 ```
 
-اگر `sni_hosts` تنظیم نشود، pool خودکار پیش‌فرض استفاده می‌شود. `mhrv-rs test-sni` را اجرا کن تا قبل از ذخیره ببینی چه چیزی از شبکه‌ات کار می‌کند.
+اگر `sni_hosts` تنظیم نشود، pool خودکار پیش‌فرض استفاده می‌شود. `rahgozar test-sni` را اجرا کن تا قبل از ذخیره ببینی چه چیزی از شبکه‌ات کار می‌کند.
 
 ## چه چیز پیاده شده و چه چیز نه
 
@@ -430,15 +430,15 @@ HTML یوتیوب سریع می‌آید (از تونل بازنویسی SNI)، 
 
 **چطور گواهی را بعداً حذف کنم؟**
 - **ساده‌ترین (هر OS):** در UI **Remove CA** را بزن، یا:
-  - مک / لینوکس: `sudo ./mhrv-rs --remove-cert`
-  - ویندوز (با Run as administrator): `mhrv-rs.exe --remove-cert`
+  - مک / لینوکس: `sudo ./rahgozar --remove-cert`
+  - ویندوز (با Run as administrator): `rahgozar.exe --remove-cert`
   - از trust store سیستم، NSS (فایرفاکس / کروم لینوکس) حذف می‌کند، و `ca/ca.crt` + `ca/ca.key` روی دیسک پاک می‌کند. `config.json` و دیپلوی Apps Script دست‌نخورده.
-- **به‌صورت دستی:** نام گواهی (Common Name) همه‌جا `MasterHttpRelayVPN` است (نه `mhrv-rs` — این نام برنامه است نه نام گواهی).
-  - **مک:** Keychain Access → System → دنبال `MasterHttpRelayVPN` بگرد → حذف کن. سپس `rm -rf ~/Library/Application\ Support/mhrv-rs/ca/`
+- **به‌صورت دستی:** نام گواهی (Common Name) همه‌جا `MasterHttpRelayVPN` است (نه `rahgozar` — این نام برنامه است نه نام گواهی).
+  - **مک:** Keychain Access → System → دنبال `MasterHttpRelayVPN` بگرد → حذف کن. سپس `rm -rf ~/Library/Application\ Support/rahgozar/ca/`
   - **ویندوز:** `certmgr.msc` → Trusted Root Certification Authorities → دنبال `MasterHttpRelayVPN` → حذف
   - **لینوکس:** `/usr/local/share/ca-certificates/MasterHttpRelayVPN.crt` را حذف کن، بعد `sudo update-ca-certificates`
 
-**خطای `GLIBC_2.39 not found` روی لینوکس؟** از `mhrv-rs-linux-musl-amd64.tar.gz` استفاده کن — کاملاً استاتیک، روی هر لینوکس بدون `glibc` کار می‌کند.
+**خطای `GLIBC_2.39 not found` روی لینوکس؟** از `rahgozar-linux-musl-amd64.tar.gz` استفاده کن — کاملاً استاتیک، روی هر لینوکس بدون `glibc` کار می‌کند.
 
 ## لایسنس
 

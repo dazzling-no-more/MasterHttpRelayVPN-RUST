@@ -127,14 +127,14 @@ const TUNNEL_AUTH_KEY = "the-secret-you-set-in-step-7";
 ```
 
 Deploy: **Deploy > New Deployment > Web App**.
-Copy the new Deployment ID and update your `mhrv-rs` config.
+Copy the new Deployment ID and update your `rahgozar` config.
 
 **This step is performed only once.** The tunnel URL never changes between
 restarts.
 
 ### Step 11: Verify
 
-Use `mhrv-rs test` or visit `https://ipleak.net` through your proxy.
+Use `rahgozar test` or visit `https://ipleak.net` through your proxy.
 You should see a Cloudflare IP address.
 
 ## How It Works

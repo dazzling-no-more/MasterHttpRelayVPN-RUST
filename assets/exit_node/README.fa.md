@@ -11,7 +11,7 @@ Script از همان رنج IP datacenter Google خروج می‌کنه، پس �
 - **claude.ai**
 - **grok.com / x.com**
 
-…مسیر apps_script-mode عادی mhrv-rs ارورهایی مثل
+…مسیر apps_script-mode عادی rahgozar ارورهایی مثل
 `Relay error: json: key must be a string at line 2 column 1` یا
 `502 Relay error` می‌ده چون Code.gs در حال wrap کردن صفحه‌ی HTML
 challenge CF است که کلاینت نمی‌تونه parse کنه.
@@ -24,7 +24,7 @@ Apps Script و destination قرار می‌گیره. مسیر traffic این م�
 Browser ─┐                                                ┌─→ Destination
          │                                                │   (chatgpt.com)
          ▼                                                │
-    mhrv-rs                                               │
+    rahgozar                                               │
        │                                                  │
        │  TLS به Google IP، SNI=www.google.com (DPI cover)│
        ▼                                                  │
@@ -44,7 +44,7 @@ Heuristic anti-bot CF نمی‌سوزه + صفحه واقعی برمی‌گرد�
 **نکته مهم:** leg user-side (Iran ISP → Apps Script) **بدون تغییر**
 است. ISP فقط TLS به Google IP می‌بینه — second hop کاملاً درون
 outbound Apps Script اجرا می‌شه، invisible از شبکه‌ی کاربر. پس DPI
-evasion property که mhrv-rs براش ساخته شده، دست نمی‌خوره.
+evasion property که rahgozar براش ساخته شده، دست نمی‌خوره.
 
 ## راه‌اندازی
 
@@ -65,7 +65,7 @@ APIهای web-standard (`Request`، `Response`، `fetch`) استفاده می‌
    جلوی serve شدن به‌عنوان open relay accidentally گرفته بشه.
 ۲. فایل رو روی host انتخابی **deploy** کنید (گزینه‌ها در ادامه).
 ۳. URL public deployment رو **copy** کنید.
-۴. در `config.json` mhrv-rs، block `exit_node` اضافه کنید:
+۴. در `config.json` rahgozar، block `exit_node` اضافه کنید:
    ```json
    "exit_node": {
      "enabled": true,
@@ -75,10 +75,10 @@ APIهای web-standard (`Request`، `Response`، `fetch`) استفاده می‌
      "hosts": ["chatgpt.com", "claude.ai", "x.com", "grok.com", "openai.com"]
    }
    ```
-۵. mhrv-rs رو **restart** کنید (Disconnect + Connect، یا `kill` +
+۵. rahgozar رو **restart** کنید (Disconnect + Connect، یا `kill` +
    restart binary).
 ۶. **تست** کنید — `chatgpt.com` یا `grok.com` رو از browser pointed به
-   mhrv-rs proxy باز کنید. صفحه login واقعی رو می‌بینید، نه CF
+   rahgozar proxy باز کنید. صفحه login واقعی رو می‌بینید، نه CF
    challenge.
 
 config مثال کامل در
@@ -111,7 +111,7 @@ config مثال کامل در
 ## رفتار در صورت failure
 
 اگر exit node در دسترس نباشه، 5xx برمی‌گردونه، یا response malformed
-بفرسته، mhrv-rs **به‌طور خودکار به Apps Script relay عادی fallback
+بفرسته، rahgozar **به‌طور خودکار به Apps Script relay عادی fallback
 می‌کنه**. در log یک خط `warn: exit node failed for ... — falling back
 to direct Apps Script` می‌بینید. سایت‌هایی که نیاز به exit node دارن در آن
 case fail می‌گیرن (CF challenge)، ولی سایر سایت‌ها کار می‌کنن — یک
@@ -127,7 +127,7 @@ PSK تنها چیز است که مانع می‌شه endpoint deployed یک publ
 - **publicly share نکنید** PSK رو. هر کسی که هم URL هم PSK رو داره
   می‌تونه quota host شما رو به‌عنوان proxy خود استفاده کنه.
 - **rotate** اگر leak مشکوک هست. PSK رو در source deployed تغییر بدید،
-  redeploy کنید، سپس `psk` در `config.json` mhrv-rs رو update + restart.
+  redeploy کنید، سپس `psk` در `config.json` rahgozar رو update + restart.
 
 اسکریپت همچنین شامل **loop guard** هست (refuse می‌کنه fetch host خود)
 + **placeholder check** (در صورت `PSK === "CHANGE_ME_TO_A_STRONG_SECRET"`

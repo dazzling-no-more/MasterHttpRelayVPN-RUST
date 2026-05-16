@@ -74,11 +74,11 @@ const TUNNEL_AUTH_KEY = "the-secret-you-set-in-step-3";
 ```
 
 Deploy: **Deploy > New Deployment > Web App**.
-Copy the new Deployment ID and update your `mhrv-rs` config.
+Copy the new Deployment ID and update your `rahgozar` config.
 
 ### Step 8: Verify
 
-`mhrv-rs test` is wired only for the apps_script relay path; in Full mode it
+`rahgozar test` is wired only for the apps_script relay path; in Full mode it
 refuses to run. To verify a Full-mode tunnel, visit `https://ipleak.net` (or
 `https://whatismyipaddress.com`) through your proxy — you should see a
 GitHub Actions or ngrok IP address.

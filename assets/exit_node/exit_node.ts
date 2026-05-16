@@ -1,4 +1,4 @@
-// mhrv-rs exit node — deploy as an HTTP endpoint on any serverless
+// rahgozar exit node — deploy as an HTTP endpoint on any serverless
 // TypeScript host with a public IP that isn't a Google datacenter
 // (Deno Deploy, fly.io, your own VPS, etc.). Uses only web-standard
 // `Request` / `Response` / `fetch` so it's portable across runtimes.
@@ -18,7 +18,7 @@
 //   3. Set PSK below to a strong secret (`openssl rand -hex 32` from
 //      a terminal — DO NOT leave the placeholder in production).
 //   4. Deploy and copy the public URL of the deployed handler.
-//   5. In mhrv-rs config.json, add:
+//   5. In rahgozar config.json, add:
 //        "exit_node": {
 //          "enabled": true,
 //          "relay_url": "https://your-deployed-exit-node.example.com",
@@ -32,7 +32,7 @@
 // to source control, do not share publicly, rotate if leaked. The exit
 // node refuses all requests that don't carry the matching PSK.
 //
-// Failure mode: if the exit node is unreachable, mhrv-rs falls back to
+// Failure mode: if the exit node is unreachable, rahgozar falls back to
 // the regular Apps Script relay automatically — the only consequence
 // of an offline exit node is that ChatGPT/Claude/Grok stop working;
 // other sites are unaffected.

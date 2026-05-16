@@ -3,6 +3,7 @@
 These are starting templates for the highest-frequency Persian-language replies. Don't use them verbatim — adapt to the specific user's log lines, config, and report. They exist to prevent re-deriving common phrasings each time and to keep the project's Persian voice consistent across replies.
 
 The conventions throughout assume:
+
 - Polite professional register (`می‌فرمایید` over `می‌گی`, full pronouns)
 - Half-spaces (ZWNJ, `‌`) in compound words
 - Latin-script for technical terms inline with Persian particles
@@ -132,7 +133,7 @@ curl -L -X POST 'https://script.google.com/macros/s/YOUR_DEPLOYMENT_ID/exec' \
 اجرا کنید ۵-۱۰ بار. اگر:
 
 - اکثرشون timeout/RST می‌گیرن = #313 ISP throttle (شبکه شما Apps Script رو filter می‌کنه)
-- اکثرشون JSON برمی‌گردونن = مشکل از path mhrv-rs است (config، auth_key، یا غیره)
+- اکثرشون JSON برمی‌گردونن = مشکل از path rahgozar است (config، auth_key، یا غیره)
 
 **Workaround احتمالی برای ISP throttle:**
 
@@ -172,12 +173,12 @@ For "how do I set up VPS?" questions:
 ```markdown
 **Q: آیا VPS باید مستقیم از Iran قابل دسترسی باشه؟**
 
-**کوتاه: نه.** VPS لازم نیست از Iran direct reachable باشه. این مزیت architectural mhrv-rs Full mode است.
+**کوتاه: نه.** VPS لازم نیست از Iran direct reachable باشه. این مزیت architectural rahgozar Full mode است.
 
 مسیر traffic:
 
 ```
-Phone (Iran) → mhrv-rs client (Iran) → Apps Script (via Google IP fronting) →
+Phone (Iran) → rahgozar client (Iran) → Apps Script (via Google IP fronting) →
                                        Apps Script's UrlFetchApp →
                                        VPS tunnel-node container →
                                        upstream internet
@@ -262,7 +263,7 @@ const TUNNEL_AUTH_KEY = "your-tunnel-secret-here";  // match با docker run -e
 
 سپس **Deploy → New deployment → Web App → Execute as: Me + Who has access: Anyone → Deploy**. URL deployment رو copy کنید + ID بخشش رو بردارید.
 
-**۷. mhrv-rs config:**
+**۷. rahgozar config:**
 
 ```json
 {
@@ -276,7 +277,7 @@ const TUNNEL_AUTH_KEY = "your-tunnel-secret-here";  // match با docker run -e
 
 **۸. Connect + verify:**
 
-mhrv-rs رو start کنید + log باید نشون بده:
+rahgozar رو start کنید + log باید نشون بده:
 
 ```
 INFO batch: 1 ops → AKfyc..., rtt=Xs    ← good
@@ -341,7 +342,7 @@ accounts احتمالاً به Stage 2-3 progress می‌کنن طی روزها-
 
 **۳. برای access به script.google.com وقتی شبکه slow:**
 
-می‌توانید از **mhrv-rs خود** برای access به script.google.com استفاده کنید. mhrv-rs's HTTP proxy به browser → CONNECT tunneling به Google عمل می‌کنه (نه UrlFetchApp.fetch — که Google block می‌کنه). browser رو با proxy `127.0.0.1:8086` تنظیم کنید + بروید script.google.com.
+می‌توانید از **rahgozar خود** برای access به script.google.com استفاده کنید. rahgozar's HTTP proxy به browser → CONNECT tunneling به Google عمل می‌کنه (نه UrlFetchApp.fetch — که Google block می‌کنه). browser رو با proxy `127.0.0.1:8086` تنظیم کنید + بروید script.google.com.
 
 **Action item:**
 
@@ -389,15 +390,15 @@ For users asking why `cloud.google.com` / `colab` / `gmail` / `meet` / `gemini` 
 
 **۲. Full mode + VPS:**
 
-VPS از طرف خود به Google direct وصل می‌شه. در Full mode، traffic Google رو می‌توانید با xray dual-routing از mhrv-rs bypass کنید. detail در [#420](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues/420). با این setup همه‌ی Google services از طریق VPS direct کار می‌کنن.
+VPS از طرف خود به Google direct وصل می‌شه. در Full mode، traffic Google رو می‌توانید با xray dual-routing از rahgozar bypass کنید. detail در [#420](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues/420). با این setup همه‌ی Google services از طریق VPS direct کار می‌کنن.
 
 **۳. temp VPN موقت:**
 
-برای access گاه‌گاهی به Google services (مثلاً برای download فایل از Drive یا setup OAuth)، یک VPN موقت ۱۰ دقیقه‌ای استفاده کنید + سپس به mhrv-rs برمی‌گردید.
+برای access گاه‌گاهی به Google services (مثلاً برای download فایل از Drive یا setup OAuth)، یک VPN موقت ۱۰ دقیقه‌ای استفاده کنید + سپس به rahgozar برمی‌گردید.
 
 **نتیجه:**
 
-اگر می‌خواهید سایت‌های Google کار کنن با همان setup mhrv-rs که الان دارید، نیاز به Full mode + VPS + xray routing است. تا وقتی فقط apps_script mode دارید، Google services unreachable می‌مونن.
+اگر می‌خواهید سایت‌های Google کار کنن با همان setup rahgozar که الان دارید، نیاز به Full mode + VPS + xray routing است. تا وقتی فقط apps_script mode دارید، Google services unreachable می‌مونن.
 
 ---
 <sub>[reply via Anthropic Claude | reviewed by @therealaleph]</sub>

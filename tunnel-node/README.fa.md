@@ -9,7 +9,7 @@
 ## معماری
 
 ```
-موبایل/PC → mhrv-rs → [TLS با domain-fronting روی Google] → Apps Script → [HTTP] → Tunnel Node (روی VPS شما) → [TCP/UDP واقعی] → اینترنت
+موبایل/PC → rahgozar → [TLS با domain-fronting روی Google] → Apps Script → [HTTP] → Tunnel Node (روی VPS شما) → [TCP/UDP واقعی] → اینترنت
 ```
 
 Tunnel-node session‌های پایدار TCP و UDP رو نگه می‌داره. session‌های TCP اتصال‌های واقعی به سرور مقصد هستن؛ session‌های UDP، socketهای connected-UDP به یک `host:port` مقصد هستن. data از طریق پروتکل JSON جریان داره:
@@ -128,7 +128,7 @@ TUNNEL_AUTH_KEY=your-secret PORT=8080 ./target/release/tunnel-node
 
 ## Performance: تعداد deployment و عمق pipeline
 
-کلاینت mhrv-rs در حالت Full یک batch-multiplexer pipelined اجرا می‌کنه. هر روند-تریپ Apps Script حدود ۲ ثانیه طول می‌کشه، پس کلاینت چندین request batch همزمان شلیک می‌کنه — عمق pipeline برابر تعداد deployment ID‌های Apps Script هست (حداقل ۲، بدون سقف بالا).
+کلاینت rahgozar در حالت Full یک batch-multiplexer pipelined اجرا می‌کنه. هر روند-تریپ Apps Script حدود ۲ ثانیه طول می‌کشه، پس کلاینت چندین request batch همزمان شلیک می‌کنه — عمق pipeline برابر تعداد deployment ID‌های Apps Script هست (حداقل ۲، بدون سقف بالا).
 
 تعداد deployment بیشتر = batchهای همزمان بیشتر روی tunnel-node = latency پایین‌تر برای session. با ۶ deployment، هر ۰.۳ ثانیه یه batch جدید می‌رسه (به‌جای هر ۲ ثانیه).
 
@@ -154,8 +154,8 @@ TUNNEL_AUTH_KEY=your-secret PORT=8080 ./target/release/tunnel-node
 
 **بستگی به Mode داره:**
 
-- **mhrv-rs Android در Tunnel mode (Operating Mode → Tunnel)** + Full + tunnel-node = ✅ کل ترافیک Android (شامل YouTube، Telegram MTProto، Instagram، Snapchat، هر چیزی) capture می‌شه. این از VpnService استفاده می‌کنه.
-- **mhrv-rs Android در Proxy mode** + Full + tunnel-node = فقط app‌هایی که proxy رو صریحاً respect می‌کنن (Chrome، Firefox، برخی app‌های Telegram-فارسی). YouTube/Insta/Telegram اصلی proxy رو نادیده می‌گیرن + از mhrv-rs رد نمی‌شن.
+- **rahgozar Android در Tunnel mode (Operating Mode → Tunnel)** + Full + tunnel-node = ✅ کل ترافیک Android (شامل YouTube، Telegram MTProto، Instagram، Snapchat، هر چیزی) capture می‌شه. این از VpnService استفاده می‌کنه.
+- **rahgozar Android در Proxy mode** + Full + tunnel-node = فقط app‌هایی که proxy رو صریحاً respect می‌کنن (Chrome، Firefox، برخی app‌های Telegram-فارسی). YouTube/Insta/Telegram اصلی proxy رو نادیده می‌گیرن + از rahgozar رد نمی‌شن.
 
 برای اینکه «همهٔ app‌ها بیان» = حتماً **Tunnel mode** فعال کن.
 
@@ -169,7 +169,7 @@ TUNNEL_AUTH_KEY=your-secret PORT=8080 ./target/release/tunnel-node
 
 برای **چند flow همزمان** (browsing با چند تب، Telegram + YouTube همزمان)، throughput جمعی به sum از همه flow‌ها مقیاس می‌خوره — با ۶ deployment روی ۶ Google account می‌تونی ۶ flow همزمان داشته باشی.
 
-**توصیه واقع‌بینانه:** برای browsing عادی + chat + ویدیو متوسط = کافیه. برای دانلود فایل‌های بزرگ سریع، **Wireguard مستقیم روی همان VPS** ابزار درست‌تره (۵-۱۰x سریع‌تر، چون Apps Script رو دور می‌زنه). mhrv-rs ارزش اصلیش لایه «دور زدن censorship با domain-fronting» هست، نه سرعت raw — وقتی به اون لایه نیاز نداری (مسیر مستقیم به VPS باز هست)، ابزار ساده‌تر بهتره.
+**توصیه واقع‌بینانه:** برای browsing عادی + chat + ویدیو متوسط = کافیه. برای دانلود فایل‌های بزرگ سریع، **Wireguard مستقیم روی همان VPS** ابزار درست‌تره (۵-۱۰x سریع‌تر، چون Apps Script رو دور می‌زنه). rahgozar ارزش اصلیش لایه «دور زدن censorship با domain-fronting» هست، نه سرعت raw — وقتی به اون لایه نیاز نداری (مسیر مستقیم به VPS باز هست)، ابزار ساده‌تر بهتره.
 
 ### آیا VPS لازمه؟
 

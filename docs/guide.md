@@ -1,4 +1,4 @@
-# mhrv-rs — Full guide
+# rahgozar — Full guide
 
 This is the long version — every config option, every advanced mode, every troubleshooting tip. For the 5-minute quick start, see the [main README](../README.md).
 
@@ -30,12 +30,12 @@ This is the long version — every config option, every advanced mode, every tro
 
 ## How it works in detail
 
-```
+```text
 Browser / Telegram / xray
         |
         | HTTP proxy (8085)  or  SOCKS5 (8086)
         v
-mhrv-rs (local)
+rahgozar (local)
         |
         | TLS to Google IP, SNI = www.google.com
         v                       ^
@@ -59,7 +59,7 @@ For Google-owned domains (`google.com`, `youtube.com`, `fonts.googleapis.com`, �
 
 Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64), **Android 7.0+** (universal APK covering arm64, armv7, x86_64, x86). Prebuilt binaries on the [releases page](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases).
 
-**Android:** download `mhrv-rs-android-universal-v*.apk`. Full walk-through in [docs/android.md](android.md) (English) or [docs/android.fa.md](android.fa.md) (Persian). The Android build runs the same `mhrv-rs` Rust crate as desktop (via JNI) plus a TUN bridge via `tun2proxy` so every app on the device routes its IP traffic through the proxy without per-app config.
+**Android:** download `rahgozar-android-universal-v*.apk`. Full walk-through in [docs/android.md](android.md) (English) or [docs/android.fa.md](android.fa.md) (Persian). The Android build runs the same `rahgozar` Rust crate as desktop (via JNI) plus a TUN bridge via `tun2proxy` so every app on the device routes its IP traffic through the proxy without per-app config.
 
 > **Important Android caveat (issues [#74](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues/74) / [#81](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues/81)):** TUN captures all IP traffic, but HTTPS from third-party apps only works for apps that trust user-installed CAs. From Android 7+ apps must opt in via `networkSecurityConfig`. **Chrome and Firefox do**; **Telegram, WhatsApp, Instagram, YouTube, banking apps, games** do not. For those: use `PROXY_ONLY` mode and point in-app proxy at `127.0.0.1:1081` (SOCKS5), or use `google_only` mode (no CA, Google services only), or set `upstream_socks5` to an external VPS. This is an Android security design, not a bug.
 
@@ -69,13 +69,13 @@ Each archive contains:
 
 | file | purpose |
 |---|---|
-| `mhrv-rs` / `mhrv-rs.exe` | CLI. Headless use, servers, automation. No system deps on macOS / Windows. |
-| `mhrv-rs-ui` / `mhrv-rs-ui.exe` | Desktop UI (egui). Config form, Start / Stop / Test buttons, live stats, log panel. |
+| `rahgozar` / `rahgozar.exe` | CLI. Headless use, servers, automation. No system deps on macOS / Windows. |
+| `rahgozar-ui` / `rahgozar-ui.exe` | Desktop UI (egui). Config form, Start / Stop / Test buttons, live stats, log panel. |
 | `run.sh` / `run.command` / `run.bat` | Platform launcher: installs the MITM CA (needs sudo / admin) then starts the UI. Use this on first run. |
 
-macOS archives also ship `mhrv-rs.app` (in `*-app.zip`) — double-click in Finder. Run `mhrv-rs --install-cert` or `run.command` once first to install the CA.
+macOS archives also ship `rahgozar.app` (in `*-app.zip`) — double-click in Finder. Run `rahgozar --install-cert` or `run.command` once first to install the CA.
 
-<p align="center"><img src="ui-screenshot.png" alt="mhrv-rs desktop UI showing config form, live traffic stats, Start/Stop/Test buttons, and log panel" width="420"></p>
+<p align="center"><img src="ui-screenshot.png" alt="rahgozar desktop UI showing config form, live traffic stats, Start/Stop/Test buttons, and log panel" width="420"></p>
 
 Linux UI also needs `libxkbcommon`, `libwayland-client`, `libxcb`, `libgl`, `libx11`, `libgtk-3`. On most desktop distros these are already there; on a headless box install them via your package manager, or just use the CLI.
 
@@ -83,9 +83,9 @@ Linux UI also needs `libxkbcommon`, `libwayland-client`, `libxcb`, `libgl`, `lib
 
 Config and the MITM CA live in the OS user-data dir:
 
-- macOS: `~/Library/Application Support/mhrv-rs/`
-- Linux: `~/.config/mhrv-rs/`
-- Windows: `%APPDATA%\mhrv-rs\`
+- macOS: `~/Library/Application Support/rahgozar/`
+- Linux: `~/.config/rahgozar/`
+- Windows: `%APPDATA%\rahgozar\`
 
 Inside that dir:
 
@@ -102,27 +102,28 @@ The 5-minute version is in the [main README](../README.md#step-1--make-the-googl
 
 A variant in [`assets/apps_script/Code.cfw.gs`](../assets/apps_script/Code.cfw.gs) + [`assets/cloudflare/worker.js`](../assets/cloudflare/worker.js) turns Apps Script into a thin forwarder and offloads the actual `fetch` to a Cloudflare Worker you deploy. **Day-one win:** latency (~10–50 ms at the CF edge vs ~250–500 ms in Apps Script — visibly snappier for browsing and Telegram).
 
-It does **not** reduce your daily 20k Apps Script `UrlFetchApp` count, because today's mhrv-rs always sends single-URL relay requests; the batch path on the GAS+Worker side is wired and ready (`ceil(N/40)` quota per N-URL batch) but no shipping client emits it.
+It does **not** reduce your daily 20k Apps Script `UrlFetchApp` count, because today's rahgozar always sends single-URL relay requests; the batch path on the GAS+Worker side is wired and ready (`ceil(N/40)` quota per N-URL batch) but no shipping client emits it.
 
 **Trade-offs:**
+
 - Worse for YouTube long-form (30 s wall clock vs 6 min Apps Script)
 - Doesn't fix Cloudflare anti-bot
 - **Not compatible with `mode: "full"`** (no tunnel-ops support → won't help WhatsApp / messengers on Android Full mode)
 
-Full setup and trade-off table in [`assets/cloudflare/README.md`](../assets/cloudflare/README.md). mhrv-rs needs no config changes — same `mode: "apps_script"`, same `script_id`, same `auth_key`.
+Full setup and trade-off table in [`assets/cloudflare/README.md`](../assets/cloudflare/README.md). rahgozar needs no config changes — same `mode: "apps_script"`, same `script_id`, same `auth_key`.
 
 ### Direct mode
 
-If your ISP is already blocking Google Apps Script (or all of Google), you need Step 1 to succeed *before* you have a relay. mhrv-rs ships a `direct` mode for exactly this — SNI-rewrite tunnel only, no Apps Script relay required. (Was named `google_only` before v1.9 — old name still accepted.)
+If your ISP is already blocking Google Apps Script (or all of Google), you need Step 1 to succeed *before* you have a relay. rahgozar ships a `direct` mode for exactly this — SNI-rewrite tunnel only, no Apps Script relay required. (Was named `google_only` before v1.9 — old name still accepted.)
 
-1. Download the binary (see [main README → Step 2](../README.md#step-2--download-mhrv-rs))
+1. Download the binary (see [main README → Step 2](../README.md#step-2--download-rahgozar))
 2. Copy [`config.direct.example.json`](../config.direct.example.json) to `config.json` — no `script_id`, no `auth_key` required
-3. Run `mhrv-rs serve` and set browser HTTP proxy to `127.0.0.1:8085`
+3. Run `rahgozar serve` and set browser HTTP proxy to `127.0.0.1:8085`
 4. In `direct` mode, the proxy only routes `*.google.com`, `*.youtube.com`, and other Google-edge hosts (plus any [`fronting_groups`](fronting-groups.md) you've configured) via the SNI-rewrite tunnel. Other traffic goes raw — no Apps Script relay exists yet.
 5. Now do Step 1 in your browser (the connection to `script.google.com` will be SNI-fronted). Deploy `Code.gs`, copy the Deployment ID.
 6. In the UI / Android app / by editing `config.json`, switch mode to `apps_script`, paste the Deployment ID and your auth key, and restart.
 
-Verify reachability before even starting the proxy: `mhrv-rs test-sni` probes `*.google.com` directly and works without any config beyond `google_ip` + `front_domain`.
+Verify reachability before even starting the proxy: `rahgozar test-sni` probes `*.google.com` directly and works without any config beyond `google_ip` + `front_domain`.
 
 ## CLI reference
 
@@ -146,13 +147,13 @@ Everything the UI does is also in the CLI. Copy `config.example.json` to `config
 Then:
 
 ```bash
-./mhrv-rs                   # serve (default)
-./mhrv-rs test              # one-shot end-to-end probe
-./mhrv-rs scan-ips          # rank Google frontend IPs by latency
-./mhrv-rs test-sni          # probe SNI names against your google_ip
-./mhrv-rs --install-cert    # reinstall the MITM CA
-./mhrv-rs --remove-cert     # uninstall + delete the whole ca/ dir
-./mhrv-rs --help
+./rahgozar                   # serve (default)
+./rahgozar test              # one-shot end-to-end probe
+./rahgozar scan-ips          # rank Google frontend IPs by latency
+./rahgozar test-sni          # probe SNI names against your google_ip
+./rahgozar --install-cert    # reinstall the MITM CA
+./rahgozar --remove-cert     # uninstall + delete the whole ca/ dir
+./rahgozar --help
 ```
 
 `--remove-cert` deletes the CA from the OS trust store, deletes the on-disk `ca/` directory, and verifies the revocation by name. NSS cleanup (Firefox, Chrome on Linux) is best-effort: if `certutil` isn't on PATH or a browser holds the NSS DB open, the tool logs a manual-cleanup hint. Your `config.json` and the Apps Script deployment are untouched, so a fresh CA does not require redeploying `Code.gs`.
@@ -175,6 +176,7 @@ By default, `scan-ips` uses a static list. Enable dynamic IP discovery in `confi
 ```
 
 When enabled:
+
 - Fetches `goog.json` from Google's public IP ranges API
 - Extracts CIDRs and expands them to individual IPs
 - Prioritizes IPs from famous Google domains (google.com, youtube.com, etc.)
@@ -187,11 +189,11 @@ You may find IPs faster than the static array, but no guarantee they all work.
 
 The Apps Script relay only speaks HTTP request / response, so non-HTTP protocols (Telegram MTProto, IMAP, SSH, raw TCP) can't travel through it. Without anything else, those flows hit the direct-TCP fallback — which means they're not actually tunneled, and an ISP that blocks Telegram still blocks them.
 
-**Fix:** run a local [xray](https://github.com/XTLS/Xray-core) (or v2ray / sing-box) with a VLESS / Trojan / Shadowsocks outbound to your own VPS, and point mhrv-rs at xray's SOCKS5 inbound via the **Upstream SOCKS5** field (or the `upstream_socks5` config key). When set, raw-TCP flows through mhrv-rs's SOCKS5 listener get chained into xray → the real tunnel.
+**Fix:** run a local [xray](https://github.com/XTLS/Xray-core) (or v2ray / sing-box) with a VLESS / Trojan / Shadowsocks outbound to your own VPS, and point rahgozar at xray's SOCKS5 inbound via the **Upstream SOCKS5** field (or the `upstream_socks5` config key). When set, raw-TCP flows through rahgozar's SOCKS5 listener get chained into xray → the real tunnel.
 
-```
+```text
 Telegram  ┐                                                    ┌─ Apps Script ── HTTP/HTTPS
-          ├─ SOCKS5 :8086 ─┤ mhrv-rs ├─ SNI rewrite ──────── google.com, youtube.com, …
+          ├─ SOCKS5 :8086 ─┤ rahgozar ├─ SNI rewrite ──────── google.com, youtube.com, …
 Browser   ┘                                                    └─ upstream SOCKS5 ─ xray ── VLESS ── your VPS   (Telegram, IMAP, SSH, raw TCP)
 ```
 
@@ -211,9 +213,9 @@ HTTP / HTTPS keeps going through Apps Script (no change), and the SNI-rewrite tu
 
 ### How deployment IDs affect performance
 
-Each Apps Script batch round-trip takes ~2 s. In Full mode, mhrv-rs runs a **pipelined batch multiplexer** that fires multiple batches concurrently without waiting on the previous one. Each Deployment ID (= one Google account) gets its own concurrency pool of **30 in-flight requests** — matching the per-account Apps Script execution limit.
+Each Apps Script batch round-trip takes ~2 s. In Full mode, rahgozar runs a **pipelined batch multiplexer** that fires multiple batches concurrently without waiting on the previous one. Each Deployment ID (= one Google account) gets its own concurrency pool of **30 in-flight requests** — matching the per-account Apps Script execution limit.
 
-```
+```text
 max_concurrent = 30 × number_of_deployment_ids
 ```
 
@@ -227,6 +229,7 @@ max_concurrent = 30 × number_of_deployment_ids
 More deployments = more total concurrency = lower per-session latency. Each batch round-robins across your IDs, spreading load and reducing the chance of hitting any single deployment's quota ceiling.
 
 **Resource guards:**
+
 - **50 ops max** per batch — if more sessions are active, the mux splits into multiple batches
 - **4 MB payload cap** per batch — well under Apps Script's 50 MB limit
 - **30 s timeout** per batch — slow / dead targets can't block other sessions forever
@@ -239,14 +242,17 @@ More deployments = more total concurrency = lower per-session latency. Each batc
    - **Shared with a group** → one account per heavy user
 
 2. Deploy [tunnel-node](../tunnel-node/) on a VPS. Fastest is the prebuilt Docker image:
+
    ```bash
    docker run -d --name mhrv-tunnel --restart unless-stopped \
      -p 8080:8080 -e TUNNEL_AUTH_KEY=your-strong-secret \
      ghcr.io/therealaleph/mhrv-tunnel-node:latest
    ```
+
    Multi-arch (linux/amd64 + linux/arm64), runs as non-root, ~32 MB compressed. Pin a version tag (`:1.5.0`) for production. See [tunnel-node/README.md](../tunnel-node/README.md) for Cloud Run, docker-compose, and source-build alternatives.
 
 3. Set `"mode": "full"` in your config with all deployment IDs:
+
    ```json
    {
      "mode": "full",
@@ -259,7 +265,7 @@ More deployments = more total concurrency = lower per-session latency. Each batc
 
 Cloudflare-fronted services (chatgpt.com, claude.ai, grok.com, x.com, openai.com) flag traffic from Google datacenter IPs as bots and serve a Turnstile / CAPTCHA challenge. The exit node fix is a small TypeScript HTTP handler you deploy on a serverless host (Deno Deploy, fly.io, or your own VPS) that sits between Apps Script and the destination:
 
-```
+```text
 client → Apps Script (Google IP) → your exit node (non-Google IP) → CF-protected site
 ```
 
@@ -269,7 +275,7 @@ The destination sees the exit node's IP, not Google's, so the anti-bot heuristic
 
 ## Sharing via hotspot
 
-mhrv-rs listens on `0.0.0.0` by default, so any device on the same network can use it. Common scenario: share the tunnel from an Android phone to an iPhone, iPad, or laptop over hotspot:
+rahgozar listens on `0.0.0.0` by default, so any device on the same network can use it. Common scenario: share the tunnel from an Android phone to an iPhone, iPad, or laptop over hotspot:
 
 1. **Android:** enable mobile hotspot + start the app
 2. **Other device:** connect to the Android hotspot Wi-Fi
@@ -295,31 +301,31 @@ The `*-linux-musl-*` archives ship a fully static CLI that runs on OpenWRT, Alpi
 
 ```sh
 # From a machine that can reach your router:
-scp mhrv-rs root@192.168.1.1:/usr/bin/mhrv-rs
-scp mhrv-rs.init root@192.168.1.1:/etc/init.d/mhrv-rs
-scp config.json root@192.168.1.1:/etc/mhrv-rs/config.json
+scp rahgozar root@192.168.1.1:/usr/bin/rahgozar
+scp rahgozar.init root@192.168.1.1:/etc/init.d/rahgozar
+scp config.json root@192.168.1.1:/etc/rahgozar/config.json
 
 # On the router:
-chmod +x /usr/bin/mhrv-rs /etc/init.d/mhrv-rs
-/etc/init.d/mhrv-rs enable
-/etc/init.d/mhrv-rs start
-logread -e mhrv-rs -f       # tail logs
+chmod +x /usr/bin/rahgozar /etc/init.d/rahgozar
+/etc/init.d/rahgozar enable
+/etc/init.d/rahgozar start
+logread -e rahgozar -f       # tail logs
 ```
 
-LAN devices then point HTTP proxy at the router's LAN IP (default port `8085`) or SOCKS5 at `<router-ip>:8086`. Set `listen_host` to `0.0.0.0` in `/etc/mhrv-rs/config.json` so the router accepts LAN connections.
+LAN devices then point HTTP proxy at the router's LAN IP (default port `8085`) or SOCKS5 at `<router-ip>:8086`. Set `listen_host` to `0.0.0.0` in `/etc/rahgozar/config.json` so the router accepts LAN connections.
 
 Memory footprint ~15–20 MB resident — fine on anything ≥128 MB RAM. No UI on musl (routers are headless).
 
 ## Diagnostics
 
-- **`mhrv-rs test`** — sends one request through the relay, reports success / latency. First thing to try when something breaks — separates "relay is up" from "client config is wrong".
-- **`mhrv-rs scan-ips`** — parallel TLS probe of 28 known Google frontend IPs, sorted by latency. Take the winner, put it in `google_ip`. UI has same thing behind **scan** button.
-- **`mhrv-rs test-sni`** — parallel TLS probe of every SNI name in your rotation pool against `google_ip`. Tells you which front-domain names pass through your ISP's DPI. UI has same thing in **SNI pool…** window with checkboxes, per-row **Test** buttons, and **Keep ✓ only** to auto-trim.
+- **`rahgozar test`** — sends one request through the relay, reports success / latency. First thing to try when something breaks — separates "relay is up" from "client config is wrong".
+- **`rahgozar scan-ips`** — parallel TLS probe of 28 known Google frontend IPs, sorted by latency. Take the winner, put it in `google_ip`. UI has same thing behind **scan** button.
+- **`rahgozar test-sni`** — parallel TLS probe of every SNI name in your rotation pool against `google_ip`. Tells you which front-domain names pass through your ISP's DPI. UI has same thing in **SNI pool…** window with checkboxes, per-row **Test** buttons, and **Keep ✓ only** to auto-trim.
 - **Periodic stats** logged every 60 s at `info` level (relay calls, cache hit rate, bytes relayed, active vs blacklisted scripts). UI shows live.
 
 ### SNI pool editor
 
-By default, mhrv-rs rotates through `{www, mail, drive, docs, calendar}.google.com` on outbound TLS to your `google_ip`, to avoid fingerprinting one name too heavily. Some may be locally blocked (e.g. `mail.google.com` has been targeted in Iran at various times).
+By default, rahgozar rotates through `{www, mail, drive, docs, calendar}.google.com` on outbound TLS to your `google_ip`, to avoid fingerprinting one name too heavily. Some may be locally blocked (e.g. `mail.google.com` has been targeted in Iran at various times).
 
 Either:
 
@@ -332,7 +338,7 @@ Either:
 }
 ```
 
-Leaving `sni_hosts` unset gives you the default auto-pool. Run `mhrv-rs test-sni` to verify what works from your network.
+Leaving `sni_hosts` unset gives you the default auto-pool. Run `rahgozar test-sni` to verify what works from your network.
 
 ## What's implemented and what isn't
 
@@ -402,16 +408,17 @@ These are inherent to the Apps Script + domain-fronting approach, not bugs in th
 **Is logging into a Google account through this safe?** Recommended: log in once **without** the proxy, or with a real VPN, the first time. Google may flag the Apps Script IP as an "unknown device" and warn. After the initial login, use is fine.
 
 **How do I remove the certificate later?**
+
 - **Easiest (any OS):** click **Remove CA** in the UI, or:
-  - macOS / Linux: `sudo ./mhrv-rs --remove-cert`
-  - Windows (run as administrator): `mhrv-rs.exe --remove-cert`
+  - macOS / Linux: `sudo ./rahgozar --remove-cert`
+  - Windows (run as administrator): `rahgozar.exe --remove-cert`
   - Removes from system trust store, NSS (Firefox / Chrome on Linux), and deletes `ca/ca.crt` + `ca/ca.key` on disk. Your `config.json` and Apps Script deployment are not touched.
-- **Manually:** the cert's Common Name is `MasterHttpRelayVPN` (not `mhrv-rs` — that's the app name).
-  - **macOS:** Keychain Access → System → search `MasterHttpRelayVPN` → delete. Then `rm -rf ~/Library/Application\ Support/mhrv-rs/ca/`
+- **Manually:** the cert's Common Name is `MasterHttpRelayVPN` (not `rahgozar` — that's the app name).
+  - **macOS:** Keychain Access → System → search `MasterHttpRelayVPN` → delete. Then `rm -rf ~/Library/Application\ Support/rahgozar/ca/`
   - **Windows:** `certmgr.msc` → Trusted Root Certification Authorities → search `MasterHttpRelayVPN` → delete
   - **Linux:** delete `/usr/local/share/ca-certificates/MasterHttpRelayVPN.crt` then `sudo update-ca-certificates`
 
-**`GLIBC_2.39 not found` error on Linux?** Use `mhrv-rs-linux-musl-amd64.tar.gz` — fully static, runs on any Linux without `glibc`.
+**`GLIBC_2.39 not found` error on Linux?** Use `rahgozar-linux-musl-amd64.tar.gz` — fully static, runs on any Linux without `glibc`.
 
 ## License
 

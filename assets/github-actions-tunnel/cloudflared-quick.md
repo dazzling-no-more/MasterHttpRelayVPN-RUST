@@ -66,11 +66,11 @@ const TUNNEL_AUTH_KEY = "the-secret-you-set-in-step-2";
 ```
 
 Deploy: **Deploy > New Deployment > Web App**.
-Copy the new Deployment ID and update your `mhrv-rs` config.
+Copy the new Deployment ID and update your `rahgozar` config.
 
 ### Step 7: Verify
 
-Use `mhrv-rs test` or visit `https://ipleak.net` through your proxy.
+Use `rahgozar test` or visit `https://ipleak.net` through your proxy.
 
 ## How It Works
 

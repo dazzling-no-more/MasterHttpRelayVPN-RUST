@@ -1,6 +1,6 @@
 # Android app
 
-Full guide for the mhrv-rs Android app: install, first-run setup, troubleshooting, known limits.
+Full guide for the rahgozar Android app: install, first-run setup, troubleshooting, known limits.
 
 - [Overview](#overview)
 - [Requirements](#requirements)
@@ -19,7 +19,7 @@ Full guide for the mhrv-rs Android app: install, first-run setup, troubleshootin
 
 ## Overview
 
-The Android app is the exact same `mhrv-rs` Rust crate that powers the desktop build, wrapped in a Compose UI and fed a TUN file descriptor via `VpnService` + [`tun2proxy`](https://crates.io/crates/tun2proxy). Every app on the device is routed through the proxy — no per-app setup.
+The Android app is the exact same `rahgozar` Rust crate that powers the desktop build, wrapped in a Compose UI and fed a TUN file descriptor via `VpnService` + [`tun2proxy`](https://crates.io/crates/tun2proxy). Every app on the device is routed through the proxy — no per-app setup.
 
 ```
 Any app on the device
@@ -28,7 +28,7 @@ Any app on the device
 VpnService TUN  ──► tun2proxy (in-process)
                         │
                         ▼
-                Local SOCKS5 listener  ──► mhrv-rs dispatcher
+                Local SOCKS5 listener  ──► rahgozar dispatcher
                                                  │
                          ┌───────────────────────┤
                          ▼                       ▼
@@ -51,14 +51,14 @@ Setup time: **~10 minutes** if your Apps Script deployment already exists, ~15 m
 | **Screen lock** | PIN, pattern, password, or biometric + fallback. **Required by Android for user-CA install.** Can be removed after install; the cert stays trusted |
 | **Data usage** | ~5 MB for the APK, then ~2 MB overhead per GB of browsing (base64 + JSON wrapping) |
 
-> **Scope note.** mhrv-rs relays through Apps Script. That's what makes it cheap and DPI-resilient, but it's also what imposes the [known limitations](#known-limitations) below. If you're evaluating against a real VPN (WireGuard/Tailscale/OpenVPN), skim that section first.
+> **Scope note.** rahgozar relays through Apps Script. That's what makes it cheap and DPI-resilient, but it's also what imposes the [known limitations](#known-limitations) below. If you're evaluating against a real VPN (WireGuard/Tailscale/OpenVPN), skim that section first.
 
 ---
 
 ## 1. Install the APK
 
 1. On your phone, open the browser and go to <https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases/latest>.
-2. Download `mhrv-rs-android-universal-v*.apk`.
+2. Download `rahgozar-android-universal-v*.apk`.
 3. Tap the download to open the installer.
 4. When Android asks **"Allow this source to install apps?"**:
    - Tap **Settings**
@@ -66,7 +66,7 @@ Setup time: **~10 minutes** if your Apps Script deployment already exists, ~15 m
    - Tap **← Back** → **Install**
 5. Tap **Open** once install finishes.
 
-> If Android refuses with "App not installed": an old build signed with a different key is still present. `Settings → Apps → mhrv-rs → Uninstall`, then try again. (From v1.0.2 onward this is a one-time thing — updates are signed with a stable key.)
+> If Android refuses with "App not installed": an old build signed with a different key is still present. `Settings → Apps → rahgozar → Uninstall`, then try again. (From v1.0.2 onward this is a one-time thing — updates are signed with a stable key.)
 
 ---
 
@@ -133,7 +133,7 @@ Before starting the tunnel, verify the outbound leg works. Expand **SNI pool + t
 | ❌ `connect timeout` on some rows | Those specific SNIs are DPI-filtered on your network | Leave them unchecked; rotation pool uses only ticked boxes |
 | ❌ `dns: ...` | Device can't resolve `www.google.com` at all | Fix Wi-Fi / airplane mode |
 
-If you tap Auto-detect and it still fails on every row, your network is blocking Google's edge entirely — mhrv-rs can't help there.
+If you tap Auto-detect and it still fails on every row, your network is blocking Google's edge entirely — rahgozar can't help there.
 
 ---
 
@@ -155,7 +155,7 @@ The proxy terminates TLS locally (re-encrypts before routing through Apps Script
 
 6. Android warns **"Your network may be monitored by an unknown third party"**. That's us. Tap **Install anyway**.
 7. Pick **Downloads** → tap **mhrv-ca.crt**. Give it a friendly name (or accept the default). Tap **OK**.
-8. Switch back to the mhrv-rs app. A snackbar confirms **Certificate installed ✓** — the app verifies by fingerprint against `AndroidCAStore`.
+8. Switch back to the rahgozar app. A snackbar confirms **Certificate installed ✓** — the app verifies by fingerprint against `AndroidCAStore`.
 
    If it says "not yet installed", repeat step 5.
 
@@ -170,7 +170,7 @@ Android 11 removed the inline `KeyChain.createInstallIntent` flow. That intent u
 ## 6. Start the tunnel
 
 1. Tap **Start**.
-2. Android shows the VPN-permission dialog: *"mhrv-rs wants to set up a VPN connection..."*. Tap **OK**.
+2. Android shows the VPN-permission dialog: *"rahgozar wants to set up a VPN connection..."*. Tap **OK**.
 3. A key icon appears in the status bar. That's your VPN indicator.
 4. Open Chrome. Try `https://www.cloudflare.com`, `https://yahoo.com`, `https://discord.com` as stress tests — all should render normally.
 
@@ -227,7 +227,7 @@ In `full` mode, the SOCKS5 listener handles `UDP ASSOCIATE` and tunnels UDP data
 
 ### IPv6 leaks
 
-The TUN only routes IPv4 (`addRoute 0.0.0.0/0`). IPv6 goes out your normal interface, including WebRTC. If you're using mhrv-rs for privacy rather than DPI bypass, disable IPv6 on your Wi-Fi network entirely.
+The TUN only routes IPv4 (`addRoute 0.0.0.0/0`). IPv6 goes out your normal interface, including WebRTC. If you're using rahgozar for privacy rather than DPI bypass, disable IPv6 on your Wi-Fi network entirely.
 
 ### Apps Script daily quota
 
@@ -235,7 +235,7 @@ Each `/exec` has a daily execution limit (20k/day for consumer Google accounts, 
 
 ### Most non-browser apps ignore user CAs
 
-By default, Android apps opt out of trusting user-installed CAs (Android 7+ `Network Security Config` default). Banking apps, Netflix, Spotify, most messengers — they'll fail with cert errors through mhrv-rs. The TUN routes their traffic to us; they just refuse our leaf. Only apps that explicitly opt in (browsers, curl, some developer tools) will work. This is a general MITM-proxy limitation.
+By default, Android apps opt out of trusting user-installed CAs (Android 7+ `Network Security Config` default). Banking apps, Netflix, Spotify, most messengers — they'll fail with cert errors through rahgozar. The TUN routes their traffic to us; they just refuse our leaf. Only apps that explicitly opt in (browsers, curl, some developer tools) will work. This is a general MITM-proxy limitation.
 
 ---
 
@@ -275,6 +275,6 @@ Attach `mhrv.log` to your issue. Also include:
 
 ## Uninstall
 
-1. `Settings → Apps → mhrv-rs → Uninstall`.
-2. Optional: remove the MITM CA — `Settings → Security → Encryption & credentials → User credentials → mhrv-rs MITM CA → Remove`. (On OEMs where that path is buried, search Settings for `user credentials`.)
+1. `Settings → Apps → rahgozar → Uninstall`.
+2. Optional: remove the MITM CA — `Settings → Security → Encryption & credentials → User credentials → rahgozar MITM CA → Remove`. (On OEMs where that path is buried, search Settings for `user credentials`.)
 3. The VPN profile is auto-revoked on uninstall — nothing to clean up there.

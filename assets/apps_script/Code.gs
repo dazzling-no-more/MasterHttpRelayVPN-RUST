@@ -43,7 +43,6 @@ const AUTH_KEY = "CHANGE_ME_TO_A_STRONG_SECRET";
 // Set to `true` during initial setup if a misconfigured client is
 // hitting "unauthorized" and you want the explicit JSON error to debug
 // — then flip back to false before the deployment is widely shared.
-// (Inspired by #365 Section 3, mhrv-rs v1.8.0+.)
 const DIAGNOSTIC_MODE = false;
 
 // ── Optional Spreadsheet Cache ──────────────────────────────
@@ -138,7 +137,7 @@ function doPost(e) {
     return _doSingle(req);
   } catch (err) {
     // Parse failures of the request body are also probe-shaped — a real
-    // mhrv-rs client never sends invalid JSON. Decoy for the same reason.
+    // rahgozar client never sends invalid JSON. Decoy for the same reason.
     return _decoyOrError({ e: String(err) });
   }
 }

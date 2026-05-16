@@ -1,18 +1,18 @@
 #!/bin/sh /etc/rc.common
-# OpenWRT procd init script for mhrv-rs.
-# Install as /etc/init.d/mhrv-rs, then:
-#   /etc/init.d/mhrv-rs enable
-#   /etc/init.d/mhrv-rs start
+# OpenWRT procd init script for rahgozar.
+# Install as /etc/init.d/rahgozar, then:
+#   /etc/init.d/rahgozar enable
+#   /etc/init.d/rahgozar start
 #
 # Expects:
-#   /usr/bin/mhrv-rs           (the static musl binary from the release)
-#   /etc/mhrv-rs/config.json   (your config)
+#   /usr/bin/rahgozar           (the static musl binary from the release)
+#   /etc/rahgozar/config.json   (your config)
 
 START=99
 USE_PROCD=1
 
-BIN=/usr/bin/mhrv-rs
-CONFIG=/etc/mhrv-rs/config.json
+BIN=/usr/bin/rahgozar
+CONFIG=/etc/rahgozar/config.json
 
 start_service() {
     [ -x "$BIN" ] || return 1

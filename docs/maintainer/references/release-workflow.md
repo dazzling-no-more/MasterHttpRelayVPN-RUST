@@ -14,6 +14,7 @@ Cut a release whenever **anything user-visible** has landed since the last tag. 
 - Documentation that users will read (README updates, troubleshooting docs — though these can also batch into the next release)
 
 Don't cut for:
+
 - Internal refactors with no behavior change
 - CI/workflow file edits
 - Markdown formatting fixes
@@ -32,13 +33,14 @@ git describe --tags --abbrev=0
 ```
 
 Then bump:
+
 - **Patch (Z+1)** — for ~95% of releases. v1.8.2 → v1.8.3
 - **Minor (Y+1)** — for a coherent feature batch shipped together. v1.7.x → v1.8.0 represented "DPI evasion + active-probing defense + full-mode usage counters" together
 - **Major (X+1)** — never done in this project's history. Reserved for true protocol-incompatible changes with the Apps Script side. Don't bump major without explicit go-ahead.
 
 ### Step 2: Bump `Cargo.toml`
 
-Edit `Cargo.toml` line 3 (`version = "X.Y.Z"`). Keep package name `mhrv-rs` unchanged. The `tunnel-node` subcrate has its own version that's independent — don't bump it unless you're shipping a tunnel-node change.
+Edit `Cargo.toml` line 3 (`version = "X.Y.Z"`). Keep package name `rahgozar` unchanged. The `tunnel-node` subcrate has its own version that's independent — don't bump it unless you're shipping a tunnel-node change.
 
 ### Step 3: Build to refresh `Cargo.lock`
 
@@ -52,7 +54,7 @@ cargo build --release 2>&1 | tail -3
 git diff Cargo.lock | head -20
 ```
 
-Should show only the `name = "mhrv-rs"` block's `version = "X.Y.Z"` change.
+Should show only the `name = "rahgozar"` block's `version = "X.Y.Z"` change.
 
 ### Step 4: Write the changelog
 
@@ -65,7 +67,7 @@ When the release is shipping multiple PRs from contributors, credit each by name
 ```bash
 cargo test --lib 2>&1 | tail -5
 cargo build --release 2>&1 | tail -3
-cargo build --bin mhrv-rs-ui --release --features ui 2>&1 | tail -3
+cargo build --bin rahgozar-ui --release --features ui 2>&1 | tail -3
 ```
 
 All three must succeed. Test count varies by version. All passing is the gate.
@@ -134,7 +136,7 @@ You should see an auto-generated commit `chore(releases): refresh prebuilt binar
 
 The Telegram publish workflow posts to channel `mhrv_rs` (public link `https://t.me/mhrv_rs`). The channel should show:
 
-1. An announcement post: `📦 mhrv-rs vX.Y.Z منتشر شد...` referencing the changelog file
+1. An announcement post: `📦 rahgozar vX.Y.Z منتشر شد...` referencing the changelog file
 2. ~16 individual file posts (Android APKs split by ABI, Windows ZIP, macOS arm64/amd64 dmg+tar, Linux x86_64/arm64 incl. musl, Raspbian, OpenWRT)
 3. Each file caption includes Persian description (e.g., "نسخه ویندوز x86") + SHA-256 hash
 4. A "main channel" post (different channel) cross-linking to the files channel post

@@ -90,7 +90,7 @@ All methods share these requirements:
 2. Copy the `TUNNEL_SERVER_URL` from the workflow log output
 3. Update the `TUNNEL_SERVER_URL` constant in `CodeFull.gs`
 4. Deploy `CodeFull.gs` (Deploy → New Deployment → Web App)
-5. Configure your `mhrv-rs` client to use the new deployment in Full mode
+5. Configure your `rahgozar` client to use the new deployment in Full mode
 
 For Method 1 (cloudflared Quick) the URL is fresh every session, so steps 2–4
 must be repeated each time. For Method 2 (ngrok), free-tier accounts now get a
