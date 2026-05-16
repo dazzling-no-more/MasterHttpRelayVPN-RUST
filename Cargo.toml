@@ -58,6 +58,11 @@ minisign-verify = "0.2"
 # 64-bit atomically; on x86_64 / aarch64 / armv7 / etc. it compiles
 # down to the native instructions with no overhead.
 portable-atomic = { version = "1", features = ["fallback"] }
+# Lock-free swap of the mode-dependent state bundle (RewriteCtx + DomainFronter
+# + TunnelMux) used by the proxy's accept loops. Lets a live mode switch happen
+# without taking a lock on the hot path — each accept loads a self-consistent
+# snapshot of all three pointers with one atomic op.
+arc-swap = "1"
 
 # Optional UI dep: only pulled in when --features ui is set.
 # Both `glow` (OpenGL 2+) and `wgpu` (DX12/Vulkan/Metal) are compiled in;

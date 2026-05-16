@@ -1,9 +1,19 @@
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
+// AtomicU64 polyfill — same reason `cache.rs` and `domain_fronter.rs`
+// use this: mipsel-unknown-linux-musl is MIPS32 without native 64-bit
+// atomics, so `std::sync::atomic::AtomicU64` doesn't resolve. The
+// `coalesce_*_ms` fields below need 64-bit width because that's what
+// `TunnelMux::start` takes, and they need atomic interior mutability
+// because `switch_mode` updates them in place when the user edits the
+// values and toggles into Full mode mid-session.
 use bytes::Bytes;
+use portable_atomic::AtomicU64;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, Mutex};
@@ -298,24 +308,127 @@ fn hosts_override<'a>(
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ProxyError {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// `switch_mode` was called after the proxy was asked to stop. The
+    /// runtime intentionally treats this as a no-op (the lifecycle is
+    /// "switch ignored because the proxy is going away anyway"), so
+    /// callers should *not* surface this to the user as a failure. The
+    /// UI background thread, for example, suppresses the toast for
+    /// this variant and only logs a debug line.
+    ///
+    /// Marked `#[non_exhaustive]` on the enum so downstream `match`es
+    /// remain forward-compatible — every new variant becomes a wildcard
+    /// for them, not a hard break.
+    #[error("proxy is shutting down; operation ignored")]
+    ShuttingDown,
 }
 
 pub struct ProxyServer {
-    host: String,
-    port: u16,
-    socks5_port: u16,
+    /// Shared, swappable state. The same `Arc<RuntimeState>` handed back
+    /// to the UI so a live mode switch can rebuild the bundle while the
+    /// listeners stay bound (see `RuntimeState::switch_mode`).
+    state: Arc<RuntimeState>,
+}
+
+/// Mode-dependent state read by the accept path. Bundled into one
+/// `Arc<ModeBundle>` (wrapped in [`ArcSwap`]) so each accepted connection
+/// reads a self-consistent (ctx, fronter, mux) triple with one atomic op —
+/// without that, a switch_mode racing an accept could pair the new
+/// `RewriteCtx::mode` with the old `fronter`, and `handle_mitm_request`
+/// would fall through its "apps_script mode with no fronter" defensive
+/// branch.
+///
+/// Visibility is `pub(crate)`: callers outside this crate must go through
+/// `RuntimeState::current_mode` / `RuntimeState::fronter` accessors, not
+/// poke at the bundle directly. Constructing a new bundle from outside
+/// would let a caller bypass `switch_lock` and `mode_tasks` cleanup —
+/// every legitimate path to a new bundle runs under `switch_mode`.
+pub(crate) struct ModeBundle {
+    pub(crate) rewrite_ctx: Arc<RewriteCtx>,
     /// `None` in `direct` mode: no Apps Script relay is wired up,
     /// only the SNI-rewrite tunnel path (Google edge + any configured
     /// `fronting_groups`) is live.
-    fronter: Option<Arc<DomainFronter>>,
+    pub(crate) fronter: Option<Arc<DomainFronter>>,
+    /// `Some` only in `full` mode — the tunnel mux is what carries
+    /// end-to-end-encrypted traffic to the tunnel node.
+    pub(crate) tunnel_mux: Option<Arc<TunnelMux>>,
+}
+
+/// Mode-dependent background tasks tied to the *current* `fronter`/`mux`.
+/// Aborted on shutdown and on every `switch_mode` so the old fronter's
+/// keepalive pings don't keep hitting Apps Script after the user has
+/// switched away from `apps_script` mode.
+#[derive(Default)]
+struct ModeTasks {
+    keepalive: Option<tokio::task::JoinHandle<()>>,
+    refill: Option<tokio::task::JoinHandle<()>>,
+    stats: Option<tokio::task::JoinHandle<()>>,
+    /// One-shot pool prewarm. Exits naturally after a few seconds, but
+    /// repeated mode switches inside that window would otherwise leave
+    /// overlapping warmups holding old `Arc<DomainFronter>`s. Tracking
+    /// it here lets `abort_all` reap them cleanly on switch / shutdown.
+    warm: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl ModeTasks {
+    fn abort_all(&mut self) {
+        if let Some(h) = self.keepalive.take() {
+            h.abort();
+        }
+        if let Some(h) = self.refill.take() {
+            h.abort();
+        }
+        if let Some(h) = self.stats.take() {
+            h.abort();
+        }
+        if let Some(h) = self.warm.take() {
+            h.abort();
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.keepalive.is_none()
+            && self.refill.is_none()
+            && self.stats.is_none()
+            && self.warm.is_none()
+    }
+}
+
+/// The live, runtime-mutable handle to a started proxy. Owns the swappable
+/// `ModeBundle` plus the listen address and the MITM CA. The UI holds an
+/// `Arc<RuntimeState>` alongside the proxy's `JoinHandle`, so a mode-switch
+/// command can call `switch_mode` from outside the run task.
+pub struct RuntimeState {
+    host: String,
+    port: u16,
+    socks5_port: u16,
+    /// Crate-private so external callers can't bypass `switch_lock` /
+    /// `mode_tasks` cleanup by `store()`-ing a hand-rolled bundle.
+    /// Read access goes through accessors (`current_mode`, `fronter`)
+    /// or, on the hot path, the accept loops which load the snapshot
+    /// once per accepted connection.
+    pub(crate) bundle: ArcSwap<ModeBundle>,
     mitm: Arc<Mutex<MitmCertManager>>,
-    rewrite_ctx: Arc<RewriteCtx>,
-    tunnel_mux: Option<Arc<TunnelMux>>,
-    coalesce_step_ms: u64,
-    coalesce_max_ms: u64,
+    mode_tasks: Mutex<ModeTasks>,
+    /// Current `TunnelMux` coalesce knobs. Atomic + interior-mutable
+    /// because `switch_mode` updates them from `new_config` so a live
+    /// switch into Full mode picks up the latest values, not the ones
+    /// captured at `RuntimeState::new` time. Read by both `run()`
+    /// (startup mux init) and `switch_mode` (post-swap mux init), both
+    /// under `switch_lock`, so plain `Relaxed` ordering suffices.
+    coalesce_step_ms: AtomicU64,
+    coalesce_max_ms: AtomicU64,
+    /// Serialises `switch_mode` against itself AND against the run-task's
+    /// shutdown path, so a detached switch-task spawned from the UI can't
+    /// race past shutdown and re-spawn fresh fronter tasks after Stop.
+    switch_lock: Mutex<()>,
+    /// Set during the shutdown arm of `run()` (under `switch_lock`). Any
+    /// subsequent `switch_mode` checks this immediately after acquiring
+    /// `switch_lock` and bails — guaranteeing no new tasks get spawned
+    /// after Stop has aborted the current ones.
+    stopped: AtomicBool,
 }
 
 pub struct RewriteCtx {
@@ -749,232 +862,399 @@ pub fn matches_passthrough(host: &str, list: &[String]) -> bool {
     })
 }
 
-impl ProxyServer {
-    pub fn new(config: &Config, mitm: Arc<Mutex<MitmCertManager>>) -> Result<Self, ProxyError> {
-        let mode = config
-            .mode_kind()
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
+/// Build the mode-dependent half of the proxy state from a `Config`: the
+/// `DomainFronter` (when mode needs one) and the `RewriteCtx` carrying all
+/// the resolved routing knobs. Used by both `ProxyServer::new` at startup
+/// and `RuntimeState::switch_mode` for live mode toggling — the two paths
+/// must produce identical state so the second-pass switch behaves the same
+/// as a fresh Start.
+fn build_mode_state(
+    config: &Config,
+) -> Result<(Option<Arc<DomainFronter>>, Arc<RewriteCtx>, Mode), ProxyError> {
+    let mode = config
+        .mode_kind()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
 
-        // `direct` mode skips the Apps Script relay entirely, so we must
-        // not try to construct the DomainFronter — it errors on a missing
-        // `script_id`, which is exactly the state a direct-mode user is in.
-        let fronter = match mode {
-            Mode::AppsScript | Mode::Full => {
-                let f = DomainFronter::new(config)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
-                Some(Arc::new(f))
-            }
-            Mode::Direct => None,
-        };
+    // `direct` mode skips the Apps Script relay entirely, so we must
+    // not try to construct the DomainFronter — it errors on a missing
+    // `script_id`, which is exactly the state a direct-mode user is in.
+    let fronter = match mode {
+        Mode::AppsScript | Mode::Full => {
+            let f = DomainFronter::new(config)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+            Some(Arc::new(f))
+        }
+        Mode::Direct => None,
+    };
 
-        let tls_config = if config.verify_ssl {
-            let mut roots = tokio_rustls::rustls::RootCertStore::empty();
-            roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth()
-        } else {
-            ClientConfig::builder()
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoVerify))
-                .with_no_client_auth()
-        };
-        let tls_connector = TlsConnector::from(Arc::new(tls_config));
+    let tls_config = if config.verify_ssl {
+        let mut roots = tokio_rustls::rustls::RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    } else {
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth()
+    };
+    let tls_connector = TlsConnector::from(Arc::new(tls_config));
 
-        // Surface a config combo that is otherwise silently inert: extras
-        // listed under `bypass_doh_hosts` only take effect when the bypass
-        // itself is on. A user who set `tunnel_doh: true` *and* populated
-        // the extras list almost certainly didn't mean to disable the
-        // feature their custom hosts feed into.
-        if config.tunnel_doh && !config.bypass_doh_hosts.is_empty() {
-            tracing::warn!(
-                "config: bypass_doh_hosts has {} entries but tunnel_doh=true — \
+    // Surface a config combo that is otherwise silently inert: extras
+    // listed under `bypass_doh_hosts` only take effect when the bypass
+    // itself is on. A user who set `tunnel_doh: true` *and* populated
+    // the extras list almost certainly didn't mean to disable the
+    // feature their custom hosts feed into.
+    if config.tunnel_doh && !config.bypass_doh_hosts.is_empty() {
+        tracing::warn!(
+            "config: bypass_doh_hosts has {} entries but tunnel_doh=true — \
                  the bypass is off, so the extras have no effect. Set \
                  tunnel_doh=false (or omit it) to use them.",
-                config.bypass_doh_hosts.len()
-            );
-        }
+            config.bypass_doh_hosts.len()
+        );
+    }
 
-        // Same-shape warning for fronting_groups in full mode. The dispatch
-        // short-circuits to the tunnel mux before the fronting_groups check
-        // (full mode preserves end-to-end TLS, fronting_groups requires
-        // MITM), so groups configured here will never fire. Surface this
-        // at startup rather than letting users wonder why their Vercel
-        // domains never hit the configured edge.
-        if mode == Mode::Full && !config.fronting_groups.is_empty() {
-            tracing::warn!(
-                "config: fronting_groups has {} entries but mode=full — \
+    // Same-shape warning for fronting_groups in full mode. The dispatch
+    // short-circuits to the tunnel mux before the fronting_groups check
+    // (full mode preserves end-to-end TLS, fronting_groups requires
+    // MITM), so groups configured here will never fire. Surface this
+    // at startup rather than letting users wonder why their Vercel
+    // domains never hit the configured edge.
+    if mode == Mode::Full && !config.fronting_groups.is_empty() {
+        tracing::warn!(
+            "config: fronting_groups has {} entries but mode=full — \
                  full mode tunnels everything end-to-end through Apps Script \
                  (no MITM), so groups never fire. Switch to mode=apps_script \
                  or mode=direct to use them, or remove the groups to silence \
                  this warning.",
-                config.fronting_groups.len()
-            );
-        }
+            config.fronting_groups.len()
+        );
+    }
 
-        let mut fronting_groups: Vec<Arc<FrontingGroupResolved>> =
-            Vec::with_capacity(config.fronting_groups.len());
-        let mut seen_names: std::collections::HashSet<String> = Default::default();
-        for g in &config.fronting_groups {
-            let resolved = FrontingGroupResolved::from_config(g).map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("fronting_groups['{}']: {}", g.name, e),
-                )
-            })?;
-            // Surface duplicate group names at startup. Not a hard
-            // error — copy-pasted configs can land here legitimately
-            // — but log lines key on `name` and dedup ambiguity makes
-            // them unreadable.
-            if !seen_names.insert(resolved.name.clone()) {
-                tracing::warn!(
-                    "fronting group name '{}' is used by more than one group; \
-                     log lines that reference the name will be ambiguous",
-                    resolved.name
-                );
-            }
-            tracing::info!(
-                "fronting group '{}': sni={} ip={} domains={}",
-                resolved.name,
-                resolved.sni,
-                resolved.ip,
-                resolved.domains_normalized.len()
-            );
-            fronting_groups.push(Arc::new(resolved));
-        }
-
-        let resolved_routing = ResolvedRouting::from_config(config, mode);
-        if resolved_routing.exit_node_full_mode_active && !config.youtube_via_relay {
-            tracing::info!(
-                "exit_node.mode=full → routing YouTube through relay (upstream commit 88b2767)"
-            );
-        }
-        if !resolved_routing.relay_url_patterns.is_empty() {
-            tracing::info!(
-                "relay_url_patterns: MITM forced on {}; relay only for: {}",
-                resolved_routing.force_mitm_hosts.join(", "),
-                resolved_routing.relay_url_patterns.join(", "),
-            );
-        }
-        if !resolved_routing.skipped_force_mitm_hosts.is_empty() {
+    let mut fronting_groups: Vec<Arc<FrontingGroupResolved>> =
+        Vec::with_capacity(config.fronting_groups.len());
+    let mut seen_names: std::collections::HashSet<String> = Default::default();
+    for g in &config.fronting_groups {
+        let resolved = FrontingGroupResolved::from_config(g).map_err(|e| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("fronting_groups['{}']: {}", g.name, e),
+            )
+        })?;
+        // Surface duplicate group names at startup. Not a hard
+        // error — copy-pasted configs can land here legitimately
+        // — but log lines key on `name` and dedup ambiguity makes
+        // them unreadable.
+        if !seen_names.insert(resolved.name.clone()) {
             tracing::warn!(
-                "relay_url_patterns: ignoring path-routing for {} — host is not in \
+                "fronting group name '{}' is used by more than one group; \
+                     log lines that reference the name will be ambiguous",
+                resolved.name
+            );
+        }
+        tracing::info!(
+            "fronting group '{}': sni={} ip={} domains={}",
+            resolved.name,
+            resolved.sni,
+            resolved.ip,
+            resolved.domains_normalized.len()
+        );
+        fronting_groups.push(Arc::new(resolved));
+    }
+
+    let resolved_routing = ResolvedRouting::from_config(config, mode);
+    if resolved_routing.exit_node_full_mode_active && !config.youtube_via_relay {
+        tracing::info!(
+            "exit_node.mode=full → routing YouTube through relay (upstream commit 88b2767)"
+        );
+    }
+    if !resolved_routing.relay_url_patterns.is_empty() {
+        tracing::info!(
+            "relay_url_patterns: MITM forced on {}; relay only for: {}",
+            resolved_routing.force_mitm_hosts.join(", "),
+            resolved_routing.relay_url_patterns.join(", "),
+        );
+    }
+    if !resolved_routing.skipped_force_mitm_hosts.is_empty() {
+        tracing::warn!(
+            "relay_url_patterns: ignoring path-routing for {} — host is not in \
                  SNI_REWRITE_SUFFIXES, so the SNI-rewrite forwarder would return a \
                  wrong-origin response from the Google edge. Patterns matching this \
                  host still route through the relay if the host is reached, but \
                  non-matching paths fall back to the regular dispatch.",
-                resolved_routing.skipped_force_mitm_hosts.join(", "),
-            );
-        }
-        if !resolved_routing.suppressed_yt_patterns.is_empty() {
-            tracing::warn!(
-                "relay_url_patterns: dropped {} — youtube_via_relay (or \
+            resolved_routing.skipped_force_mitm_hosts.join(", "),
+        );
+    }
+    if !resolved_routing.suppressed_yt_patterns.is_empty() {
+        tracing::warn!(
+            "relay_url_patterns: dropped {} — youtube_via_relay (or \
                  exit_node.mode=full) routes all YouTube through the relay \
                  already, so a YT-host path filter would route non-matching \
                  paths through the SNI-rewrite forwarder and partially defeat \
                  the full-relay contract. Remove these entries from \
                  config.json to silence this warning.",
-                resolved_routing.suppressed_yt_patterns.join(", "),
-            );
-        }
+            resolved_routing.suppressed_yt_patterns.join(", "),
+        );
+    }
 
-        // Fronting groups are dispatched BEFORE the force-MITM check
-        // (`dispatch_tunnel` step 2a vs 2). That precedence is intentional
-        // — a user adding `youtube.com` to a fronting group is making a
-        // deliberate "send all of YT through this alternate edge" choice
-        // and the path filter, which assumes the Google edge handles the
-        // request, would land at the wrong upstream. But the silent
-        // override is a footgun if the user didn't realise the two
-        // features overlap, so surface it at startup with both names
-        // and the resolved precedence.
-        for forced in &resolved_routing.force_mitm_hosts {
-            for g in &fronting_groups {
-                let overlaps = g.domains_normalized.iter().any(|d| {
-                    forced == d
-                        || forced.ends_with(&format!(".{}", d))
-                        || d.ends_with(&format!(".{}", forced))
-                });
-                if overlaps {
-                    tracing::warn!(
-                        "config: fronting group '{}' covers host '{}', which is also \
+    // Fronting groups are dispatched BEFORE the force-MITM check
+    // (`dispatch_tunnel` step 2a vs 2). That precedence is intentional
+    // — a user adding `youtube.com` to a fronting group is making a
+    // deliberate "send all of YT through this alternate edge" choice
+    // and the path filter, which assumes the Google edge handles the
+    // request, would land at the wrong upstream. But the silent
+    // override is a footgun if the user didn't realise the two
+    // features overlap, so surface it at startup with both names
+    // and the resolved precedence.
+    for forced in &resolved_routing.force_mitm_hosts {
+        for g in &fronting_groups {
+            let overlaps = g.domains_normalized.iter().any(|d| {
+                forced == d
+                    || forced.ends_with(&format!(".{}", d))
+                    || d.ends_with(&format!(".{}", forced))
+            });
+            if overlaps {
+                tracing::warn!(
+                    "config: fronting group '{}' covers host '{}', which is also \
                          in relay_url_patterns. Fronting-group dispatch wins — the \
                          path filter will NOT run for this host. Remove the host \
                          from the fronting group if you want path-pinned relay routing.",
-                        g.name,
-                        forced,
-                    );
-                }
+                    g.name,
+                    forced,
+                );
             }
         }
-        let ResolvedRouting {
-            youtube_via_relay_effective,
-            relay_url_patterns: resolved_patterns,
-            force_mitm_hosts,
-            skipped_force_mitm_hosts: _,
-            suppressed_yt_patterns: _,
-            exit_node_full_mode_active,
-        } = resolved_routing;
+    }
+    let ResolvedRouting {
+        youtube_via_relay_effective,
+        relay_url_patterns: resolved_patterns,
+        force_mitm_hosts,
+        skipped_force_mitm_hosts: _,
+        suppressed_yt_patterns: _,
+        exit_node_full_mode_active,
+    } = resolved_routing;
 
-        let rewrite_ctx = Arc::new(RewriteCtx {
-            google_ip: config.google_ip.clone(),
-            front_domain: config.front_domain.clone(),
-            hosts: config.hosts.clone(),
-            tls_connector,
-            upstream_socks5: config.upstream_socks5.clone(),
-            mode,
-            youtube_via_relay: youtube_via_relay_effective,
-            relay_url_patterns: resolved_patterns,
-            force_mitm_hosts,
-            exit_node_full_mode_active,
-            passthrough_hosts: config.passthrough_hosts.clone(),
-            block_quic: config.block_quic,
-            bypass_doh: !config.tunnel_doh,
-            block_doh: config.block_doh,
-            bypass_doh_hosts: config.bypass_doh_hosts.clone(),
-            fronting_groups,
-        });
+    let rewrite_ctx = Arc::new(RewriteCtx {
+        google_ip: config.google_ip.clone(),
+        front_domain: config.front_domain.clone(),
+        hosts: config.hosts.clone(),
+        tls_connector,
+        upstream_socks5: config.upstream_socks5.clone(),
+        mode,
+        youtube_via_relay: youtube_via_relay_effective,
+        relay_url_patterns: resolved_patterns,
+        force_mitm_hosts,
+        exit_node_full_mode_active,
+        passthrough_hosts: config.passthrough_hosts.clone(),
+        block_quic: config.block_quic,
+        bypass_doh: !config.tunnel_doh,
+        block_doh: config.block_doh,
+        bypass_doh_hosts: config.bypass_doh_hosts.clone(),
+        fronting_groups,
+    });
 
-        let socks5_port = config.socks5_port.unwrap_or(config.listen_port + 1);
+    Ok((fronter, rewrite_ctx, mode))
+}
 
-        Ok(Self {
-            host: config.listen_host.clone(),
-            port: config.listen_port,
-            socks5_port,
-            fronter,
-            mitm,
-            rewrite_ctx,
-            tunnel_mux: None, // initialized in run() inside the tokio runtime
-            coalesce_step_ms: if config.coalesce_step_ms > 0 {
-                config.coalesce_step_ms as u64
-            } else {
-                10
-            },
-            coalesce_max_ms: if config.coalesce_max_ms > 0 {
-                config.coalesce_max_ms as u64
-            } else {
-                1000
-            },
-        })
+/// Pick out `TunnelMux` coalesce knobs from a `Config`, applying the
+/// "0 → default" semantics (step=10ms, max=1000ms). Lives outside
+/// `RuntimeState::new` / `switch_mode` so both paths produce identical
+/// values for the same config — a live switch updates the runtime's
+/// atomics from this, so editing `coalesce_*_ms` and toggling into
+/// Full mode picks up the new values rather than the ones captured at
+/// startup. Returns `(step_ms, max_ms)`.
+fn resolve_coalesce(config: &Config) -> (u64, u64) {
+    let step = if config.coalesce_step_ms > 0 {
+        config.coalesce_step_ms as u64
+    } else {
+        10
+    };
+    let max = if config.coalesce_max_ms > 0 {
+        config.coalesce_max_ms as u64
+    } else {
+        1000
+    };
+    (step, max)
+}
+
+/// Spawn the mode-dependent background tasks for `fronter` (keepalive,
+/// pool refill, periodic stats log) and a one-shot pool warm. Used by
+/// both `RuntimeState::run` at startup and `switch_mode` after a swap
+/// into a mode that needs a fronter. Caller holds the `mode_tasks`
+/// mutex; tasks are stored under that guard so a subsequent abort sees
+/// every handle.
+///
+/// Idempotent — aborts any prior tasks on `tasks` before spawning fresh
+/// ones. That matters because the UI can call `switch_mode` between
+/// `Cmd::Start` flipping `running = true` and `run()` reaching its
+/// startup spawn point; without the abort-first contract, the switch's
+/// tasks would be silently dropped by `run()`'s subsequent overwrite.
+fn spawn_mode_tasks(tasks: &mut ModeTasks, fronter: Arc<DomainFronter>) {
+    tasks.abort_all();
+    // Pre-warm — runs to completion and exits, but tracked so a switch
+    // landing inside its window can abort the old warmup along with the
+    // rest of the bag.
+    tasks.warm = Some(tokio::spawn({
+        let f = fronter.clone();
+        async move {
+            let n = f.num_scripts().clamp(6, 16);
+            f.warm(n).await;
+        }
+    }));
+    tasks.keepalive = Some(tokio::spawn({
+        let f = fronter.clone();
+        async move { f.run_keepalive().await }
+    }));
+    tasks.refill = Some(tokio::spawn({
+        let f = fronter.clone();
+        async move { f.run_pool_refill().await }
+    }));
+    tasks.stats = Some(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            let s = fronter.snapshot_stats();
+            if s.relay_calls > 0 || s.cache_hits > 0 {
+                tracing::info!("{}", s.fmt_line());
+            }
+        }
+    }));
+}
+
+impl ProxyServer {
+    pub fn new(config: &Config, mitm: Arc<Mutex<MitmCertManager>>) -> Result<Self, ProxyError> {
+        let state = RuntimeState::new(config, mitm)?;
+        Ok(Self { state })
     }
 
     pub fn fronter(&self) -> Option<Arc<DomainFronter>> {
-        self.fronter.clone()
+        self.state.fronter()
     }
+
+    /// Hand out the shared runtime handle. The caller (UI background thread)
+    /// holds it alongside the spawned run-future's `JoinHandle` so a
+    /// `Cmd::SwitchMode` can invoke `state.switch_mode(...)` without
+    /// stopping the proxy.
+    pub fn state(&self) -> Arc<RuntimeState> {
+        self.state.clone()
+    }
+
     pub async fn run(
-        mut self,
-        mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+        self,
+        shutdown_rx: tokio::sync::oneshot::Receiver<()>,
     ) -> Result<(), ProxyError> {
-        // Initialize TunnelMux inside the runtime (tokio::spawn requires it).
-        if self.rewrite_ctx.mode == Mode::Full {
-            if let Some(f) = self.fronter.as_ref() {
-                self.tunnel_mux = Some(TunnelMux::start(
-                    f.clone(),
-                    self.coalesce_step_ms,
-                    self.coalesce_max_ms,
-                ));
+        self.state.run(shutdown_rx).await
+    }
+}
+
+impl RuntimeState {
+    pub fn new(
+        config: &Config,
+        mitm: Arc<Mutex<MitmCertManager>>,
+    ) -> Result<Arc<Self>, ProxyError> {
+        let (fronter, rewrite_ctx, _mode) = build_mode_state(config)?;
+        let socks5_port = config.socks5_port.unwrap_or(config.listen_port + 1);
+        let bundle = Arc::new(ModeBundle {
+            rewrite_ctx,
+            fronter,
+            // TunnelMux is spawned in `run()` because `TunnelMux::start`
+            // calls `tokio::spawn` internally and needs a runtime.
+            tunnel_mux: None,
+        });
+        let (coalesce_step, coalesce_max) = resolve_coalesce(config);
+        Ok(Arc::new(Self {
+            host: config.listen_host.clone(),
+            port: config.listen_port,
+            socks5_port,
+            bundle: ArcSwap::from(bundle),
+            mitm,
+            mode_tasks: Mutex::new(ModeTasks::default()),
+            coalesce_step_ms: AtomicU64::new(coalesce_step),
+            coalesce_max_ms: AtomicU64::new(coalesce_max),
+            switch_lock: Mutex::new(()),
+            stopped: AtomicBool::new(false),
+        }))
+    }
+
+    /// Cheap accessor exposed to UI / JNI / CLI callers so they don't have
+    /// to know that `ModeBundle` is wrapped in `ArcSwap`.
+    pub fn fronter(&self) -> Option<Arc<DomainFronter>> {
+        self.bundle.load().fronter.clone()
+    }
+
+    /// Mode the proxy is currently serving traffic in. UI uses this for
+    /// "what mode is *actually* live right now" displays (status badge,
+    /// rollback target on a failed switch). Keeps the `ArcSwap` /
+    /// `ModeBundle` details out of callers.
+    pub fn current_mode(&self) -> Mode {
+        self.bundle.load().rewrite_ctx.mode
+    }
+
+    pub async fn run(
+        self: Arc<Self>,
+        shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), ProxyError> {
+        // Trampoline so every exit path (bind failure, accept-loop
+        // crash, normal shutdown) funnels through the same cleanup
+        // epilog. The previous shape only cleaned up inside the
+        // shutdown arm of `select!`, which meant a bind failure after a
+        // racing `switch_mode` had already spawned mode_tasks would
+        // leak those tasks: run() returned via `?` and the UI's spawn
+        // dropped the JoinHandle but the keepalive / refill / stats
+        // tasks held their own `Arc<DomainFronter>` and kept pinging.
+        let result = self.clone().run_inner(shutdown_rx).await;
+
+        // Unconditional cleanup: set `stopped` (so any switch_mode
+        // currently waiting on `switch_lock` bails on resumption),
+        // abort whatever mode_tasks are populated, and drop any live
+        // `TunnelMux` out of the bundle.
+        //
+        // Why drop the mux: `TunnelMux::start` spawns a `mux_loop`
+        // task that captures its own `Arc<DomainFronter>` and lives
+        // for as long as any `Arc<TunnelMux>` exists. `abort_all`
+        // only reaches the keepalive/refill/stats/warm tasks — the
+        // mux_loop is NOT in `mode_tasks`. Leaving `tunnel_mux` in
+        // the bundle means the mux_loop (and its captured fronter)
+        // outlive `run()`'s return until the UI eventually releases
+        // its `Arc<RuntimeState>`, which is observable as the fronter
+        // still pinging Apps Script for a window after Stop. Clearing
+        // it here drops the only stable `Arc<TunnelMux>`, so the
+        // mux_loop's mpsc Sender drops and the loop exits naturally.
+        //
+        // Idempotent: the shutdown arm of run_inner already aborts
+        // accept tasks; running cleanup a second time on a bundle
+        // that already has `tunnel_mux: None` is a no-op (guarded
+        // below).
+        {
+            let _g = self.switch_lock.lock().await;
+            self.stopped.store(true, Ordering::SeqCst);
+            self.mode_tasks.lock().await.abort_all();
+            let cur = self.bundle.load_full();
+            if cur.tunnel_mux.is_some() {
+                self.bundle.store(Arc::new(ModeBundle {
+                    rewrite_ctx: cur.rewrite_ctx.clone(),
+                    fronter: cur.fronter.clone(),
+                    tunnel_mux: None,
+                }));
             }
         }
 
+        result
+    }
+
+    async fn run_inner(
+        self: Arc<Self>,
+        mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    ) -> Result<(), ProxyError> {
+        // Bind listeners FIRST. Both binds are the only fallible step in
+        // the startup path; doing them before any task spawn means a
+        // bind failure (port already in use, permission denied) returns
+        // `Err` with nothing locally spawned to clean up. Tasks spawned
+        // by a racing switch_mode are reaped in the outer `run()`'s
+        // cleanup epilog.
         let http_addr = format!("{}:{}", self.host, self.port);
         let socks_addr = format!("{}:{}", self.host, self.socks5_port);
         let http_listener = TcpListener::bind(&http_addr).await?;
@@ -987,77 +1267,47 @@ impl ProxyServer {
             "Listening SOCKS5 on {} — xray / Telegram / app-level SOCKS5 clients use this.",
             socks_addr
         );
-        // Pre-warm the outbound connection pool so the user's first request
-        // doesn't pay a fresh TLS handshake to Google edge. Best-effort;
-        // failures are logged and ignored. Skipped in `direct` mode —
-        // there is no fronter to warm.
-        //
-        // Sized to roughly match a browser's parallel-connection burst at
-        // startup. The previous fixed `3` was fine for a single deployment
-        // but left requests 4-10 of the opening burst paying a cold TLS
-        // handshake each (~300ms). Scaling with deployment count gives
-        // multi-account configs a proportionally warmer pool, capped so
-        // single-deployment users don't hammer Google edge unnecessarily.
-        if let Some(warm_fronter) = self.fronter.clone() {
-            let n = warm_fronter.num_scripts().clamp(6, 16);
-            tokio::spawn(async move {
-                warm_fronter.warm(n).await;
-            });
+
+        // Spawn TunnelMux inside the runtime (`TunnelMux::start` calls
+        // `tokio::spawn`). If the starting mode is Full and the bundle
+        // doesn't already have a mux (a `switch_mode` racing Start may
+        // have installed one), install it now so the first connections
+        // see it. Holding `switch_lock` for the whole startup-init block
+        // serialises this against switch_mode so we don't overwrite each
+        // other's bundle.
+        {
+            let _g = self.switch_lock.lock().await;
+            let cur = self.bundle.load_full();
+            if cur.rewrite_ctx.mode == Mode::Full
+                && cur.tunnel_mux.is_none()
+                && cur.fronter.is_some()
+            {
+                let f = cur.fronter.clone().unwrap();
+                let step = self.coalesce_step_ms.load(Ordering::Relaxed);
+                let max = self.coalesce_max_ms.load(Ordering::Relaxed);
+                let mux = TunnelMux::start(f, step, max);
+                self.bundle.store(Arc::new(ModeBundle {
+                    rewrite_ctx: cur.rewrite_ctx.clone(),
+                    fronter: cur.fronter.clone(),
+                    tunnel_mux: Some(mux),
+                }));
+            }
+
+            // Mode-dependent background tasks (warm + keepalive + refill +
+            // stats) are owned by `mode_tasks` so `switch_mode` can abort
+            // them and respawn the new mode's set atomically. Skip if a
+            // racing switch_mode already populated them — its set is on
+            // the *current* fronter (we re-read the bundle above under
+            // the switch_lock).
+            if let Some(f) = self.bundle.load().fronter.clone() {
+                let mut tasks = self.mode_tasks.lock().await;
+                if tasks.is_empty() {
+                    spawn_mode_tasks(&mut tasks, f);
+                }
+            }
         }
 
-        // Apps Script container keepalive. `warm()` above keeps the TCP
-        // pool warm at startup, but the V8 container behind UrlFetchApp
-        // goes cold after ~5min idle and costs 1-3s to wake. A periodic
-        // HEAD ping prevents the cold-start lag on the first request
-        // after a quiet pause (most visible as YouTube player stalls).
-        // Skipped in direct mode for the same reason as warm —
-        // there's no fronter to ping.
-        //
-        // The handle is captured (not fire-and-forget) so the shutdown
-        // arm of the select! below can abort it. Without that, hitting
-        // Stop in the UI would leave the keepalive holding an
-        // Arc<DomainFronter> on stale config and pinging Apps Script
-        // every 240s — same class of bug that issue #99 hit for the
-        // accept loops.
-        let keepalive_task = if let Some(keepalive_fronter) = self.fronter.clone() {
-            tokio::spawn(async move {
-                keepalive_fronter.run_keepalive().await;
-            })
-        } else {
-            tokio::spawn(async move { std::future::pending::<()>().await })
-        };
-
-        // Background pool refill: keeps at least POOL_MIN ready TLS
-        // connections so acquire() never pays a cold handshake.
-        let refill_task = if let Some(refill_fronter) = self.fronter.clone() {
-            tokio::spawn(async move {
-                refill_fronter.run_pool_refill().await;
-            })
-        } else {
-            tokio::spawn(async move { std::future::pending::<()>().await })
-        };
-
-        let stats_task = if let Some(stats_fronter) = self.fronter.clone() {
-            tokio::spawn(async move {
-                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                ticker.tick().await;
-                loop {
-                    ticker.tick().await;
-                    let s = stats_fronter.snapshot_stats();
-                    if s.relay_calls > 0 || s.cache_hits > 0 {
-                        tracing::info!("{}", s.fmt_line());
-                    }
-                }
-            })
-        } else {
-            tokio::spawn(async move { std::future::pending::<()>().await })
-        };
-
-        let http_fronter = self.fronter.clone();
-        let http_mitm = self.mitm.clone();
-        let http_ctx = self.rewrite_ctx.clone();
-        let http_mux = self.tunnel_mux.clone();
+        let accept_state = self.clone();
         let mut http_task = tokio::spawn(async move {
             let mut fd_exhaust_count: u64 = 0;
             // Track every per-client child task in a JoinSet so that when
@@ -1088,10 +1338,16 @@ impl ProxyServer {
                     }
                 };
                 let _ = sock.set_nodelay(true);
-                let fronter = http_fronter.clone();
-                let mitm = http_mitm.clone();
-                let rewrite_ctx = http_ctx.clone();
-                let mux = http_mux.clone();
+                // Load the current bundle ONCE per accepted connection so
+                // (ctx, fronter, mux) stay self-consistent for the lifetime
+                // of this handler even if `switch_mode` races. A `switch_mode`
+                // happening between this load and the spawn just means the
+                // *next* accept sees the new state.
+                let bundle = accept_state.bundle.load_full();
+                let mitm = accept_state.mitm.clone();
+                let fronter = bundle.fronter.clone();
+                let rewrite_ctx = bundle.rewrite_ctx.clone();
+                let mux = bundle.tunnel_mux.clone();
                 children.spawn(async move {
                     if let Err(e) = handle_http_client(sock, fronter, mitm, rewrite_ctx, mux).await
                     {
@@ -1101,10 +1357,7 @@ impl ProxyServer {
             }
         });
 
-        let socks_fronter = self.fronter.clone();
-        let socks_mitm = self.mitm.clone();
-        let socks_ctx = self.rewrite_ctx.clone();
-        let socks_mux = self.tunnel_mux.clone();
+        let accept_state2 = self.clone();
         let mut socks_task = tokio::spawn(async move {
             let mut fd_exhaust_count: u64 = 0;
             // Same pattern as http_task above — JoinSet so shutdown
@@ -1125,10 +1378,11 @@ impl ProxyServer {
                     }
                 };
                 let _ = sock.set_nodelay(true);
-                let fronter = socks_fronter.clone();
-                let mitm = socks_mitm.clone();
-                let rewrite_ctx = socks_ctx.clone();
-                let mux = socks_mux.clone();
+                let bundle = accept_state2.bundle.load_full();
+                let mitm = accept_state2.mitm.clone();
+                let fronter = bundle.fronter.clone();
+                let rewrite_ctx = bundle.rewrite_ctx.clone();
+                let mux = bundle.tunnel_mux.clone();
                 children.spawn(async move {
                     if let Err(e) =
                         handle_socks5_client(sock, fronter, mitm, rewrite_ctx, mux).await
@@ -1139,19 +1393,152 @@ impl ProxyServer {
             }
         });
 
+        // The outer `run()` cleanup epilog handles `stopped` +
+        // `mode_tasks.abort_all()`. Inside `select!` we still need to
+        // abort the OTHER accept task on every exit path — dropping a
+        // `JoinHandle` only detaches it, so without an explicit
+        // `.abort()` the sibling listener would stay bound and serving
+        // even after `run()` returned.
+        //
+        // The two non-shutdown arms propagate the anomaly as an `Err`
+        // rather than logging and returning `Ok(())`. Reaching those
+        // arms means the accept loop exited on its own, which — given
+        // the loop has no `break` — can only happen via panic (caught
+        // by tokio into `JoinError::is_panic()`). Surfacing that as
+        // `ProxyError::Io` lets the UI background thread distinguish
+        // "user clicked Stop" from "proxy crashed" and show an error
+        // line instead of a silent "proxy stopped". `is_cancelled()`
+        // is still treated as a clean exit because it only happens if
+        // somebody aborted the task from outside this `select!`, which
+        // is currently unreachable but worth not flagging if it ever
+        // becomes a thing.
         tokio::select! {
             biased;
             _ = &mut shutdown_rx => {
                 tracing::info!("Shutdown signal received, stopping listeners");
-                stats_task.abort();
-                keepalive_task.abort();
-                refill_task.abort();
                 http_task.abort();
                 socks_task.abort();
             }
-            _ = &mut http_task => {}
-            _ = &mut socks_task => {}
+            res = &mut http_task => {
+                socks_task.abort();
+                match res {
+                    Ok(()) => {
+                        return Err(std::io::Error::other(
+                            "http accept loop exited unexpectedly",
+                        )
+                        .into());
+                    }
+                    Err(e) if !e.is_cancelled() => {
+                        return Err(std::io::Error::other(format!(
+                            "http accept loop ended unexpectedly: {e}"
+                        ))
+                        .into());
+                    }
+                    Err(_) => {}
+                }
+            }
+            res = &mut socks_task => {
+                http_task.abort();
+                match res {
+                    Ok(()) => {
+                        return Err(std::io::Error::other(
+                            "socks5 accept loop exited unexpectedly",
+                        )
+                        .into());
+                    }
+                    Err(e) if !e.is_cancelled() => {
+                        return Err(std::io::Error::other(format!(
+                            "socks5 accept loop ended unexpectedly: {e}"
+                        ))
+                        .into());
+                    }
+                    Err(_) => {}
+                }
+            }
         }
+
+        Ok(())
+    }
+
+    /// Hot-swap the proxy into a new mode (or rebuild the fronter/mux with
+    /// fresh config) without touching the bound listeners. The accept loops
+    /// pick up the new `ModeBundle` on their next `accept().await`; in-flight
+    /// requests keep their already-cloned arcs to completion.
+    ///
+    /// `apply` semantics: this always rebuilds the bundle from `new_config`,
+    /// even when the mode kind is unchanged — so a user editing
+    /// `script_id` / `passthrough_hosts` / `fronting_groups` while running
+    /// gets the new settings on the next connection. The listen host/port
+    /// in `new_config` are ignored; changing those requires Stop + Start
+    /// since rebinding a socket is fundamentally observable to clients.
+    /// `coalesce_step_ms` / `coalesce_max_ms` ARE picked up — they're
+    /// stored as atomics on `RuntimeState` and a Full-mode switch reads
+    /// the current values for `TunnelMux::start`.
+    ///
+    /// Returns `Err(ProxyError::ShuttingDown)` if the proxy has already
+    /// been stopped (or is in the middle of stopping). Callers should
+    /// treat that as a no-op, not a UI-surfaced error — it just means
+    /// the user clicked Stop while a SwitchMode was queued.
+    pub async fn switch_mode(self: &Arc<Self>, new_config: &Config) -> Result<(), ProxyError> {
+        let _g = self.switch_lock.lock().await;
+        // Re-check `stopped` under the lock: the shutdown arm of `run()`
+        // sets this also under `switch_lock`, so once we hold the lock
+        // either (a) shutdown has not yet run and stopped == false, or
+        // (b) shutdown has run, stopped == true, and we must NOT spawn
+        // tasks because nothing will abort them.
+        if self.stopped.load(Ordering::SeqCst) {
+            return Err(ProxyError::ShuttingDown);
+        }
+
+        // Build the new state BEFORE touching live state — if config parse
+        // or DomainFronter::new fails, the running proxy stays on its
+        // current bundle untouched. Errors propagate to the UI.
+        let (new_fronter, new_ctx, new_mode) = build_mode_state(new_config)?;
+        // Pick up coalesce edits from `new_config` so a Full-mode switch
+        // honours the latest tuning. Stored as the runtime's "current
+        // snapshot" so subsequent switches (and any future `run()`
+        // restarts, although that path doesn't exist today) see them too.
+        let (new_step, new_max) = resolve_coalesce(new_config);
+        self.coalesce_step_ms.store(new_step, Ordering::Relaxed);
+        self.coalesce_max_ms.store(new_max, Ordering::Relaxed);
+        let new_mux = if new_mode == Mode::Full {
+            new_fronter
+                .as_ref()
+                .map(|f| TunnelMux::start(f.clone(), new_step, new_max))
+        } else {
+            None
+        };
+
+        // Abort old mode tasks BEFORE the swap so the old fronter's refcount
+        // can drop. The accept loops still see the old bundle until the
+        // store() below; that's fine — they don't read `mode_tasks`.
+        {
+            let mut tasks = self.mode_tasks.lock().await;
+            tasks.abort_all();
+        }
+
+        let prev_mode = self.bundle.load().rewrite_ctx.mode;
+        self.bundle.store(Arc::new(ModeBundle {
+            rewrite_ctx: new_ctx,
+            fronter: new_fronter.clone(),
+            tunnel_mux: new_mux,
+        }));
+
+        if let Some(f) = new_fronter {
+            let mut tasks = self.mode_tasks.lock().await;
+            // Tasks could only land here on a stopped runtime if a Stop
+            // raced past the early `stopped` check above (the shutdown
+            // arm takes `switch_lock` and sets `stopped` before
+            // releasing). The early check inside `switch_lock` makes
+            // that impossible by construction; spawn unconditionally.
+            spawn_mode_tasks(&mut tasks, f);
+        }
+
+        tracing::warn!(
+            "Mode switched live: {} → {} (listeners unchanged)",
+            prev_mode.as_str(),
+            new_mode.as_str(),
+        );
 
         Ok(())
     }
@@ -5576,5 +5963,649 @@ mod tests {
         // Matchers must agree on membership of the parent.
         assert!(!host_in_force_mitm_list("youtube.com", &force));
         assert!(!host_in_force_mitm_list("www.youtube.com", &force));
+    }
+
+    // ── Live-switch lifecycle tests ─────────────────────────────────────
+    // Cover three contracts: switch-vs-shutdown safety (no spawning
+    // after Stop), error paths leaving the bundle untouched, and
+    // mode-task lifecycle (abort-on-switch, no leaks).
+
+    fn switch_test_direct_config() -> crate::config::Config {
+        serde_json::from_str(r#"{"mode": "direct"}"#).unwrap()
+    }
+
+    fn switch_test_apps_script_config() -> crate::config::Config {
+        serde_json::from_str(
+            r#"{
+                "mode": "apps_script",
+                "auth_key": "secret-test-secret-test",
+                "script_id": "X"
+            }"#,
+        )
+        .unwrap()
+    }
+
+    fn switch_test_full_config() -> crate::config::Config {
+        // Full-tunnel mode shares its DomainFronter::new validation
+        // contract with apps_script (script_id is the only required
+        // field for `DomainFronter::new` itself; runtime tunnel-node
+        // settings are validated elsewhere and not exercised here).
+        // What's *unique* about Full mode for switch_mode is that the
+        // ModeBundle ends up with `Some(tunnel_mux)` — the path that
+        // calls `TunnelMux::start`.
+        serde_json::from_str(
+            r#"{
+                "mode": "full",
+                "auth_key": "secret-test-secret-test",
+                "script_id": "X"
+            }"#,
+        )
+        .unwrap()
+    }
+
+    fn switch_test_invalid_apps_script_config() -> crate::config::Config {
+        // apps_script without script_id — DomainFronter::new will reject
+        // with "no script_id configured". Used to verify the error path
+        // through switch_mode leaves the live bundle untouched.
+        serde_json::from_str(r#"{"mode": "apps_script"}"#).unwrap()
+    }
+
+    /// Build a `RuntimeState` for tests. Returns the `TempDir` alongside
+    /// so the caller can keep it alive for the test's scope — the
+    /// underlying `MitmCertManager` reads CA key+cert into memory at
+    /// construction and doesn't touch them again, so the TempDir can
+    /// safely drop at end of scope (cleaning up the generated `ca/ca.key`
+    /// material). A previous shape leaked the TempDir via
+    /// `std::mem::forget`, which left CA private keys littering the
+    /// host's temp directory after every test run.
+    async fn make_runtime_state(
+        cfg: &crate::config::Config,
+    ) -> (Arc<RuntimeState>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mitm = MitmCertManager::new_in(tmp.path()).expect("mitm init");
+        let mitm = Arc::new(Mutex::new(mitm));
+        let state = RuntimeState::new(cfg, mitm).expect("runtime state");
+        (state, tmp)
+    }
+
+    #[tokio::test]
+    async fn switch_direct_to_apps_script_swaps_mode_and_populates_fronter() {
+        let (state, _tmp) = make_runtime_state(&switch_test_direct_config()).await;
+        assert_eq!(state.bundle.load().rewrite_ctx.mode, Mode::Direct);
+        assert!(state.bundle.load().fronter.is_none());
+        // No tasks at rest — `run()` hasn't been called, switch_mode
+        // hasn't either.
+        assert!(state.mode_tasks.lock().await.is_empty());
+
+        state
+            .switch_mode(&switch_test_apps_script_config())
+            .await
+            .expect("switch ok");
+
+        let cur = state.bundle.load();
+        assert_eq!(cur.rewrite_ctx.mode, Mode::AppsScript);
+        assert!(cur.fronter.is_some());
+        // switch_mode must have spawned the fronter's background tasks.
+        assert!(!state.mode_tasks.lock().await.is_empty());
+
+        // Clean up so the tokio runtime can tear down without warning
+        // about still-running background tasks.
+        state.mode_tasks.lock().await.abort_all();
+    }
+
+    #[tokio::test]
+    async fn switch_direct_to_full_starts_tunnel_mux() {
+        // Exercises the Full-mode branch of switch_mode: bundle gets a
+        // `Some(tunnel_mux)` from `TunnelMux::start`, fronter is built
+        // the same way as apps_script, and the mode-task set is
+        // spawned. Without this test the `TunnelMux::start` call inside
+        // `switch_mode` is reachable only at process startup via
+        // `RuntimeState::run`'s post-bind init — not by any live-switch
+        // test.
+        let (state, _tmp) = make_runtime_state(&switch_test_direct_config()).await;
+        assert_eq!(state.current_mode(), Mode::Direct);
+        assert!(state.bundle.load().tunnel_mux.is_none());
+
+        state
+            .switch_mode(&switch_test_full_config())
+            .await
+            .expect("switch to full");
+
+        let cur = state.bundle.load();
+        assert_eq!(cur.rewrite_ctx.mode, Mode::Full);
+        assert!(cur.fronter.is_some(), "Full mode must have a fronter");
+        assert!(
+            cur.tunnel_mux.is_some(),
+            "Full mode must install a TunnelMux",
+        );
+        drop(cur);
+        assert!(!state.mode_tasks.lock().await.is_empty());
+
+        // Switching away from Full must clear the mux (next mode has no
+        // tunnel) so its mpsc::Sender drops and the spawned mux_loop
+        // exits naturally.
+        state
+            .switch_mode(&switch_test_direct_config())
+            .await
+            .expect("switch back to direct");
+        let cur = state.bundle.load();
+        assert!(cur.tunnel_mux.is_none(), "direct mode must clear the mux");
+        assert!(cur.fronter.is_none());
+
+        state.mode_tasks.lock().await.abort_all();
+    }
+
+    #[tokio::test]
+    async fn switch_apps_script_to_direct_clears_fronter_and_tasks() {
+        let (state, _tmp) = make_runtime_state(&switch_test_apps_script_config()).await;
+        // Prime apps_script tasks via a no-op switch into the same mode.
+        state
+            .switch_mode(&switch_test_apps_script_config())
+            .await
+            .expect("prime");
+        assert!(!state.mode_tasks.lock().await.is_empty());
+        assert!(state.bundle.load().fronter.is_some());
+
+        state
+            .switch_mode(&switch_test_direct_config())
+            .await
+            .expect("switch to direct");
+
+        let cur = state.bundle.load();
+        assert_eq!(cur.rewrite_ctx.mode, Mode::Direct);
+        assert!(cur.fronter.is_none());
+        // No fronter → spawn_mode_tasks was never called → bag stays
+        // empty. The previous mode's handles were aborted by switch_mode.
+        assert!(state.mode_tasks.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn switch_with_invalid_config_keeps_live_bundle_intact() {
+        let (state, _tmp) = make_runtime_state(&switch_test_direct_config()).await;
+
+        let err = state
+            .switch_mode(&switch_test_invalid_apps_script_config())
+            .await
+            .expect_err("invalid apps_script config must reject");
+        // The DomainFronter::new "no script_id configured" error comes
+        // through as a generic io::Other.
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("script_id") || msg.contains("no script_id"),
+            "unexpected error message: {}",
+            msg
+        );
+
+        // Live bundle untouched.
+        let cur = state.bundle.load();
+        assert_eq!(cur.rewrite_ctx.mode, Mode::Direct);
+        assert!(cur.fronter.is_none());
+        assert!(state.mode_tasks.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn switch_after_stop_bails_and_does_not_spawn_tasks() {
+        // Guards the switch-vs-shutdown contract: if Stop has set
+        // `stopped = true` under `switch_lock`, a later `switch_mode`
+        // must NOT spawn fresh keepalive/refill/stats tasks that
+        // would outlive shutdown.
+        let (state, _tmp) = make_runtime_state(&switch_test_direct_config()).await;
+        {
+            let _g = state.switch_lock.lock().await;
+            state.stopped.store(true, Ordering::SeqCst);
+        }
+        let err = state
+            .switch_mode(&switch_test_apps_script_config())
+            .await
+            .expect_err("must refuse after stop");
+        // The "shutting down" race is its own error variant so the UI
+        // can suppress it. A string-only assertion would be brittle
+        // against future error-message edits.
+        assert!(matches!(err, ProxyError::ShuttingDown), "got {:?}", err);
+
+        // Bundle unchanged.
+        assert_eq!(state.bundle.load().rewrite_ctx.mode, Mode::Direct);
+        // Critical: nothing was spawned — otherwise the test runtime
+        // would be holding orphan tasks pinning DomainFronter alive.
+        assert!(state.mode_tasks.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn spawn_mode_tasks_aborts_prior_handles() {
+        // Belt-and-braces check on the startup-vs-switch race: if the UI
+        // fires SwitchMode between `running = true` and run()'s post-bind
+        // task spawn, run() must not silently leak the switch's task
+        // handles. spawn_mode_tasks aborts prior entries first.
+        let (state, _tmp) = make_runtime_state(&switch_test_apps_script_config()).await;
+        let fronter = state.bundle.load().fronter.clone().expect("apps_script");
+
+        // First pass — populate the bag and grab an `AbortHandle` for the
+        // keepalive task. `AbortHandle::is_finished()` reads the same
+        // completion bit as `JoinHandle::is_finished`, so it's the right
+        // signal to observe whether the next `spawn_mode_tasks` actually
+        // aborted the original.
+        let prior_abort = {
+            let mut tasks = state.mode_tasks.lock().await;
+            spawn_mode_tasks(&mut tasks, fronter.clone());
+            tasks
+                .keepalive
+                .as_ref()
+                .expect("keepalive spawned")
+                .abort_handle()
+        };
+        assert!(
+            !prior_abort.is_finished(),
+            "prior keepalive should still be running before respawn"
+        );
+
+        // Second pass — must abort the first set.
+        {
+            let mut tasks = state.mode_tasks.lock().await;
+            spawn_mode_tasks(&mut tasks, fronter);
+        }
+
+        // Tokio's abort is cooperative — yield once so the runtime can
+        // mark the prior task as finished before we inspect it.
+        for _ in 0..32 {
+            if prior_abort.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            prior_abort.is_finished(),
+            "spawn_mode_tasks must abort the previous keepalive handle",
+        );
+
+        state.mode_tasks.lock().await.abort_all();
+    }
+
+    #[tokio::test]
+    async fn run_bind_failure_leaves_no_mode_tasks_running() {
+        // Regression guard for the startup ordering: bind must happen
+        // BEFORE any spawn_mode_tasks call, so a bind failure returns
+        // cleanly with no orphaned keepalive/refill/stats/warm tasks
+        // pinging the upstream forever.
+        //
+        // Force the failure by binding 127.0.0.1:0 ourselves first, then
+        // pointing RuntimeState at the same address.
+        let blocker = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("blocker bind");
+        let blocked_addr = blocker.local_addr().expect("local_addr");
+        let cfg_json = format!(
+            r#"{{
+                "mode": "apps_script",
+                "auth_key": "secret-test-secret-test",
+                "script_id": "X",
+                "listen_host": "127.0.0.1",
+                "listen_port": {}
+            }}"#,
+            blocked_addr.port(),
+        );
+        let cfg: crate::config::Config = serde_json::from_str(&cfg_json).expect("config parse");
+        let (state, _tmp) = make_runtime_state(&cfg).await;
+
+        // Pre-condition: no tasks at rest.
+        assert!(state.mode_tasks.lock().await.is_empty());
+
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let result = state.clone().run(rx).await;
+        assert!(
+            matches!(result, Err(ProxyError::Io(_))),
+            "expected Io bind failure, got {:?}",
+            result
+        );
+
+        // Post-condition: nothing was spawned. Without the bind-first
+        // ordering this would observe live keepalive/refill/stats handles
+        // (and the test process would still be pinging Apps Script after
+        // the test ended).
+        assert!(
+            state.mode_tasks.lock().await.is_empty(),
+            "bind failure must not leak mode tasks",
+        );
+        // Bundle also should still have no tunnel_mux installed — the
+        // startup mux init runs after bind, so a bind failure must not
+        // have populated it either.
+        assert!(state.bundle.load().tunnel_mux.is_none());
+        // Cleanup epilog also flips `stopped` so any post-failure
+        // switch_mode bails instead of spawning fresh tasks against a
+        // dead listener.
+        assert!(state.stopped.load(Ordering::SeqCst));
+
+        drop(blocker);
+    }
+
+    #[tokio::test]
+    async fn run_bind_failure_after_switch_aborts_switched_in_tasks() {
+        // The harder lifecycle race: a `switch_mode` lands BEFORE
+        // `run()` reaches `bind`, then bind fails. Without the
+        // cleanup epilog on `run()`, the `?` early-return would skip
+        // the shutdown arm and leak the switch's spawned mode_tasks
+        // forever.
+        let blocker = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("blocker bind");
+        let blocked_port = blocker.local_addr().expect("local_addr").port();
+
+        let cfg_json = format!(
+            r#"{{
+                "mode": "direct",
+                "listen_host": "127.0.0.1",
+                "listen_port": {}
+            }}"#,
+            blocked_port,
+        );
+        let cfg: crate::config::Config = serde_json::from_str(&cfg_json).expect("config parse");
+        let (state, _tmp) = make_runtime_state(&cfg).await;
+
+        // Simulate the UI firing SwitchMode between `running = true`
+        // and the spawned `server.run()` reaching its bind call.
+        state
+            .switch_mode(&switch_test_apps_script_config())
+            .await
+            .expect("pre-bind switch");
+        assert!(
+            !state.mode_tasks.lock().await.is_empty(),
+            "pre-bind switch should have spawned tasks",
+        );
+
+        // Now run() — bind will fail because `blocker` still holds
+        // the port. The cleanup epilog must reap the switch's tasks.
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let result = state.clone().run(rx).await;
+        assert!(
+            matches!(result, Err(ProxyError::Io(_))),
+            "expected bind failure, got {:?}",
+            result,
+        );
+
+        assert!(
+            state.mode_tasks.lock().await.is_empty(),
+            "run() cleanup epilog must abort the switch's mode tasks",
+        );
+        assert!(
+            state.stopped.load(Ordering::SeqCst),
+            "run() cleanup epilog must mark the runtime as stopped",
+        );
+
+        // And a subsequent switch_mode is correctly refused.
+        let err = state
+            .switch_mode(&switch_test_apps_script_config())
+            .await
+            .expect_err("switch after stopped must bail");
+        assert!(matches!(err, ProxyError::ShuttingDown));
+
+        drop(blocker);
+    }
+
+    #[tokio::test]
+    async fn run_bind_failure_after_full_switch_clears_tunnel_mux() {
+        // Full-mode flavour of the bind-failure cleanup contract: a
+        // `switch_mode` to Full lands before `run()` reaches `bind`,
+        // installing a `TunnelMux`. Bind then fails. The cleanup
+        // epilog must clear `tunnel_mux` from the bundle so the
+        // `mux_loop` task's mpsc Sender drops and the loop exits —
+        // otherwise the loop (and the `Arc<DomainFronter>` it
+        // captured) outlive `run()` until the UI releases the
+        // `Arc<RuntimeState>` minutes later.
+        let blocker = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("blocker bind");
+        let blocked_port = blocker.local_addr().expect("local_addr").port();
+
+        let cfg_json = format!(
+            r#"{{
+                "mode": "direct",
+                "listen_host": "127.0.0.1",
+                "listen_port": {}
+            }}"#,
+            blocked_port,
+        );
+        let cfg: crate::config::Config = serde_json::from_str(&cfg_json).expect("config parse");
+        let (state, _tmp) = make_runtime_state(&cfg).await;
+
+        // Pre-bind switch into Full → installs TunnelMux + mode tasks.
+        state
+            .switch_mode(&switch_test_full_config())
+            .await
+            .expect("pre-bind full switch");
+        assert!(
+            state.bundle.load().tunnel_mux.is_some(),
+            "Full switch must install a TunnelMux before bind",
+        );
+        assert!(!state.mode_tasks.lock().await.is_empty());
+
+        let (_tx, rx) = tokio::sync::oneshot::channel();
+        let result = state.clone().run(rx).await;
+        assert!(
+            matches!(result, Err(ProxyError::Io(_))),
+            "expected bind failure, got {:?}",
+            result,
+        );
+
+        // Cleanup epilog must drop the mux from the bundle.
+        assert!(
+            state.bundle.load().tunnel_mux.is_none(),
+            "cleanup epilog must clear bundle.tunnel_mux so mux_loop exits",
+        );
+        assert!(state.mode_tasks.lock().await.is_empty());
+        assert!(state.stopped.load(Ordering::SeqCst));
+
+        drop(blocker);
+    }
+
+    #[tokio::test]
+    async fn concurrent_switch_mode_calls_do_not_leak_or_panic() {
+        // The UI now serialises Cmd::SwitchMode via `rt.block_on`, but
+        // the lock-based serialisation in `switch_mode` itself is the
+        // defence-in-depth for any future caller (or test) that spawns
+        // multiple switches concurrently. Spin up several races and
+        // assert that (a) every call returns Ok, (b) the final bundle
+        // matches one of the requested modes, and (c) mode_tasks
+        // contains exactly one fresh set — not several leaked.
+        let (state, _tmp) = make_runtime_state(&switch_test_direct_config()).await;
+
+        // 8 switches: 4 → apps_script, 4 → direct. Random-ish ordering
+        // via tokio's join_all scheduling.
+        let mut handles = Vec::new();
+        for i in 0..8u32 {
+            let s = state.clone();
+            let cfg = if i % 2 == 0 {
+                switch_test_apps_script_config()
+            } else {
+                switch_test_direct_config()
+            };
+            handles.push(tokio::spawn(async move { s.switch_mode(&cfg).await }));
+        }
+        for h in handles {
+            h.await.expect("join").expect("switch ok");
+        }
+
+        // Final mode is whichever one was last to commit under
+        // `switch_lock`. Both are valid outcomes — we just want to
+        // confirm no torn state or panic.
+        let final_mode = state.current_mode();
+        assert!(matches!(final_mode, Mode::AppsScript | Mode::Direct));
+
+        // No leaked tasks: either we're in direct (no fronter, empty
+        // bag) or we're in apps_script (single fresh fronter, four
+        // task handles). Without spawn_mode_tasks's abort_all contract,
+        // back-to-back apps_script switches would have stacked four
+        // sets of handles in the bag.
+        let tasks = state.mode_tasks.lock().await;
+        match final_mode {
+            Mode::Direct => {
+                assert!(tasks.is_empty(), "direct mode should have no tasks");
+            }
+            Mode::AppsScript => {
+                assert!(tasks.keepalive.is_some());
+                assert!(tasks.refill.is_some());
+                assert!(tasks.stats.is_some());
+                assert!(tasks.warm.is_some());
+            }
+            _ => unreachable!(),
+        }
+        drop(tasks);
+        state.mode_tasks.lock().await.abort_all();
+    }
+
+    #[tokio::test]
+    async fn run_startup_races_with_switch_mode_apply_under_lock() {
+        // Models the UI's startup window: a `switch_mode` lands while
+        // `run()` is mid-init. Both serialise under `switch_lock`; the
+        // post-bind init block in `run()` then sees `mode_tasks` already
+        // populated and skips, leaving the switch's set in place.
+        //
+        // Without the bind happening first or the `is_empty()` guard,
+        // either (a) bind failure leaks the switch's tasks or (b) run()
+        // double-spawns and orphans the switch's handles.
+        //
+        // Reserve TWO ports via 0-port probes, drop, then ask run() to
+        // bind both. `socks5_port` defaults to `listen_port + 1`, and
+        // an adjacent port is exactly the kind of thing a sibling
+        // parallel test in the suite tends to be holding — leaving it
+        // implicit would make this test flaky under `cargo test` (the
+        // failure mode being `ProxyError::ShuttingDown` from the
+        // cleanup epilog firing on a bind-failed `run`). Probe both
+        // explicitly so flakes can only come from a genuinely racy
+        // co-tenant on the host, not the test suite itself.
+        let probe_http = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("probe http");
+        let probe_socks = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("probe socks");
+        let http_port = probe_http.local_addr().expect("http addr").port();
+        let socks_port = probe_socks.local_addr().expect("socks addr").port();
+        drop(probe_http);
+        drop(probe_socks);
+
+        let cfg_json = format!(
+            r#"{{
+                "mode": "direct",
+                "listen_host": "127.0.0.1",
+                "listen_port": {},
+                "socks5_port": {}
+            }}"#,
+            http_port, socks_port,
+        );
+        let cfg: crate::config::Config = serde_json::from_str(&cfg_json).expect("config parse");
+        let (state, _tmp) = make_runtime_state(&cfg).await;
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let state_run = state.clone();
+        let run_handle = tokio::spawn(async move { state_run.run(shutdown_rx).await });
+
+        // Tiny yield so run() at least reaches its first await point;
+        // not required for correctness (the lock serialises) but it
+        // makes the race more interesting under loom-like exploration.
+        tokio::task::yield_now().await;
+
+        // Apply a switch concurrently with run()'s startup-init.
+        state
+            .switch_mode(&switch_test_apps_script_config())
+            .await
+            .expect("switch_mode during startup");
+
+        assert_eq!(state.current_mode(), Mode::AppsScript);
+        {
+            let tasks = state.mode_tasks.lock().await;
+            assert!(
+                !tasks.is_empty(),
+                "switch into apps_script must have spawned tasks",
+            );
+        }
+
+        // Tear down cleanly.
+        let _ = shutdown_tx.send(());
+        let run_result = run_handle.await.expect("join run");
+        assert!(
+            run_result.is_ok(),
+            "run() should exit clean: {:?}",
+            run_result
+        );
+
+        // Cleanup epilog must reap the switch's tasks.
+        assert!(
+            state.mode_tasks.lock().await.is_empty(),
+            "shutdown cleanup must abort the switch's mode_tasks",
+        );
+        assert!(state.stopped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn switch_fail_then_success_leaves_consistent_state() {
+        // Covers the proxy-side half of the UI's "fail-A, succeed-B"
+        // sequence: switch_mode must leave the runtime untouched on
+        // failure, and a subsequent success must commit cleanly. The
+        // UI-side `mode_switch_revert` clearing is plumbed separately
+        // (see `Cmd::SwitchMode` Ok-arm); this test pins the underlying
+        // state-machine invariant the UI's bookkeeping depends on.
+        let (state, _tmp) = make_runtime_state(&switch_test_direct_config()).await;
+
+        // Fail-A: apps_script without script_id → DomainFronter rejects.
+        let err = state
+            .switch_mode(&switch_test_invalid_apps_script_config())
+            .await
+            .expect_err("invalid config must fail");
+        assert!(matches!(err, ProxyError::Io(_)));
+        // Live state unchanged.
+        assert_eq!(state.current_mode(), Mode::Direct);
+        assert!(state.bundle.load().fronter.is_none());
+        assert!(state.mode_tasks.lock().await.is_empty());
+
+        // Succeed-B: valid apps_script.
+        state
+            .switch_mode(&switch_test_apps_script_config())
+            .await
+            .expect("valid switch ok");
+        assert_eq!(state.current_mode(), Mode::AppsScript);
+        assert!(state.bundle.load().fronter.is_some());
+        let tasks = state.mode_tasks.lock().await;
+        assert!(tasks.keepalive.is_some());
+        assert!(tasks.refill.is_some());
+        assert!(tasks.stats.is_some());
+        assert!(tasks.warm.is_some());
+        drop(tasks);
+
+        state.mode_tasks.lock().await.abort_all();
+    }
+
+    #[tokio::test]
+    async fn switch_mode_picks_up_edited_coalesce_knobs() {
+        // Live switches must read coalesce_*_ms from the new config,
+        // not from the values captured at startup. Most observable in
+        // a switch into Full mode where the new TunnelMux is built
+        // with the runtime's current snapshot — without this, a user
+        // edits `coalesce_max_ms`, switches to Full, and the mux uses
+        // the old value while the form claims the new one is live.
+        let mut start_cfg = switch_test_direct_config();
+        start_cfg.coalesce_step_ms = 5;
+        start_cfg.coalesce_max_ms = 500;
+        let (state, _tmp) = make_runtime_state(&start_cfg).await;
+        assert_eq!(state.coalesce_step_ms.load(Ordering::Relaxed), 5);
+        assert_eq!(state.coalesce_max_ms.load(Ordering::Relaxed), 500);
+
+        // Edited apps_script config with different coalesce values.
+        let mut new_cfg = switch_test_apps_script_config();
+        new_cfg.coalesce_step_ms = 25;
+        new_cfg.coalesce_max_ms = 2500;
+        state.switch_mode(&new_cfg).await.expect("switch ok");
+
+        assert_eq!(state.coalesce_step_ms.load(Ordering::Relaxed), 25);
+        assert_eq!(state.coalesce_max_ms.load(Ordering::Relaxed), 2500);
+
+        // And `0` falls back to defaults (10 / 1000) — same shape as
+        // the original ProxyServer::new used.
+        let mut zero_cfg = switch_test_direct_config();
+        zero_cfg.coalesce_step_ms = 0;
+        zero_cfg.coalesce_max_ms = 0;
+        state.switch_mode(&zero_cfg).await.expect("switch back");
+        assert_eq!(state.coalesce_step_ms.load(Ordering::Relaxed), 10);
+        assert_eq!(state.coalesce_max_ms.load(Ordering::Relaxed), 1000);
+
+        state.mode_tasks.lock().await.abort_all();
     }
 }

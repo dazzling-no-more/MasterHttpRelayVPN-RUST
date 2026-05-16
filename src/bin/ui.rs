@@ -13,11 +13,11 @@ use rahgozar::cdn_discover::{discover_front, DiscoveredFront};
 use rahgozar::cert_installer::{install_ca, reconcile_sudo_environment, remove_ca};
 use rahgozar::config::{Config, FrontingGroup, ScriptId};
 use rahgozar::data_dir;
-use rahgozar::domain_fronter::{DomainFronter, DEFAULT_GOOGLE_SNI_POOL};
+use rahgozar::domain_fronter::DEFAULT_GOOGLE_SNI_POOL;
 use rahgozar::lan_utils::{advertise_proxy_host, detect_lan_ip, is_share_on_lan};
 use rahgozar::mitm::{MitmCertManager, CA_CERT_FILE};
 use rahgozar::profiles::{self, ProfilesFile};
-use rahgozar::proxy_server::ProxyServer;
+use rahgozar::proxy_server::{ProxyError, ProxyServer, RuntimeState};
 use rahgozar::{scan_ips, scan_sni, test_cmd};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -244,13 +244,17 @@ struct UiState {
     /// deleted it, or vice versa. Both UI buttons disable while this
     /// is set, and both handlers gate-and-flip it.
     cert_op_in_progress: bool,
-    /// Set synchronously when `Cmd::Start` is received by the background
-    /// thread, cleared synchronously when `Cmd::Stop` completes. Broader
-    /// than `running` (which only flips after the MITM manager has
-    /// finished loading). Used to block `Remove CA` during the window
-    /// between start-click and `running = true` — otherwise a queued
-    /// `Cmd::RemoveCa` could delete `ca/` while the server is partway
-    /// through loading the keypair into memory.
+    /// Set synchronously when the Start button is clicked (UI-thread)
+    /// and re-affirmed by the bg-thread when it dequeues `Cmd::Start`.
+    /// Cleared synchronously on `Cmd::Stop`, on build-failure inside
+    /// the bg-thread, and at the end of the spawned `server.run()`
+    /// task. Broader than `running` (which is set inside the spawned
+    /// task on entry, before `server.run()` binds — so there's a
+    /// short scheduling-latency window where `proxy_active = true`
+    /// and `running = false`). Used to block `Remove CA` and to gate
+    /// live mode-switch dispatch during that startup window so a
+    /// queued `Cmd::RemoveCa` can't delete `ca/` mid-load and a mode
+    /// change in the same gap can't be silently dropped.
     proxy_active: bool,
     /// One-line status of the most recent download (Ok(path) or Err(msg)).
     last_download: Option<Result<std::path::PathBuf, String>>,
@@ -265,6 +269,13 @@ struct UiState {
     /// Cleared on next install attempt.
     last_install: Option<Result<rahgozar::update_apply::StagedUpdate, String>>,
     last_install_at: Option<Instant>,
+    /// Signal from a failed live mode switch: `(revert_to_mode_str, err_msg)`.
+    /// The UI's `update()` reads this once per frame, reverts `form.mode`
+    /// to the snapshot, shows a toast with the error, and clears the field.
+    /// Without this round-trip the form drifts from the runtime — the
+    /// dropdown would display the rejected mode while the proxy is still
+    /// happily serving the previous one.
+    mode_switch_revert: Option<(String, String)>,
 }
 
 #[derive(Clone, Debug)]
@@ -302,6 +313,11 @@ enum DiscoverState {
 enum Cmd {
     Start(Config),
     Stop,
+    /// Hot-swap the running proxy into a new mode (and pick up any other
+    /// related config changes in the snapshot) without dropping connections
+    /// or rebinding listeners. Ignored when no proxy is running. See
+    /// `RuntimeState::switch_mode` for what does and doesn't get applied.
+    SwitchMode(Config),
     Test(Config),
     InstallCa,
     RemoveCa,
@@ -1715,6 +1731,21 @@ impl eframe::App for App {
         }
         ctx.request_repaint_after(Duration::from_millis(500));
 
+        // Drain a pending mode-switch revert signal. The background
+        // thread sets this when `switch_mode` rejects the new config
+        // (typically build_mode_state failing, e.g. DomainFronter::new
+        // refusing a missing script_id). We roll the dropdown back to
+        // the runtime's actual mode and surface the error as a toast,
+        // so the user sees a clear "tried → failed → still on previous
+        // mode" rather than a silently-out-of-sync UI.
+        {
+            let revert = self.shared.state.lock().unwrap().mode_switch_revert.take();
+            if let Some((revert_to, err_msg)) = revert {
+                self.form.mode = revert_to;
+                self.toast = Some((err_msg, Instant::now()));
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.style_mut().spacing.item_spacing = egui::vec2(8.0, 6.0);
 
@@ -1794,11 +1825,20 @@ impl eframe::App for App {
             // fronting_groups via the SNI-rewrite tunnel only) — useful as
             // a bootstrap to deploy Code.gs, or as a standalone mode for
             // users who only need access to fronting-group targets.
+            // Snapshot the mode before the dropdown so we can detect a
+            // change after the closure returns. When the proxy is running
+            // and the user picks a different mode, we fire `Cmd::SwitchMode`
+            // and let `RuntimeState::switch_mode` hot-swap the bundle
+            // (fronter + TunnelMux + RewriteCtx) without rebinding the
+            // listeners. See `src/proxy_server.rs::switch_mode`.
+            let mode_before = self.form.mode.clone();
             section(ui, "Mode", |ui| {
                 form_row(ui, "Mode", Some(
                     "apps_script: DPI bypass via Apps Script relay (needs cert).\n\
                      full: tunnel ALL traffic through Apps Script + tunnel node (no cert needed).\n\
-                     direct: SNI-rewrite tunnel only — no relay (Google edge + any fronting_groups)."
+                     direct: SNI-rewrite tunnel only — no relay (Google edge + any fronting_groups).\n\
+                     \n\
+                     While the proxy is running, switching mode here hot-swaps the routing live — no Stop/Start needed."
                 ), |ui, _label_id| {
                     egui::ComboBox::from_id_source("mode")
                         .selected_text(match self.form.mode.as_str() {
@@ -1850,6 +1890,52 @@ impl eframe::App for App {
                     });
                 }
             });
+
+            // Live mode-switch dispatch. Compares against the snapshot taken
+            // before the section closure; only fires while the proxy is
+            // running so a stopped proxy still picks up the new mode on the
+            // next Start (no behavior change for the Start/Stop flow).
+            //
+            // If `to_config()` rejects the form (e.g. apps_script picked
+            // without a script_id), we revert `self.form.mode` and toast
+            // the error so the user isn't left with a UI state the runtime
+            // never accepted.
+            if mode_before != self.form.mode {
+                // Use `proxy_active`, not `running`. The Start button
+                // flips `proxy_active = true` synchronously on click,
+                // while `running` only flips on the entry of the
+                // spawned `server.run()` task — which sits behind a
+                // bg-thread → tokio-spawn → scheduler hop. A mode
+                // change inside that latency window would otherwise be
+                // silently dropped (gate sees `running = false`),
+                // leaving the form on the new mode while the proxy
+                // serves the original. The bg-thread orders commands
+                // as it dequeues, so a SwitchMode landing in this
+                // window is processed strictly after Cmd::Start
+                // finishes its synchronous setup (`active = Some`),
+                // and the `state.switch_mode` call then races
+                // correctly with the spawned `server.run()`'s init
+                // block under `switch_lock`.
+                let proxy_active_now = self.shared.state.lock().unwrap().proxy_active;
+                if proxy_active_now {
+                    match self.form.to_config() {
+                        Ok(cfg) => {
+                            let _ = self.cmd_tx.send(Cmd::SwitchMode(cfg));
+                            self.toast = Some((
+                                format!("Switching mode → {}", self.form.mode),
+                                Instant::now(),
+                            ));
+                        }
+                        Err(e) => {
+                            self.toast = Some((
+                                format!("Cannot switch mode: {}", e),
+                                Instant::now(),
+                            ));
+                            self.form.mode = mode_before;
+                        }
+                    }
+                }
+            }
 
             let direct_mode = self.form.mode == "direct" || self.form.mode == "google_only";
 
@@ -2233,6 +2319,24 @@ impl eframe::App for App {
                     && lower_snapshot != "127.0.0.1"
                     && lower_snapshot != "localhost";
                 let mut new_listen_host: Option<String> = None;
+                // Listener fields (bind host + HTTP/SOCKS5 ports) need
+                // a Stop+Start to take effect — `RuntimeState::switch_mode`
+                // explicitly ignores changes to them since rebinding a
+                // socket is observable to clients. Disable the
+                // widgets while the proxy is running (or starting) so
+                // the user isn't surprised when they edit a port and
+                // the form does nothing live.
+                let proxy_active_for_listeners =
+                    self.shared.state.lock().unwrap().proxy_active;
+                let listener_hover = if proxy_active_for_listeners {
+                    Some(
+                        "Stop the proxy first — listen host and ports are bound at \
+                         Start and aren't part of the live mode-switch contract.",
+                    )
+                } else {
+                    None
+                };
+                ui.add_enabled_ui(!proxy_active_for_listeners, |ui| {
                 form_row(ui, "Network", Some(
                     "By default the proxy is reachable only from this computer. \
                      Turn this on to let phones, tablets, and other laptops on the \
@@ -2307,14 +2411,28 @@ impl eframe::App for App {
                             .color(egui::Color32::from_gray(200))),
                     );
                     let http_label = ui.label(egui::RichText::new("HTTP").small());
-                    ui.add(egui::TextEdit::singleline(&mut self.form.listen_port)
+                    let http_resp = ui.add(egui::TextEdit::singleline(&mut self.form.listen_port)
                         .desired_width(70.0))
                     .labelled_by(http_label.id);
+                    if let Some(h) = listener_hover { http_resp.on_hover_text(h); }
                     ui.add_space(10.0);
                     let socks_label = ui.label(egui::RichText::new("SOCKS5").small());
-                    ui.add(egui::TextEdit::singleline(&mut self.form.socks5_port)
+                    let socks_resp = ui.add(egui::TextEdit::singleline(&mut self.form.socks5_port)
                         .desired_width(70.0))
                     .labelled_by(socks_label.id);
+                    if let Some(h) = listener_hover { socks_resp.on_hover_text(h); }
+                });
+                if proxy_active_for_listeners {
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        ui.small(
+                            egui::RichText::new(
+                                "Listen host / ports are bound at Start — Stop the proxy to change them.",
+                            )
+                            .color(egui::Color32::from_gray(150)),
+                        );
+                    });
+                }
                 });
             });
 
@@ -2853,8 +2971,22 @@ impl eframe::App for App {
             ui.add_space(8.0);
 
             // ── Primary action: Start / Stop is the headline; others smaller ──
+            // Gate on `proxy_active`, not `running`, so the in-between
+            // "starting but not yet bound" window already shows Stop and
+            // not Start. Without this:
+            //   * a double-click would queue two `Cmd::Start`s — the
+            //     bg-thread's `if active.is_some()` guard catches it but
+            //     only because the first Start completed synchronously
+            //     enough to set `active`; before this change the second
+            //     click would silently send a second Start cmd.
+            //   * a mode change in the gap between click and bg-thread
+            //     processing reads `proxy_active = false`, doesn't send
+            //     SwitchMode, and the runtime ends up serving the old
+            //     mode while the form shows the new one.
+            // Flipping proxy_active synchronously on click closes both.
+            let proxy_active_now = self.shared.state.lock().unwrap().proxy_active;
             ui.horizontal(|ui| {
-                if !running {
+                if !proxy_active_now {
                     let btn = egui::Button::new(
                         egui::RichText::new("▶  Start").color(egui::Color32::WHITE).strong(),
                     )
@@ -2864,6 +2996,14 @@ impl eframe::App for App {
                     if ui.add(btn).clicked() {
                         match self.form.to_config() {
                             Ok(cfg) => {
+                                // Flip BEFORE send so a same-frame mode
+                                // change sees `proxy_active = true` and
+                                // dispatches `Cmd::SwitchMode` correctly.
+                                // The bg-thread will re-affirm this when
+                                // it dequeues `Cmd::Start`, and will
+                                // clear it on build-failure / self-exit /
+                                // Cmd::Stop.
+                                self.shared.state.lock().unwrap().proxy_active = true;
                                 let _ = self.cmd_tx.send(Cmd::Start(cfg));
                             }
                             Err(e) => {
@@ -4186,26 +4326,84 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
 
     let mut active: Option<(
         JoinHandle<()>,
-        Arc<AsyncMutex<Option<Arc<DomainFronter>>>>,
+        Arc<RuntimeState>,
         tokio::sync::oneshot::Sender<()>,
     )> = None;
 
     loop {
+        // Reap a self-exited proxy task. Without this, a bind failure
+        // (or any path where `server.run()` returns without going
+        // through `Cmd::Stop`) leaves `active = Some(...)` pinning a
+        // finished JoinHandle, and `Cmd::Start` rejects every future
+        // start attempt with "already running" — even though the UI
+        // shows "stopped" because the task body itself cleared
+        // `running`/`proxy_active`. Polling `is_finished` each loop
+        // iteration is cheap and matches the existing recv_timeout
+        // cadence (~250 ms), which is well below human-perceptible
+        // delay between a Stop and the next Start.
+        //
+        // Consolidates ALL finished-task cleanup in one place: the
+        // previous shape had a footer at the bottom of the loop that
+        // dropped `active` without `block_on`-ing the handle (so panics
+        // disappeared into the runtime drop path) and only cleared
+        // `running`/`started_at` (so an abnormally-ended task that
+        // didn't reach its own cleanup block left `proxy_active` stuck
+        // true — UI permanently in "starting"). Doing block_on +
+        // defensive flag-clearing once here covers both gaps.
+        if let Some((handle, _, _)) = &active {
+            if handle.is_finished() {
+                if let Some((handle, _, _)) = active.take() {
+                    // Await the handle so a panic inside the task
+                    // surfaces in the log instead of silently going to
+                    // the runtime drop path. Best-effort: a successful
+                    // join is the normal exit, JoinError covers panic
+                    // and cancellation alike.
+                    if let Err(e) = rt.block_on(handle) {
+                        push_log(
+                            &shared,
+                            &format!("[ui] proxy task ended unexpectedly: {}", e),
+                        );
+                    }
+                    // Defensive flag reset. The task body's cleanup
+                    // block normally clears all three before exit, but
+                    // a panic or external abort can bypass it. Clearing
+                    // here is idempotent for the normal-exit case and
+                    // load-bearing for the abnormal one.
+                    let mut st = shared.state.lock().unwrap();
+                    st.running = false;
+                    st.started_at = None;
+                    st.proxy_active = false;
+                }
+            }
+        }
+
         match rx.recv_timeout(Duration::from_millis(250)) {
             Ok(Cmd::PollStats) => {
-                if let Some((_, fronter_slot, _)) = &active {
-                    let slot = fronter_slot.clone();
-                    let shared = shared.clone();
-                    rt.spawn(async move {
-                        let f = slot.lock().await;
-                        if let Some(fronter) = f.as_ref() {
+                if let Some((_, state, _)) = &active {
+                    // Read the *current* fronter from the live bundle —
+                    // after a live mode switch this may be a different
+                    // `Arc<DomainFronter>` than the one Start handed us,
+                    // or `None` if the user switched to direct mode.
+                    if let Some(fronter) = state.fronter() {
+                        let shared = shared.clone();
+                        rt.spawn(async move {
                             let s = fronter.snapshot_stats();
                             let per_site = fronter.snapshot_per_site();
                             let mut st = shared.state.lock().unwrap();
                             st.last_stats = Some(s);
                             st.last_per_site = per_site;
+                        });
+                    } else {
+                        // No fronter in the current mode (direct). Clear
+                        // any cached stats from a previous apps_script /
+                        // full mode session so the UI doesn't show stale
+                        // numbers next to a "Direct" badge.
+                        let mut st = shared.state.lock().unwrap();
+                        if st.last_stats.is_some() || !st.last_per_site.is_empty() {
+                            st.last_stats = None;
+                            st.last_per_site.clear();
                         }
-                    });
+                    }
                 }
             }
             Ok(Cmd::Start(cfg)) => {
@@ -4218,39 +4416,42 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                 // queued in the same frame as Start is rejected before
                 // the MITM manager begins loading.
                 shared.state.lock().unwrap().proxy_active = true;
-                let shared2 = shared.clone();
-                let fronter_slot: Arc<AsyncMutex<Option<Arc<DomainFronter>>>> =
-                    Arc::new(AsyncMutex::new(None));
-                let fronter_slot2 = fronter_slot.clone();
+
+                // Build the proxy synchronously on this thread so we can
+                // capture the `Arc<RuntimeState>` BEFORE spawning the run
+                // future. The previous shape constructed inside the spawn
+                // and stashed the fronter into an outer AsyncMutex slot;
+                // with a swappable bundle we just hand the state out
+                // directly. The MITM cert manager initialisation is also
+                // sync and lives here so build failures abort cleanly.
+                let base = data_dir::data_dir();
+                let mitm = match MitmCertManager::new_in(&base) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        push_log(&shared, &format!("[ui] MITM init failed: {}", e));
+                        let mut s = shared.state.lock().unwrap();
+                        s.running = false;
+                        s.proxy_active = false;
+                        continue;
+                    }
+                };
+                let mitm = Arc::new(AsyncMutex::new(mitm));
+                let server = match ProxyServer::new(&cfg, mitm) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        push_log(&shared, &format!("[ui] proxy build failed: {}", e));
+                        let mut st = shared.state.lock().unwrap();
+                        st.running = false;
+                        st.proxy_active = false;
+                        continue;
+                    }
+                };
+                let state = server.state();
 
                 let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
-
+                let shared2 = shared.clone();
+                let cfg_for_log = cfg.clone();
                 let handle = rt.spawn(async move {
-                    let base = data_dir::data_dir();
-                    let mitm = match MitmCertManager::new_in(&base) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            push_log(&shared2, &format!("[ui] MITM init failed: {}", e));
-                            let mut s = shared2.state.lock().unwrap();
-                            s.running = false;
-                            s.proxy_active = false;
-                            return;
-                        }
-                    };
-                    let mitm = Arc::new(AsyncMutex::new(mitm));
-                    let server = match ProxyServer::new(&cfg, mitm) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            push_log(&shared2, &format!("[ui] proxy build failed: {}", e));
-                            let mut st = shared2.state.lock().unwrap();
-                            st.running = false;
-                            st.proxy_active = false;
-                            return;
-                        }
-                    };
-                    // `fronter()` is `None` in direct mode — the
-                    // status panel's relay stats simply show no data in that case.
-                    *fronter_slot2.lock().await = server.fronter();
                     {
                         let mut s = shared2.state.lock().unwrap();
                         s.running = true;
@@ -4260,10 +4461,12 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                         &shared2,
                         &format!(
                             "[ui] listening HTTP {}:{} SOCKS5 {}:{}",
-                            cfg.listen_host,
-                            cfg.listen_port,
-                            cfg.listen_host,
-                            cfg.socks5_port.unwrap_or(cfg.listen_port + 1)
+                            cfg_for_log.listen_host,
+                            cfg_for_log.listen_port,
+                            cfg_for_log.listen_host,
+                            cfg_for_log
+                                .socks5_port
+                                .unwrap_or(cfg_for_log.listen_port + 1)
                         ),
                     );
 
@@ -4283,7 +4486,67 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     push_log(&shared2, "[ui] proxy stopped");
                 });
 
-                active = Some((handle, fronter_slot, shutdown_tx));
+                active = Some((handle, state, shutdown_tx));
+            }
+
+            Ok(Cmd::SwitchMode(cfg)) => {
+                if let Some((_, state, _)) = &active {
+                    // Serial dispatch: `rt.block_on` waits for this
+                    // switch to finish before the background thread
+                    // services the next `Cmd::*`. Detached `rt.spawn`
+                    // was the wrong shape — two rapid mode changes
+                    // could spawn two switch tasks contending on
+                    // `switch_lock` in arbitrary order, so the later
+                    // dropdown choice could commit BEFORE the earlier
+                    // one and end up overwritten. Serial dispatch
+                    // makes "latest click wins" trivially true.
+                    //
+                    // switch_mode is sub-millisecond when the new
+                    // mode is direct, low-millisecond when it has to
+                    // build a fresh `DomainFronter` — no IO involved,
+                    // so blocking the bg-thread loop briefly is fine
+                    // and matches what `Cmd::Stop` already does.
+                    push_log(&shared, "[ui] switching mode live...");
+                    let result = rt.block_on(state.switch_mode(&cfg));
+                    match result {
+                        Ok(()) => {
+                            push_log(
+                                &shared,
+                                &format!("[ui] mode switched live to '{}'", cfg.mode),
+                            );
+                            // Discard any pending revert left by a
+                            // prior failed switch. Without this, a
+                            // sequence (fail-A, succeed-B) could let
+                            // the UI revert the form back from B to
+                            // A's stale target on the next frame even
+                            // though B is what's actually serving
+                            // traffic. Clearing here makes "latest
+                            // success wins" hold for the form too.
+                            shared.state.lock().unwrap().mode_switch_revert = None;
+                        }
+                        // Stop racing with a queued SwitchMode is a
+                        // designed no-op, not a failure. Don't toast
+                        // it — the user just sees their click took
+                        // effect ("proxy stopped") without a confusing
+                        // "switch failed" pop-up. Debug log only.
+                        Err(ProxyError::ShuttingDown) => {
+                            push_log(&shared, "[ui] mode switch skipped (proxy stopping)");
+                        }
+                        Err(e) => {
+                            let msg = format!("Live mode switch failed: {}", e);
+                            push_log(&shared, &format!("[ui] {}", msg));
+                            // Re-read the live mode AFTER the failed
+                            // switch returns so the revert target is
+                            // the runtime's actual current mode, not
+                            // whatever was live at dispatch time.
+                            let revert_to = state.current_mode().as_str().to_string();
+                            let mut st = shared.state.lock().unwrap();
+                            st.mode_switch_revert = Some((revert_to, msg));
+                        }
+                    }
+                } else {
+                    push_log(&shared, "[ui] not running; ignoring SwitchMode");
+                }
             }
 
             Ok(Cmd::Stop) => {
@@ -4698,15 +4961,6 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                 }
             }
             Err(_) => {}
-        }
-
-        // Clean up finished task.
-        if let Some((handle, _, _)) = &active {
-            if handle.is_finished() {
-                active = None;
-                shared.state.lock().unwrap().running = false;
-                shared.state.lock().unwrap().started_at = None;
-            }
         }
     }
 }
