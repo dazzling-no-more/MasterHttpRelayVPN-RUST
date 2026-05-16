@@ -673,17 +673,21 @@ jobs:
           for f in dist/*.tar.gz dist/*.zip dist/*.apk; do
             [ -f "$f" ] || continue
             echo "::group::sign $(basename "$f")"
-            # rsign reads the key's password from `$RSIGN_PASSWORD` by
-            # default (no flag needed). Earlier this used `-W`, but in
-            # rsign2 `-W` on the sign side means "the key is NOT password-
-            # protected, skip decryption entirely" — and our keys ARE
-            # passphrase-protected, so `-W` made decryption fail with
-            # "Wrong password for that key" before the env var was even
-            # consulted.
+            # `-W` = "this key is NOT password-protected, skip decryption."
+            # The matching expectation is that the keypair was generated
+            # with `rsign generate -W` (creates an unencrypted secret-key
+            # file). For CI-only signing where the key file and any
+            # passphrase would both live in the same GitHub Secrets store,
+            # the passphrase adds no real security — anyone who can read
+            # MINISIGN_SECRET_KEY can also read MINISIGN_KEY_PASSWORD —
+            # so we just use an unencrypted key and let `-W` skip the
+            # password machinery entirely. Without `-W`, rsign2 tries to
+            # prompt via /dev/tty and fails with ENXIO in CI.
             # `-x <out>` = write the signature to a specific path so it
             # lands as `<asset>.minisig` instead of rsign's default
             # next-to-binary location.
             rsign sign \
+              -W \
               -s "${KEY_FILE}" \
               -x "${f}.minisig" \
               "$f"
