@@ -10,9 +10,7 @@ on:
   # this workflow manually with `version` set to the existing release tag —
   # the build matrix runs against the current main, artifacts are uploaded
   # to the matching release page, and the release-notes step is a no-op
-  # (release already exists). Pair with `gh variable set
-  # TELEGRAM_NOTIFY_ENABLED --body false` before dispatch if you don't want
-  # the channel re-pinged for what's effectively the same release.
+  # (release already exists).
   workflow_dispatch:
     inputs:
       version:
@@ -830,10 +828,10 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # release + telegram: lightweight aggregation jobs kept on GH-hosted
-  # ubuntu-latest. They only download artifacts and call APIs — no build
-  # tooling needed, no benefit from moving to self-hosted, and keeping them
-  # off the self-hosted runners avoids contention with Linux build jobs from
+  # release: lightweight aggregation job kept on GH-hosted ubuntu-latest.
+  # It only downloads artifacts and calls APIs — no build tooling needed,
+  # no benefit from moving to self-hosted, and keeping it off the
+  # self-hosted runners avoids contention with Linux build jobs from
   # the next tag if two releases overlap.
   release:
     needs: [build, android, sign]
@@ -1092,16 +1090,3 @@ jobs:
           # apply to refs/tags/* not refs/heads/main, so this push
           # isn't gated by the same protection.
           git push origin HEAD:main
-
-  # The legacy `telegram` job that posted a universal APK + changelog
-  # bundle to the main Telegram channel was removed in v1.9.4. It was
-  # superseded by `.github/workflows/telegram-publish-files.yml` (per-
-  # platform per-file posts to the files channel + a single cross-link
-  # to the main channel). With both running together, every release
-  # produced a duplicate APK post on the main channel — the legacy
-  # bundled post AND the new cross-link.
-  #
-  # If you ever need to bring back the bundled-APK-on-main pattern, the
-  # commit history before v1.9.4 has the full job — `git log -- .github/workflows/release.yml`.
-  # The `TELEGRAM_NOTIFY_ENABLED` repo variable + `telegram_release_notify.py`
-  # script that the legacy job called are no longer referenced.

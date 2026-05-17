@@ -118,5 +118,3 @@ Iran ISPs occasionally filter specific Google IPs (#313 pattern). When this happ
 - `android/app/src/main/java/com/therealaleph/mhrv/` — Android Kotlin glue. `MhrvVpnService.kt` is the VPNService that calls into Rust via JNI. `ConfigStore.kt` is the form/preferences round-trip.
 - `docs/changelog/` — versioned changelog files. Format: Persian, then `---`, then English.
 - `.github/workflows/release.yml` — release CI: builds for all platforms, attaches to GitHub release.
-- `.github/workflows/telegram-publish-files.yml` — fires on `workflow_run` of release.yml; posts each file individually to the Telegram channel `-1003966234444` with Persian captions, SHA-256 in caption, and a cross-link from the main channel.
-- `.github/scripts/telegram_publish_files.py` — stdlib-only Python script that does the actual Telegram posting (no `requests` dep so it works in minimal CI runners).

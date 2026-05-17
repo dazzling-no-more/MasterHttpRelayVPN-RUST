@@ -22,7 +22,7 @@ This knowledge base is structured for progressive disclosure. The body below cov
 - **`references/issue-patterns.md`** — Read when triaging a new issue. Catalogs the most common user-reported issue patterns with diagnostic procedures and canonical reply structures.
 - **`references/diagnostic-taxonomy.md`** — Read when a user shows a failure log with `no json in batch response` or HTML body. The six candidate causes for the placeholder body, what each looks like, and how `DIAGNOSTIC_MODE=true` disambiguates them.
 - **`references/workflow-conventions.md`** — Read when writing a reply, changelog, or commit message. Reply marker, Persian-vs-English language convention, changelog format, semver discipline.
-- **`references/release-workflow.md`** — Read when cutting a release. Cargo.toml bump → changelog → commit → tag → push, then auto-fired CI handles the rest (release builds + Telegram channel publishing).
+- **`references/release-workflow.md`** — Read when cutting a release. Cargo.toml bump → changelog → commit → tag → push, then auto-fired CI handles the rest (matrix release builds + GitHub release page).
 - **`references/contributors.md`** — Read when interacting with named contributors. Each top contributor has a domain they specialize in.
 - **`references/roadmap.md`** — Read when categorizing a feature request. Current and upcoming release batches.
 - **`references/persian-templates.md`** — Read when writing a Persian reply. Common phrases and full-paragraph templates for the most-repeated Persian-language situations.
@@ -61,7 +61,7 @@ The project uses `vX.Y.Z` strictly:
 - **Y (minor)** — feature batch. Bump when shipping a coherent set of features (e.g. v1.7 → v1.8).
 - **Z (patch)** — small fix or single-feature addition that doesn't justify a minor bump. Most releases are patch bumps.
 
-Patch releases (v1.8.1, v1.8.2, v1.8.3) ship continuously — every time something user-visible lands. Don't sit on completed work; releases are cheap and Iranian users who ask "when's the fix shipping?" deserve "in the next 30 minutes" not "next week". The release CI is fast (~30 min from tag push to Telegram publish).
+Patch releases (v1.8.1, v1.8.2, v1.8.3) ship continuously — every time something user-visible lands. Don't sit on completed work; releases are cheap and Iranian users who ask "when's the fix shipping?" deserve "in the next 30 minutes" not "next week". The release CI is fast (~30 min from tag push to GitHub release page).
 
 ### Persian-then-English changelog
 

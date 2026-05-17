@@ -1,7 +1,7 @@
 # Prepare a new release: bump version strings, prefill the changelog
 # stub from release-drafter's draft, and open a PR. After the PR is
 # merged, you push the `v<version>` tag manually and `release.yml`
-# takes over (matrix build → GitHub release → Telegram notify).
+# takes over (matrix build → GitHub release).
 #
 # Triggered manually from the Actions UI or via:
 #   gh workflow run prepare-release.yml -f version=1.6.6
@@ -192,14 +192,14 @@ jobs:
           #
           # Why no TODO/instructional <!-- comments -->:
           # release.yml strips leading <!-- comment --> blocks from the
-          # file before publishing the GitHub Release body, and the
-          # Telegram script does the same — both via a regex that handles
-          # multiple consecutive comments. But relying on stripping is
-          # brittle: a maintainer adding a new comment with a different
-          # shape (multi-line, indented, etc.) could leak it. Instead we
-          # use VISIBLE placeholders below. If the maintainer forgets to
-          # edit them, they ship as obvious `[FA]`/`<expand>` markers
-          # that an admin will spot in the release page within seconds.
+          # file before publishing the GitHub Release body via a regex
+          # that handles multiple consecutive comments. But relying on
+          # stripping is brittle: a maintainer adding a new comment with
+          # a different shape (multi-line, indented, etc.) could leak it.
+          # Instead we use VISIBLE placeholders below. If the maintainer
+          # forgets to edit them, they ship as obvious `[FA]`/`<expand>`
+          # markers that an admin will spot in the release page within
+          # seconds.
           mkdir -p docs/changelog
           OUT="docs/changelog/v${NEW_VER}.md"
           {
@@ -280,12 +280,12 @@ jobs:
              - **English section:** for each bullet, (a) fix the verb tense if needed (release-drafter passes through PR titles as-is, so "added" → "Add", "fixed" → "Fix"), and (b) replace \`<expand>\` with a short explanatory clause matching the project's \`• headline (#NN): full explanation\` style. The Conventional-Commit prefix (\`feat:\`/\`fix:\`/etc.) and the trailing \`. Thanks @author\` are already handled.
           3. Commit + push to this branch so the PR includes the final bilingual changelog.
 
-          Any \`[FA]\` or \`<expand>\` markers left in the file will ship verbatim into the GitHub Release page and the Telegram post — they're intentionally visible, not hidden in HTML comments.
+          Any \`[FA]\` or \`<expand>\` markers left in the file will ship verbatim into the GitHub Release page — they're intentionally visible, not hidden in HTML comments.
 
           **After merging — ship it:**
           1. \`git checkout main && git pull\`
           2. \`git tag v${NEW_VER} && git push origin v${NEW_VER}\`
-          3. \`release.yml\` picks up the tag, builds artifacts, creates the GitHub release, and (if enabled) posts to Telegram.
+          3. \`release.yml\` picks up the tag, builds artifacts, and creates the GitHub release.
           MSG
 
           gh pr create \

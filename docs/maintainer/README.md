@@ -10,7 +10,7 @@ Start with `SKILL.md` for orientation, conventions, and pointers. Then read refe
 - `references/issue-patterns.md` — recurring user issue patterns with diagnostic procedures and canonical reply structures
 - `references/diagnostic-taxonomy.md` — six candidate causes for the placeholder body, DIAGNOSTIC_MODE disambiguator
 - `references/workflow-conventions.md` — reply marker, Persian/English match rule, changelog format, commit messages, close reasons
-- `references/release-workflow.md` — Cargo.toml → tag → Telegram pipeline
+- `references/release-workflow.md` — Cargo.toml → tag → GitHub release pipeline
 - `references/update-signing.md` — one-time maintainer setup for minisign-signed auto-updates (CI gates on repo vars, defaults to off)
 - `references/contributors.md` — core contributor roles + their substantive PRs
 - `references/roadmap.md` — current and upcoming release batches

@@ -1,6 +1,6 @@
 # Release workflow
 
-Cutting a release is fast and low-ceremony for this project. Most releases are patch bumps that go from "decision to ship" to "Telegram channel posting" in under 30 minutes of human work + ~30 minutes of CI.
+Cutting a release is fast and low-ceremony for this project. Most releases are patch bumps that go from "decision to ship" to "GitHub release published" in under 30 minutes of human work + ~30 minutes of CI.
 
 ## When to cut a release
 
@@ -112,11 +112,9 @@ gh run list --limit 3
 ```
 
 Two workflows fire on tag push:
+
 1. **`release-drafter`** — quick (~15s), updates the GitHub release draft. Always succeeds.
 2. **`release`** — slow (~25-35 minutes), builds binaries for all platforms, attaches to release.
-
-Once `release` succeeds, a third workflow auto-fires:
-3. **`Telegram publish release files`** — posts each binary individually to the Telegram channel `mhrv_rs` with Persian captions, SHA-256 hashes, and a cross-link from the main channel. Takes ~1-2 minutes.
 
 If `release` fails, common causes:
 
@@ -131,35 +129,6 @@ git log --oneline -3
 ```
 
 You should see an auto-generated commit `chore(releases): refresh prebuilt binaries for vX.Y.Z` from the release CI bot.
-
-### Step 8: Verify Telegram channel
-
-The Telegram publish workflow posts to channel `mhrv_rs` (public link `https://t.me/mhrv_rs`). The channel should show:
-
-1. An announcement post: `📦 rahgozar vX.Y.Z منتشر شد...` referencing the changelog file
-2. ~16 individual file posts (Android APKs split by ABI, Windows ZIP, macOS arm64/amd64 dmg+tar, Linux x86_64/arm64 incl. musl, Raspbian, OpenWRT)
-3. Each file caption includes Persian description (e.g., "نسخه ویندوز x86") + SHA-256 hash
-4. A "main channel" post (different channel) cross-linking to the files channel post
-
-Files larger than 50 MB get chunked into `.part_aa`, `.part_ab`, etc. via the `split` pattern in `.github/scripts/telegram_publish_files.py`.
-
-If something didn't post, check the workflow run logs:
-
-```bash
-gh run view <run-id> --log
-```
-
-Common cause: the auto-fire dispatch on `workflow_run` requires the parent workflow to succeed; if release.yml had a flaky download retry, the dispatch might still succeed but partial.
-
-## Manual re-publish (rare)
-
-If you need to re-trigger Telegram publishing for an already-released version (e.g., the workflow failed and you fixed it), use `workflow_dispatch`:
-
-```bash
-gh workflow run "Telegram publish release files" -f version=vX.Y.Z
-```
-
-The script downloads artifacts via `gh release download` (not the workflow's artifacts) so it works retroactively.
 
 ## Re-cutting a release (very rare)
 
