@@ -383,6 +383,16 @@ function _doSingle(req) {
   }
   var opts = _buildOpts(req);
   var resp = UrlFetchApp.fetch(req.u, opts);
+
+  // Raw-return mode for the exit-node outer hop — see Code.gs _doSingle
+  // for the rationale. CodeFull.gs's HTTP relay path mirrors Code.gs's
+  // wire contract, so the same flag needs the same handling here.
+  if (req.raw === true) {
+    return ContentService
+      .createTextOutput(resp.getContentText())
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+
   return _json({
     s: resp.getResponseCode(),
     h: _respHeaders(resp),

@@ -284,6 +284,21 @@ function _doSingle(req) {
   try {
     var opts = _buildOpts(req);
     var resp = UrlFetchApp.fetch(req.u, opts);
+
+    // Raw-return mode for the exit-node outer hop. When `raw: true` is
+    // set on the request, return the destination body verbatim instead
+    // of wrapping it in another `{s, h, b}` envelope. The destination
+    // here IS the exit node, whose body is already a `{s, h, b}` JSON
+    // envelope — without raw mode, Apps Script would double-wrap it and
+    // the client would receive raw JSON instead of the page content.
+    // Only the exit-node outer call sets this flag; every other relay
+    // path leaves it unset and takes the wrapping branch below.
+    if (req.raw === true) {
+      return ContentService
+        .createTextOutput(resp.getContentText())
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
     return _json({
       s: resp.getResponseCode(),
       h: _respHeaders(resp),

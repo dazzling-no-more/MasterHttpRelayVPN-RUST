@@ -269,6 +269,12 @@ function _doSingle(req) {
     ct: item.ct,
     r: item.r,
   };
+  // Raw-return mode (exit-node outer hop) propagates to the Worker so
+  // it returns the destination body verbatim; we then pass it through
+  // to rahgozar without re-wrapping. Mirrors Code.gs _doSingle. Only
+  // set when present so old Workers without `raw` handling keep
+  // working for non-exit-node calls.
+  if (req.raw === true) envelope.raw = true;
   var opts = _workerFetchOptions(envelope);
   // muteHttpExceptions covers HTTP-level errors (4xx/5xx come back as
   // a normal HTTPResponse). It does NOT cover network-level failures
@@ -284,6 +290,15 @@ function _doSingle(req) {
     resp = UrlFetchApp.fetch(opts.url, opts);
   } catch (err) {
     return _json({ e: "worker unreachable: " + String(err) });
+  }
+  // Raw-return: the Worker has handed back the exit-node's body verbatim
+  // (no `{s, h, b}` wrap). Forward it through unchanged so rahgozar's
+  // parse_exit_node_response unwraps the single envelope. Anything else
+  // — including Worker errors — takes the parse-and-re-emit path below.
+  if (req.raw === true && resp.getResponseCode() === 200) {
+    return ContentService
+      .createTextOutput(resp.getContentText())
+      .setMimeType(ContentService.MimeType.JSON);
   }
   return _json(_parseWorkerJson(resp));
 }

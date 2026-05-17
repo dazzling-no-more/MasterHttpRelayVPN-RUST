@@ -13,8 +13,17 @@
  * response.
  *
  * Two request shapes are accepted:
- *   1. Single:  { k, u, m, h, b, ct, r }            → { s, h, b }
+ *   1. Single:  { k, u, m, h, b, ct, r, raw? }      → { s, h, b }
+ *                                                       (or raw bytes when raw:true)
  *   2. Batch:   { k, q: [{u,m,h,b,ct,r}, ...] }     → { q: [{s,h,b} | {e}, ...] }
+ *
+ * The optional `raw: true` flag is single-mode only and used by the
+ * exit-node outer hop: the Worker fetches the destination (which is
+ * itself an exit-node returning a `{s, h, b}` envelope) and returns
+ * the response body verbatim instead of wrapping it again. Without
+ * this, the client would receive a double-wrapped envelope and decode
+ * to raw JSON instead of page content. `raw` is stripped from batch
+ * items defensively since the batch shape cannot carry a raw item.
  *
  * The batch shape is what makes this design actually save Apps Script
  * UrlFetchApp quota. Without it, Code.cfw.gs would have to do
@@ -158,6 +167,14 @@ export default {
     // parallel via Promise.all. Per-item failures are per-item `{e}`s in
     // the response array; the envelope itself stays 200 unless the batch
     // is malformed at the top level.
+    //
+    // `raw` is single-mode only — the batch response is `{q: [...]}` of
+    // `{s,h,b}|{e}` shapes, and the sentinel from processOne wouldn't
+    // serialize correctly inside a JSON array slot (Uint8Array becomes
+    // an object map). Strip it defensively so a malformed caller can't
+    // poison the batch shape. rahgozar itself never sets `raw` in
+    // batched payloads — only the exit-node outer call sets it, and
+    // that call is always single — so this strip is belt-and-braces.
     if (Array.isArray(req.q)) {
       if (req.q.length === 0) return json({ q: [] });
       if (req.q.length > MAX_BATCH_SIZE) {
@@ -166,14 +183,19 @@ export default {
         }, 400);
       }
       const results = await Promise.all(
-        req.q.map((item) => processOne(item, selfHost).catch((err) => ({
-          e: "fetch failed: " + String(err),
-        })))
+        req.q.map((item) => {
+          if (item && typeof item === "object" && item.raw !== undefined) {
+            delete item.raw;
+          }
+          return processOne(item, selfHost).catch((err) => ({
+            e: "fetch failed: " + String(err),
+          }));
+        })
       );
       return json({ q: results });
     }
 
-    // Single mode: { k, u, m, h, b, ct, r }
+    // Single mode: { k, u, m, h, b, ct, r, raw? }
     let result;
     try {
       result = await processOne(req, selfHost);
@@ -185,6 +207,15 @@ export default {
       // rahgozar sees the same shape as in standard Code.gs ("bad url"
       // etc are already client-error-coded there).
       return json(result, 400);
+    }
+    if (result.__raw === true) {
+      // Raw-return mode: hand back the exit-node's body verbatim under
+      // application/json so Code.cfw.gs can forward it untouched and
+      // rahgozar's parse_exit_node_response unwraps the single envelope.
+      return new Response(result.body, {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
     }
     return json(result);
   },
@@ -266,6 +297,18 @@ async function processOne(item, selfHost) {
 
   const buffer = await resp.arrayBuffer();
   const uint8 = new Uint8Array(buffer);
+
+  // Raw-return mode for the exit-node outer hop — see Code.gs _doSingle
+  // for the full rationale. The destination IS the exit node and its
+  // body is already a `{s, h, b}` envelope; we hand it back verbatim so
+  // rahgozar's parser unwraps the single layer instead of the double
+  // layer that would land otherwise. Returns a sentinel object that the
+  // single-mode dispatcher in fetch() unwraps into a raw HTTP response;
+  // batch mode never carries `raw: true` (only the exit-node outer call
+  // sets it, and that call is always single).
+  if (item.raw === true) {
+    return { __raw: true, body: uint8 };
+  }
 
   // Avoid call-stack overflow from String.fromCharCode.apply on big
   // bodies — chunk the conversion.

@@ -508,6 +508,14 @@ struct RelayRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     ct: Option<&'a str>,
     r: bool,
+    /// Tells Code.gs / Worker / CodeFull to return the destination's
+    /// response body verbatim instead of wrapping it in another
+    /// `{s, h, b}` envelope. Set ONLY by the exit-node outer call —
+    /// without it, Apps Script's wrap would double-encapsulate the
+    /// exit-node's own `{s, h, b}` envelope and the browser would
+    /// receive raw JSON instead of the destination's content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    raw: Option<bool>,
 }
 
 /// Parsed Apps Script response JSON (single mode).
@@ -2807,13 +2815,34 @@ impl DomainFronter {
         // pointing at the exit-node URL with POST + the inner JSON as body.
         // Reusing build_payload_json keeps the outer envelope consistent
         // with everything else (including the random padding for DPI
-        // evasion). The `r: true` flag in RelayRequest makes Code.gs
-        // return exit-node's raw HTTP response, which is what we want to
-        // unwrap below.
+        // evasion). We then splice in `raw: true` so Code.gs returns the
+        // exit-node's response body verbatim instead of wrapping it in
+        // another `{s, h, b}` envelope — without this, parse_exit_node_response
+        // would see Apps Script's wrap around the exit-node's wrap and only
+        // unwrap one layer, delivering raw JSON to the browser.
+        //
+        // **Deployment pairing:** the `raw` field is additive on the wire,
+        // so a regular (non-exit-node) relay against an old Code.gs / Worker
+        // deployment is unaffected — they just ignore the unknown field.
+        // BUT the exit-node path specifically needs the matching server
+        // change (raw-return branch in Code.gs / CodeFull.gs / worker.js).
+        // A v2.0.2+ binary against a pre-v2.0.2 Apps Script or Worker will
+        // still double-wrap exit-node responses and the browser will see
+        // raw JSON instead of page content. The v2.0.2 release notes call
+        // this out — users with `exit_node.enabled: true` must redeploy
+        // Code.gs (or Code.cfw.gs + worker.js) when they upgrade.
         let exit_url = self.exit_node_url.clone();
         let outer_headers = vec![("Content-Type".to_string(), "application/json".to_string())];
-        let outer_payload: Bytes =
-            Bytes::from(self.build_payload_json("POST", &exit_url, &outer_headers, &inner_json)?);
+        let mut outer_value: Value = serde_json::from_slice(&self.build_payload_json(
+            "POST",
+            &exit_url,
+            &outer_headers,
+            &inner_json,
+        )?)?;
+        if let Value::Object(map) = &mut outer_value {
+            map.insert("raw".to_string(), Value::Bool(true));
+        }
+        let outer_payload: Bytes = Bytes::from(serde_json::to_vec(&outer_value)?);
 
         // Send the outer payload through the relay machinery and get back
         // Apps Script's response body (which is exit-node's JSON envelope).
@@ -2867,7 +2896,8 @@ impl DomainFronter {
             h: hmap,
             b: b_encoded,
             ct,
-            r: false, // the exit node returns its own JSON envelope, not raw HTTP
+            r: false,  // the exit node returns its own JSON envelope, not raw HTTP
+            raw: None, // exit-node TS handler ignores `raw`; field is for Code.gs
         };
         Ok(serde_json::to_vec(&req)?)
     }
@@ -3040,6 +3070,7 @@ impl DomainFronter {
             b: b_encoded,
             ct,
             r: true,
+            raw: None,
         };
         // Serialize via Value so we can splice in the random `_pad` field
         // without changing RelayRequest's wire schema. Apps Script ignores
@@ -4110,11 +4141,23 @@ fn unix_to_ymd_utc(secs: u64) -> (i64, u32, u32) {
 /// MITM TLS write-back path sees the same shape it gets from the regular
 /// Apps Script relay (status line + headers + body).
 fn parse_exit_node_response(body: &[u8]) -> Result<Vec<u8>, FronterError> {
-    let v: Value = serde_json::from_slice(body).map_err(|e| {
+    // Defensive: if Apps Script accidentally prepends an HTTP-framing
+    // prefix (status line + headers terminated by `\r\n\r\n`) before
+    // the JSON envelope, skip past it before parsing. Normally Code.gs
+    // returns just the envelope text under MimeType.JSON, but the raw
+    // surface here is whatever bytes h2_round_trip / read_http_response
+    // handed back, so a single defensive skip is cheap insurance.
+    let json_start = body
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|i| i + 4)
+        .unwrap_or(0);
+    let json_bytes = &body[json_start..];
+    let v: Value = serde_json::from_slice(json_bytes).map_err(|e| {
         FronterError::Relay(format!(
             "exit-node response not valid JSON ({}): {}",
             e,
-            String::from_utf8_lossy(&body[..body.len().min(200)])
+            String::from_utf8_lossy(&json_bytes[..json_bytes.len().min(200)])
         ))
     })?;
 
@@ -4150,6 +4193,12 @@ fn parse_exit_node_response(body: &[u8]) -> Result<Vec<u8>, FronterError> {
         "transfer-encoding",
         "connection",
         "keep-alive",
+        // The exit node's fetch() auto-decompresses gzip/br/deflate, so
+        // the destination's Content-Encoding header is stale by the time
+        // it reaches us — forwarding it to the browser as-is causes
+        // ERR_CONTENT_DECODING_FAILED (the browser tries to decompress
+        // already-plain bytes). Matches the skip in parse_relay_json.
+        "content-encoding",
     ];
 
     let mut out = Vec::with_capacity(body_bytes.len() + 256);
@@ -5629,6 +5678,98 @@ mod tests {
         let msg = format!("{}", err);
         assert!(msg.contains("unauthorized"), "got: {}", msg);
         assert!(msg.contains("exit node"), "got: {}", msg);
+    }
+
+    #[test]
+    fn parse_exit_node_response_strips_stale_content_encoding() {
+        // The exit-node's fetch() auto-decompresses gzip/br/deflate response
+        // bodies, so the destination's Content-Encoding header is stale by
+        // the time it reaches us. Forwarding it to the browser as-is is
+        // exactly what ERR_CONTENT_DECODING_FAILED is — the browser tries
+        // to decompress already-plain bytes. The skip list in
+        // parse_exit_node_response must scrub `content-encoding` from `h`
+        // before synthesising the HTTP response.
+        let envelope =
+            br#"{"s":200,"h":{"content-type":"text/html","content-encoding":"br","x-served-by":"edge-1"},"b":"PGgxPmhpPC9oMT4="}"#;
+        let raw = parse_exit_node_response(envelope)
+            .expect("envelope unwrap should succeed even with stale content-encoding");
+        let raw_str = String::from_utf8_lossy(&raw);
+        assert!(raw_str.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(raw_str.contains("content-type: text/html\r\n"));
+        // Non-skipped headers pass through.
+        assert!(raw_str.contains("x-served-by: edge-1\r\n"));
+        // Stale Content-Encoding must be stripped (case-insensitive).
+        assert!(
+            !raw_str.to_ascii_lowercase().contains("content-encoding"),
+            "Content-Encoding header should be stripped, got: {}",
+            raw_str
+        );
+        // Body is `<h1>hi</h1>` (11 bytes; base64-decoded from the b field).
+        assert!(raw.ends_with(b"<h1>hi</h1>"));
+        assert!(raw_str.contains("Content-Length: 11\r\n"));
+    }
+
+    #[test]
+    fn parse_exit_node_response_tolerates_leading_http_framing() {
+        // Defensive: if h2_round_trip / read_http_response ever hands back
+        // bytes that include an HTTP status line + headers before the JSON
+        // envelope (e.g. a misconfigured intermediary), parse_exit_node_response
+        // must skip past the `\r\n\r\n` separator and parse the envelope
+        // anyway rather than failing with "not valid JSON".
+        let prefixed = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n\
+            {\"s\":200,\"h\":{\"content-type\":\"application/json\"},\"b\":\"eyJvayI6dHJ1ZX0=\"}";
+        let raw = parse_exit_node_response(prefixed)
+            .expect("envelope unwrap should tolerate a leading HTTP framing prefix");
+        let raw_str = String::from_utf8_lossy(&raw);
+        assert!(raw_str.starts_with("HTTP/1.1 200 OK\r\n"));
+        // Body is `{"ok":true}` (11 bytes).
+        assert!(raw.ends_with(b"{\"ok\":true}"));
+    }
+
+    #[test]
+    fn relay_request_serialization_omits_raw_by_default() {
+        // The `raw` flag is wire-additive — it must NOT appear in serialized
+        // payloads when unset, so non-exit-node relays against deployments
+        // that don't know about `raw` see the same wire shape as before.
+        // Pre-v2.0.2 Apps Script/Worker deployments parsing this JSON would
+        // ignore an unknown `raw` field anyway, but adding bytes that don't
+        // exist in the old contract changes the random-padding budget and
+        // is wasteful — `skip_serializing_if` is the right call.
+        let regular = RelayRequest {
+            k: "secret",
+            m: "GET",
+            u: "https://example.com/",
+            h: None,
+            b: None,
+            ct: None,
+            r: true,
+            raw: None,
+        };
+        let json = serde_json::to_string(&regular).expect("serialize regular");
+        assert!(
+            !json.contains("\"raw\""),
+            "raw must be absent when None, got: {}",
+            json
+        );
+
+        // And when explicitly set, it serializes as `"raw":true` so the
+        // splice in relay_via_exit_node lands on the correct wire field.
+        let exit_outer = RelayRequest {
+            k: "secret",
+            m: "POST",
+            u: "https://exit.example.com/",
+            h: None,
+            b: None,
+            ct: None,
+            r: true,
+            raw: Some(true),
+        };
+        let json = serde_json::to_string(&exit_outer).expect("serialize exit_outer");
+        assert!(
+            json.contains("\"raw\":true"),
+            "raw:true must appear when Some(true), got: {}",
+            json
+        );
     }
 
     #[test]
