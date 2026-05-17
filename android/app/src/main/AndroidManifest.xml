@@ -17,6 +17,13 @@
       prompt.
     -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <!--
+      SYSTEM_ALERT_WINDOW is declared only in src/debug/AndroidManifest.xml
+      so release builds never request it (it's a "sensitive" permission and
+      the only feature using it — the pipelining debug overlay — is also
+      gated to debug at runtime via BuildConfig.DEBUG).
+    -->
+
 
     <!--
       Required so we can hand a downloaded APK to the system installer

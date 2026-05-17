@@ -218,7 +218,7 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_startProxy(
             // Try to build the runtime first — if allocation fails we want to
             // know before spinning up anything stateful.
             let rt = match tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(2)
+                .worker_threads(4)
                 .enable_all()
                 .thread_name("mhrv-worker")
                 .build()
@@ -651,6 +651,29 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_statsJson<'a>(
             };
             f.snapshot_stats().to_json()
         }),
+    );
+    env.new_string(out)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// `Native.pipelineDebugJson()` -> String. Snapshot of pipeline debug
+/// state: elevated session count, batch semaphore usage, recent ramp /
+/// drop events. The Kotlin caller (the debug overlay) is gated to
+/// `BuildConfig.DEBUG`, and the underlying `pipeline_debug::to_json`
+/// is gated to the `pipeline-debug` cargo feature — without the feature,
+/// this returns a stable empty-snapshot JSON instead of doing any work.
+/// The JNI symbol itself is kept unconditionally so Android can load
+/// the library cleanly regardless of which variant the Rust side was
+/// built with.
+#[no_mangle]
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_pipelineDebugJson<'a>(
+    env: JNIEnv<'a>,
+    _class: JClass,
+) -> jstring {
+    let out = safe(
+        String::new(),
+        AssertUnwindSafe(|| crate::tunnel_client::pipeline_debug::to_json()),
     );
     env.new_string(out)
         .map(|s| s.into_raw())

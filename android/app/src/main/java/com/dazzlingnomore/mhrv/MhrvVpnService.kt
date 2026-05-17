@@ -7,6 +7,8 @@ import android.app.PendingIntent
 import android.content.Intent
 import android.net.VpnService
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -34,6 +36,7 @@ class MhrvVpnService : VpnService() {
     private var proxyHandle: Long = 0L
     private var tun2proxyThread: Thread? = null
     private val tun2proxyRunning = AtomicBoolean(false)
+    private var debugOverlay: PipelineDebugOverlay? = null
 
     // Idempotency guard. teardown() is reachable from three paths:
     //   1. ACTION_STOP onStartCommand branch (background thread)
@@ -164,6 +167,7 @@ class MhrvVpnService : VpnService() {
             Log.i(TAG, "PROXY_ONLY mode: listeners up, skipping VpnService/TUN")
             VpnState.setProxyHandle(proxyHandle)
             VpnState.setRunning(true)
+            showDebugOverlay()
             return
         }
 
@@ -345,6 +349,42 @@ class MhrvVpnService : VpnService() {
         // a failed-to-establish run.
         VpnState.setProxyHandle(proxyHandle)
         VpnState.setRunning(true)
+        showDebugOverlay()
+    }
+
+    private fun showDebugOverlay() {
+        // Pipelining-debug overlay is a development affordance only.
+        // Release builds skip it entirely so end-users never hit the
+        // SYSTEM_ALERT_WINDOW prompt (no user benefit, and Play Console
+        // flags the permission as sensitive). Strip via BuildConfig.DEBUG
+        // — the JIT/R8 elides the rest of the body in release.
+        if (!BuildConfig.DEBUG) return
+        if (debugOverlay != null) return
+        if (!android.provider.Settings.canDrawOverlays(this)) {
+            Log.w(TAG, "overlay permission not granted — skipping debug overlay")
+            return
+        }
+        // wm.addView must run on the main looper (Looper.getMainLooper()):
+        // WindowManager rejects view ops from arbitrary threads on most
+        // OEM builds. startEverything() runs on a worker thread because
+        // it does blocking JNI, so we post here.
+        //
+        // Store the overlay reference *before* posting show(): teardown
+        // (cleanupEverything) may run on the worker thread between the
+        // post and its execution, and it needs to be able to call hide()
+        // on whatever overlay instance we constructed — even if show()
+        // hasn't attached the view yet. PipelineDebugOverlay's `torn`
+        // flag handles the late-show case (a hide() before show() makes
+        // the subsequent show() a no-op + tears down the poll thread).
+        // We also drop the reference if show() failed, so a one-time
+        // addView failure doesn't suppress a future retry attempt.
+        val overlay = PipelineDebugOverlay(this)
+        debugOverlay = overlay
+        Handler(Looper.getMainLooper()).post {
+            if (!overlay.show() && debugOverlay === overlay) {
+                debugOverlay = null
+            }
+        }
     }
 
     /**
@@ -474,6 +514,16 @@ class MhrvVpnService : VpnService() {
         tun2proxyThread = null
         if (stillAlive) {
             Log.w(TAG, "tun2proxy thread still alive after join timeout — proceeding anyway")
+        }
+
+        // Hide debug overlay before flipping UI state. Like show(),
+        // hide() ultimately touches WindowManager and must run on the
+        // main looper — teardown runs on the worker thread that owned
+        // the VPN run loop, so we post.
+        val overlayToHide = debugOverlay
+        debugOverlay = null
+        if (overlayToHide != null) {
+            Handler(Looper.getMainLooper()).post { overlayToHide.hide() }
         }
 
         // Flip UI state last — the button reverts to Connect only after

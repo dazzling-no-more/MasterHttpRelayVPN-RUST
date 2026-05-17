@@ -25,6 +25,13 @@ required-features = ["ui"]
 [features]
 default = []
 ui = ["dep:eframe"]
+# Pipelining-internal counters + the JNI export that backs the Android
+# debug overlay. Off by default — the overlay is itself debug-only on
+# Android (see android/app/src/debug/AndroidManifest.xml), and the
+# desktop binaries don't surface this data, so the mutators on the hot
+# upload/reply path are dead weight in release. Enable for diagnostic
+# builds: `cargo build --features pipeline-debug`.
+pipeline-debug = []
 
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "signal", "sync", "fs"] }

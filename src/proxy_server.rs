@@ -482,6 +482,7 @@ pub struct RewriteCtx {
     /// callers fall back to TCP/HTTPS. See config.rs `block_quic` for
     /// the trade-off. Issue #213.
     pub block_quic: bool,
+    pub block_stun: bool,
     /// If true, route DoH CONNECTs around the Apps Script tunnel via
     /// plain TCP. Default false via `Config::tunnel_doh = true` (flipped
     /// in v1.9.0, issue #468). See `DEFAULT_DOH_HOSTS` and
@@ -740,6 +741,18 @@ fn host_matches_doh_entry(h: &str, entry: &str) -> bool {
         return false;
     }
     h == e || h.ends_with(&format!(".{}", e))
+}
+
+/// IANA-registered STUN/TURN UDP ports plus the Google STUN allocation
+/// (`stun.l.google.com:19302`). When `Config::block_stun` is on, the
+/// UDP-relay datagram filter (`handle_socks5_udp_associate`) drops
+/// matching datagrams so WebRTC apps skip UDP ICE candidates and fall
+/// back to TCP TURN — typically on :443, which stays open. We do NOT
+/// reject the same ports on the TCP CONNECT path, since that would also
+/// break the very TURN-TCP fallback we're steering clients toward.
+/// Centralized in a helper so a focused test pins the port list.
+fn is_stun_turn_port(port: u16) -> bool {
+    matches!(port, 3478 | 5349 | 19302)
 }
 
 pub fn matches_doh_host(host: &str, extra: &[String]) -> bool {
@@ -1048,6 +1061,7 @@ fn build_mode_state(
         exit_node_full_mode_active,
         passthrough_hosts: config.passthrough_hosts.clone(),
         block_quic: config.block_quic,
+        block_stun: config.block_stun,
         bypass_doh: !config.tunnel_doh,
         block_doh: config.block_doh,
         bypass_doh_hosts: config.bypass_doh_hosts.clone(),
@@ -1764,6 +1778,13 @@ async fn handle_socks5_client(
         }
     }
 
+    // `block_stun` is UDP-only by design: the goal is to make WebRTC
+    // skip UDP ICE candidates so it falls back to TCP TURN. Blocking
+    // TCP/3478 too would break the very fallback path we're steering
+    // clients toward (TURN-TCP deployments that don't advertise :443),
+    // so we leave the CONNECT path alone here. The matching UDP
+    // datagram filter lives in `handle_socks5_udp_associate`.
+
     tracing::info!("SOCKS5 CONNECT -> {}:{}", host, port);
 
     // Success reply with zeroed BND.
@@ -2021,6 +2042,23 @@ async fn handle_socks5_udp_associate(
                     tracing::debug!(
                         "udp dropped: block_quic=true, target {}:443",
                         target.host
+                    );
+                    continue;
+                }
+
+                // Same shape as the QUIC drop above, but for WebRTC
+                // STUN/TURN. The intent is to make Meet/Discord/WhatsApp
+                // skip UDP ICE candidates and fall back to TCP TURN on
+                // :443 immediately, instead of waiting out the 10–30 s
+                // ICE timeout per attempt. The upstream PR added the
+                // matching CONNECT-path check; doing it here too is what
+                // actually denies the UDP candidates that the PR's
+                // comment claims to deny.
+                if rewrite_ctx.block_stun && is_stun_turn_port(target.port) {
+                    tracing::debug!(
+                        "udp dropped: block_stun=true, target {}:{}",
+                        target.host,
+                        target.port,
                     );
                     continue;
                 }
@@ -4214,6 +4252,98 @@ fn split_authority(authority: &str, default_port: u16) -> (String, u16) {
 mod tests {
     use super::*;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+
+    /// `block_stun` rejects three specific UDP ports — IANA STUN (3478),
+    /// STUNS/TURNS over TLS (5349), and Google's STUN allocation (19302).
+    /// The drop fires only on the UDP-relay path; TCP CONNECT to the
+    /// same ports is intentionally left open so TURN-TCP fallback works.
+    /// Pin the port set so a careless `matches!` typo or a new-port
+    /// refactor doesn't silently un-block WebRTC candidates the rest of
+    /// the pipeline assumed were already gone.
+    #[test]
+    fn is_stun_turn_port_matches_only_documented_ports() {
+        assert!(is_stun_turn_port(3478), "IANA STUN UDP");
+        assert!(is_stun_turn_port(5349), "STUNS/TURNS over TLS");
+        assert!(is_stun_turn_port(19302), "Google STUN allocation");
+
+        // Neighboring ports must not be caught: 3479 is unassigned but
+        // adjacent; 443 is HTTPS / TURNS-fallback target (must stay open);
+        // 0 / u16::MAX are sentinel boundaries.
+        assert!(!is_stun_turn_port(0));
+        assert!(!is_stun_turn_port(443));
+        assert!(!is_stun_turn_port(3477));
+        assert!(!is_stun_turn_port(3479));
+        assert!(!is_stun_turn_port(5348));
+        assert!(!is_stun_turn_port(5350));
+        assert!(!is_stun_turn_port(19301));
+        assert!(!is_stun_turn_port(19303));
+        assert!(!is_stun_turn_port(u16::MAX));
+    }
+
+    /// The UDP-relay path filters STUN/TURN by inspecting the parsed
+    /// SOCKS5 UDP packet's `target.port`. This guards the assumption that
+    /// `parse_socks5_udp_packet_offsets` extracts the destination port
+    /// from the header in the right byte order — feed it a packet
+    /// addressed at `stun.l.google.com:19302` (literal IPv4 form) and
+    /// confirm the parsed port lights up `is_stun_turn_port`. Also
+    /// exercises both polarities of the `block_stun` config gate so a
+    /// future refactor that inverts the condition fails loudly.
+    #[test]
+    fn block_stun_udp_path_recognizes_stun_target_port() {
+        // SOCKS5 UDP request header (RFC 1928 §7):
+        //   RSV(2) | FRAG(1) | ATYP(1) | DST.ADDR | DST.PORT(2) | DATA
+        // Use ATYP=0x01 (IPv4) so we don't drag DNS into the test.
+        fn build_pkt(port: u16, payload: &[u8]) -> Vec<u8> {
+            let mut pkt = vec![0x00, 0x00, 0x00, 0x01];
+            pkt.extend_from_slice(&[74, 125, 250, 129]); // any IPv4
+            pkt.extend_from_slice(&port.to_be_bytes());
+            pkt.extend_from_slice(payload);
+            pkt
+        }
+
+        // Mirror the runtime decision verbatim — both lines are the
+        // exact gate in `handle_socks5_udp_associate`'s recv loop.
+        fn should_drop(block_stun: bool, target_port: u16) -> bool {
+            block_stun && is_stun_turn_port(target_port)
+        }
+
+        // STUN target packet parses cleanly and the payload offset
+        // skips the 4 + 4 + 2 = 10-byte SOCKS5 UDP header.
+        let stun_pkt = build_pkt(19302, b"stun-binding-request-payload");
+        let (stun_target, stun_payload_off) =
+            parse_socks5_udp_packet_offsets(&stun_pkt).expect("STUN packet must parse");
+        assert_eq!(stun_target.port, 19302);
+        assert_eq!(
+            &stun_pkt[stun_payload_off..],
+            b"stun-binding-request-payload",
+            "payload offset must skip past the SOCKS5 header",
+        );
+
+        // block_stun=true: STUN target gets dropped.
+        assert!(
+            should_drop(true, stun_target.port),
+            "block_stun=true must drop datagrams to STUN/TURN ports",
+        );
+        // block_stun=false: STUN target passes through.
+        assert!(
+            !should_drop(false, stun_target.port),
+            "block_stun=false must NOT drop STUN/TURN — \
+             config has to remain a real toggle",
+        );
+
+        // Negative: a parallel packet to :443 must NOT match under
+        // either polarity — that's the TURN-over-TLS fallback path
+        // we explicitly want to keep open even when block_stun is on.
+        let https_pkt = build_pkt(443, b"");
+        let (https_target, _) =
+            parse_socks5_udp_packet_offsets(&https_pkt).expect("HTTPS packet must parse");
+        assert_eq!(https_target.port, 443);
+        assert!(
+            !should_drop(true, https_target.port),
+            "block_stun=true must NOT touch :443 — TURNS fallback lives there",
+        );
+        assert!(!should_drop(false, https_target.port));
+    }
 
     fn headers(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs

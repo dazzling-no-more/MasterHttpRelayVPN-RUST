@@ -228,7 +228,14 @@ tasks.register<Exec>("cargoBuildDebug") {
     // never worth it just for a Rust stack trace you wouldn't see in
     // logcat anyway. If you need Rust debug symbols, temporarily drop
     // `--release` below and accept the APK size.
-    description = "Cross-compile rahgozar for all ABIs (release — same as cargoBuildRelease)"
+    //
+    // `--features pipeline-debug` is added ONLY here so the debug-variant
+    // APK gets the real `Native.pipelineDebugJson()` snapshot that the
+    // BuildConfig.DEBUG-gated overlay and HomeScreen card consume. The
+    // release task below intentionally omits the feature — release users
+    // don't see the overlay and shouldn't pay the atomic / HashMap cost
+    // on the upload/reply hot path.
+    description = "Cross-compile rahgozar for all ABIs (release + pipeline-debug)"
     workingDir = rustCrateDir
     commandLine(
         buildList<String> {
@@ -242,6 +249,8 @@ tasks.register<Exec>("cargoBuildDebug") {
             add(jniLibsDir.absolutePath)
             add("build")
             add("--release")
+            add("--features")
+            add("pipeline-debug")
         },
     )
     doLast { normalizeTun2proxySo() }

@@ -5,7 +5,7 @@
 //! Each Apps Script deployment (account) gets its own concurrency pool of
 //! 30 in-flight requests — matching the per-account Apps Script limit.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 // `AtomicU64` from `std::sync::atomic` requires hardware-backed 64-bit
 // atomics, which 32-bit MIPS (`mipsel-unknown-linux-musl` — our OpenWRT
 // router target) does not provide — the std type isn't even defined
@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use bytes::{Bytes, BytesMut};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot, Semaphore};
@@ -58,6 +59,31 @@ const REPLY_TIMEOUT_SLACK: Duration = Duration::from_secs(5);
 /// connect saves one Apps Script round-trip per new flow.
 const CLIENT_FIRST_DATA_WAIT: Duration = Duration::from_millis(50);
 
+/// Floor depth after a drop (first empty reply).
+const INFLIGHT_IDLE: usize = 1;
+
+/// Optimistic starting depth — every session gets 2 in-flight polls
+/// without needing an elevation permit. Drops to IDLE on first empty.
+const INFLIGHT_OPTIMIST: usize = 2;
+
+/// Maximum pipeline depth when data is actively flowing. Ramps up on
+/// data-bearing replies, drops back to IDLE after consecutive empties.
+const INFLIGHT_ACTIVE: usize = 4;
+
+/// Max sessions that can run at elevated pipeline depth per deployment.
+const MAX_ELEVATED_PER_DEPLOYMENT: u64 = 30;
+
+/// Capacity of the bounded MuxMsg channel between `TunnelMux::send_sync`
+/// and `mux_loop`. Sized for ~256 active-sending sessions at the per-
+/// session in-flight cap (`INFLIGHT_ACTIVE + 4` = 8). When full,
+/// `send_sync`'s `try_send` drops the message and logs once per session;
+/// the affected session's `reply_rx` will then hit `reply_timeout` and
+/// close terminally. This is the global back-pressure boundary —
+/// without it, a local/LAN client could open many sessions and queue
+/// raw payloads + pending batch tasks until OOM. Tune up for high-fan-
+/// in relay operators.
+const MUX_CHANNEL_DEPTH: usize = 2048;
+
 /// Adaptive coalesce defaults: after each new op arrives, wait another
 /// step for more ops. Resets on every arrival, up to max from the first
 /// op. Overridable via config `coalesce_step_ms` / `coalesce_max_ms`.
@@ -81,10 +107,13 @@ const CODE_UNSUPPORTED_OP: &str = "UNSUPPORTED_OP";
 /// Empty poll round-trip latency below which we conclude the tunnel-node
 /// is *not* long-polling (legacy fixed-sleep drain instead). On a
 /// long-poll-capable server an empty poll with no upstream push either
-/// returns near `LONGPOLL_DEADLINE` (~5 s) or comes back early *with*
-/// pushed bytes — neither matches a fast empty reply. Threshold sits
-/// well above the legacy `~350 ms` drain and well below the long-poll
-/// floor, so network jitter on either side won't false-trigger.
+/// returns near `LONGPOLL_DEADLINE` (currently 4 s, see tunnel-node)
+/// or comes back early *with* pushed bytes — neither matches a fast
+/// empty reply. Threshold sits well above the legacy `~350 ms` drain
+/// and well below the long-poll floor, so network jitter on either
+/// side won't false-trigger. Keep this in sync with the tunnel-node
+/// constant; if `LONGPOLL_DEADLINE` ever drops below ~1.6 s this
+/// threshold needs to come down with it.
 const LEGACY_DETECT_THRESHOLD: Duration = Duration::from_millis(1500);
 
 /// How long a deployment stays in "legacy / no long-poll" mode after the
@@ -108,6 +137,217 @@ const UNREACHABLE_CACHE_TTL: Duration = Duration::from_secs(30);
 /// Hard cap on negative-cache size. Browsing pulls in dozens of distinct
 /// hosts; we don't want a runaway map. Pruned opportunistically on insert.
 const UNREACHABLE_CACHE_MAX: usize = 256;
+
+// ---------------------------------------------------------------------------
+// Pipeline debug overlay state — gated behind the `pipeline-debug` cargo
+// feature. Off by default: the Android overlay that consumes this lives
+// behind `BuildConfig.DEBUG` on the Kotlin side and is not surfaced by
+// any desktop UI, so paying the atomic-fetch / HashMap-insert cost on
+// the upload/reply hot path in release builds buys nothing. Production
+// builds use the no-op stubs below; diagnostic builds pass
+// `--features pipeline-debug` to get real counters.
+// ---------------------------------------------------------------------------
+#[cfg(feature = "pipeline-debug")]
+pub(crate) mod pipeline_debug {
+    use portable_atomic::AtomicU64;
+    use std::collections::VecDeque;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Mutex, OnceLock};
+
+    const EVENT_CAP: usize = 30;
+
+    struct SessionInfo {
+        depth: usize,
+        inflight: usize,
+        elevated: bool,
+    }
+
+    struct State {
+        events: Mutex<VecDeque<String>>,
+        elevated: AtomicU64,
+        max_elevated: AtomicU64,
+        active_batches: AtomicU64,
+        max_batch_slots: AtomicU64,
+        active_sessions: AtomicU64,
+        sessions: Mutex<std::collections::HashMap<String, SessionInfo>>,
+    }
+
+    fn state() -> &'static State {
+        static S: OnceLock<State> = OnceLock::new();
+        S.get_or_init(|| State {
+            events: Mutex::new(VecDeque::with_capacity(EVENT_CAP)),
+            elevated: AtomicU64::new(0),
+            max_elevated: AtomicU64::new(0),
+            active_batches: AtomicU64::new(0),
+            max_batch_slots: AtomicU64::new(0),
+            active_sessions: AtomicU64::new(0),
+            sessions: Mutex::new(std::collections::HashMap::new()),
+        })
+    }
+
+    pub fn push_event(msg: String) {
+        if let Ok(mut g) = state().events.lock() {
+            if g.len() >= EVENT_CAP {
+                g.pop_front();
+            }
+            g.push_back(msg);
+        }
+    }
+
+    pub fn set_limits(max_elev: u64, max_batches: u64) {
+        let s = state();
+        s.max_elevated.store(max_elev, Ordering::Relaxed);
+        s.max_batch_slots.store(max_batches, Ordering::Relaxed);
+    }
+
+    pub fn set_elevated(n: u64) {
+        state().elevated.store(n, Ordering::Relaxed);
+    }
+
+    pub fn batch_acquire() {
+        state().active_batches.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn batch_release() {
+        // saturating decrement — never wrap past zero.
+        let s = state();
+        let mut cur = s.active_batches.load(Ordering::Relaxed);
+        loop {
+            if cur == 0 {
+                return;
+            }
+            match s.active_batches.compare_exchange_weak(
+                cur,
+                cur - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(v) => cur = v,
+            }
+        }
+    }
+
+    pub fn session_start(sid: &str) {
+        let s = state();
+        if let Ok(mut g) = s.sessions.lock() {
+            // Only count the session if this is the first insertion —
+            // a reconnect/re-init under the same sid mustn't double-count.
+            if g.insert(
+                sid.to_string(),
+                SessionInfo {
+                    depth: 0,
+                    inflight: 0,
+                    elevated: false,
+                },
+            )
+            .is_none()
+            {
+                s.active_sessions.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn session_end(sid: &str) {
+        let s = state();
+        if let Ok(mut g) = s.sessions.lock() {
+            if g.remove(sid).is_some() {
+                let mut cur = s.active_sessions.load(Ordering::Relaxed);
+                loop {
+                    if cur == 0 {
+                        break;
+                    }
+                    match s.active_sessions.compare_exchange_weak(
+                        cur,
+                        cur - 1,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(v) => cur = v,
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn session_update(sid: &str, depth: usize, inflight: usize, elevated: bool) {
+        if let Ok(mut g) = state().sessions.lock() {
+            if let Some(info) = g.get_mut(sid) {
+                info.depth = depth;
+                info.inflight = inflight;
+                info.elevated = elevated;
+            }
+        }
+    }
+
+    pub fn to_json() -> String {
+        let s = state();
+        let events: Vec<String> = s
+            .events
+            .lock()
+            .map(|g| g.iter().cloned().collect())
+            .unwrap_or_default();
+        let sessions: Vec<serde_json::Value> = s
+            .sessions
+            .lock()
+            .map(|g| {
+                g.iter()
+                    .map(|(sid, info)| {
+                        serde_json::json!({
+                            "sid": sid,
+                            "depth": info.depth,
+                            "inflight": info.inflight,
+                            "elevated": info.elevated,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let payload = serde_json::json!({
+            "elevated": s.elevated.load(Ordering::Relaxed),
+            "max_elevated": s.max_elevated.load(Ordering::Relaxed),
+            "active_batches": s.active_batches.load(Ordering::Relaxed),
+            "max_batch_slots": s.max_batch_slots.load(Ordering::Relaxed),
+            "active_sessions": s.active_sessions.load(Ordering::Relaxed),
+            "sessions": sessions,
+            "events": events,
+        });
+        payload.to_string()
+    }
+}
+
+#[cfg(not(feature = "pipeline-debug"))]
+pub(crate) mod pipeline_debug {
+    // No-op stubs. With the feature off, the compiler inlines every
+    // call site to nothing (each function body is empty) so the hot
+    // path pays no cost. `to_json` returns a stable empty-snapshot
+    // shape so any JNI consumer that calls it on a release build still
+    // gets parseable JSON rather than an error.
+    #[inline]
+    pub fn push_event(_msg: String) {}
+    #[inline]
+    pub fn set_limits(_max_elev: u64, _max_batches: u64) {}
+    #[inline]
+    pub fn set_elevated(_n: u64) {}
+    #[inline]
+    pub fn batch_acquire() {}
+    #[inline]
+    pub fn batch_release() {}
+    #[inline]
+    pub fn session_start(_sid: &str) {}
+    #[inline]
+    pub fn session_end(_sid: &str) {}
+    #[inline]
+    pub fn session_update(_sid: &str, _depth: usize, _inflight: usize, _elevated: bool) {}
+
+    pub fn to_json() -> String {
+        // Stable empty snapshot — same key set as the feature-on path
+        // so consumers don't need to handle two shapes.
+        r#"{"elevated":0,"max_elevated":0,"active_batches":0,"max_batch_slots":0,"active_sessions":0,"sessions":[],"events":[]}"#
+            .to_string()
+    }
+}
 
 /// Ports where the *server* speaks first (SMTP banner, SSH identification,
 /// POP3/IMAP greeting, FTP banner). On these, waiting for client bytes
@@ -174,6 +414,8 @@ enum MuxMsg {
     Data {
         sid: String,
         data: Bytes,
+        seq: Option<u64>,
+        wseq: Option<u64>,
         reply: BatchedReply,
     },
     UdpOpen {
@@ -209,9 +451,21 @@ struct PendingOp {
     /// only `connect_data`, which uses presence of `d` as the signal
     /// that the caller is opting into the bundled-first-bytes flow).
     encode_empty: bool,
+    seq: Option<u64>,
+    wseq: Option<u64>,
 }
 
 pub struct TunnelMux {
+    // Bounded channel — global back-pressure boundary. Per-session
+    // pipeline depth caps each session at ~8 in-flight MuxMsgs, but
+    // active_sessions itself isn't capped, so an unbounded channel
+    // would let a local/LAN client open many sessions and queue raw
+    // payloads + pending batch tasks until OOM. Bounded `channel(N)`
+    // means `tx.send` is async — incompatible with `send_sync`, which
+    // is called from `tunnel_loop`'s sync select arms — so the sync
+    // path uses `try_send` and drops on full. The dropped op's
+    // `reply_rx` then hits `reply_timeout` and the session closes
+    // terminally (clean error path). See `MUX_CHANNEL_DEPTH`.
     tx: mpsc::Sender<MuxMsg>,
     /// Set to `true` after the first time the tunnel-node rejects
     /// `connect_data` as unsupported. Subsequent sessions skip the
@@ -289,6 +543,9 @@ pub struct TunnelMux {
     /// `request_timeout_secs` would see sessions abandon replies just
     /// before the batch would have completed.
     reply_timeout: Duration,
+    /// How many sessions are currently at elevated pipeline depth (>= 3).
+    elevated_sessions: AtomicU64,
+    max_elevated: u64,
 }
 
 impl TunnelMux {
@@ -331,14 +588,24 @@ impl TunnelMux {
         } else {
             DEFAULT_COALESCE_MAX_MS
         };
-        tracing::info!("batch coalesce: step={}ms max={}ms", step, max);
+        tracing::info!(
+            "batch coalesce: step={}ms max={}ms, pipeline max depth: {}, optimist: {}",
+            step,
+            max,
+            INFLIGHT_ACTIVE,
+            INFLIGHT_OPTIMIST,
+        );
         // Reply timeout co-varies with `request_timeout_secs` so an
         // operator who raises the batch budget doesn't have sessions
         // abandoning replies just before the HTTP round-trip would
         // have completed. See the `reply_timeout` field comment for
         // the invariant.
         let reply_timeout = fronter.batch_timeout().saturating_add(REPLY_TIMEOUT_SLACK);
-        let (tx, rx) = mpsc::channel(512);
+        pipeline_debug::set_limits(
+            MAX_ELEVATED_PER_DEPLOYMENT * unique_n as u64,
+            (CONCURRENCY_PER_DEPLOYMENT * unique_n) as u64,
+        );
+        let (tx, rx) = mpsc::channel(MUX_CHANNEL_DEPTH);
         tokio::spawn(mux_loop(rx, fronter, step, max));
         Arc::new(Self {
             tx,
@@ -354,6 +621,8 @@ impl TunnelMux {
             preread_total_events: AtomicU64::new(0),
             unreachable_cache: Mutex::new(HashMap::new()),
             reply_timeout,
+            elevated_sessions: AtomicU64::new(0),
+            max_elevated: MAX_ELEVATED_PER_DEPLOYMENT * unique_n as u64,
         })
     }
 
@@ -364,7 +633,30 @@ impl TunnelMux {
         self.reply_timeout
     }
 
+    fn send_sync(&self, msg: MuxMsg) {
+        // Bounded `try_send` — drops on full instead of awaiting (this
+        // path is called from `tunnel_loop`'s sync select arms and can't
+        // .await). The dropped op's reply_rx never resolves, so the
+        // session hits `reply_timeout` and closes terminally — clean
+        // error path. Tokio's tracing handles dedupe; we don't try to
+        // log per-drop here because under saturation that's its own
+        // hot-path tax.
+        if let Err(e) = self.tx.try_send(msg) {
+            tracing::warn!(
+                "mux channel full ({} cap) — dropping MuxMsg, session will close via reply_timeout",
+                MUX_CHANNEL_DEPTH,
+            );
+            // Explicitly drop the un-sent MuxMsg so any held `reply_tx`
+            // inside it is closed; this surfaces the failure to the
+            // waiting session as `oneshot::Canceled` immediately instead
+            // of forcing a wait for reply_timeout.
+            drop(e);
+        }
+    }
+
     async fn send(&self, msg: MuxMsg) {
+        // Async path — does await, providing real back-pressure to
+        // callers like `udp_open` that already run in an async context.
         let _ = self.tx.send(msg).await;
     }
 
@@ -719,12 +1011,20 @@ async fn mux_loop(
                         port: Some(port),
                         data: Some(data),
                         encode_empty: true,
+                        seq: None,
+                        wseq: None,
                     };
                     accum
                         .push_or_fire(op, op_bytes, reply, &sems, &fronter)
                         .await;
                 }
-                MuxMsg::Data { sid, data, reply } => {
+                MuxMsg::Data {
+                    sid,
+                    data,
+                    seq,
+                    wseq,
+                    reply,
+                } => {
                     let op_bytes = encoded_len(data.len());
                     let op = PendingOp {
                         op: "data",
@@ -733,6 +1033,8 @@ async fn mux_loop(
                         port: None,
                         data: if data.is_empty() { None } else { Some(data) },
                         encode_empty: false,
+                        seq,
+                        wseq,
                     };
                     accum
                         .push_or_fire(op, op_bytes, reply, &sems, &fronter)
@@ -752,6 +1054,8 @@ async fn mux_loop(
                         port: Some(port),
                         data: if data.is_empty() { None } else { Some(data) },
                         encode_empty: false,
+                        seq: None,
+                        wseq: None,
                     };
                     accum
                         .push_or_fire(op, op_bytes, reply, &sems, &fronter)
@@ -766,6 +1070,8 @@ async fn mux_loop(
                         port: None,
                         data: if data.is_empty() { None } else { Some(data) },
                         encode_empty: false,
+                        seq: None,
+                        wseq: None,
                     };
                     accum
                         .push_or_fire(op, op_bytes, reply, &sems, &fronter)
@@ -787,6 +1093,8 @@ async fn mux_loop(
                 port: None,
                 data: None,
                 encode_empty: false,
+                seq: None,
+                wseq: None,
             });
         }
 
@@ -891,6 +1199,8 @@ fn encode_pending(p: PendingOp) -> BatchOp {
         host: p.host,
         port: p.port,
         d,
+        seq: p.seq,
+        wseq: p.wseq,
     }
 }
 
@@ -913,15 +1223,32 @@ async fn fire_batch(
     pending_ops: Vec<PendingOp>,
     data_replies: Vec<(usize, BatchedReply)>,
 ) {
+    // Choose deployment + look up its semaphore on the mux task (cheap;
+    // no awaits). The actual `acquire_owned().await` lives inside the
+    // spawned batch task below so mux_loop never blocks here. Previously
+    // a saturated per-deployment semaphore stalled mux_loop's `rx.recv`
+    // consumer while `send_sync` kept dumping into the unbounded
+    // channel — memory grew and per-op `reply_timeout` started firing
+    // before ops even got a permit. Now mux_loop drains continuously;
+    // back-pressure on the upstream HTTP path comes from the spawned
+    // tasks queuing on the semaphore, each holding only its own ops.
     let script_id = fronter.next_script_id();
     let sem = sems
         .get(&script_id)
         .cloned()
         .unwrap_or_else(|| Arc::new(Semaphore::new(CONCURRENCY_PER_DEPLOYMENT)));
-    let permit = sem.acquire_owned().await.unwrap();
     let f = fronter.clone();
 
     tokio::spawn(async move {
+        let permit = sem.acquire_owned().await.unwrap();
+        pipeline_debug::batch_acquire();
+        struct BatchGuard;
+        impl Drop for BatchGuard {
+            fn drop(&mut self) {
+                pipeline_debug::batch_release();
+            }
+        }
+        let _batch_guard = BatchGuard;
         let _permit = permit;
         let t0 = std::time::Instant::now();
         let n_ops = pending_ops.len();
@@ -985,6 +1312,10 @@ async fn fire_batch(
                     if let Some(resp) = batch_resp.r.get(idx) {
                         let _ = reply.send(Ok((resp.clone(), script_id.clone())));
                     } else {
+                        tracing::error!(
+                            "batch response mismatch: idx={} but r.len()={} (sent {} ops) from script {}",
+                            idx, batch_resp.r.len(), n_ops, sid_short,
+                        );
                         let _ = reply.send(Err(format!(
                             "missing response in batch from script {}",
                             sid_short
@@ -1104,6 +1435,7 @@ pub async fn tunnel_connection(
     };
 
     tracing::info!("tunnel session {} opened for {}:{}", sid, host, port);
+    pipeline_debug::session_start(&sid);
 
     // Run the first-response write + tunnel_loop inside an async block so
     // any io-error propagates via `?` without bypassing the Close below.
@@ -1133,6 +1465,7 @@ pub async fn tunnel_connection(
     .await;
 
     mux.send(MuxMsg::Close { sid: sid.clone() }).await;
+    pipeline_debug::session_end(&sid);
     tracing::info!("tunnel session {} closed for {}:{}", sid, host, port);
     result
 }
@@ -1290,181 +1623,642 @@ fn is_connect_data_unsupported_error_str(e: &str) -> bool {
     (e.contains("unknown op") || e.contains("unknown tunnel op")) && e.contains("connect_data")
 }
 
+/// Metadata for one in-flight Data op, returned alongside its reply.
+struct InflightMeta {
+    seq: u64,
+    was_empty_poll: bool,
+    send_at: Instant,
+}
+
 async fn tunnel_loop(
     sock: &mut TcpStream,
     sid: &str,
     mux: &Arc<TunnelMux>,
-    mut pending_client_data: Option<Bytes>,
+    pending_client_data: Option<Bytes>,
 ) -> std::io::Result<()> {
     let (mut reader, mut writer) = sock.split();
-    // `BytesMut` + `read_buf` + a per-read decision between
-    // `split().freeze()` (zero-copy) and `copy_from_slice` + `clear`
-    // (right-sized copy, buffer reused).
-    //
-    // Why the split decision: `bytes` 1.x refcounts the *whole*
-    // backing allocation, so a frozen `Bytes` from a partial read
-    // pins all `READ_CHUNK` bytes until it drops. Under semaphore
-    // saturation or reply timeouts, dozens of small TLS records or
-    // HTTP/2 frames can each retain ~64 KB instead of their actual
-    // payload size — order-of-magnitude memory regression on
-    // constrained targets (router builds with 64 MB RAM).
-    //
-    // Threshold: at ≥ half-buffer the saved memcpy outweighs the
-    // wasted slack, and these reads are typically streaming bulk
-    // transfer where the `Bytes` flushes through the mux quickly.
-    // Below that, copy out and `clear()` so the same allocation
-    // serves the next read — equivalent memory profile to the old
-    // `vec![0u8; 65536]` + `to_vec()` code on small-read workloads.
-    const READ_CHUNK: usize = 65536;
-    const ZERO_COPY_THRESHOLD: usize = READ_CHUNK / 2;
-    let mut buf = BytesMut::with_capacity(READ_CHUNK);
+
+    let inflight_cap = INFLIGHT_ACTIVE;
+    let mut max_inflight = INFLIGHT_OPTIMIST.min(inflight_cap);
     let mut consecutive_empty = 0u32;
+    let mut consecutive_data: u32 = 0;
+    let mut is_elevated = false;
+    let mut total_download_bytes: u64 = 0;
+    let mut next_send_seq: u64 = 0;
+    let mut next_write_seq: u64 = 0;
+    let mut next_data_write_seq: u64 = 0;
+    let mut eof_seen = false;
+    let mut client_closed = false;
+    let mut pending_writes: BTreeMap<u64, (TunnelResponse, String)> = BTreeMap::new();
 
-    loop {
-        // Cadence depends on whether the tunnel-node is doing long-poll
-        // drains. With long-poll, the server holds empty polls open up
-        // to its `LONGPOLL_DEADLINE` (~5 s currently), so the client
-        // can keep this read timeout short — the wait is on the wire,
-        // not here. Against *legacy* tunnel-nodes (no long-poll, fast
-        // empty replies), the same short cadence + always-poll behavior
-        // would generate continuous round-trips on idle sessions and
-        // burn Apps Script quota.
-        //
-        // Both the read timeout and the skip-empty-when-idle decision
-        // are gated on `all_legacy` — i.e. *every known deployment is
-        // currently legacy*. Per-deployment "skip when this script is
-        // legacy" sounds appealing but is unsafe: the next op's
-        // deployment is chosen by `next_script_id()` only when the
-        // batch fires, so the loop can't predict where the empty poll
-        // will land. Suppressing polls based on the *previous* reply's
-        // script would stall remote→client data on mixed setups —
-        // round-robin would never reach the long-poll-capable peer for
-        // this session if every iteration short-circuits before
-        // sending. Cost of the conservative gate: legacy peers see
-        // some wasted empty polls when at least one peer is healthy,
-        // bounded by round-robin fan-out. Worth it to keep pushed
-        // bytes flowing.
-        let all_legacy = mux.all_servers_legacy();
-        let client_data = if let Some(data) = pending_client_data.take() {
-            Some(data)
-        } else {
-            let read_timeout = match (all_legacy, consecutive_empty) {
-                (_, 0) => Duration::from_millis(20),
-                (_, 1) => Duration::from_millis(80),
-                (_, 2) => Duration::from_millis(200),
-                (false, _) => Duration::from_millis(500),
-                (true, _) => Duration::from_secs(30),
-            };
+    // Tunnel-node feature detection. Two facts:
+    //   * Pipelining nodes echo `resp.seq` on every reply; pre-pipelining
+    //     nodes drop the unknown field and return without it.
+    //   * Both kinds of node tolerate `wseq` on the wire — legacy nodes
+    //     drop it and write in arrival order, pipelining nodes use it
+    //     for in-order flushing.
+    //
+    // So `send_data_op` unconditionally attaches `wseq` (no rollout
+    // race: there is no transition window during which uploads carry
+    // None then suddenly Some). What this flag DOES gate is *throughput*:
+    //   * `max_inflight + 4` fast-path slack stays at 0 until we
+    //     confirm pipelining (no point queuing more inflight ops on a
+    //     server that processes them serially).
+    //   * `max_inflight` is force-clamped to 1 if any reply lacks `seq`.
+    // Detection is one-way (false → true on first `Some(seq)` reply)
+    // and tied to the connection lifetime — a deployment swap mid-flight
+    // is the only thing that would break the invariant, and even then
+    // the worst case is the slack temporarily over-allocates ops the
+    // serial server will process in order.
+    let mut tunnel_node_supports_seq: bool = false;
 
-            buf.reserve(READ_CHUNK);
-            match tokio::time::timeout(read_timeout, reader.read_buf(&mut buf)).await {
-                Ok(Ok(0)) => break,
-                Ok(Ok(n)) => {
-                    consecutive_empty = 0;
-                    if n >= ZERO_COPY_THRESHOLD {
-                        // Big read: split off the filled region. The
-                        // frozen `Bytes` is at-least-half-full, so the
-                        // saved 64 KB memcpy outweighs the brief
-                        // retention until the mux drains.
-                        Some(buf.split().freeze())
-                    } else {
-                        // Small read: copy out a payload-sized `Bytes`
-                        // and `clear()` so the buffer is reused on the
-                        // next iter (no `reserve` allocation needed
-                        // because the alloc stays uniquely owned).
-                        // Bounds retention to actual data even when
-                        // the mux is backpressured.
-                        let owned = Bytes::copy_from_slice(&buf[..n]);
-                        buf.clear();
-                        Some(owned)
-                    }
-                }
-                Ok(Err(_)) => break,
-                Err(_) => None,
+    // Buffered upload data waiting to be sent (when pipeline is full).
+    let mut buffered_upload: Option<Bytes> = None;
+
+    enum ReplyOutcome {
+        Ok(TunnelResponse, String),
+        BatchErr(String),
+        Timeout,
+        Dropped,
+    }
+    type ReplyFut =
+        std::pin::Pin<Box<dyn std::future::Future<Output = (InflightMeta, ReplyOutcome)> + Send>>;
+    let mut inflight: FuturesUnordered<ReplyFut> = FuturesUnordered::new();
+
+    // Reply timeout: use the mux's config-derived value (request_timeout_secs
+    // + REPLY_TIMEOUT_SLACK) rather than the hardcoded REPLY_TIMEOUT constant
+    // so an operator who raised `request_timeout_secs` doesn't see pipelined
+    // polls abandon their reply just before the HTTP round-trip would have
+    // completed. Matches the contract on `TunnelMux::reply_timeout`.
+    let reply_timeout = mux.reply_timeout();
+
+    // Helper: wrap a reply_rx into a ReplyFut with timeout.
+    fn wrap_reply(
+        meta: InflightMeta,
+        reply_rx: oneshot::Receiver<Result<(TunnelResponse, String), String>>,
+        reply_timeout: Duration,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (InflightMeta, ReplyOutcome)> + Send>>
+    {
+        Box::pin(async move {
+            match tokio::time::timeout(reply_timeout, reply_rx).await {
+                Ok(Ok(Ok((r, sid)))) => (meta, ReplyOutcome::Ok(r, sid)),
+                Ok(Ok(Err(e))) => (meta, ReplyOutcome::BatchErr(e)),
+                Ok(Err(_)) => (meta, ReplyOutcome::Dropped),
+                Err(_) => (meta, ReplyOutcome::Timeout),
             }
-        };
+        })
+    }
 
-        // Skip empty polls only when *every* deployment is legacy. With
-        // even one long-poll-capable peer, round-robin will land some
-        // empty polls there where the server holds them open and can
-        // deliver pushed bytes — that's the whole point of long-poll,
-        // so we must keep emitting. See the `all_legacy` comment above
-        // for why a per-deployment gate here would stall mixed setups.
-        if all_legacy && client_data.is_none() && consecutive_empty > 3 {
-            continue;
-        }
-
-        let data = client_data.unwrap_or_else(Bytes::new);
-        let was_empty_poll = data.is_empty();
-
+    /// Send an empty poll Data op. Returns the InflightMeta and reply rx.
+    #[inline]
+    fn send_empty_poll(
+        sid: &str,
+        next_send_seq: &mut u64,
+        mux: &Arc<TunnelMux>,
+    ) -> (
+        InflightMeta,
+        oneshot::Receiver<Result<(TunnelResponse, String), String>>,
+    ) {
+        let seq = *next_send_seq;
+        *next_send_seq += 1;
         let (reply_tx, reply_rx) = oneshot::channel();
         let send_at = Instant::now();
-        mux.send(MuxMsg::Data {
+        mux.send_sync(MuxMsg::Data {
+            sid: sid.to_string(),
+            data: Bytes::new(),
+            seq: Some(seq),
+            wseq: None,
+            reply: reply_tx,
+        });
+        let meta = InflightMeta {
+            seq,
+            was_empty_poll: true,
+            send_at,
+        };
+        (meta, reply_rx)
+    }
+
+    /// Send a data op with a monotonic `wseq` attached. The wseq field
+    /// is *always* set — pre-pipelining tunnel-nodes silently drop it
+    /// (serde's default `#[derive(Deserialize)]` ignores unknown fields)
+    /// and write in arrival order, so attaching wseq is a no-op there.
+    /// Pipelining tunnel-nodes use wseq to flush per-session writes in
+    /// client order. The previous shape gated wseq behind a runtime
+    /// "supports_seq" flag, but that opened a rollout race: pre-detection
+    /// uploads went out with `wseq=None`, the pipelining server wrote
+    /// those immediately while later `Some(wseq)` uploads were ordered,
+    /// and the two streams could interleave out of order on the upstream
+    /// socket. Always-on wseq eliminates the race.
+    #[inline]
+    fn send_data_op(
+        sid: &str,
+        data: Bytes,
+        next_send_seq: &mut u64,
+        next_data_write_seq: &mut u64,
+        mux: &Arc<TunnelMux>,
+    ) -> (
+        InflightMeta,
+        oneshot::Receiver<Result<(TunnelResponse, String), String>>,
+    ) {
+        let seq = *next_send_seq;
+        *next_send_seq += 1;
+        let wseq = *next_data_write_seq;
+        *next_data_write_seq += 1;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let send_at = Instant::now();
+        let sid_short = &sid[..sid.len().min(8)];
+        tracing::debug!(
+            "sess {}: upload send seq={} wseq={} len={}B",
+            sid_short,
+            seq,
+            wseq,
+            data.len(),
+        );
+        mux.send_sync(MuxMsg::Data {
             sid: sid.to_string(),
             data,
+            seq: Some(seq),
+            wseq: Some(wseq),
             reply: reply_tx,
-        })
-        .await;
-
-        // Bounded-wait on reply: if the batch this op landed in is slow
-        // (dead target on the tunnel-node side), don't block this session
-        // forever — timeout and let it retry on the next tick.
-        let (resp, script_id) = match tokio::time::timeout(mux.reply_timeout(), reply_rx).await {
-            Ok(Ok(Ok((r, sid_used)))) => (r, sid_used),
-            Ok(Ok(Err(e))) => {
-                tracing::debug!("tunnel data error: {}", e);
-                break;
-            }
-            Ok(Err(_)) => break, // channel dropped
-            Err(_) => {
-                tracing::warn!("sess {}: reply timeout, retrying", &sid[..sid.len().min(8)]);
-                consecutive_empty = consecutive_empty.saturating_add(1);
-                continue;
-            }
+        });
+        let meta = InflightMeta {
+            seq,
+            was_empty_poll: false,
+            send_at,
         };
+        (meta, reply_rx)
+    }
 
-        // Per-deployment legacy detection: an empty-in/empty-out round
-        // trip that finishes well under `LEGACY_DETECT_THRESHOLD` is
-        // structurally impossible on a long-poll-capable tunnel-node
-        // (the server holds the response either until data arrives or
-        // until its long-poll deadline). One observation marks *this
-        // specific* deployment as legacy for `LEGACY_RECOVER_AFTER`;
-        // peers stay on the fast path. The aggregate `all_legacy` gate
-        // only flips once *every* deployment has been so marked.
-        if was_empty_poll {
-            let reply_was_empty = resp.d.as_deref().map(str::is_empty).unwrap_or(true);
-            if reply_was_empty && send_at.elapsed() < LEGACY_DETECT_THRESHOLD {
-                mux.mark_server_no_longpoll(&script_id);
-            }
-        }
-
-        if let Some(ref e) = resp.e {
-            tracing::debug!("tunnel error: {}", e);
-            break;
-        }
-
-        let got_data = match write_tunnel_response(&mut writer, &resp).await? {
-            WriteOutcome::Wrote => true,
-            WriteOutcome::NoData => false,
-            WriteOutcome::BadBase64 => {
-                // Tunnel-node gave us garbage; tear the session down but
-                // do NOT propagate as an io error — the caller's Close
-                // guard will clean up on the tunnel-node side.
-                break;
-            }
-        };
-
-        if resp.eof.unwrap_or(false) {
-            break;
-        }
-
-        if got_data {
-            consecutive_empty = 0;
-        } else {
-            consecutive_empty = consecutive_empty.saturating_add(1);
+    // ── Initial path: send pending client data or read from client ──
+    if let Some(data) = pending_client_data {
+        if !data.is_empty() {
+            let (meta, reply_rx) =
+                send_data_op(sid, data, &mut next_send_seq, &mut next_data_write_seq, mux);
+            tracing::debug!(
+                "sess {}: pending data seq={}",
+                &sid[..sid.len().min(8)],
+                meta.seq,
+            );
+            inflight.push(wrap_reply(meta, reply_rx, reply_timeout));
         }
     }
 
+    // Pre-fill one poll synchronously (so we have something in flight
+    // immediately and the tunnel-node sees a poll within the first RTT),
+    // then hand the rest of the optimist-depth pre-fill off to the
+    // refill timer below. The previous shape blocked the entire setup
+    // path with a `tokio::time::sleep(1s)` per extra slot, during which
+    // the client socket wasn't read — visible as a >1 s startup stall
+    // on no-pending-data flows like HTTPS GETs that send a small
+    // ClientHello and expect a fast first response.
+    if inflight.len() < max_inflight {
+        let (meta, reply_rx) = send_empty_poll(sid, &mut next_send_seq, mux);
+        tracing::debug!(
+            "sess {}: prefill poll seq={}, inflight={}",
+            &sid[..sid.len().min(8)],
+            meta.seq,
+            inflight.len() + 1,
+        );
+        inflight.push(wrap_reply(meta, reply_rx, reply_timeout));
+    }
+
+    // Timer for staggered refill polls — fires in the select, never blocks.
+    let mut refill_at: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
+    let mut refill_steps: u32 = 0;
+
+    // Arm the refill timer if we still owe pre-fill slots. The select
+    // loop's refill arm already paces subsequent polls (100 ms steps,
+    // emit after 10 steps ≈ 1 s separation) — same cadence the old
+    // synchronous loop produced, just non-blocking.
+    if inflight.len() < max_inflight {
+        refill_at = Some(Box::pin(tokio::time::sleep(Duration::from_millis(100))));
+        refill_steps = 0;
+    }
+
+    // Read buffer for client socket.
+    let mut read_buf = BytesMut::with_capacity(65536);
+
+    // Main select loop — handles both upload reads and download replies.
+    loop {
+        // If nothing in flight and tunnel EOF, we're done.
+        if inflight.is_empty() && eof_seen {
+            break;
+        }
+
+        // If nothing in flight and client closed, we're done.
+        if inflight.is_empty() && client_closed {
+            break;
+        }
+
+        // If eof was seen but inflight is not empty, give remaining
+        // replies a short grace period to deliver any buffered data
+        // before the remote connection closed. After 500ms, abandon them.
+        if eof_seen && !inflight.is_empty() {
+            match tokio::time::timeout(Duration::from_millis(500), inflight.next()).await {
+                Ok(Some((meta, ReplyOutcome::Ok(resp, script_id)))) => {
+                    if meta.seq == next_write_seq {
+                        let _ = write_tunnel_response(&mut writer, &resp).await;
+                        next_write_seq += 1;
+                        while let Some(entry) = pending_writes.first_entry() {
+                            if *entry.key() != next_write_seq {
+                                break;
+                            }
+                            let (_, (buffered_resp, _)) = entry.remove_entry();
+                            let _ = write_tunnel_response(&mut writer, &buffered_resp).await;
+                            next_write_seq += 1;
+                        }
+                    } else {
+                        pending_writes.insert(meta.seq, (resp, script_id));
+                    }
+                    continue;
+                }
+                _ => break,
+            }
+        }
+
+        // When inflight is empty and we haven't seen eof, read from
+        // client or send an empty poll to keep the session alive.
+        if inflight.is_empty() && !eof_seen {
+            let all_legacy = mux.all_servers_legacy();
+
+            // If all servers are legacy and we've had many consecutive
+            // empties, wait for client data before sending.
+            if all_legacy && consecutive_empty > 3 && !client_closed {
+                read_buf.reserve(65536);
+                match reader.read_buf(&mut read_buf).await {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        consecutive_empty = 0;
+                        let data = extract_bytes(&mut read_buf, n);
+                        let (meta, reply_rx) = send_data_op(
+                            sid,
+                            data,
+                            &mut next_send_seq,
+                            &mut next_data_write_seq,
+                            mux,
+                        );
+                        inflight.push(wrap_reply(meta, reply_rx, reply_timeout));
+                        continue;
+                    }
+                    Err(_) => break,
+                }
+            }
+
+            let (meta, reply_rx) = send_empty_poll(sid, &mut next_send_seq, mux);
+            tracing::debug!(
+                "sess {}: keepalive poll seq={}",
+                &sid[..sid.len().min(8)],
+                meta.seq
+            );
+            inflight.push(wrap_reply(meta, reply_rx, reply_timeout));
+        }
+
+        // Can we read from the client? Yes if not closed, not eof, and
+        // we have room for more inflight ops. The +4 fast-path bonus
+        // only applies once we've confirmed the tunnel-node supports
+        // pipelined replies — on a legacy server (no `seq` echo) we
+        // hold the loop at `max_inflight = 1` since extra inflight ops
+        // would just queue on the server's serial reply path with no
+        // throughput benefit.
+        let fast_path_slack = if tunnel_node_supports_seq { 4 } else { 0 };
+        let can_read =
+            !client_closed && !eof_seen && inflight.len() < max_inflight + fast_path_slack;
+
+        tokio::select! {
+            biased;
+
+            // Refill timer: 100ms steps, send empty poll after 10 steps
+            // (1s) for batch separation.
+            _ = async { refill_at.as_mut().unwrap().await }, if refill_at.is_some() => {
+                refill_at = None;
+                if !eof_seen && inflight.len() < max_inflight {
+                    refill_steps += 1;
+
+                    if refill_steps >= 10 {
+                        // Check buffered upload first — merge into a data
+                        // op instead of sending an empty poll.
+                        if let Some(data) = buffered_upload.take() {
+                            let (meta, reply_rx) = send_data_op(sid, data, &mut next_send_seq, &mut next_data_write_seq, mux);
+                            inflight.push(wrap_reply(meta, reply_rx, reply_timeout));
+                        } else {
+                            let (meta, reply_rx) = send_empty_poll(sid, &mut next_send_seq, mux);
+                            inflight.push(wrap_reply(meta, reply_rx, reply_timeout));
+                        }
+                        refill_steps = 0;
+
+                        if inflight.len() < max_inflight && max_inflight > INFLIGHT_IDLE {
+                            refill_at = Some(Box::pin(tokio::time::sleep(Duration::from_millis(100))));
+                        }
+                    } else {
+                        refill_at = Some(Box::pin(tokio::time::sleep(Duration::from_millis(100))));
+                    }
+                }
+            }
+
+            // Process completed replies.
+            Some((meta, outcome)) = inflight.next() => {
+                match outcome {
+                    ReplyOutcome::Ok(resp, script_id) => {
+                        let has_data = resp.d.as_ref().map(|d| !d.is_empty()).unwrap_or(false);
+                        tracing::debug!(
+                            "sess {}: recv seq={}, rtt={:?}, data={}, inflight={}",
+                            &sid[..sid.len().min(8)],
+                            meta.seq,
+                            meta.send_at.elapsed(),
+                            has_data,
+                            inflight.len(),
+                        );
+                        // Throughput gate: `tunnel_node_supports_seq`
+                        // controls whether we use the fast-path slack
+                        // (+4 reads beyond `max_inflight`) and whether
+                        // depth ramps past 1. It does NOT control wseq
+                        // emission — `send_data_op` always sets wseq,
+                        // since a legacy server safely ignores the field
+                        // (see the rollout-race note on `send_data_op`).
+                        if resp.seq.is_some() && !tunnel_node_supports_seq {
+                            tunnel_node_supports_seq = true;
+                        }
+                        if resp.seq.is_none() {
+                            max_inflight = 1;
+                        }
+
+                        // Legacy / no-long-poll deployment detection.
+                        // Two signals, both per-`script_id`:
+                        //
+                        //   1. `resp.seq.is_none()`: the deterministic
+                        //      one. The pipelining tunnel-node echoes
+                        //      `seq` on every reply; pre-pipelining nodes
+                        //      drop the unknown field and return without
+                        //      it. A single seq-absent reply is enough
+                        //      to flag the deployment.
+                        //   2. Fast-empty-poll heuristic (pre-PR style):
+                        //      an empty poll that came back with no data
+                        //      faster than `LEGACY_DETECT_THRESHOLD`
+                        //      indicates the server isn't really
+                        //      long-polling — covers pathological cases
+                        //      where seq IS echoed but the server still
+                        //      drains-and-returns immediately.
+                        //
+                        // The aggregate `all_servers_legacy()` gate
+                        // drives the skip-empty-when-idle path in the
+                        // outer loop (line ~1818). Without this call,
+                        // legacy deployments keep fast-polling and burn
+                        // Apps Script quota at the pipelined defaults.
+                        let fast_empty_poll =
+                            meta.was_empty_poll
+                                && !has_data
+                                && meta.send_at.elapsed() < LEGACY_DETECT_THRESHOLD;
+                        if resp.seq.is_none() || fast_empty_poll {
+                            mux.mark_server_no_longpoll(&script_id);
+                        }
+
+                        if let Some(ref e) = resp.e {
+                            tracing::debug!("tunnel error: {}", e);
+                            break;
+                        }
+
+                        let is_eof = resp.eof.unwrap_or(false);
+                        let resp_has_seq = resp.seq.is_some();
+
+                        // Write in-order to client.
+                        if meta.seq == next_write_seq {
+                            let got_data = match write_tunnel_response(&mut writer, &resp).await? {
+                                WriteOutcome::Wrote => true,
+                                WriteOutcome::NoData => false,
+                                WriteOutcome::BadBase64 => break,
+                            };
+                            next_write_seq += 1;
+                            if got_data {
+                                consecutive_empty = 0;
+                                consecutive_data = consecutive_data.saturating_add(1);
+                                let bytes = resp.d.as_ref().map(|d| d.len() as u64 * 3 / 4).unwrap_or(0);
+                                total_download_bytes += bytes;
+                            } else {
+                                consecutive_empty = consecutive_empty.saturating_add(1);
+                            }
+                            if is_eof {
+                                eof_seen = true;
+                            }
+
+                            // Flush buffered out-of-order writes.
+                            let mut bad_base64_in_buffered = false;
+                            while let Some(entry) = pending_writes.first_entry() {
+                                if *entry.key() != next_write_seq { break; }
+                                let (_, (buffered_resp, _)) = entry.remove_entry();
+                                let buf_eof = buffered_resp.eof.unwrap_or(false);
+                                match write_tunnel_response(&mut writer, &buffered_resp).await? {
+                                    WriteOutcome::Wrote => {
+                                        consecutive_empty = 0;
+                                        consecutive_data = consecutive_data.saturating_add(1);
+                                        let bytes = buffered_resp.d.as_ref().map(|d| d.len() as u64 * 3 / 4).unwrap_or(0);
+                                        total_download_bytes += bytes;
+                                    }
+                                    WriteOutcome::NoData => {
+                                        consecutive_empty = consecutive_empty.saturating_add(1);
+                                    }
+                                    WriteOutcome::BadBase64 => {
+                                        // The immediate-response path
+                                        // (above) `break`s the outer
+                                        // tunnel loop on BadBase64,
+                                        // closing the session. The
+                                        // buffered-flush path must do
+                                        // the same: we just removed the
+                                        // entry from `pending_writes`
+                                        // without bumping
+                                        // `next_write_seq`, so leaving
+                                        // the session alive would stall
+                                        // every subsequent reply behind
+                                        // a seq that can't arrive.
+                                        bad_base64_in_buffered = true;
+                                        break;
+                                    }
+                                }
+                                next_write_seq += 1;
+                                if buf_eof {
+                                    eof_seen = true;
+                                }
+                            }
+                            if bad_base64_in_buffered {
+                                break;
+                            }
+                        } else {
+                            pending_writes.insert(meta.seq, (resp, script_id));
+                        }
+
+                        // Send buffered upload data now that a slot freed up.
+                        if let Some(data) = buffered_upload.take() {
+                            if inflight.len() < max_inflight {
+                                let (meta, reply_rx) = send_data_op(sid, data, &mut next_send_seq, &mut next_data_write_seq, mux);
+                                consecutive_empty = 0;
+                                inflight.push(wrap_reply(meta, reply_rx, reply_timeout));
+                            } else {
+                                buffered_upload = Some(data);
+                            }
+                        }
+
+                        // Adaptive pipeline depth management.
+                        tracing::debug!(
+                            "sess {}: depth={} cd={} ce={} inf={} has_seq={}",
+                            &sid[..sid.len().min(8)],
+                            max_inflight, consecutive_data, consecutive_empty, inflight.len(), resp_has_seq,
+                        );
+                        if resp_has_seq {
+                            let prev = max_inflight;
+                            if consecutive_empty >= 2 && max_inflight > INFLIGHT_IDLE {
+                                max_inflight = INFLIGHT_IDLE.min(inflight_cap);
+                                if is_elevated {
+                                    let n = mux.elevated_sessions.fetch_sub(1, Ordering::Relaxed);
+                                    pipeline_debug::set_elevated(n.saturating_sub(1));
+                                    is_elevated = false;
+                                }
+                            } else if consecutive_data >= 1 && max_inflight < INFLIGHT_OPTIMIST {
+                                max_inflight = INFLIGHT_OPTIMIST.min(inflight_cap);
+                            } else if consecutive_data >= 2
+                                && max_inflight >= INFLIGHT_OPTIMIST
+                                && max_inflight < inflight_cap
+                                && total_download_bytes >= 32 * 1024
+                            {
+                                if !is_elevated {
+                                    // CAS-loop admission: load + fetch_add
+                                    // raced — two concurrent sessions could
+                                    // both observe `cur < max_elevated`, both
+                                    // fetch_add, and overshoot the cap.
+                                    // compare_exchange_weak in a retry loop
+                                    // keeps the count under the ceiling.
+                                    let max = mux.max_elevated;
+                                    let mut cur = mux.elevated_sessions.load(Ordering::Relaxed);
+                                    loop {
+                                        if cur >= max {
+                                            break;
+                                        }
+                                        match mux.elevated_sessions.compare_exchange_weak(
+                                            cur,
+                                            cur + 1,
+                                            Ordering::Relaxed,
+                                            Ordering::Relaxed,
+                                        ) {
+                                            Ok(_) => {
+                                                pipeline_debug::set_elevated(cur + 1);
+                                                is_elevated = true;
+                                                max_inflight =
+                                                    (max_inflight + 1).min(inflight_cap);
+                                                break;
+                                            }
+                                            Err(v) => cur = v,
+                                        }
+                                    }
+                                } else {
+                                    max_inflight = (max_inflight + 1).min(inflight_cap);
+                                }
+                            }
+                            pipeline_debug::session_update(sid, max_inflight, inflight.len(), is_elevated);
+                            if max_inflight != prev {
+                                tracing::info!(
+                                    "sess {}: pipeline {} -> {}{}",
+                                    &sid[..sid.len().min(8)],
+                                    prev,
+                                    max_inflight,
+                                    if is_elevated { " [elevated]" } else { "" },
+                                );
+                                pipeline_debug::push_event(format!(
+                                    "{} {}->{}{}",
+                                    &sid[..sid.len().min(8)],
+                                    prev,
+                                    max_inflight,
+                                    if is_elevated { " E" } else { "" },
+                                ));
+                            }
+                        }
+
+                        // Schedule refill if pipeline needs more polls.
+                        if !eof_seen
+                            && inflight.len() < max_inflight
+                            && refill_at.is_none()
+                        {
+                            refill_at = Some(Box::pin(tokio::time::sleep(
+                                if max_inflight > INFLIGHT_IDLE { Duration::from_millis(100) } else { Duration::ZERO }
+                            )));
+                            refill_steps = 0;
+                        }
+                    }
+                    ReplyOutcome::BatchErr(e) => {
+                        tracing::debug!("tunnel data error: {}", e);
+                        break;
+                    }
+                    ReplyOutcome::Timeout => {
+                        // Terminal: closing the session. Reasoning —
+                        // downstream is strictly in-order by `meta.seq`
+                        // (see the `meta.seq == next_write_seq` gate
+                        // above), and any later replies are held in
+                        // `pending_writes` until the missing seq catches
+                        // up. A timed-out seq never catches up, so
+                        // continuing here would silently stall the
+                        // session until eviction; the client would see
+                        // a half-open connection that accepts uploads
+                        // but never receives a byte back. Closing forces
+                        // the client (browser / app) to retry — usually
+                        // over the regular TCP path or a new SOCKS5
+                        // session — which is the correct recovery shape.
+                        tracing::warn!(
+                            "sess {}: reply timeout (seq {}), closing session",
+                            &sid[..sid.len().min(8)],
+                            meta.seq,
+                        );
+                        break;
+                    }
+                    ReplyOutcome::Dropped => {
+                        break;
+                    }
+                }
+            }
+
+            // Read from client (overlapped with reply processing).
+            result = async {
+                read_buf.reserve(65536);
+                reader.read_buf(&mut read_buf).await
+            }, if can_read => {
+                match result {
+                    Ok(0) => {
+                        client_closed = true;
+                    }
+                    Ok(n) => {
+                        let data = extract_bytes(&mut read_buf, n);
+                        if inflight.len() < max_inflight {
+                            // Normal path: send immediately as data op.
+                            let (meta, reply_rx) = send_data_op(sid, data, &mut next_send_seq, &mut next_data_write_seq, mux);
+                            consecutive_empty = 0;
+                            inflight.push(wrap_reply(meta, reply_rx, reply_timeout));
+                        } else if inflight.len() < max_inflight + 4 {
+                            // Fast-path: pipeline full but under +4 extra.
+                            let (meta, reply_rx) = send_data_op(sid, data, &mut next_send_seq, &mut next_data_write_seq, mux);
+                            consecutive_empty = 0;
+                            inflight.push(wrap_reply(meta, reply_rx, reply_timeout));
+                        } else {
+                            // Buffer upload data until a slot frees up.
+                            if let Some(ref mut existing) = buffered_upload {
+                                // Merge: append new data to existing buffer.
+                                let mut merged = BytesMut::with_capacity(existing.len() + data.len());
+                                merged.extend_from_slice(existing);
+                                merged.extend_from_slice(&data);
+                                *existing = merged.freeze();
+                            } else {
+                                buffered_upload = Some(data);
+                            }
+                        }
+                    }
+                    Err(_) => {
+                        client_closed = true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Release elevation permit.
+    if is_elevated {
+        let n = mux.elevated_sessions.fetch_sub(1, Ordering::Relaxed);
+        pipeline_debug::set_elevated(n.saturating_sub(1));
+    }
     Ok(())
 }
 
@@ -1502,6 +2296,20 @@ where
     }
 }
 
+/// Extract bytes from the read buffer, applying the zero-copy threshold.
+/// Reads >= half the buffer use split+freeze (zero-copy); smaller reads
+/// copy out and clear so the buffer allocation is reused.
+fn extract_bytes(buf: &mut BytesMut, n: usize) -> Bytes {
+    const ZERO_COPY_THRESHOLD: usize = 65536 / 2;
+    if n >= ZERO_COPY_THRESHOLD {
+        buf.split().freeze()
+    } else {
+        let owned = Bytes::copy_from_slice(&buf[..n]);
+        buf.clear();
+        owned
+    }
+}
+
 pub fn decode_udp_packets(resp: &TunnelResponse) -> Result<Vec<Vec<u8>>, String> {
     let Some(pkts) = resp.pkts.as_ref() else {
         return Ok(Vec::new());
@@ -1530,6 +2338,7 @@ mod tests {
             eof: None,
             e: e.map(str::to_string),
             code: code.map(str::to_string),
+            seq: None,
         }
     }
 
@@ -1739,7 +2548,7 @@ mod tests {
     /// requires `legacy_deployments.len() == num_scripts`, so tests that
     /// exercise that gate need to control how many "deployments" exist.
     fn mux_for_test_with(num_scripts: usize) -> (Arc<TunnelMux>, mpsc::Receiver<MuxMsg>) {
-        let (tx, rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::channel(MUX_CHANNEL_DEPTH);
         let mux = Arc::new(TunnelMux {
             tx,
             connect_data_unsupported: Arc::new(AtomicBool::new(false)),
@@ -1757,6 +2566,8 @@ mod tests {
             // generous fixed value here; production derives this from
             // `fronter.batch_timeout()` (see `TunnelMux::start`).
             reply_timeout: Duration::from_secs(35),
+            elevated_sessions: AtomicU64::new(0),
+            max_elevated: MAX_ELEVATED_PER_DEPLOYMENT * num_scripts as u64,
         });
         (mux, rx)
     }
@@ -1802,6 +2613,73 @@ mod tests {
         );
     }
 
+    /// Regression for the mux-loop semaphore-stall. The first cut of
+    /// the unbounded-channel patch awaited the per-deployment permit
+    /// inline in `fire_batch` BEFORE the `tokio::spawn`, so when all
+    /// `CONCURRENCY_PER_DEPLOYMENT` permits were occupied, `mux_loop`
+    /// stopped consuming from its `rx` while `send_sync` kept pushing
+    /// into the unbounded channel. Memory grew, and the per-op
+    /// `reply_timeout` could fire before the op even reached a permit.
+    ///
+    /// The fix moves the await inside the spawned task — `fire_batch`
+    /// returns to mux_loop immediately regardless of semaphore state.
+    /// This test pre-saturates the per-deployment semaphore and times
+    /// the `fire_batch().await` call; with the fix it returns within
+    /// a few milliseconds, without it would hang.
+    #[tokio::test(start_paused = true)]
+    async fn fire_batch_does_not_block_caller_on_saturated_semaphore() {
+        use crate::config::Config;
+
+        let cfg: Config = serde_json::from_str(
+            r#"{
+                "mode": "apps_script",
+                "google_ip": "127.0.0.1",
+                "front_domain": "www.google.com",
+                "script_id": "X",
+                "auth_key": "secret-test-secret-test"
+            }"#,
+        )
+        .unwrap();
+        let fronter = Arc::new(DomainFronter::new(&cfg).expect("test fronter must construct"));
+
+        // Build `sems` with one entry for the only deployment, capacity 1.
+        let sem = Arc::new(Semaphore::new(1));
+        let sems: Arc<HashMap<String, Arc<Semaphore>>> =
+            Arc::new(std::iter::once(("X".to_string(), sem.clone())).collect());
+
+        // Saturate by holding the sole permit forever.
+        let hog_task = tokio::spawn({
+            let sem = sem.clone();
+            async move {
+                let _p = sem.acquire_owned().await.unwrap();
+                std::future::pending::<()>().await;
+            }
+        });
+        // Yield so the hog task actually acquires the permit before
+        // we measure.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(sem.available_permits(), 0, "hog must hold the permit");
+
+        let t0 = std::time::Instant::now();
+        fire_batch(&sems, &fronter, Vec::new(), Vec::new()).await;
+        let elapsed = t0.elapsed();
+
+        hog_task.abort();
+
+        // With the fix, `fire_batch` returns immediately because the
+        // permit await lives inside `tokio::spawn`. Allow 250ms of
+        // slack for scheduler jitter; the pre-fix code would block
+        // indefinitely (test framework would time out).
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "fire_batch blocked for {:?} with semaphore saturated — \
+             expected immediate return because the permit await must \
+             live inside the spawned batch task, not on the caller path",
+            elapsed,
+        );
+    }
+
     /// The buffered ClientHello from the pre-read window must reach the
     /// tunnel-node as the first `Data` op on the fallback path. If this
     /// regresses, every TLS handshake stalls until the 30 s read-timeout
@@ -1818,14 +2696,17 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
         let _client = TcpStream::connect(addr).await.unwrap();
-        let mut server_side = accept.await.unwrap();
+        let server_side = accept.await.unwrap();
 
         let (mux, mut rx) = mux_for_test();
         let pending = Some(Bytes::from_static(b"CLIENTHELLO"));
 
         let loop_handle = tokio::spawn({
             let mux = mux.clone();
-            async move { tunnel_loop(&mut server_side, "sid-under-test", &mux, pending).await }
+            async move {
+                let mut server_side = server_side;
+                tunnel_loop(&mut server_side, "sid-under-test", &mux, pending).await
+            }
         });
 
         // The first message tunnel_loop emits must be Data carrying the
@@ -1836,7 +2717,9 @@ mod tests {
             .expect("mux channel closed unexpectedly");
 
         match msg {
-            MuxMsg::Data { sid, data, reply } => {
+            MuxMsg::Data {
+                sid, data, reply, ..
+            } => {
                 assert_eq!(sid, "sid-under-test");
                 assert_eq!(&data[..], b"CLIENTHELLO");
                 // Reply with eof so tunnel_loop unwinds cleanly.
@@ -1848,6 +2731,7 @@ mod tests {
                         eof: Some(true),
                         e: None,
                         code: None,
+                        seq: Some(0),
                     },
                     "test-script".to_string(),
                 )));
@@ -1865,7 +2749,31 @@ mod tests {
             ),
         }
 
-        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle)
+        // With pipelining (INFLIGHT_OPTIMIST=2), the second op is
+        // launched after a 1 s stagger sleep, so we need to wait long
+        // enough for it to arrive. Reply to any remaining messages so the
+        // loop can exit cleanly.
+        let mut seq = 1u64;
+        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(1500), rx.recv()).await
+        {
+            if let MuxMsg::Data { reply, .. } = msg {
+                let _ = reply.send(Ok((
+                    TunnelResponse {
+                        sid: Some("sid-under-test".into()),
+                        d: None,
+                        pkts: None,
+                        eof: Some(true),
+                        e: None,
+                        code: None,
+                        seq: Some(seq),
+                    },
+                    "test-script".to_string(),
+                )));
+                seq += 1;
+            }
+        }
+
+        let _ = tokio::time::timeout(Duration::from_secs(4), loop_handle)
             .await
             .expect("tunnel_loop did not exit after eof");
     }
@@ -1889,7 +2797,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
         let _client = TcpStream::connect(addr).await.unwrap();
-        let mut server_side = accept.await.unwrap();
+        let server_side = accept.await.unwrap();
 
         // 2 deployments, only A marked legacy → all_servers_legacy = false.
         let (mux, mut rx) = mux_for_test_with(2);
@@ -1898,7 +2806,10 @@ mod tests {
 
         let loop_handle = tokio::spawn({
             let mux = mux.clone();
-            async move { tunnel_loop(&mut server_side, "sid-mixed", &mux, None).await }
+            async move {
+                let mut server_side = server_side;
+                tunnel_loop(&mut server_side, "sid-mixed", &mux, None).await
+            }
         });
 
         // Reply to 6 empty polls, all from A. With the regression
@@ -1908,23 +2819,30 @@ mod tests {
         // the aggregate gate stays false and the loop keeps polling.
         // The 60 s timeout below is paused-time, so it only "elapses"
         // if rx.recv() truly never resolves (i.e. the loop has stalled).
-        for i in 0..6u32 {
+        let mut received = 0u32;
+        while received < 6 {
             let msg = tokio::time::timeout(Duration::from_secs(60), rx.recv())
                 .await
                 .unwrap_or_else(|_| panic!(
                     "loop stopped emitting at iteration {} — regression: per-deployment skip-when-idle stalled session even though long-poll-capable peer was available",
-                    i
+                    received
                 ))
                 .expect("mux channel closed unexpectedly");
             match msg {
-                MuxMsg::Data { sid, data, reply } => {
+                MuxMsg::Data {
+                    sid,
+                    data,
+                    seq,
+                    reply,
+                    ..
+                } => {
                     assert_eq!(sid, "sid-mixed");
                     assert!(
                         data.is_empty(),
                         "expected empty poll, got {} bytes",
                         data.len()
                     );
-                    let last = i == 5;
+                    let last = received == 5;
                     let _ = reply.send(Ok((
                         TunnelResponse {
                             sid: Some("sid-mixed".into()),
@@ -1933,13 +2851,15 @@ mod tests {
                             eof: if last { Some(true) } else { None },
                             e: None,
                             code: None,
+                            seq,
                         },
                         "script-A".to_string(),
                     )));
+                    received += 1;
                 }
                 _ => panic!(
                     "iteration {}: expected Data poll, got a different MuxMsg variant",
-                    i
+                    received
                 ),
             }
         }
@@ -2128,6 +3048,8 @@ mod tests {
             port: None,
             data: Some(Bytes::from_static(b"x")),
             encode_empty: false,
+            seq: None,
+            wseq: None,
         };
         let mk_reply = || oneshot::channel::<Result<(TunnelResponse, String), String>>().0;
 
@@ -2181,6 +3103,8 @@ mod tests {
             port: None,
             data: Some(Bytes::from_static(b"hello")),
             encode_empty: false,
+            seq: None,
+            wseq: None,
         };
         let b = encode_pending(op);
         assert_eq!(b.op, "data");
@@ -2198,6 +3122,8 @@ mod tests {
             port: None,
             data: None,
             encode_empty: false,
+            seq: None,
+            wseq: None,
         };
         assert!(encode_pending(empty_poll).d.is_none());
 
@@ -2209,6 +3135,8 @@ mod tests {
             port: None,
             data: None,
             encode_empty: false,
+            seq: None,
+            wseq: None,
         };
         assert!(encode_pending(udp_poll).d.is_none());
 
@@ -2220,6 +3148,8 @@ mod tests {
             port: None,
             data: None,
             encode_empty: false,
+            seq: None,
+            wseq: None,
         };
         assert!(encode_pending(close).d.is_none());
     }
@@ -2237,6 +3167,8 @@ mod tests {
             port: Some(443),
             data: Some(Bytes::new()),
             encode_empty: true,
+            seq: None,
+            wseq: None,
         };
         let b = encode_pending(op);
         assert_eq!(b.op, "connect_data");
@@ -2252,6 +3184,8 @@ mod tests {
             port: Some(443),
             data: Some(Bytes::from_static(b"\x16\x03\x01")), // ClientHello prefix
             encode_empty: true,
+            seq: None,
+            wseq: None,
         };
         let b = encode_pending(op);
         assert_eq!(b.d.as_deref(), Some(B64.encode(b"\x16\x03\x01").as_str()));
@@ -2275,5 +3209,324 @@ mod tests {
         assert_eq!(mux.preread_win_total_us.load(Ordering::Relaxed), 5_000);
         // Five record_* calls, so trigger counter is at 5.
         assert_eq!(mux.preread_total_events.load(Ordering::Relaxed), 5);
+    }
+
+    /// Client data written to the socket *during* the reply wait must be
+    /// buffered and sent in a subsequent op — not blocked until the reply
+    /// arrives and a fresh read-timeout elapses.
+    #[tokio::test]
+    async fn tunnel_loop_reads_client_during_reply_wait() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let server_side = accept.await.unwrap();
+
+        let (mux, mut rx) = mux_for_test();
+
+        let loop_handle = tokio::spawn({
+            let mux = mux.clone();
+            async move {
+                let mut server_side = server_side;
+                tunnel_loop(&mut server_side, "sid-overlap", &mux, None).await
+            }
+        });
+
+        // With pipelining (N=2), the loop may send two ops before we
+        // can write client data. Collect all initial ops, reply to each,
+        // then write data and check a subsequent op carries it.
+        let mut pending_replies: Vec<BatchedReply> = Vec::new();
+        let mut seq: u64 = 0;
+
+        // Drain initial ops (up to N=2).
+        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
+        {
+            if let MuxMsg::Data { reply, .. } = msg {
+                pending_replies.push(reply);
+            }
+            if pending_replies.len() >= INFLIGHT_ACTIVE {
+                break;
+            }
+        }
+
+        // Write client data while replies are pending.
+        client.write_all(b"UPLOAD_DATA").await.unwrap();
+        client.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Reply to all pending ops (no eof, no data).
+        for reply in pending_replies.drain(..) {
+            let _ = reply.send(Ok((
+                TunnelResponse {
+                    sid: Some("sid-overlap".into()),
+                    d: None,
+                    pkts: None,
+                    eof: None,
+                    e: None,
+                    code: None,
+                    seq: Some(seq),
+                },
+                "test-script".to_string(),
+            )));
+            seq += 1;
+        }
+
+        // Now check that a subsequent op carries the buffered upload data.
+        let mut found_upload = false;
+        for _ in 0..4 {
+            let msg = match tokio::time::timeout(Duration::from_secs(2), rx.recv()).await {
+                Ok(Some(m)) => m,
+                _ => break,
+            };
+            if let MuxMsg::Data { data, reply, .. } = msg {
+                if &data[..] == b"UPLOAD_DATA" {
+                    found_upload = true;
+                }
+                let _ = reply.send(Ok((
+                    TunnelResponse {
+                        sid: Some("sid-overlap".into()),
+                        d: None,
+                        pkts: None,
+                        eof: Some(found_upload),
+                        e: None,
+                        code: None,
+                        seq: Some(seq),
+                    },
+                    "test-script".to_string(),
+                )));
+                seq += 1;
+                if found_upload {
+                    break;
+                }
+            }
+        }
+        assert!(found_upload, "upload data must appear in a subsequent op");
+
+        // Drain any remaining in-flight ops (stagger sleep is 1 s,
+        // so allow enough time for late-arriving ops).
+        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(1500), rx.recv()).await
+        {
+            if let MuxMsg::Data { reply, .. } = msg {
+                let _ = reply.send(Ok((
+                    TunnelResponse {
+                        sid: Some("sid-overlap".into()),
+                        d: None,
+                        pkts: None,
+                        eof: Some(true),
+                        e: None,
+                        code: None,
+                        seq: Some(seq),
+                    },
+                    "test-script".to_string(),
+                )));
+                seq += 1;
+            }
+        }
+
+        let _ = tokio::time::timeout(Duration::from_secs(4), loop_handle)
+            .await
+            .expect("tunnel_loop did not exit after eof");
+    }
+
+    /// When a data-bearing op times out, downstream order is broken:
+    /// the missing `meta.seq` would otherwise block every later reply
+    /// in `pending_writes` forever. The session must close terminally so
+    /// the client (browser / app) gets a TCP RST and can retry — silent
+    /// stall would leave a half-open connection that accepts uploads
+    /// but never writes a byte back.
+    ///
+    /// Reproduce by sending the initial pipelined polls, replying to
+    /// seq=1 out-of-order (which goes into `pending_writes`), starving
+    /// seq=0 of a reply, and letting paused-time auto-advance past
+    /// `mux.reply_timeout`. The loop must exit on its own.
+    #[tokio::test(start_paused = true)]
+    async fn tunnel_loop_exits_when_reply_seq_times_out() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let _client = TcpStream::connect(addr).await.unwrap();
+        let server_side = accept.await.unwrap();
+
+        let (mux, mut rx) = mux_for_test();
+        let reply_timeout = mux.reply_timeout();
+
+        let loop_handle = tokio::spawn({
+            let mux = mux.clone();
+            async move {
+                let mut server_side = server_side;
+                tunnel_loop(&mut server_side, "sid-timeout", &mux, None).await
+            }
+        });
+
+        // Collect the first two MuxMsgs — the optimist-depth pipeline
+        // emits seq=0 then seq=1.
+        let mut first_reply: Option<BatchedReply> = None;
+        let mut second_reply: Option<BatchedReply> = None;
+        let mut second_seq: Option<u64> = None;
+        for _ in 0..2 {
+            let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("did not receive initial poll")
+                .expect("mux channel closed");
+            if let MuxMsg::Data { reply, seq, .. } = msg {
+                if first_reply.is_none() {
+                    first_reply = Some(reply);
+                } else {
+                    second_seq = seq;
+                    second_reply = Some(reply);
+                }
+            }
+        }
+        let second_seq = second_seq.expect("second op should have a seq");
+        let second_reply = second_reply.expect("must have observed second op");
+
+        // Reply to seq=1 first — pending_writes would buffer it waiting
+        // for seq=0. seq=0's reply never comes; the loop must time out.
+        let _ = second_reply.send(Ok((
+            TunnelResponse {
+                sid: Some("sid-timeout".into()),
+                d: None,
+                pkts: None,
+                eof: None,
+                e: None,
+                code: None,
+                seq: Some(second_seq),
+            },
+            "test-script".to_string(),
+        )));
+
+        // Hold the first reply but never send — it will time out.
+        let _starved = first_reply.expect("must have observed first op");
+
+        // Auto-advance fires the reply_timeout. The loop should exit
+        // on its own within slightly more than `reply_timeout`.
+        let exit = tokio::time::timeout(reply_timeout + Duration::from_secs(2), loop_handle)
+            .await
+            .expect("tunnel_loop did not exit after reply timeout");
+        // The task itself must not panic — `Ok(_)` on the JoinHandle.
+        let _ = exit.expect("tunnel_loop task panicked");
+    }
+
+    /// Pipelining can deliver replies in any order — a later poll on
+    /// one deployment can win the tunnel-node's `notify_one` wake-up and
+    /// drain bytes while an earlier poll on another deployment is still
+    /// held under `LONGPOLL_DEADLINE`. The client must buffer the out-of-
+    /// order reply (in `pending_writes`) until the missing earlier seq
+    /// lands, then flush. Without that, downstream bytes either show up
+    /// in the wrong order on the client socket or get dropped.
+    ///
+    /// Reproduce by replying to seq=1 with data first, asserting nothing
+    /// reaches the client socket yet, then replying to seq=0 empty and
+    /// asserting the buffered seq=1 payload now arrives at the client.
+    #[tokio::test]
+    async fn tunnel_loop_buffers_out_of_order_reply_and_flushes_on_catch_up() {
+        use tokio::io::AsyncReadExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let server_side = accept.await.unwrap();
+
+        let (mux, mut rx) = mux_for_test();
+
+        let loop_handle = tokio::spawn({
+            let mux = mux.clone();
+            async move {
+                let mut server_side = server_side;
+                tunnel_loop(&mut server_side, "sid-hol", &mux, None).await
+            }
+        });
+
+        // Optimist-depth pipeline emits seq=0 then seq=1.
+        let mut first_reply: Option<BatchedReply> = None;
+        let mut second_reply: Option<BatchedReply> = None;
+        let (mut first_seq, mut second_seq) = (None, None);
+        for _ in 0..2 {
+            let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("did not receive initial poll")
+                .expect("mux channel closed");
+            if let MuxMsg::Data { reply, seq, .. } = msg {
+                if first_reply.is_none() {
+                    first_seq = seq;
+                    first_reply = Some(reply);
+                } else {
+                    second_seq = seq;
+                    second_reply = Some(reply);
+                }
+            }
+        }
+        let first_seq = first_seq.expect("first op has seq");
+        let second_seq = second_seq.expect("second op has seq");
+        assert!(
+            first_seq < second_seq,
+            "tunnel_loop must send sequential meta.seqs"
+        );
+
+        // Reply to seq=1 with a marker payload FIRST.
+        let payload_b64 = B64.encode(b"HOL_DATA");
+        let _ = second_reply.take().unwrap().send(Ok((
+            TunnelResponse {
+                sid: Some("sid-hol".into()),
+                d: Some(payload_b64),
+                pkts: None,
+                eof: None,
+                e: None,
+                code: None,
+                seq: Some(second_seq),
+            },
+            "test-script".to_string(),
+        )));
+
+        // The bytes MUST NOT show up on the client socket yet: seq=0
+        // hasn't been replied to, so the strict-in-order writer holds
+        // seq=1's payload in `pending_writes`. Probe with a short
+        // read-timeout and assert it times out.
+        let mut buf = [0u8; 8];
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(200), client.read_exact(&mut buf)).await;
+        assert!(
+            blocked.is_err(),
+            "client must NOT receive seq=1 bytes before seq=0 reply lands — \
+             got {:?} instead of timeout",
+            blocked,
+        );
+
+        // Now reply to seq=0 empty. The buffered seq=1 payload should
+        // flush immediately on the same select arm.
+        let _ = first_reply.take().unwrap().send(Ok((
+            TunnelResponse {
+                sid: Some("sid-hol".into()),
+                d: None,
+                pkts: None,
+                eof: None,
+                e: None,
+                code: None,
+                seq: Some(first_seq),
+            },
+            "test-script".to_string(),
+        )));
+
+        // The 8 bytes of HOL_DATA must arrive on the client socket
+        // within a short slack window (no LONGPOLL_DEADLINE wait).
+        let n = tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut buf))
+            .await
+            .expect("client must receive buffered seq=1 payload after seq=0 lands")
+            .expect("client read");
+        assert_eq!(n, 8);
+        assert_eq!(&buf, b"HOL_DATA");
+
+        // Tidy up — drain any further polls so the loop can shut down
+        // when we drop the senders, otherwise the test hangs at end.
+        drop(client);
+        while let Ok(Some(_)) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await {}
+        let _ = tokio::time::timeout(Duration::from_secs(2), loop_handle).await;
     }
 }

@@ -297,6 +297,13 @@ pub struct Config {
     /// failure modes later. Issue #213.
     #[serde(default = "default_block_quic")]
     pub block_quic: bool,
+
+    /// Block STUN/TURN UDP ports (3478, 5349, 19302) at the SOCKS5 listener.
+    /// Forces WebRTC apps (Google Meet, Discord, WhatsApp) to fall back to
+    /// TCP TURN on port 443, skipping the 10-30s UDP ICE timeout. Default
+    /// true — TCP fallback works for all tested apps and connects instantly.
+    #[serde(default = "default_block_stun")]
+    pub block_stun: bool,
     /// When true, suppress the random `_pad` field that v1.8.0+ adds
     /// to outbound Apps Script requests for DPI evasion. Default off
     /// (padding active). Some users on heavily-throttled ISPs find
@@ -628,6 +635,20 @@ fn default_tunnel_doh() -> bool {
 /// HTTPS/TCP within seconds of the silent UDP drop. Issue #793.
 fn default_block_quic() -> bool {
     true
+}
+
+/// Default for `block_stun`: `false`. Upstream PR #1115 shipped this
+/// as `true` so WebRTC apps would skip the ~10–30 s UDP ICE timeout
+/// and fall back to TCP TURN immediately. For rahgozar we default it
+/// off to preserve existing upgrade behavior: an existing config that
+/// omits the key keeps the pre-PR semantics (UDP STUN/TURN datagrams
+/// pass through the relay unchanged) so a user on Meet/WhatsApp who
+/// upgrades doesn't suddenly see calls behave differently without
+/// being aware of the new toggle. Users who do want the fast-fail
+/// behavior can opt in by setting `block_stun: true` in `config.json`
+/// or via the UI checkbox.
+fn default_block_stun() -> bool {
+    false
 }
 
 /// Default for `block_doh`: `true` (browser DoH is rejected so the

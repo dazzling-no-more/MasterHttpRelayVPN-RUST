@@ -488,6 +488,10 @@ struct FormState {
     sabr_strip: bool,
     passthrough_hosts: Vec<String>,
     block_quic: bool,
+    /// Round-tripped from config.json and exposed beside QUIC blocking.
+    /// Default true to push WebRTC apps toward TCP TURN instead of slow
+    /// UDP ICE retries.
+    block_stun: bool,
     /// Round-tripped from config.json. Not exposed as a UI control —
     /// users edit `disable_padding` directly when needed (Issue #391).
     /// Default false (padding active).
@@ -679,6 +683,7 @@ fn load_form() -> (FormState, Option<String>) {
             sabr_strip: c.sabr_strip,
             passthrough_hosts: c.passthrough_hosts.clone(),
             block_quic: c.block_quic,
+            block_stun: c.block_stun,
             disable_padding: c.disable_padding,
             force_http1: c.force_http1,
             tunnel_doh: c.tunnel_doh,
@@ -767,6 +772,7 @@ impl FormState {
             sabr_strip: false,
             passthrough_hosts: Vec::new(),
             block_quic: true,
+            block_stun: false,
             disable_padding: false,
             force_http1: false,
             tunnel_doh: true,
@@ -881,6 +887,7 @@ const MODELED_CONFIG_KEYS: &[&str] = &[
     "sabr_strip",
     "passthrough_hosts",
     "block_quic",
+    "block_stun",
     "disable_padding",
     "force_http1",
     "tunnel_doh",
@@ -1038,6 +1045,7 @@ impl FormState {
             // file so the UI doesn't drop the user's entries on save.
             passthrough_hosts: self.passthrough_hosts.clone(),
             block_quic: self.block_quic,
+            block_stun: self.block_stun,
             // Issue #391: disable_padding is config-only for now.
             // Round-trip preserves the user's choice.
             disable_padding: self.disable_padding,
@@ -1262,6 +1270,12 @@ struct ConfigWire<'a> {
     /// emit only when the user has explicitly disabled the block.
     #[serde(skip_serializing_if = "is_true")]
     block_doh: bool,
+    /// Default false. Emit only when the user has explicitly enabled
+    /// STUN/TURN blocking. Flipped from upstream's default-true so an
+    /// existing config that omits the key keeps pre-PR semantics on
+    /// upgrade — see `default_block_stun` in src/config.rs.
+    #[serde(skip_serializing_if = "is_false")]
+    block_stun: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     fronting_groups: &'a Vec<FrontingGroup>,
     /// Auto-blacklist tuning + batch timeout (#391, #444, #430). Skip
@@ -1414,6 +1428,7 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             tunnel_doh: c.tunnel_doh,
             bypass_doh_hosts: &c.bypass_doh_hosts,
             block_doh: c.block_doh,
+            block_stun: c.block_stun,
             fronting_groups: &c.fronting_groups,
             auto_blacklist_strikes: c.auto_blacklist_strikes,
             auto_blacklist_window_secs: c.auto_blacklist_window_secs,
@@ -2523,6 +2538,17 @@ impl eframe::App for App {
                                  QUIC over the TCP-based tunnel causes TCP-over-TCP meltdown \
                                  (<1 Mbps). Browsers detect the drop and switch to TCP within seconds. \
                                  Issue #213, #793.",
+                            );
+                    });
+
+                    ui.horizontal(|ui| {
+                        ui.add_space(120.0 + 8.0);
+                        ui.checkbox(&mut self.form.block_stun, "Block STUN/TURN UDP")
+                            .on_hover_text(
+                                "Opt-in: drop WebRTC STUN/TURN UDP ports 3478, 5349, and 19302 \
+                                 so apps such as Meet, Discord, and WhatsApp move to TCP TURN \
+                                 instead of waiting on UDP ICE retries. Off by default so existing \
+                                 configs behave the same after upgrade.",
                             );
                     });
 
@@ -5327,6 +5353,7 @@ mod tests {
         let json = r#"{
             "mode": "direct",
             "block_quic": false,
+            "block_stun": true,
             "disable_padding": true,
             "enable_batching": true,
             "coalesce_step_ms": 25,
@@ -5337,6 +5364,8 @@ mod tests {
         let out = serde_json::to_value(&wire).unwrap();
         // block_quic: default true → emit when false.
         assert_eq!(out.get("block_quic"), Some(&serde_json::json!(false)));
+        // block_stun: default false → emit when true.
+        assert_eq!(out.get("block_stun"), Some(&serde_json::json!(true)));
         // disable_padding: default false → emit when true.
         assert_eq!(out.get("disable_padding"), Some(&serde_json::json!(true)));
         // enable_batching: default false → emit when true.
@@ -5358,10 +5387,15 @@ mod tests {
         let cfg: Config = serde_json::from_str(json).unwrap();
         let wire = ConfigWire::from(&cfg);
         let out = serde_json::to_value(&wire).unwrap();
-        // block_quic defaults true → should NOT appear in output.
+        // block_quic defaults true / block_stun defaults false → both
+        // omitted from the wire on a fresh "mode: direct" config.
         assert!(
             out.get("block_quic").is_none(),
             "default block_quic must be omitted"
+        );
+        assert!(
+            out.get("block_stun").is_none(),
+            "default block_stun must be omitted"
         );
         assert!(out.get("disable_padding").is_none());
         assert!(out.get("enable_batching").is_none());
@@ -5594,6 +5628,7 @@ mod tests {
             "sabr_strip": true,
             "passthrough_hosts": ["a.example"],
             "block_quic": false,
+            "block_stun": true,
             "disable_padding": true,
             "force_http1": true,
             "tunnel_doh": true,

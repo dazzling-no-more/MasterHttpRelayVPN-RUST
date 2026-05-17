@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      Debug-only addition. Used by PipelineDebugOverlay to draw a
+      semi-transparent stats panel on top of other apps while validating
+      the pipelined-tunnel rollout. The matching runtime call in
+      MhrvVpnService.showDebugOverlay() is gated on BuildConfig.DEBUG,
+      so this declaration is the only thing keeping the permission off
+      release builds — leave them in sync.
+    -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+</manifest>

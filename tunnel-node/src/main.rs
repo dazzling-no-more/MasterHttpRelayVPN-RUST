@@ -57,21 +57,38 @@ const STRAGGLER_SETTLE_MAX: Duration = Duration::from_millis(1000);
 /// waiting for the client's next tick.
 ///
 /// **This is a knob, not a constant of nature.** It trades push latency
-/// against the worst-case "client wants to send while mid-poll" delay:
-/// the tunnel-client's `tunnel_loop` is strictly serial (one in-flight
-/// op per session), so any local bytes that arrive while the poll is
-/// being held are stuck in the kernel until the poll returns.
+/// against per-session quota burn — every empty return is a
+/// round-trip charged against the Apps Script daily ceiling.
 ///
-/// 15 s keeps persistent connections (Telegram XMPP on :5222, Google
-/// Push on :5228) alive without forcing frequent reconnects. At 5 s,
-/// apps like Telegram interpreted the frequent empty returns as
-/// connection instability and rotated sessions — each reconnect costs
-/// a full TLS handshake (~4 s through Apps Script), causing visible
-/// video/voice interruptions. 15 s is well below the client's
-/// `BATCH_TIMEOUT` (30 s) and Apps Script's UrlFetch ceiling (~60 s).
-/// Tested on censored networks in Iran where users reported smoother
-/// Telegram video playback and fewer session resets at this value.
-const LONGPOLL_DEADLINE: Duration = Duration::from_secs(15);
+/// **History:** the pre-pipelining tunnel-client was strictly serial
+/// (one in-flight op per session). Holding the poll for 15 s was the
+/// sweet spot — long enough that Telegram XMPP / Google Push didn't
+/// interpret frequent empty returns as connection instability and
+/// rotate sessions (which each cost a 4 s TLS handshake through Apps
+/// Script), short enough to fit inside the client's 30 s `BATCH_TIMEOUT`.
+///
+/// The pipelining redesign (upstream PR #1115) changed the trade-off
+/// shape entirely. Each session now keeps `INFLIGHT_OPTIMIST` (=2) to
+/// `INFLIGHT_ACTIVE` (=4) batches in flight at once, so a poll resolving
+/// at 4 s is invisible to the client: a sibling slot is still holding
+/// the channel open and will collect any push data the moment it
+/// arrives. The Telegram-stability concern that motivated 15 s no longer
+/// applies — there is always at least one other slot in flight to
+/// absorb push within ≤ 4 s. The 4 s value also gives the pipeline's
+/// adaptive-depth controller faster feedback for ramp-down on idle.
+///
+/// Quota note (honest version): even at the `INFLIGHT_IDLE = 1` floor,
+/// one idle session still cycles roughly every 5 s (4 s long-poll +
+/// ~1 s refill stagger), or ~12 polls/min. The old serial design at
+/// 15 s cycled every ~16 s — ~3.75 polls/min. Idle sessions cost about
+/// 3× more polls under the pipelined defaults; that's amortized by the
+/// throughput win on active sessions and by users typically having far
+/// fewer idle sessions than active ones, but it IS a measurable
+/// quota-rate increase. If a future deployment needs to clamp idle
+/// quota burn back to pre-pipelining levels, the cleanest knob is to
+/// stretch the refill-step count once `consecutive_empty` exceeds the
+/// idle threshold (10 steps → 60 steps would give ~7 s pacing).
+const LONGPOLL_DEADLINE: Duration = Duration::from_secs(4);
 
 /// Bound on each UDP session's inbound queue. Beyond this we drop oldest
 /// to keep recent voice/media packets moving — a stale RTP frame is
@@ -111,6 +128,22 @@ const TCP_DRAIN_MAX_BYTES: usize = 16 * 1024 * 1024;
 /// (their data stays in their per-session `read_buf`, so no data loss
 /// — they just settle one batch later).
 const BATCH_RESPONSE_BUDGET: usize = 32 * 1024 * 1024;
+
+/// Maximum number of out-of-order upload chunks buffered per session in
+/// the wseq-ordering map. The official client's `INFLIGHT_ACTIVE` cap is
+/// 4 (with +4 fast-path slack = 8 in-flight max), so a legitimate gap is
+/// bounded to ~8 missing wseqs. Anything past 32 is an authenticated
+/// caller intentionally jumping wseq to consume server memory — close
+/// the session rather than letting `pending_writes` grow without bound.
+const MAX_PENDING_WRITES_PER_SESSION: usize = 32;
+
+/// Maximum aggregate bytes the wseq-ordering buffer holds for one session.
+/// A misbehaving client that stays under `MAX_PENDING_WRITES_PER_SESSION`
+/// by chance could still flood individual chunks; cap the total so the
+/// per-session ceiling is bounded in both dimensions. Sized in step with
+/// `TCP_DRAIN_MAX_BYTES` (16 MiB) — beyond that, the cumulative buffered
+/// upload doesn't fit in one drain response anyway.
+const MAX_PENDING_WRITE_BYTES_PER_SESSION: usize = 16 * 1024 * 1024;
 
 /// First queue-drop on a session always logs at warn level; subsequent
 /// drops log at debug only every Nth occurrence so a single congested
@@ -153,6 +186,11 @@ struct SessionInner {
     /// to wake the drain phase as soon as any session has something to
     /// ship, replacing the old fixed-sleep heuristic.
     notify: Notify,
+    /// Sequence-ordered write buffer: pipelined data ops may arrive
+    /// out of order (different batches completing at different times).
+    /// We buffer out-of-order writes and flush in seq order.
+    next_write_seq: Mutex<Option<u64>>,
+    pending_writes: Mutex<std::collections::BTreeMap<u64, Vec<u8>>>,
 }
 
 struct ManagedSession {
@@ -212,6 +250,8 @@ async fn create_session(host: &str, port: u16) -> std::io::Result<ManagedSession
         eof: AtomicBool::new(false),
         last_active: Mutex::new(Instant::now()),
         notify: Notify::new(),
+        next_write_seq: Mutex::new(None),
+        pending_writes: Mutex::new(std::collections::BTreeMap::new()),
     });
 
     let inner_ref = inner.clone();
@@ -235,6 +275,8 @@ fn create_udpgw_session() -> ManagedSession {
         eof: AtomicBool::new(false),
         last_active: Mutex::new(Instant::now()),
         notify: Notify::new(),
+        next_write_seq: Mutex::new(None),
+        pending_writes: Mutex::new(std::collections::BTreeMap::new()),
     });
 
     let inner_ref = inner.clone();
@@ -249,7 +291,14 @@ fn create_udpgw_session() -> ManagedSession {
 }
 
 async fn reader_task(mut reader: impl AsyncRead + Unpin, session: Arc<SessionInner>) {
-    let mut buf = vec![0u8; 65536];
+    // 256 KiB syscall staging buffer. Upstream PR #1115 bumped this to
+    // 2 MiB to fewer-syscall a single drain, but the buf is per-session
+    // and persists for the session's lifetime — multiplying by N concurrent
+    // sessions, 2 MiB became a multi-hundred-MiB ceiling on the tunnel-node.
+    // 256 KiB stays large enough to absorb a full kernel TCP recv window
+    // in one syscall on typical Linux defaults, while keeping per-session
+    // baseline memory bounded.
+    let mut buf = vec![0u8; 256 * 1024];
     loop {
         match reader.read(&mut buf).await {
             Ok(0) => {
@@ -667,6 +716,8 @@ struct TunnelResponse {
     e: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seq: Option<u64>,
 }
 
 impl TunnelResponse {
@@ -678,6 +729,7 @@ impl TunnelResponse {
             eof: None,
             e: Some(msg.into()),
             code: None,
+            seq: None,
         }
     }
     fn unsupported_op(op: &str) -> Self {
@@ -688,6 +740,7 @@ impl TunnelResponse {
             eof: None,
             e: Some(format!("unknown op: {}", op)),
             code: Some(CODE_UNSUPPORTED_OP.into()),
+            seq: None,
         }
     }
 }
@@ -713,6 +766,10 @@ struct BatchOp {
     port: Option<u16>,
     #[serde(default)]
     d: Option<String>, // base64 data
+    #[serde(default)]
+    seq: Option<u64>,
+    #[serde(default)]
+    wseq: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -849,8 +906,8 @@ async fn handle_batch(State(state): State<AppState>, body: Bytes) -> impl IntoRe
     // map lock isn't held across the per-session read_buf / packets
     // mutex acquisition — without this, every other batch (and every
     // connect/close op) head-of-line-blocks behind the drain.
-    let mut tcp_drains: Vec<(usize, String, Arc<SessionInner>)> = Vec::new();
-    let mut udp_drains: Vec<(usize, String, Arc<UdpSessionInner>)> = Vec::new();
+    let mut tcp_drains: Vec<(usize, String, Arc<SessionInner>, Option<u64>)> = Vec::new();
+    let mut udp_drains: Vec<(usize, String, Arc<UdpSessionInner>, Option<u64>)> = Vec::new();
     // True iff the batch contained any op that performed a real action
     // upstream — a new connection or a non-empty data write. A batch of
     // only empty "data" / "udp_data" polls (and possibly closes) leaves
@@ -951,15 +1008,110 @@ async fn handle_batch(State(state): State<AppState>, body: Bytes) -> impl IntoRe
                             };
                             if !bytes.is_empty() {
                                 had_writes_or_connects = true;
-                                let mut w = inner.writer.lock().await;
-                                let _ = w.write_all(&bytes).await;
-                                let _ = w.flush().await;
+                                tracing::debug!(
+                                    "session {} upload {}B wseq={:?}",
+                                    &sid[..sid.len().min(8)],
+                                    bytes.len(),
+                                    op.wseq,
+                                );
+                                match op.wseq {
+                                    None => {
+                                        // Old client (no wseq): write immediately.
+                                        let mut w = inner.writer.lock().await;
+                                        let _ = w.write_all(&bytes).await;
+                                        let _ = w.flush().await;
+                                    }
+                                    Some(wseq) => {
+                                        let mut nws = inner.next_write_seq.lock().await;
+                                        // Sessions start at wseq=0 on the client (see
+                                        // `next_data_write_seq` in tunnel_client.rs).
+                                        // Seed `expected` to 0 so a pipelined wseq=1
+                                        // arriving before wseq=0 buffers correctly
+                                        // instead of dropping wseq=0 as "stale".
+                                        let expected = nws.get_or_insert(0);
+
+                                        if wseq < *expected {
+                                            // Stale / duplicate — skip.
+                                            tracing::debug!(
+                                                "session {} wseq {} < expected {} — skipping",
+                                                &sid[..sid.len().min(8)],
+                                                wseq,
+                                                *expected,
+                                            );
+                                        } else if wseq == *expected {
+                                            // In order — write immediately.
+                                            let mut w = inner.writer.lock().await;
+                                            let _ = w.write_all(&bytes).await;
+                                            *expected += 1;
+
+                                            // Flush any buffered writes that
+                                            // are now in sequence.
+                                            let mut pw = inner.pending_writes.lock().await;
+                                            while let Some(entry) = pw.first_entry() {
+                                                if *entry.key() != *expected {
+                                                    break;
+                                                }
+                                                let (_, buffered) = entry.remove_entry();
+                                                let _ = w.write_all(&buffered).await;
+                                                *expected += 1;
+                                            }
+                                            let _ = w.flush().await;
+                                        } else {
+                                            // Out of order — buffer for later,
+                                            // but cap so an authenticated caller
+                                            // can't consume unbounded server
+                                            // memory by jumping wseq.
+                                            let mut pw = inner.pending_writes.lock().await;
+                                            let pending_bytes: usize =
+                                                pw.values().map(|v| v.len()).sum();
+                                            let short = &sid[..sid.len().min(8)];
+                                            if pw.len() >= MAX_PENDING_WRITES_PER_SESSION
+                                                || pending_bytes + bytes.len()
+                                                    > MAX_PENDING_WRITE_BYTES_PER_SESSION
+                                            {
+                                                tracing::warn!(
+                                                    "session {} closing: wseq buffer cap \
+                                                     reached ({} entries / {} pending bytes, \
+                                                     incoming wseq {} +{}B)",
+                                                    short,
+                                                    pw.len(),
+                                                    pending_bytes,
+                                                    wseq,
+                                                    bytes.len(),
+                                                );
+                                                drop(pw);
+                                                results.push((
+                                                    i,
+                                                    TunnelResponse::error(
+                                                        "wseq buffer cap exceeded",
+                                                    ),
+                                                ));
+                                                // Close server-side so the
+                                                // reader_task is aborted and the
+                                                // map slot is freed immediately.
+                                                if let Some(s) =
+                                                    state.sessions.lock().await.remove(&sid)
+                                                {
+                                                    s.reader_handle.abort();
+                                                }
+                                                continue;
+                                            }
+                                            tracing::debug!(
+                                                "session {} wseq {} > expected {} — buffering",
+                                                short,
+                                                wseq,
+                                                *expected,
+                                            );
+                                            pw.insert(wseq, bytes);
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
-                    tcp_drains.push((i, sid, inner));
+                    tcp_drains.push((i, sid, inner, op.seq));
                 } else {
-                    results.push((i, eof_response(sid)));
+                    results.push((i, eof_response(sid, op.seq)));
                 }
             }
             "udp_data" => {
@@ -1003,9 +1155,9 @@ async fn handle_batch(State(state): State<AppState>, body: Bytes) -> impl IntoRe
                     if had_uplink {
                         *inner.last_active.lock().await = Instant::now();
                     }
-                    udp_drains.push((i, sid, inner));
+                    udp_drains.push((i, sid, inner, op.seq));
                 } else {
-                    results.push((i, eof_response(sid)));
+                    results.push((i, eof_response(sid, op.seq)));
                 }
             }
             "close" => {
@@ -1025,11 +1177,11 @@ async fn handle_batch(State(state): State<AppState>, body: Bytes) -> impl IntoRe
         match join {
             Ok((i, NewConn::Connect(r))) => results.push((i, r)),
             Ok((i, NewConn::ConnectData(Ok((sid, inner))))) => {
-                tcp_drains.push((i, sid, inner));
+                tcp_drains.push((i, sid, inner, None));
             }
             Ok((i, NewConn::ConnectData(Err(r)))) => results.push((i, r)),
             Ok((i, NewConn::UdpOpen(Ok((sid, inner))))) => {
-                udp_drains.push((i, sid, inner));
+                udp_drains.push((i, sid, inner, None));
             }
             Ok((i, NewConn::UdpOpen(Err(r)))) => results.push((i, r)),
             Err(e) => {
@@ -1061,11 +1213,11 @@ async fn handle_batch(State(state): State<AppState>, body: Bytes) -> impl IntoRe
         // the Arc is just a refcount bump.
         let tcp_inners: Vec<Arc<SessionInner>> = tcp_drains
             .iter()
-            .map(|(_, _, inner)| inner.clone())
+            .map(|(_, _, inner, _)| inner.clone())
             .collect();
         let udp_inners: Vec<Arc<UdpSessionInner>> = udp_drains
             .iter()
-            .map(|(_, _, inner)| inner.clone())
+            .map(|(_, _, inner, _)| inner.clone())
             .collect();
 
         // Wake on whichever side has work first. The previous
@@ -1151,19 +1303,66 @@ async fn handle_batch(State(state): State<AppState>, body: Bytes) -> impl IntoRe
         // Apps Script's 50 MiB response ceiling. This cap stops one session
         // short of the cliff; deferred sessions drain on the next poll.
         let mut remaining_budget: usize = BATCH_RESPONSE_BUDGET;
-        for (i, sid, inner) in &tcp_drains {
-            let (data, eof) = drain_now(inner, remaining_budget).await;
-            let drained = data.len();
-            if eof {
+        // Batch-wide drain deadline. The previous shape gave each session a
+        // fresh 1 s window — N sessions in a single batch could each spin
+        // for a full second, blowing through Apps Script's batch budget and
+        // letting the whole response time out client-side. With a single
+        // shared deadline, the per-session loop never extends total drain
+        // time past 1 s no matter how many sessions are in the batch; any
+        // session whose tail wasn't drained still has its data intact in
+        // `read_buf` and picks up on the next poll.
+        let tcp_drain_deadline = Instant::now() + Duration::from_secs(1);
+        for (i, sid, inner, seq) in &tcp_drains {
+            // Budget exhausted by an earlier session: emit an empty drain
+            // response so the client's positional index into `batch_resp.r`
+            // still lines up with this op's `i`. The session's buffered
+            // data is left intact and picked up on the next poll.
+            if remaining_budget == 0 {
+                results.push((*i, tcp_drain_response(sid.clone(), Vec::new(), false, *seq)));
+                continue;
+            }
+            // Drain in a loop: keep reading until the buffer is empty
+            // so we catch data that arrives during the drain itself.
+            // Honors the BATCH-WIDE deadline so total drain time is
+            // bounded regardless of how many sessions are in the batch.
+            let mut all_data = Vec::new();
+            let mut final_eof = false;
+            loop {
+                let (data, eof) =
+                    drain_now(inner, remaining_budget.saturating_sub(all_data.len())).await;
+                if eof {
+                    final_eof = true;
+                }
+                if data.is_empty() {
+                    break;
+                }
+                let hit_session_cap = data.len() >= TCP_DRAIN_MAX_BYTES;
+                all_data.extend_from_slice(&data);
+                if final_eof || hit_session_cap || all_data.len() >= remaining_budget {
+                    break;
+                }
+                if Instant::now() >= tcp_drain_deadline {
+                    break;
+                }
+                // Brief yield to let reader_task finish its current read
+                tokio::task::yield_now().await;
+            }
+            let drained = all_data.len();
+            if drained > 0 {
+                tracing::debug!(
+                    "session {} drained {}KB",
+                    &sid[..sid.len().min(8)],
+                    drained / 1024
+                );
+            }
+            if final_eof {
                 tcp_eof_sids.push(sid.clone());
             }
-            results.push((*i, tcp_drain_response(sid.clone(), data, eof)));
+            results.push((
+                *i,
+                tcp_drain_response(sid.clone(), all_data, final_eof, *seq),
+            ));
             remaining_budget = remaining_budget.saturating_sub(drained);
-            if remaining_budget == 0 {
-                // Budget exhausted; remaining sessions in `tcp_drains` keep
-                // their buffered data and pick up next batch.
-                break;
-            }
         }
         if !tcp_eof_sids.is_empty() {
             let mut sessions = state.sessions.lock().await;
@@ -1184,12 +1383,12 @@ async fn handle_batch(State(state): State<AppState>, body: Bytes) -> impl IntoRe
         // trap that motivated the TCP-side fix reappears, and tracking
         // eof from the drain return rather than the atomic catches it.
         let mut udp_eof_sids: Vec<String> = Vec::new();
-        for (i, sid, inner) in &udp_drains {
+        for (i, sid, inner, seq) in &udp_drains {
             let (packets, eof) = drain_udp_now(inner).await;
             if eof {
                 udp_eof_sids.push(sid.clone());
             }
-            results.push((*i, udp_drain_response(sid.clone(), packets, eof)));
+            results.push((*i, udp_drain_response(sid.clone(), packets, eof, *seq)));
         }
         if !udp_eof_sids.is_empty() {
             let mut sessions = state.udp_sessions.lock().await;
@@ -1216,7 +1415,7 @@ async fn handle_batch(State(state): State<AppState>, body: Bytes) -> impl IntoRe
     )
 }
 
-fn tcp_drain_response(sid: String, data: Vec<u8>, eof: bool) -> TunnelResponse {
+fn tcp_drain_response(sid: String, data: Vec<u8>, eof: bool, seq: Option<u64>) -> TunnelResponse {
     TunnelResponse {
         sid: Some(sid),
         d: if data.is_empty() {
@@ -1228,10 +1427,16 @@ fn tcp_drain_response(sid: String, data: Vec<u8>, eof: bool) -> TunnelResponse {
         eof: Some(eof),
         e: None,
         code: None,
+        seq,
     }
 }
 
-fn udp_drain_response(sid: String, packets: Vec<Vec<u8>>, eof: bool) -> TunnelResponse {
+fn udp_drain_response(
+    sid: String,
+    packets: Vec<Vec<u8>>,
+    eof: bool,
+    seq: Option<u64>,
+) -> TunnelResponse {
     let pkts = if packets.is_empty() {
         None
     } else {
@@ -1244,10 +1449,11 @@ fn udp_drain_response(sid: String, packets: Vec<Vec<u8>>, eof: bool) -> TunnelRe
         eof: Some(eof),
         e: None,
         code: None,
+        seq,
     }
 }
 
-fn eof_response(sid: String) -> TunnelResponse {
+fn eof_response(sid: String, seq: Option<u64>) -> TunnelResponse {
     TunnelResponse {
         sid: Some(sid),
         d: None,
@@ -1255,6 +1461,7 @@ fn eof_response(sid: String) -> TunnelResponse {
         eof: Some(true),
         e: None,
         code: None,
+        seq,
     }
 }
 
@@ -1312,6 +1519,7 @@ async fn handle_connect(
         eof: Some(false),
         e: None,
         code: None,
+        seq: None,
     }
 }
 
@@ -1438,6 +1646,7 @@ async fn handle_connect_data_single(
         eof: Some(eof),
         e: None,
         code: None,
+        seq: None,
     }
 }
 
@@ -1497,6 +1706,7 @@ async fn handle_data_single(
         eof: Some(eof),
         e: None,
         code: None,
+        seq: None,
     }
 }
 
@@ -1520,6 +1730,7 @@ async fn handle_close(state: &AppState, sid: Option<String>) -> TunnelResponse {
         eof: Some(true),
         e: None,
         code: None,
+        seq: None,
     }
 }
 
@@ -1835,7 +2046,33 @@ mod tests {
             eof: AtomicBool::new(false),
             last_active: Mutex::new(Instant::now()),
             notify: Notify::new(),
+            next_write_seq: Mutex::new(None),
+            pending_writes: Mutex::new(std::collections::BTreeMap::new()),
         })
+    }
+
+    /// Like `fake_inner`, but returns the upstream-side `TcpStream` so
+    /// the caller can observe (in order) what bytes the SessionInner's
+    /// writer actually flushed. Tests for `handle_batch`'s wseq ordering
+    /// logic need this — `fake_inner` drops the upstream end and there's
+    /// no way to recover the byte sequence.
+    async fn fake_inner_with_observer() -> (Arc<SessionInner>, TcpStream) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap().0 });
+        let client = TcpStream::connect(addr).await.unwrap();
+        let server_side = accept.await.unwrap();
+        let (_reader, writer) = client.into_split();
+        let inner = Arc::new(SessionInner {
+            writer: Mutex::new(SessionWriter::Tcp(writer)),
+            read_buf: Mutex::new(Vec::new()),
+            eof: AtomicBool::new(false),
+            last_active: Mutex::new(Instant::now()),
+            notify: Notify::new(),
+            next_write_seq: Mutex::new(None),
+            pending_writes: Mutex::new(std::collections::BTreeMap::new()),
+        });
+        (inner, server_side)
     }
 
     #[tokio::test]
@@ -2090,6 +2327,8 @@ mod tests {
             eof: AtomicBool::new(false),
             last_active: Mutex::new(Instant::now()),
             notify: Notify::new(),
+            next_write_seq: Mutex::new(None),
+            pending_writes: Mutex::new(std::collections::BTreeMap::new()),
         });
         let _reader_handle = tokio::spawn(reader_task(reader, inner.clone()));
 
@@ -2458,7 +2697,7 @@ mod tests {
         );
 
         // The `udp_drain_response` helper threads eof into `eof: Some(true)`.
-        let resp = udp_drain_response("zombie".into(), pkts, eof);
+        let resp = udp_drain_response("zombie".into(), pkts, eof, None);
         assert_eq!(resp.eof, Some(true));
         assert!(resp.pkts.is_none());
     }
@@ -2564,6 +2803,87 @@ mod tests {
         );
     }
 
+    /// Regression for the pipelined-drain batch budget. The first cut of
+    /// the wseq-pipelining patch gave each TCP session a fresh 1 s
+    /// drain-loop deadline, so a batch with N continuously-producing
+    /// sessions could spend up to N seconds in the drain phase — long
+    /// past Apps Script's batch budget. The batch-wide deadline caps
+    /// total drain time at 1 s regardless of how many sessions share
+    /// the batch. Background tasks below keep appending one byte every
+    /// 10 ms so `drain_now` never returns empty (its empty-buffer break
+    /// would otherwise mask the deadline check).
+    #[tokio::test]
+    async fn batch_tcp_drain_phase_is_bounded_across_many_sessions() {
+        use axum::body::Bytes;
+        use axum::extract::State;
+
+        let state = fresh_state();
+        let n_sessions = 5usize;
+        let mut sids: Vec<String> = Vec::with_capacity(n_sessions);
+        let mut producers: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(n_sessions);
+
+        for i in 0..n_sessions {
+            let inner = fake_inner().await;
+            // Trickle one byte every 10 ms into read_buf for the lifetime
+            // of the test — keeps `drain_now` returning Non-empty so the
+            // per-session loop must rely on the deadline to break out.
+            let inner_for_producer = inner.clone();
+            let producer = tokio::spawn(async move {
+                loop {
+                    {
+                        let mut g = inner_for_producer.read_buf.lock().await;
+                        g.push(0xab);
+                    }
+                    inner_for_producer.notify.notify_one();
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            });
+            producers.push(producer);
+
+            let sid = format!("drain-bounded-sid-{}", i);
+            state.sessions.lock().await.insert(
+                sid.clone(),
+                ManagedSession {
+                    inner,
+                    reader_handle: tokio::spawn(async {}),
+                    udpgw_handle: None,
+                },
+            );
+            sids.push(sid);
+        }
+
+        // Build a batch containing one "data" op per session — that's
+        // what populates the TCP drain phase that the deadline gates.
+        let ops: Vec<serde_json::Value> = sids
+            .iter()
+            .map(|sid| serde_json::json!({ "op": "data", "sid": sid }))
+            .collect();
+        let body = serde_json::json!({"k": "test-key", "ops": ops}).to_string();
+
+        let t0 = Instant::now();
+        let _resp = handle_batch(State(state.clone()), Bytes::from(body))
+            .await
+            .into_response();
+        let elapsed = t0.elapsed();
+
+        for p in producers {
+            p.abort();
+        }
+
+        // Allow generous slack for scheduler jitter on slower CI hosts:
+        // batch-wide deadline is 1 s, the test budget is 2.5 s. The
+        // pre-fix code would burn ~`n_sessions × 1 s` here.
+        assert!(
+            elapsed < Duration::from_millis(2500),
+            "TCP drain phase took {:?} for {} sessions — \
+             expected < 2.5s under the batch-wide deadline; per-session \
+             1 s deadlines stack and would have produced > {}s",
+            elapsed,
+            n_sessions,
+            n_sessions,
+        );
+    }
+
     /// Regression for the `tokio::join!` → `tokio::select!` mixed-drain
     /// fix. Before the change, a TCP-ready / UDP-idle pure-poll batch
     /// paid the full UDP `LONGPOLL_DEADLINE` (15 s) because the join
@@ -2626,6 +2946,247 @@ mod tests {
             "TCP-ready / UDP-idle pure-poll batch must not pay \
              LONGPOLL_DEADLINE; elapsed={:?}",
             elapsed,
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // wseq ordering protocol — server-side correctness.
+    //
+    // The pipelining client (`tunnel_client.rs`) sends data ops with a
+    // monotonic `wseq` so that pipelined batches completing out of order
+    // still get written upstream in the order the client read them off
+    // the SOCKS5 socket. handle_batch's `data` op handler buffers
+    // out-of-order writes in `inner.pending_writes` and flushes them in
+    // sequence as the gaps fill. Without these tests, a refactor of
+    // that block silently breaks upstream byte order — a class of bug
+    // that's nearly invisible to manual testing because it only shows up
+    // under specific scheduling.
+    // ---------------------------------------------------------------------
+
+    /// Helper for the wseq tests: install `inner` into `state.sessions`
+    /// under `sid` and drive a single `data` op through `handle_batch`.
+    /// The batch body is the smallest valid wire payload for a data op
+    /// with a wseq attached.
+    async fn drive_data_op_with_wseq(state: &AppState, sid: &str, wseq: u64, payload: &[u8]) {
+        use axum::body::Bytes;
+        use axum::extract::State;
+        let body = serde_json::json!({
+            "k": "test-key",
+            "ops": [{
+                "op": "data",
+                "sid": sid,
+                "d": B64.encode(payload),
+                "wseq": wseq,
+            }]
+        })
+        .to_string();
+        let _resp = handle_batch(State(state.clone()), Bytes::from(body))
+            .await
+            .into_response();
+    }
+
+    /// Drain whatever bytes the SessionInner's writer wrote to the
+    /// upstream socket. Reads until we've collected `expected_len` bytes
+    /// or the timeout fires (which lets a test assert "exactly N bytes,
+    /// no trailing junk").
+    async fn read_upstream_exact(
+        server_side: &mut TcpStream,
+        expected_len: usize,
+        timeout: Duration,
+    ) -> Vec<u8> {
+        let mut out = Vec::with_capacity(expected_len);
+        let deadline = Instant::now() + timeout;
+        let mut chunk = [0u8; 256];
+        while out.len() < expected_len {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, server_side.read(&mut chunk)).await {
+                Ok(Ok(0)) => break,
+                Ok(Ok(n)) => out.extend_from_slice(&chunk[..n]),
+                _ => break,
+            }
+        }
+        out
+    }
+
+    /// In-order arrivals (wseq=0 then wseq=1) must write upstream in
+    /// arrival order with no buffering. Establishes the baseline that
+    /// the next three tests' assertions are compared against.
+    #[tokio::test]
+    async fn wseq_in_order_writes_pass_through_immediately() {
+        let state = fresh_state();
+        let (inner, mut server_side) = fake_inner_with_observer().await;
+        let sid = "wseq-in-order".to_string();
+        state.sessions.lock().await.insert(
+            sid.clone(),
+            ManagedSession {
+                inner: inner.clone(),
+                reader_handle: tokio::spawn(async {}),
+                udpgw_handle: None,
+            },
+        );
+
+        drive_data_op_with_wseq(&state, &sid, 0, b"AAA").await;
+        drive_data_op_with_wseq(&state, &sid, 1, b"BB").await;
+
+        let upstream = read_upstream_exact(&mut server_side, 5, Duration::from_secs(2)).await;
+        assert_eq!(&upstream[..], b"AAABB");
+
+        // After both writes, pending_writes must be empty (nothing was
+        // buffered for later) and next_write_seq has advanced past 1.
+        let pending = inner.pending_writes.lock().await;
+        assert!(pending.is_empty(), "in-order arrivals must not buffer");
+        let nws = *inner.next_write_seq.lock().await;
+        assert_eq!(nws, Some(2));
+    }
+
+    /// Out-of-order: wseq=1 arrives first, buffers; wseq=0 arrives
+    /// second, the wseq=0 byte is written, then the buffered wseq=1
+    /// byte flushes. Upstream sees the bytes in client-write order
+    /// regardless of arrival order.
+    #[tokio::test]
+    async fn wseq_buffers_out_of_order_and_flushes_when_gap_fills() {
+        let state = fresh_state();
+        let (inner, mut server_side) = fake_inner_with_observer().await;
+        let sid = "wseq-ooo".to_string();
+        state.sessions.lock().await.insert(
+            sid.clone(),
+            ManagedSession {
+                inner: inner.clone(),
+                reader_handle: tokio::spawn(async {}),
+                udpgw_handle: None,
+            },
+        );
+
+        // wseq=1 arrives first. Nothing should reach upstream yet.
+        drive_data_op_with_wseq(&state, &sid, 1, b"second").await;
+        let early =
+            tokio::time::timeout(Duration::from_millis(150), server_side.read(&mut [0u8; 32]))
+                .await;
+        assert!(
+            early.is_err(),
+            "wseq=1 must not write upstream while wseq=0 is missing — got {:?}",
+            early,
+        );
+        // pending_writes carries the buffered chunk.
+        assert_eq!(inner.pending_writes.lock().await.len(), 1);
+
+        // wseq=0 arrives. Should write "first" then drain the buffered
+        // "second" in sequence.
+        drive_data_op_with_wseq(&state, &sid, 0, b"first").await;
+        let upstream = read_upstream_exact(&mut server_side, 11, Duration::from_secs(2)).await;
+        assert_eq!(&upstream[..], b"firstsecond");
+
+        // Buffer drained; next_write_seq advanced past both ops.
+        assert!(inner.pending_writes.lock().await.is_empty());
+        assert_eq!(*inner.next_write_seq.lock().await, Some(2));
+    }
+
+    /// Stale duplicate (wseq below `next_write_seq`) must be dropped
+    /// silently — never written, never buffered. This is the "duplicate
+    /// retry" failure mode: a client re-sends an op the server already
+    /// flushed, and we must not double-write.
+    #[tokio::test]
+    async fn wseq_drops_stale_duplicate_silently() {
+        let state = fresh_state();
+        let (inner, mut server_side) = fake_inner_with_observer().await;
+        let sid = "wseq-stale".to_string();
+        state.sessions.lock().await.insert(
+            sid.clone(),
+            ManagedSession {
+                inner: inner.clone(),
+                reader_handle: tokio::spawn(async {}),
+                udpgw_handle: None,
+            },
+        );
+
+        // Advance next_write_seq to 2 by sending wseq 0 then 1.
+        drive_data_op_with_wseq(&state, &sid, 0, b"X").await;
+        drive_data_op_with_wseq(&state, &sid, 1, b"Y").await;
+        let initial = read_upstream_exact(&mut server_side, 2, Duration::from_secs(1)).await;
+        assert_eq!(&initial[..], b"XY");
+        assert_eq!(*inner.next_write_seq.lock().await, Some(2));
+
+        // Now replay wseq=0 — must NOT be written upstream and must
+        // NOT pollute pending_writes.
+        drive_data_op_with_wseq(&state, &sid, 0, b"REPLAY").await;
+        let dup =
+            tokio::time::timeout(Duration::from_millis(150), server_side.read(&mut [0u8; 32]))
+                .await;
+        assert!(
+            dup.is_err(),
+            "stale duplicate must produce no upstream write"
+        );
+        assert!(inner.pending_writes.lock().await.is_empty());
+        assert_eq!(*inner.next_write_seq.lock().await, Some(2));
+    }
+
+    /// Exceeding `MAX_PENDING_WRITES_PER_SESSION` closes the session:
+    /// the offending op gets an error response, and `state.sessions`
+    /// no longer holds the sid (preventing further out-of-order writes
+    /// from consuming server memory).
+    #[tokio::test]
+    async fn wseq_cap_exceeded_closes_session_and_errors_op() {
+        use axum::body::Bytes;
+        use axum::extract::State;
+
+        let state = fresh_state();
+        let (inner, mut _server_side) = fake_inner_with_observer().await;
+        let sid = "wseq-cap".to_string();
+        state.sessions.lock().await.insert(
+            sid.clone(),
+            ManagedSession {
+                inner: inner.clone(),
+                reader_handle: tokio::spawn(async {}),
+                udpgw_handle: None,
+            },
+        );
+
+        // Fill pending_writes to exactly the cap by sending
+        // `MAX_PENDING_WRITES_PER_SESSION` non-zero wseqs (each
+        // out-of-order because wseq=0 never arrives). These succeed.
+        for i in 1..=MAX_PENDING_WRITES_PER_SESSION as u64 {
+            drive_data_op_with_wseq(&state, &sid, i, b"x").await;
+        }
+        assert_eq!(
+            inner.pending_writes.lock().await.len(),
+            MAX_PENDING_WRITES_PER_SESSION,
+        );
+        assert!(state.sessions.lock().await.contains_key(&sid));
+
+        // One more out-of-order op triggers the cap. The batch response
+        // must surface "wseq buffer cap exceeded" and the session must
+        // be removed from state.sessions.
+        let trigger_wseq = (MAX_PENDING_WRITES_PER_SESSION as u64) + 1;
+        let body = serde_json::json!({
+            "k": "test-key",
+            "ops": [{
+                "op": "data",
+                "sid": &sid,
+                "d": B64.encode(b"x"),
+                "wseq": trigger_wseq,
+            }]
+        })
+        .to_string();
+        let resp = handle_batch(State(state.clone()), Bytes::from(body))
+            .await
+            .into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&bytes).expect("response JSON parses");
+        let err = parsed["r"][0]["e"].as_str().unwrap_or("");
+        assert!(
+            err.contains("wseq buffer cap exceeded"),
+            "cap-triggering op must return the exact error string, got: {}",
+            err,
+        );
+        assert!(
+            !state.sessions.lock().await.contains_key(&sid),
+            "session must be removed when the cap fires",
         );
     }
 }
