@@ -1,6 +1,6 @@
 [package]
 name = "rahgozar"
-version = "2.0.1"
+version = "2.0.2"
 edition = "2021"
 description = "rahgozar — community continuation of mhrv-rs (Rust port of MasterHttpRelayVPN). DPI bypass via Google Apps Script relay with domain fronting."
 license = "MIT"
