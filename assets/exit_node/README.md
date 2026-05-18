@@ -147,6 +147,17 @@ ChatGPT / Claude / Grok opt in; everyone else runs lighter.
 
 ## Troubleshooting
 
+**Browser shows raw `{"s":200,"h":{...},"b":"..."}` JSON instead of the
+page content** — your Apps Script (or Cloudflare Worker) deployment is
+pre-v2.0.2 and ignores the `raw: true` flag the client sets on the
+exit-node outer hop, so it double-wraps the response. Open your Apps
+Script project, replace `Code.gs` with the current
+[`assets/apps_script/Code.gs`](../apps_script/Code.gs) (or `worker.js`
+with [`assets/cloudflare/worker.js`](../cloudflare/worker.js)), then
+**Deploy → Manage deployments → New version**. v2.0.4+ clients detect
+this case and surface a specific error in the log instead of letting
+the browser render the inner JSON envelope.
+
 **`exit node refused or errored: unauthorized`** — PSK mismatch.
 Double-check `psk` in `config.json` matches the `PSK` constant in your
 deployed source character-for-character. Whitespace and quoting

@@ -4147,6 +4147,23 @@ fn unix_to_ymd_utc(secs: u64) -> (i64, u32, u32) {
     (y, m as u32, d as u32)
 }
 
+/// Heuristic: does this byte slice parse as an exit-node `{s, h, b}`
+/// envelope? Used to detect the pre-v2.0.2 Code.gs double-wrap case
+/// where Apps Script ignored `raw: true` and re-wrapped the exit-node
+/// response — the symptom is that, after one layer of unwrapping, the
+/// body is *itself* another envelope. We require all three fields with
+/// the expected types so a legitimate API response that happens to be
+/// JSON with one matching key (e.g. an upstream that returns `{"s":
+/// "ok"}`) doesn't trip the detector.
+fn looks_like_exit_node_envelope(bytes: &[u8]) -> bool {
+    let Ok(v) = serde_json::from_slice::<Value>(bytes) else {
+        return false;
+    };
+    v.get("s").and_then(|x| x.as_u64()).is_some()
+        && v.get("h").is_some_and(|x| x.is_object())
+        && v.get("b").is_some_and(|x| x.is_string())
+}
+
 /// Parse the exit-node JSON envelope back into a raw HTTP/1.1
 /// response. The envelope shape is:
 ///
@@ -4202,6 +4219,26 @@ fn parse_exit_node_response(body: &[u8]) -> Result<Vec<u8>, FronterError> {
             FronterError::Relay(format!("exit-node body base64 decode failed: {}", e))
         })?
     };
+
+    // Detect the pre-v2.0.2 Code.gs double-wrap. If Apps Script ignored
+    // our `raw: true` flag and re-wrapped the exit-node response, the
+    // decoded body is itself another {s, h, b} envelope rather than the
+    // destination's bytes. Without this check the inner JSON would be
+    // handed to the browser as page content, which is what users saw on
+    // upstream issue #1239. Surface the misconfig as a specific error
+    // pointing at the fix (redeploy Code.gs) instead of letting raw JSON
+    // render in the browser silently.
+    if looks_like_exit_node_envelope(&body_bytes) {
+        return Err(FronterError::Relay(
+            "exit-node response was double-wrapped — Apps Script is running a \
+             pre-v2.0.2 Code.gs that ignores the `raw: true` flag. Open your \
+             Apps Script project, replace Code.gs with the v2.0.2+ version from \
+             assets/apps_script/Code.gs, then Deploy → Manage deployments → \
+             New version. Same fix applies to Cloudflare Worker deployments \
+             (assets/cloudflare/worker.js)."
+                .to_string(),
+        ));
+    }
 
     // Reconstruct headers. Skip hop-by-hop / would-double-up headers
     // (Content-Length comes from our own length count below; the outer
@@ -5731,6 +5768,50 @@ mod tests {
         // Body is `<h1>hi</h1>` (11 bytes; base64-decoded from the b field).
         assert!(raw.ends_with(b"<h1>hi</h1>"));
         assert!(raw_str.contains("Content-Length: 11\r\n"));
+    }
+
+    #[test]
+    fn parse_exit_node_response_detects_pre_v202_double_wrap() {
+        // Upstream issue #1239 symptom: client is v2.0.2+ but Apps Script
+        // is running an old Code.gs that doesn't honour `raw: true`, so it
+        // re-wraps the exit-node JSON envelope inside its own {s, h, b}.
+        // After one layer of unwrapping, the decoded `b` is *itself* an
+        // envelope. Without detection, parse_exit_node_response would
+        // hand that inner envelope to the browser as page content; with
+        // detection we surface a specific error telling the user to
+        // redeploy Code.gs.
+        let inner_envelope =
+            br#"{"s":200,"h":{"content-type":"text/html"},"b":"PGgxPmhpPC9oMT4="}"#;
+        let inner_b64 = B64.encode(inner_envelope);
+        let outer = format!(
+            r#"{{"s":200,"h":{{"content-type":"application/json"}},"b":"{}"}}"#,
+            inner_b64
+        );
+        let err =
+            parse_exit_node_response(outer.as_bytes()).expect_err("double-wrap must be detected");
+        let msg = format!("{}", err);
+        assert!(
+            msg.contains("double-wrapped") && msg.contains("Code.gs"),
+            "error should point at the Code.gs redeploy fix, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn parse_exit_node_response_does_not_misdetect_json_api_response() {
+        // The detector must require all three envelope fields (s number,
+        // h object, b string). A destination that legitimately returns
+        // JSON with only some matching keys (e.g. an API returning
+        // `{"s":"ok"}`) must not trip the double-wrap check.
+        let api_body = br#"{"s":"ok","message":"hello"}"#;
+        let api_b64 = B64.encode(api_body);
+        let envelope = format!(
+            r#"{{"s":200,"h":{{"content-type":"application/json"}},"b":"{}"}}"#,
+            api_b64
+        );
+        let raw = parse_exit_node_response(envelope.as_bytes())
+            .expect("non-envelope JSON body must pass through unchanged");
+        assert!(raw.ends_with(api_body));
     }
 
     #[test]

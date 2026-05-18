@@ -146,6 +146,8 @@ Grok اهمیت می‌دن opt in؛ همه‌ی دیگران lighter اجرا �
 
 ## Troubleshooting
 
+**در browser به‌جای محتوای صفحه، JSON خام به شکل `{"s":200,"h":{...},"b":"..."}` نمایش داده می‌شود** — deployment Apps Script (یا Cloudflare Worker) شما نسخه‌ای پیش از v2.0.2 است و flag `raw: true` که client روی hop بیرونی exit-node می‌فرستد را نادیده می‌گیرد، در نتیجه response را double-wrap می‌کند. پروژه Apps Script خود را باز کنید، محتوای `Code.gs` را با نسخه فعلی [`assets/apps_script/Code.gs`](../apps_script/Code.gs) (یا `worker.js` با [`assets/cloudflare/worker.js`](../cloudflare/worker.js)) جایگزین کنید، سپس **Deploy → Manage deployments → New version**. کلاینت v2.0.4+ این حالت را تشخیص می‌دهد و به‌جای نمایش envelope داخلی JSON در browser، یک ارور مشخص در log سرفیس می‌کند.
+
 **`exit node refused or errored: unauthorized`** — PSK mismatch.
 بررسی کنید `psk` در `config.json` دقیقاً با `PSK` constant در source
 deployed match هست. whitespace + quoting مهم است.
