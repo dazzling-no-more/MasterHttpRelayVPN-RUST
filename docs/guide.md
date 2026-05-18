@@ -114,7 +114,7 @@ Full setup and trade-off table in [`assets/cloudflare/README.md`](../assets/clou
 
 ### Direct mode
 
-If your ISP is already blocking Google Apps Script (or all of Google), you need Step 1 to succeed *before* you have a relay. rahgozar ships a `direct` mode for exactly this — SNI-rewrite tunnel only, no Apps Script relay required. (Was named `google_only` before v1.9 — old name still accepted.)
+If your ISP is already blocking Google Apps Script (or all of Google), you need Step 1 to succeed *before* you have a relay. rahgozar ships a `direct` mode for exactly this — no Apps Script relay required. Google traffic uses TLS-fragmentation direct dial (browser does real TLS to Google, no MITM cert needed) and falls back to the SNI-rewrite tunnel if fragmentation can't beat the local DPI. (Was named `google_only` before v1.9 — old name still accepted.)
 
 1. Download the binary (see [main README → Step 2](../README.md#step-2--download-rahgozar))
 2. Copy [`config.direct.example.json`](../config.direct.example.json) to `config.json` — no `script_id`, no `auth_key` required

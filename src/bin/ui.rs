@@ -530,6 +530,11 @@ struct FormState {
     /// claude.ai / grok.com / x.com). Config-only — no UI editor yet.
     /// See `assets/exit_node/` for the generic exit-node handler.
     exit_node: rahgozar::config::ExitNodeConfig,
+    /// TLS-fragmentation Direct Mode for Google-owned domains.
+    /// Config-only — no UI editor yet. Round-tripped through FormState
+    /// so Save preserves hand-edited `direct_mode` blocks in
+    /// `config.json`.
+    direct_mode: rahgozar::config::DirectModeConfig,
     // (No raw `extras` field on FormState anymore — the
     // `custom_params_buffer` below is the editor's source of truth,
     // and [`to_config`] rebuilds `Config::extras` from it on save via
@@ -695,6 +700,7 @@ fn load_form() -> (FormState, Option<String>) {
             auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
             request_timeout_secs: c.request_timeout_secs,
             exit_node: c.exit_node.clone(),
+            direct_mode: c.direct_mode.clone(),
             // The editor buffer is the only persistent representation
             // of `Config::extras` on the UI side — there's no longer
             // a separate `FormState.extras` field. `to_config()` builds
@@ -786,6 +792,7 @@ impl FormState {
             auto_blacklist_cooldown_secs: 120,
             request_timeout_secs: 30,
             exit_node: rahgozar::config::ExitNodeConfig::default(),
+            direct_mode: rahgozar::config::DirectModeConfig::default(),
             custom_params_buffer: Vec::new(),
             hosts_passthrough: std::collections::HashMap::new(),
             enable_batching: false,
@@ -899,6 +906,7 @@ const MODELED_CONFIG_KEYS: &[&str] = &[
     "auto_blacklist_cooldown_secs",
     "request_timeout_secs",
     "exit_node",
+    "direct_mode",
 ];
 
 /// True when `key` collides with a modeled Config field. Trimmed,
@@ -1101,6 +1109,10 @@ impl FormState {
             // / grok.com / x.com). Round-trip through FormState — config-only
             // editing for now, UI editor planned for v1.9.x desktop UI batch.
             exit_node: self.exit_node.clone(),
+            // TLS-fragmentation Direct Mode (zyrln-style). Config-only
+            // for now; preserve hand-edited blocks across UI saves the
+            // same way exit_node does.
+            direct_mode: self.direct_mode.clone(),
             // Custom-parameters editor: the buffer is the authoritative
             // source for `extras` on save. Rows with a blank key are
             // dropped; values that don't parse as JSON are stored as
@@ -1324,6 +1336,16 @@ struct ConfigWire<'a> {
     #[serde(skip_serializing_if = "is_default_exit_node")]
     exit_node: &'a rahgozar::config::ExitNodeConfig,
 
+    /// TLS-fragmentation Direct Mode for Google domains — see
+    /// `src/direct_mode.rs` for the algorithm and the
+    /// `DirectModeConfig` doc-comment in `src/config.rs` for the
+    /// override semantics. Skip when fully default (enabled with
+    /// empty override lists) so configs that use the built-in defaults
+    /// stay clean. Round-tripped through FormState so Save preserves
+    /// hand-edited values.
+    #[serde(skip_serializing_if = "is_default_direct_mode")]
+    direct_mode: &'a rahgozar::config::DirectModeConfig,
+
     /// Verbatim passthrough of unknown / future config.json keys
     /// captured at load time. Re-emitted via `#[serde(flatten)]`
     /// so a Save-config or Save-as-profile round-trip preserves
@@ -1351,6 +1373,17 @@ fn is_default_exit_node(en: &&rahgozar::config::ExitNodeConfig) -> bool {
         && en.psk.is_empty()
         && en.hosts.is_empty()
         && (en.mode.is_empty() || en.mode == "selective")
+}
+
+/// Direct Mode default = `enabled: true` (compiled default) AND every
+/// override list empty (so the runtime falls back to the built-in
+/// defaults from `direct_mode.rs`). Skip serialization in that case so
+/// configs that haven't been hand-edited stay quiet.
+fn is_default_direct_mode(d: &&rahgozar::config::DirectModeConfig) -> bool {
+    d.enabled
+        && d.fronts.is_empty()
+        && d.google_domains.is_empty()
+        && d.sanctioned_domains.is_empty()
 }
 
 /// Match the log-colour defaults case-insensitively so `#5AB464` and
@@ -1436,6 +1469,7 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             request_timeout_secs: c.request_timeout_secs,
             force_http1: c.force_http1,
             exit_node: &c.exit_node,
+            direct_mode: &c.direct_mode,
             extras: &c.extras,
             block_quic: c.block_quic,
             disable_padding: c.disable_padding,

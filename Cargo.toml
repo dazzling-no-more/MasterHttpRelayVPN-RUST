@@ -128,6 +128,11 @@ x509-parser = "0.16"
 # sensitive tests in `tunnel_client` (the empty-poll cadence) can
 # auto-advance virtual time instead of burning real wall-clock seconds.
 tokio = { version = "1", features = ["test-util"] }
+# Scratch directories for direct_mode candidate-cache persistence tests.
+# The non-dev `tempfile` dep is scoped to non-android targets (for the
+# desktop auto-updater), so we re-declare here so tests compile against
+# every target including android.
+tempfile = "3"
 
 [profile.release]
 panic = "abort"

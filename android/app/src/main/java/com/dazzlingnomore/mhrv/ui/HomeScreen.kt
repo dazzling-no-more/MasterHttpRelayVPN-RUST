@@ -1084,7 +1084,7 @@ private fun ModeDropdown(
                 }
 
                 Mode.DIRECT -> {
-                    "SNI-rewrite tunnel only — no relay. Reach *.google.com (and any configured fronting_groups) directly. Useful as a bootstrap to open script.google.com and deploy Code.gs."
+                    "No Apps Script relay. Google traffic uses TLS-fragmentation direct dial (no MITM cert needed) and falls back to the SNI-rewrite tunnel if fragmentation can't beat your DPI. Useful as a bootstrap to open script.google.com and deploy Code.gs."
                 }
 
                 Mode.FULL -> {

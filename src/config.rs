@@ -429,6 +429,22 @@ pub struct Config {
     #[serde(default)]
     pub fronting_groups: Vec<FrontingGroup>,
 
+    /// TLS-fragmentation Direct Mode for Google-owned domains. When
+    /// enabled, Google-edge-served traffic skips both the Apps Script
+    /// relay AND the MITM SNI-rewrite path: the browser's real TLS
+    /// ClientHello is forwarded to Google directly, split into N TCP
+    /// segments so DPI can't reassemble the SNI. No MITM cert needed
+    /// for Google traffic, no Apps Script quota burn for Gmail / Drive
+    /// / Maps / YouTube / etc.
+    ///
+    /// On total dial failure, traffic falls back to the existing
+    /// SNI-rewrite tunnel — so existing setups keep working even on
+    /// networks where fragmentation alone doesn't beat DPI.
+    ///
+    /// Ported from zyrln (https://github.com/ajavadinezhad/zyrln).
+    #[serde(default)]
+    pub direct_mode: DirectModeConfig,
+
     /// Auto-blacklist tuning — how many timeouts within the window
     /// trip a per-deployment cooldown.
     ///
@@ -569,6 +585,64 @@ pub struct ExitNodeConfig {
 
 fn default_exit_node_mode() -> String {
     "selective".into()
+}
+
+/// Configuration for the TLS-fragmentation Direct Mode (port of zyrln's
+/// `relay/core/direct.go`). Defaults to enabled with the upstream
+/// suffix list — set `enabled: false` to disable.
+///
+/// `fronts` / `google_domains` / `sanctioned_domains` are exposed only
+/// so users on unusual networks can override (e.g. add a corporate
+/// Google domain, or replace the front list with `clients4.google.com`
+/// if `www.google.com` is somehow blocked). Empty → use built-in
+/// defaults from `direct_mode.rs`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DirectModeConfig {
+    /// Master switch. Default `true`. Even with the feature on, only
+    /// hosts matching `google_domains` (and not on `sanctioned_domains`)
+    /// take this path; everything else routes as before.
+    #[serde(default = "default_direct_mode_enabled")]
+    pub enabled: bool,
+
+    /// Front hostnames for the TCP dial — the browser's ClientHello
+    /// still carries the real SNI, this is just where we open the
+    /// socket. Both must resolve to a Google edge that serves Google
+    /// certs. Empty → built-in `["www.google.com", "script.google.com"]`.
+    #[serde(default)]
+    pub fronts: Vec<String>,
+
+    /// Suffix list of Google-edge-served domains that should use Direct
+    /// Mode. Each entry matches the bare apex (`google.com`) and any
+    /// subdomain (`mail.google.com`). Empty → bundled default in
+    /// `src/direct_mode.rs::DEFAULT_GOOGLE_DOMAINS` (14 suffixes
+    /// covering google.com / googleapis.com / gstatic.com / youtube
+    /// family / etc., constrained to the intersection with
+    /// `SNI_REWRITE_SUFFIXES` so the dial-failure fallback path is
+    /// always safe).
+    #[serde(default)]
+    pub google_domains: Vec<String>,
+
+    /// Domains that route via the Apps Script relay even when Direct
+    /// Mode is enabled — needed for services that Google geo-blocks
+    /// from Iranian IPs (Gemini, AI Studio, Bard, Labs). Subdomains
+    /// inherit the exclusion. Empty → built-in 5-entry list.
+    #[serde(default)]
+    pub sanctioned_domains: Vec<String>,
+}
+
+impl Default for DirectModeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_direct_mode_enabled(),
+            fronts: Vec::new(),
+            google_domains: Vec::new(),
+            sanctioned_domains: Vec::new(),
+        }
+    }
+}
+
+fn default_direct_mode_enabled() -> bool {
+    true
 }
 
 /// One multi-edge fronting group. Edge CDNs like Vercel and Fastly
@@ -746,6 +820,111 @@ fn default_verify_ssl() -> bool {
 ///   path filter while the matching half still routes via relay.
 /// * path syntax — any byte sequence after the first `/` is treated
 ///   as a literal prefix to `starts_with` against URL paths, by design.
+
+/// Validate a `direct_mode` hostname / suffix list entry.
+///
+/// Accepts: ASCII LDH-shaped (RFC 952 §2 + RFC 1123 §2.1) DNS labels
+/// separated by dots. IDN domains must be pre-encoded as punycode
+/// (`xn--…`) — the runtime matcher is byte-based and can't compare
+/// raw Unicode to a wire-encoded hostname.
+///
+/// Rejects (fail-fast at config load, not after a 3-second dial):
+///   - empty / whitespace-only (degrades to a slow runtime failure);
+///   - URL schemes (`https://...`) — direct_mode entries aren't URLs;
+///   - paths (any `/`) — same reason;
+///   - whitespace inside the entry (space / tab / newline) — almost
+///     always copy-paste fat-finger error;
+///   - ports / IPv6 colons (`example.com:443` or `2607:...`) — fronts
+///     are dialed with the destination port, IPv6 literals as fronts
+///     aren't supported by the matcher anyway;
+///   - labels with non-LDH characters (`_underscore`, raw Unicode);
+///   - labels with leading or trailing hyphen (`-bad`, `bad-`);
+///   - labels longer than 63 octets, names longer than 253 octets
+///     (RFC 1035 §2.3.4 limits — anything beyond these can't resolve).
+fn validate_direct_mode_hostname(field: &str, i: usize, raw: &str) -> Result<(), ConfigError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(ConfigError::Invalid(format!(
+            "{}[{}]: empty / whitespace-only entry",
+            field, i
+        )));
+    }
+    if raw.chars().any(|c| matches!(c, ' ' | '\t' | '\r' | '\n')) {
+        return Err(ConfigError::Invalid(format!(
+            "{}[{}] ('{}'): hostname must not contain whitespace",
+            field, i, raw
+        )));
+    }
+    if trimmed.contains("://") || trimmed.starts_with("//") {
+        return Err(ConfigError::Invalid(format!(
+            "{}[{}] ('{}'): expected a bare hostname, not a URL",
+            field, i, raw
+        )));
+    }
+    if trimmed.contains('/') {
+        return Err(ConfigError::Invalid(format!(
+            "{}[{}] ('{}'): path component is not allowed — entries match by hostname only",
+            field, i, raw
+        )));
+    }
+    if trimmed.contains(':') {
+        return Err(ConfigError::Invalid(format!(
+            "{}[{}] ('{}'): port / IPv6 colon is not allowed — \
+             fronts are dialed with the destination's port",
+            field, i, raw
+        )));
+    }
+    let stripped = trimmed.trim_start_matches('.').trim_end_matches('.');
+    if stripped.is_empty() {
+        return Err(ConfigError::Invalid(format!(
+            "{}[{}] ('{}'): hostname has no labels (just dots)",
+            field, i, raw
+        )));
+    }
+    if stripped.len() > 253 {
+        return Err(ConfigError::Invalid(format!(
+            "{}[{}] ('{}'): hostname exceeds RFC 1035 max length of 253 octets",
+            field, i, raw
+        )));
+    }
+    for label in stripped.split('.') {
+        if label.is_empty() {
+            return Err(ConfigError::Invalid(format!(
+                "{}[{}] ('{}'): empty label (consecutive dots)",
+                field, i, raw
+            )));
+        }
+        if label.len() > 63 {
+            return Err(ConfigError::Invalid(format!(
+                "{}[{}] ('{}'): label '{}' exceeds RFC 1035 max of 63 octets",
+                field, i, raw, label
+            )));
+        }
+        // LDH (Letters, Digits, Hyphen) + the leading/trailing-hyphen
+        // ban from RFC 952 §2 / RFC 1123 §2.1. IDN labels arrive
+        // already punycode-encoded (`xn--…`) which is itself LDH, so
+        // this check is compatible with international names; the
+        // matcher (`direct_mode::is_google_domain`) is byte-based and
+        // a raw Unicode label here couldn't match wire-encoded
+        // hostnames anyway.
+        if !label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            return Err(ConfigError::Invalid(format!(
+                "{}[{}] ('{}'): label '{}' contains non-LDH character \
+                 (only letters, digits, and hyphens allowed; IDN names \
+                 must be punycode-encoded as 'xn--...')",
+                field, i, raw, label
+            )));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(ConfigError::Invalid(format!(
+                "{}[{}] ('{}'): label '{}' must not start or end with a hyphen",
+                field, i, raw, label
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_relay_url_pattern(p: &str) -> Result<(), String> {
     let trimmed = p.trim();
     if trimmed.is_empty() {
@@ -910,6 +1089,21 @@ impl Config {
                     i, p, e
                 )));
             }
+        }
+        // `direct_mode` overrides — same fail-fast contract as the rest
+        // of validate(). The runtime substitutes built-in defaults when
+        // these lists are empty, but a *non-empty* list containing
+        // whitespace-only or syntactically nonsense entries should hard
+        // error rather than degrade to a slow connection failure on
+        // first dial.
+        for (i, f) in self.direct_mode.fronts.iter().enumerate() {
+            validate_direct_mode_hostname("direct_mode.fronts", i, f)?;
+        }
+        for (i, d) in self.direct_mode.google_domains.iter().enumerate() {
+            validate_direct_mode_hostname("direct_mode.google_domains", i, d)?;
+        }
+        for (i, d) in self.direct_mode.sanctioned_domains.iter().enumerate() {
+            validate_direct_mode_hostname("direct_mode.sanctioned_domains", i, d)?;
         }
         Ok(())
     }
@@ -1213,6 +1407,107 @@ mod tests {
         assert!(validate_relay_url_pattern("").is_err());
         assert!(validate_relay_url_pattern("   ").is_err());
         assert!(validate_relay_url_pattern("\t\n").is_err());
+    }
+
+    #[test]
+    fn validate_direct_mode_hostname_accepts_canonical_forms() {
+        for s in [
+            "google.com",
+            "www.google.com",
+            ".google.com",
+            "google.com.",
+            ".google.com.",
+            "youtube-nocookie.com",
+            "r1---sn-aigl6n7e.googlevideo.com",
+        ] {
+            assert!(
+                validate_direct_mode_hostname("f", 0, s).is_ok(),
+                "{:?} should validate",
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn validate_direct_mode_hostname_rejects_garbage() {
+        for s in [
+            "",
+            "   ",
+            "\t",
+            "\n",
+            "ho st.com",
+            "host\tcom",
+            "host\ncom",
+            "https://google.com",
+            "//google.com",
+            "google.com/path",
+            "google.com:443",
+            "[2607:f8b0::1]",
+            "2607:f8b0::1",
+            ".",
+            "..",
+            "...",
+            "host..com",
+            // LDH rules below: non-ASCII / underscore / leading-hyphen
+            // / trailing-hyphen are wire-illegal even though they'd
+            // pass the structural checks above.
+            "_bad.example.com",      // underscore in label
+            "bad_label.example.com", // underscore mid-label
+            "-leading.example.com",  // leading hyphen
+            "trailing-.example.com", // trailing hyphen
+            "münchen.example.com",   // raw Unicode (must be punycode)
+            "host!.example.com",     // arbitrary symbol
+        ] {
+            assert!(
+                validate_direct_mode_hostname("f", 0, s).is_err(),
+                "{:?} should be rejected",
+                s
+            );
+        }
+    }
+
+    #[test]
+    fn validate_direct_mode_hostname_accepts_punycode_idn() {
+        // Punycode-encoded IDN passes LDH (xn-- + LDH).
+        assert!(validate_direct_mode_hostname("f", 0, "xn--mnchen-3ya.example.com").is_ok());
+    }
+
+    #[test]
+    fn validate_direct_mode_hostname_rejects_oversized() {
+        let too_long_label = "a".repeat(64);
+        assert!(validate_direct_mode_hostname("f", 0, &too_long_label).is_err());
+        let long_name = (0..40)
+            .map(|_| "abcdef".to_string())
+            .collect::<Vec<_>>()
+            .join(".");
+        assert!(long_name.len() > 253);
+        assert!(validate_direct_mode_hostname("f", 0, &long_name).is_err());
+    }
+
+    #[test]
+    fn validate_config_rejects_bad_direct_mode_entries() {
+        let mut cfg: Config = serde_json::from_str(
+            r#"{"mode":"direct","script_id":"x","auth_key":"strong","direct_mode":{"fronts":["www.google.com:443"]}}"#,
+        )
+        .unwrap();
+        assert!(cfg.validate().is_err(), "port-bearing front should reject");
+
+        cfg.direct_mode.fronts = vec!["www.google.com".into()];
+        cfg.direct_mode.google_domains = vec!["https://google.com".into()];
+        assert!(
+            cfg.validate().is_err(),
+            "scheme in google_domains should reject"
+        );
+
+        cfg.direct_mode.google_domains = vec![".google.com".into()];
+        cfg.direct_mode.sanctioned_domains = vec!["gemini.google.com/api".into()];
+        assert!(
+            cfg.validate().is_err(),
+            "path in sanctioned_domains should reject"
+        );
+
+        cfg.direct_mode.sanctioned_domains = vec!["gemini.google.com".into()];
+        assert!(cfg.validate().is_ok(), "valid config should pass");
     }
 
     #[test]

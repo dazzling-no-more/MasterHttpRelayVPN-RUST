@@ -503,6 +503,14 @@ pub struct RewriteCtx {
     /// domains used only for matching). Empty = feature off (only
     /// the built-in Google edge SNI-rewrite is active).
     pub fronting_groups: Vec<Arc<FrontingGroupResolved>>,
+    /// TLS-fragmentation Direct Mode runtime context. `None` when the
+    /// feature is disabled in config or there are no usable fronts.
+    /// Wins over `fronting_groups` and the built-in SNI-rewrite list
+    /// when the host matches its Google-suffix list — but falls back
+    /// to those paths if every fragmented dial fails, so existing
+    /// SNI-rewrite-only users see no regression on networks where
+    /// fragmentation can't beat DPI.
+    pub direct_mode: Option<Arc<crate::direct_mode::DirectModeCtx>>,
 }
 
 /// One-shot resolution of the YouTube routing knobs (`youtube_via_relay`,
@@ -1048,6 +1056,8 @@ fn build_mode_state(
         exit_node_full_mode_active,
     } = resolved_routing;
 
+    let direct_mode = build_direct_mode_ctx(&config.direct_mode);
+
     let rewrite_ctx = Arc::new(RewriteCtx {
         google_ip: config.google_ip.clone(),
         front_domain: config.front_domain.clone(),
@@ -1066,9 +1076,122 @@ fn build_mode_state(
         block_doh: config.block_doh,
         bypass_doh_hosts: config.bypass_doh_hosts.clone(),
         fronting_groups,
+        direct_mode,
     });
 
     Ok((fronter, rewrite_ctx, mode))
+}
+
+/// Decision predicate for the Direct Mode dispatch branch. Pulled out
+/// of `dispatch_tunnel` so the precedence rules — port-gating,
+/// force-MITM carve-out, `youtube_via_relay` exclusion, explicit hosts
+/// override — can be tested directly without standing up sockets,
+/// certs, or a full RewriteCtx.
+///
+/// Returns `true` only when EVERY condition for taking the direct
+/// branch is satisfied. False otherwise; caller falls through to
+/// `should_use_sni_rewrite` and the rest of the pipeline. Keep this
+/// predicate in lockstep with the `dispatch_tunnel` step 2b block.
+pub(crate) fn should_take_direct_mode_branch(
+    port: u16,
+    direct: Option<&Arc<crate::direct_mode::DirectModeCtx>>,
+    host: &str,
+    force_mitm_hosts: &[String],
+    youtube_via_relay: bool,
+    hosts: &std::collections::HashMap<String, String>,
+) -> bool {
+    if port != 443 {
+        return false;
+    }
+    let Some(direct) = direct else {
+        return false;
+    };
+    if host_in_force_mitm_list(host, force_mitm_hosts) {
+        return false;
+    }
+    if youtube_via_relay && host_matches_youtube_relay(host) {
+        return false;
+    }
+    // Explicit hosts override is a deliberate user choice: they typed
+    // `mail.google.com: 1.2.3.4` because they know that IP works on
+    // their network. Direct Mode dialing to a different front would
+    // silently bypass that signal. Always defer to the user — the
+    // SNI-rewrite path honours the override and that's what they
+    // asked for.
+    if hosts_override(hosts, host).is_some() {
+        return false;
+    }
+    if !direct.is_direct(host) {
+        return false;
+    }
+    // Defense-in-depth: Direct Mode's `SkipPrefaced` fallback can only
+    // route to `do_sni_rewrite_tunnel_from_tcp`, which is only safe
+    // for hosts in `SNI_REWRITE_SUFFIXES`. Hosts outside that list
+    // (e.g. a user-customised `direct_mode.google_domains` that adds
+    // back `googlevideo.com`) would on dial failure 502 or trigger a
+    // wrong-edge / wrong-cert error rather than fall to the relay.
+    // Skip Direct Mode entirely for those — the existing dispatch
+    // routes them through their normal path (relay in AppsScript mode).
+    // The bundled `DEFAULT_GOOGLE_DOMAINS` is already constrained to
+    // this intersection; this check defends against custom lists.
+    if !matches_sni_rewrite(host, youtube_via_relay, force_mitm_hosts) {
+        return false;
+    }
+    true
+}
+
+/// Build the `DirectModeCtx` from a `DirectModeConfig`. Returns `None`
+/// when disabled in config so the dispatch branch is fully skipped
+/// (no atomic load, no Arc traffic on the hot path) — same shape as
+/// `fronting_groups` being an empty `Vec`. Substitutes built-in
+/// defaults when the user left the list fields empty.
+fn build_direct_mode_ctx(
+    cfg: &crate::config::DirectModeConfig,
+) -> Option<Arc<crate::direct_mode::DirectModeCtx>> {
+    if !cfg.enabled {
+        return None;
+    }
+    let fronts: Vec<String> = if cfg.fronts.is_empty() {
+        crate::direct_mode::DEFAULT_FRONTS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        cfg.fronts.clone()
+    };
+    let google_domains: Vec<String> = if cfg.google_domains.is_empty() {
+        crate::direct_mode::DEFAULT_GOOGLE_DOMAINS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        cfg.google_domains.clone()
+    };
+    let sanctioned_domains: Vec<String> = if cfg.sanctioned_domains.is_empty() {
+        crate::direct_mode::DEFAULT_SANCTIONED_DOMAINS
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    } else {
+        cfg.sanctioned_domains.clone()
+    };
+    if fronts.is_empty() {
+        tracing::warn!("direct_mode: enabled but no fronts configured — disabling");
+        return None;
+    }
+    tracing::info!(
+        "direct_mode: enabled (fronts={}, google_domains={}, sanctioned={})",
+        fronts.len(),
+        google_domains.len(),
+        sanctioned_domains.len(),
+    );
+    Some(Arc::new(crate::direct_mode::DirectModeCtx::from_parts(
+        true,
+        fronts,
+        google_domains,
+        sanctioned_domains,
+        Some(crate::data_dir::data_dir()),
+    )))
 }
 
 /// Pick out `TunnelMux` coalesce knobs from a `Config`, applying the
@@ -2559,13 +2682,15 @@ async fn dispatch_tunnel(
     }
 
     // 2a. User-configured fronting groups (Vercel, Fastly, etc.). Wins
-    //     over the built-in Google SNI-rewrite suffix list — if a user
-    //     adds e.g. `vercel.com` to a Vercel fronting group, we hit
-    //     Vercel's edge with sni=react.dev rather than trying to resolve
-    //     it through Google's. Port-gated to 443: SNI-rewrite needs a
-    //     real ClientHello and a non-TLS CONNECT to the same hostname
-    //     would just hang. Only HTTPS sites are fronted by these CDNs in
-    //     practice, so the gate has no false negatives we care about.
+    //     over the built-in Google SNI-rewrite suffix list AND over
+    //     Direct Mode below — if a user adds e.g. `youtube.com` to a
+    //     fronting group, that's an explicit override and the fronting
+    //     edge takes precedence over the automatic Google routing.
+    //     Port-gated to 443: SNI-rewrite needs a real ClientHello and
+    //     a non-TLS CONNECT to the same hostname would just hang. Only
+    //     HTTPS sites are fronted by these CDNs in practice, so the
+    //     gate has no false negatives we care about.
+    let mut sock = sock;
     if port == 443 {
         // `Arc::clone` here is refcount-only; we hold it across the
         // await below without keeping `rewrite_ctx` borrowed.
@@ -2591,21 +2716,136 @@ async fn dispatch_tunnel(
         }
     }
 
+    // 2b. TLS-fragmentation Direct Mode for Google-owned domains.
+    //     Sits between fronting_groups (2a) and the built-in
+    //     SNI-rewrite suffix list (2) — explicit user fronting wins,
+    //     but Direct Mode takes over from the MITM SNI-rewrite path
+    //     for plain Google traffic. Big win: the browser does real
+    //     TLS to Google with a real cert, so no MITM CA install is
+    //     needed for any Google domain.
+    //
+    //     Skipped (handed to step 2 below) when:
+    //       - port != 443 (need a real ClientHello to fragment);
+    //       - host is in `force_mitm_hosts` — `relay_url_patterns`
+    //         pulled this host out of SNI-rewrite specifically so
+    //         the MITM path-matcher can run; bypassing MITM here
+    //         would defeat that;
+    //       - `youtube_via_relay` is on AND the host is one of the
+    //         four `YOUTUBE_RELAY_HOSTS` — user explicitly wants
+    //         YouTube traffic through the relay (e.g. for SafeSearch
+    //         enforcement via SNI), so fragmented-direct is wrong.
+    //         The carve-out is narrow: `ytimg.com` / `googlevideo.com`
+    //         still go direct, matching how `matches_sni_rewrite`
+    //         already treats them.
+    //
+    //     On total dial failure the socket comes back un-consumed
+    //     (peek-only path) and falls through to step 2 — preserves
+    //     the existing SNI-rewrite tunnel as a fallback on networks
+    //     where fragmentation can't beat DPI alone.
+    if should_take_direct_mode_branch(
+        port,
+        rewrite_ctx.direct_mode.as_ref(),
+        &host,
+        &rewrite_ctx.force_mitm_hosts,
+        rewrite_ctx.youtube_via_relay,
+        &rewrite_ctx.hosts,
+    ) {
+        // Predicate guaranteed direct is Some.
+        let direct = rewrite_ctx.direct_mode.as_ref().expect("predicate guard");
+        tracing::debug!(
+            "dispatch {}:{} -> direct-mode (TLS fragmentation)",
+            host,
+            port
+        );
+        match crate::direct_mode::try_tunnel(sock, &host, port, direct).await {
+            Ok(crate::direct_mode::TunnelOutcome::Done) => return Ok(()),
+            Ok(crate::direct_mode::TunnelOutcome::Skip(s)) => {
+                tracing::debug!(
+                    "dispatch {}:{} -> direct-mode skipped, falling through to SNI-rewrite",
+                    host,
+                    port,
+                );
+                sock = s;
+            }
+            Ok(crate::direct_mode::TunnelOutcome::SkipPrefaced(prefaced)) => {
+                // Every (front, profile) failed the handshake check.
+                // The ClientHello is buffered as a preface in front of
+                // the original client socket; the SNI-rewrite tunnel
+                // can re-accept the same bytes via its generic stream
+                // signature. This is the *only* sensible fallback for
+                // a host that reached this branch (already proven
+                // SNI-rewrite-eligible by the predicate guards).
+                tracing::info!(
+                    "dispatch {}:{} -> sni-rewrite tunnel (direct-mode handshake failed, prefaced fallback)",
+                    host,
+                    port,
+                );
+                return do_sni_rewrite_tunnel_from_tcp(
+                    prefaced,
+                    &host,
+                    port,
+                    mitm,
+                    rewrite_ctx,
+                    None,
+                )
+                .await;
+            }
+            Err(e) => {
+                tracing::debug!("direct-mode error for {}:{}: {}", host, port, e);
+                return Ok(());
+            }
+        }
+    }
+
+    // 2c. Sanctioned-domain routing override (AppsScript mode only).
+    //     Google geo-blocks Iranian IPs for Gemini / AI Studio / Bard
+    //     / Labs; both the direct fragmented path AND the SNI-rewrite
+    //     path originate from the user's source IP, so neither reaches
+    //     those endpoints. Only the Apps Script relay does (it runs in
+    //     Google US datacenters and outbound traffic carries a US IP).
+    //
+    //     We can ONLY apply this override when an Apps Script relay
+    //     actually exists — in `Mode::Direct` there's no relay at all,
+    //     so pulling the host out of SNI-rewrite would just drop it
+    //     onto raw TCP (which the user's network blocks anyway, that's
+    //     why they're using rahgozar). For Mode::Direct users the
+    //     SNI-rewrite path is the LEAST-BAD option and we keep it.
+    //
+    //     `direct_mode.is_some()` is the second guard: a user who
+    //     disabled Direct Mode entirely opts out of this routing
+    //     override too — they're responsible for routing via
+    //     `relay_url_patterns` or similar machinery instead.
+    let sanctioned = rewrite_ctx.mode == Mode::AppsScript
+        && rewrite_ctx
+            .direct_mode
+            .as_ref()
+            .map(|d| d.is_sanctioned(&host))
+            .unwrap_or(false);
+
     // 2. Explicit hosts override or SNI-rewrite suffix: for HTTPS targets,
     //    use the TLS SNI-rewrite tunnel (skipped in full mode above).
-    if should_use_sni_rewrite(
-        &rewrite_ctx.hosts,
-        &host,
-        port,
-        rewrite_ctx.youtube_via_relay,
-        &rewrite_ctx.force_mitm_hosts,
-    ) {
+    if !sanctioned
+        && should_use_sni_rewrite(
+            &rewrite_ctx.hosts,
+            &host,
+            port,
+            rewrite_ctx.youtube_via_relay,
+            &rewrite_ctx.force_mitm_hosts,
+        )
+    {
         tracing::info!(
             "dispatch {}:{} -> sni-rewrite tunnel (Google edge direct)",
             host,
             port
         );
         return do_sni_rewrite_tunnel_from_tcp(sock, &host, port, mitm, rewrite_ctx, None).await;
+    }
+    if sanctioned {
+        tracing::info!(
+            "dispatch {}:{} -> Apps Script relay (sanctioned host: geo-blocked direct)",
+            host,
+            port
+        );
     }
 
     // 3. direct mode: no Apps Script relay exists. Anything that isn't
@@ -3087,8 +3327,8 @@ async fn relay_http_stream_raw(
     }
 }
 
-async fn do_sni_rewrite_tunnel_from_tcp(
-    sock: TcpStream,
+async fn do_sni_rewrite_tunnel_from_tcp<S>(
+    sock: S,
     host: &str,
     port: u16,
     mitm: Arc<Mutex<MitmCertManager>>,
@@ -3099,7 +3339,16 @@ async fn do_sni_rewrite_tunnel_from_tcp(
     // group also carries the matcher's normalized domain list which
     // we don't need here. None = built-in Google edge path.
     group: Option<Arc<FrontingGroupResolved>>,
-) -> std::io::Result<()> {
+) -> std::io::Result<()>
+where
+    // Generic over the inbound socket so the dispatcher can hand us
+    // either a plain `TcpStream` or a `PrefacedTcpStream` (the
+    // direct-mode fallback path wraps the already-consumed ClientHello
+    // bytes back in front of the original socket). `TlsAcceptor` is
+    // already generic over IO; this just propagates that to our
+    // signature.
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let (target_ip, outbound_sni, server_name) = match &group {
         Some(g) => (g.ip.clone(), g.sni.clone(), g.server_name.clone()),
         None => {
@@ -5730,6 +5979,363 @@ mod tests {
         // Empty list never matches.
         let empty: Vec<String> = vec![];
         assert!(!host_in_force_mitm_list("anything", &empty));
+    }
+
+    fn make_direct_ctx() -> Arc<crate::direct_mode::DirectModeCtx> {
+        Arc::new(crate::direct_mode::DirectModeCtx::from_parts(
+            true,
+            vec!["www.google.com".into()],
+            crate::direct_mode::DEFAULT_GOOGLE_DOMAINS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            crate::direct_mode::DEFAULT_SANCTIONED_DOMAINS
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            None,
+        ))
+    }
+
+    fn empty_hosts() -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::new()
+    }
+
+    #[test]
+    fn direct_mode_branch_fires_for_google_host() {
+        let direct = make_direct_ctx();
+        let h = empty_hosts();
+        assert!(should_take_direct_mode_branch(
+            443,
+            Some(&direct),
+            "mail.google.com",
+            &[],
+            false,
+            &h
+        ));
+        assert!(should_take_direct_mode_branch(
+            443,
+            Some(&direct),
+            "i.ytimg.com",
+            &[],
+            false,
+            &h
+        ));
+    }
+
+    #[test]
+    fn direct_mode_branch_skips_non_google() {
+        let direct = make_direct_ctx();
+        let h = empty_hosts();
+        assert!(!should_take_direct_mode_branch(
+            443,
+            Some(&direct),
+            "example.com",
+            &[],
+            false,
+            &h
+        ));
+        assert!(!should_take_direct_mode_branch(
+            443,
+            Some(&direct),
+            "twitter.com",
+            &[],
+            false,
+            &h
+        ));
+    }
+
+    #[test]
+    fn direct_mode_branch_skips_non_443() {
+        let direct = make_direct_ctx();
+        let h = empty_hosts();
+        // Port-gated: a non-443 CONNECT (e.g. google.com:80) must NOT
+        // be diverted to a path that requires a TLS ClientHello.
+        assert!(!should_take_direct_mode_branch(
+            80,
+            Some(&direct),
+            "google.com",
+            &[],
+            false,
+            &h
+        ));
+        assert!(!should_take_direct_mode_branch(
+            8080,
+            Some(&direct),
+            "google.com",
+            &[],
+            false,
+            &h
+        ));
+    }
+
+    #[test]
+    fn direct_mode_branch_skips_when_ctx_none() {
+        let h = empty_hosts();
+        // Feature disabled in config → predicate returns false even
+        // for canonical Google hosts.
+        assert!(!should_take_direct_mode_branch(
+            443,
+            None,
+            "mail.google.com",
+            &[],
+            false,
+            &h
+        ));
+    }
+
+    #[test]
+    fn direct_mode_branch_yields_to_force_mitm_hosts() {
+        let direct = make_direct_ctx();
+        let h = empty_hosts();
+        let force = vec!["youtube.com".to_string()];
+        assert!(!should_take_direct_mode_branch(
+            443,
+            Some(&direct),
+            "www.youtube.com",
+            &force,
+            false,
+            &h
+        ));
+        assert!(!should_take_direct_mode_branch(
+            443,
+            Some(&direct),
+            "youtube.com",
+            &force,
+            false,
+            &h
+        ));
+        // Sibling hosts not in force_mitm_hosts still take direct.
+        assert!(should_take_direct_mode_branch(
+            443,
+            Some(&direct),
+            "i.ytimg.com",
+            &force,
+            false,
+            &h
+        ));
+    }
+
+    #[test]
+    fn direct_mode_branch_yields_to_youtube_via_relay() {
+        let direct = make_direct_ctx();
+        let h = empty_hosts();
+        assert!(!should_take_direct_mode_branch(
+            443,
+            Some(&direct),
+            "www.youtube.com",
+            &[],
+            true,
+            &h
+        ));
+        assert!(!should_take_direct_mode_branch(
+            443,
+            Some(&direct),
+            "youtu.be",
+            &[],
+            true,
+            &h
+        ));
+        assert!(!should_take_direct_mode_branch(
+            443,
+            Some(&direct),
+            "youtubei.googleapis.com",
+            &[],
+            true,
+            &h
+        ));
+        // Static CDN (ytimg) still takes direct under youtube_via_relay
+        // — it's SNI-rewrite-capable, so the carve-out doesn't apply.
+        // googlevideo.com is NOT in `DEFAULT_GOOGLE_DOMAINS` (no safe
+        // fallback path), so it never enters Direct Mode in the first
+        // place; see `default_google_domains_are_subset_of_sni_rewrite_suffixes`.
+        assert!(should_take_direct_mode_branch(
+            443,
+            Some(&direct),
+            "i.ytimg.com",
+            &[],
+            true,
+            &h
+        ));
+    }
+
+    #[test]
+    fn direct_mode_branch_yields_to_sanctioned_domains() {
+        let direct = make_direct_ctx();
+        let h = empty_hosts();
+        assert!(!should_take_direct_mode_branch(
+            443,
+            Some(&direct),
+            "gemini.google.com",
+            &[],
+            false,
+            &h
+        ));
+        assert!(!should_take_direct_mode_branch(
+            443,
+            Some(&direct),
+            "aistudio.google.com",
+            &[],
+            false,
+            &h
+        ));
+        assert!(should_take_direct_mode_branch(
+            443,
+            Some(&direct),
+            "mail.google.com",
+            &[],
+            false,
+            &h
+        ));
+    }
+
+    #[test]
+    fn direct_mode_branch_yields_to_hosts_override() {
+        // A user-typed `hosts: { "mail.google.com": "1.2.3.4" }` is a
+        // deliberate signal that this exact IP works on the user's
+        // network. Direct Mode would silently bypass the override by
+        // dialing to a different front; instead defer to SNI-rewrite,
+        // which honours the override.
+        let direct = make_direct_ctx();
+        let mut hosts = std::collections::HashMap::new();
+        hosts.insert("mail.google.com".to_string(), "1.2.3.4".to_string());
+        assert!(!should_take_direct_mode_branch(
+            443,
+            Some(&direct),
+            "mail.google.com",
+            &[],
+            false,
+            &hosts
+        ));
+        // Non-overridden hosts still take direct.
+        assert!(should_take_direct_mode_branch(
+            443,
+            Some(&direct),
+            "drive.google.com",
+            &[],
+            false,
+            &hosts
+        ));
+    }
+
+    #[test]
+    fn direct_mode_branch_skips_non_sni_rewrite_capable_hosts() {
+        // Defense-in-depth: even if a user customises
+        // `direct_mode.google_domains` to include hosts that aren't
+        // in `SNI_REWRITE_SUFFIXES` (e.g. they re-add `googlevideo.com`
+        // because they read zyrln's defaults), the predicate must
+        // skip Direct Mode for them — fallback to SNI-rewrite would
+        // hit wrong-cert errors, regressing the pre-Direct-Mode
+        // relay-only routing for those hosts.
+        let custom = Arc::new(crate::direct_mode::DirectModeCtx::from_parts(
+            true,
+            vec!["www.google.com".into()],
+            vec![
+                // Bundled defaults — these ARE in SNI_REWRITE_SUFFIXES.
+                ".google.com".into(),
+                ".youtube.com".into(),
+                // User-added entries that ARE NOT — must be skipped.
+                ".googlevideo.com".into(),
+                ".gmail.com".into(),
+                ".android.com".into(),
+            ],
+            vec![],
+            None,
+        ));
+        let h = empty_hosts();
+        // SNI-rewrite-capable → fires.
+        assert!(should_take_direct_mode_branch(
+            443,
+            Some(&custom),
+            "mail.google.com",
+            &[],
+            false,
+            &h
+        ));
+        assert!(should_take_direct_mode_branch(
+            443,
+            Some(&custom),
+            "www.youtube.com",
+            &[],
+            false,
+            &h
+        ));
+        // Non-SNI-rewrite-capable → skipped (defense-in-depth check).
+        assert!(!should_take_direct_mode_branch(
+            443,
+            Some(&custom),
+            "r1.googlevideo.com",
+            &[],
+            false,
+            &h
+        ));
+        assert!(!should_take_direct_mode_branch(
+            443,
+            Some(&custom),
+            "mail.gmail.com",
+            &[],
+            false,
+            &h
+        ));
+        assert!(!should_take_direct_mode_branch(
+            443,
+            Some(&custom),
+            "developer.android.com",
+            &[],
+            false,
+            &h
+        ));
+    }
+
+    #[test]
+    fn default_google_domains_are_subset_of_sni_rewrite_suffixes() {
+        // Contract guard: `DEFAULT_GOOGLE_DOMAINS` must be a strict
+        // subset of `SNI_REWRITE_SUFFIXES` so the bundled defaults
+        // never trigger the wrong-fallback regression. If someone
+        // re-adds googlevideo.com / gmail.com / etc. to the defaults
+        // in `direct_mode.rs`, this fails loudly.
+        for entry in crate::direct_mode::DEFAULT_GOOGLE_DOMAINS {
+            let bare = entry.trim_start_matches('.');
+            assert!(
+                SNI_REWRITE_SUFFIXES.iter().any(|s| *s == bare),
+                "{} is in DEFAULT_GOOGLE_DOMAINS but not in SNI_REWRITE_SUFFIXES — \
+                 the SkipPrefaced fallback to SNI-rewrite would be unsafe for this host",
+                bare
+            );
+        }
+    }
+
+    #[test]
+    fn direct_mode_branch_yields_when_breaker_tripped() {
+        // After enough consecutive failures the breaker engages and
+        // the dispatcher skips direct mode entirely until cooldown
+        // elapses — protects users on networks where direct never
+        // works from eating fast-path + race latency on every CONNECT.
+        let direct = make_direct_ctx();
+        let h = empty_hosts();
+        for _ in 0..crate::direct_mode::CIRCUIT_BREAKER_THRESHOLD {
+            direct.note_failure();
+        }
+        assert!(direct.breaker_tripped());
+        assert!(!should_take_direct_mode_branch(
+            443,
+            Some(&direct),
+            "mail.google.com",
+            &[],
+            false,
+            &h
+        ));
+        // Recording a success clears the breaker.
+        direct.note_success();
+        assert!(!direct.breaker_tripped());
+        assert!(should_take_direct_mode_branch(
+            443,
+            Some(&direct),
+            "mail.google.com",
+            &[],
+            false,
+            &h
+        ));
     }
 
     #[test]

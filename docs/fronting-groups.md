@@ -140,9 +140,15 @@ Within a single CONNECT, the dispatch order is:
 2. DoH bypass (port 443, known DoH host).
 3. `mode = full` — everything via the batch tunnel mux.
 4. **`fronting_groups` match (port 443).** — this feature.
-5. Built-in Google SNI-rewrite suffix list (port 443).
-6. `mode = direct` fallback → raw TCP.
-7. `mode = apps_script` peek + relay.
+5. TLS-fragmentation Direct Mode for Google-owned domains (port 443,
+   `direct_mode.enabled = true`, host in `direct_mode.google_domains`).
+   Falls back to the SNI-rewrite path below on dial failure.
+6. Sanctioned-domain override (only in `mode = apps_script`): Gemini /
+   AI Studio / Bard / Labs skip SNI-rewrite so they reach the relay
+   instead (Google geo-blocks Iranian IPs).
+7. Built-in Google SNI-rewrite suffix list (port 443).
+8. `mode = direct` fallback → raw TCP.
+9. `mode = apps_script` peek + relay.
 
 So fronting groups beat the Google-edge default for hosts they list,
 but lose to user-explicit passthrough/DoH choices. Putting `vercel.com`
