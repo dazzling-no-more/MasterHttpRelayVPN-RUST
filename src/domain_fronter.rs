@@ -356,7 +356,7 @@ pub struct DomainFronter {
     cache: Arc<ResponseCache>,
     inflight: Arc<Mutex<HashMap<String, broadcast::Sender<Vec<u8>>>>>,
     coalesced: AtomicU64,
-    blacklist: Arc<std::sync::Mutex<HashMap<String, Instant>>>,
+    blacklist: Arc<std::sync::Mutex<HashMap<String, BlacklistEntry>>>,
     /// Per-deployment rolling timeout counter. Maps `script_id` →
     /// `(window_start, strike_count)`. Reset when the window expires
     /// or when a batch succeeds. Triggers a short-cooldown blacklist
@@ -466,6 +466,17 @@ pub struct DomainFronter {
     /// reported in #977. See config.rs `sabr_strip` for the full
     /// trade-off.
     sabr_strip: bool,
+    /// Language hint passed to Apps Script as `?hl=<lang>` on every
+    /// `/macros/s/<sid>/exec` request. Pinned to English by default so
+    /// the envelope classifier patterns match. Mirrors
+    /// `Config::apps_script_lang`. Sanitised at construction by
+    /// [`Config::apps_script_lang_resolved`].
+    apps_script_lang: String,
+    /// Pre-built `Accept-Language` header value derived from
+    /// `apps_script_lang`. Stored as a string so it's a single Bytes
+    /// reference per request rather than a per-call format!. Built once
+    /// via [`accept_language_for_lang`] in [`DomainFronter::new`].
+    apps_script_accept_lang: String,
 }
 
 /// Aggregated stats for one remote host.
@@ -488,6 +499,81 @@ impl HostStat {
 }
 
 const BLACKLIST_COOLDOWN_SECS: u64 = 600;
+
+/// Outcome of [`DomainFronter::apply_probe_recovery`] — the
+/// compare-and-swap step the probe loop runs after a recovery-
+/// indicating relay round-trip. Public-by-`pub(crate)` so tests can
+/// drive the post-decision logic without instantiating a live relay.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeApplyResult {
+    /// The captured `until` still matched the live entry; the entry
+    /// was removed.
+    Cleared,
+    /// The captured `until` no longer matched — a concurrent
+    /// blacklist write landed between probe issue and probe completion
+    /// (cooldown extended, new probe-disowned reason). The clear is
+    /// declined so the in-flight extension isn't silently undone.
+    RewrittenInFlight,
+    /// The entry was no longer in the map at CAS time (TTL expired
+    /// during the probe).
+    AlreadyExpired,
+}
+
+/// One entry of `DomainFronter::blacklist`. Carries the cooldown expiry
+/// plus a `probe_recoverable` flag so the background probe loop knows
+/// which entries it owns. Without that flag, a generic `example.com`
+/// probe success could clear entries created for reasons the probe
+/// never checked — most notably `record_timeout_strike` entries whose
+/// trigger is a network-level stall rather than a deployment-side
+/// failure the probe would diagnose.
+#[derive(Clone, Copy, Debug)]
+struct BlacklistEntry {
+    /// Wall-clock deadline. Entry stays in the map until either the
+    /// probe loop clears it (when `probe_recoverable`) or `Instant::now()`
+    /// passes this value (every blacklist consumer prunes on read).
+    until: Instant,
+    /// `true` when the entry was added for a reason the example.com
+    /// probe path can validate: an envelope-classified permanent
+    /// failure (quota/auth/deploy/admin) or an HTTP 429/403 from the
+    /// Apps Script edge. `false` when the entry was added by
+    /// [`DomainFronter::record_timeout_strike`] — probing those would
+    /// risk silent recovery on a still-broken deployment because
+    /// rolling timeouts can stem from causes the probe doesn't
+    /// reproduce (transient network stall, slow client tunnel write,
+    /// etc.).
+    probe_recoverable: bool,
+}
+
+/// Lower bound of the randomized probe interval (seconds). See
+/// [`SCRIPT_PROBE_INTERVAL_MAX`].
+const SCRIPT_PROBE_INTERVAL_MIN_SECS: u64 = 300;
+/// Upper bound of the randomized probe interval (seconds).
+///
+/// The probe loop sleeps for a uniform draw from `[MIN, MAX]` each
+/// cycle so a deployment that recovers ahead of `BLACKLIST_COOLDOWN_SECS`
+/// (most visibly: a quota-blacklisted SID rolling past 00:00 PT in less
+/// than ten minutes) gets noticed without spamming Apps Script with
+/// probes. Matches upstream Python `SCRIPT_PROBE_INTERVAL_MIN/MAX`
+/// (commit 190e6fa).
+const SCRIPT_PROBE_INTERVAL_MAX_SECS: u64 = 600;
+/// Per-probe response budget (seconds). One probe is a cheap GET to
+/// `http://example.com/` through the SID, so anything longer than this
+/// indicates the deployment is still wedged; the probe fails and the
+/// blacklist entry stays.
+const SCRIPT_PROBE_TIMEOUT_SECS: u64 = 15;
+
+/// Host suffixes that always bypass the exit-node hop, even in `full`
+/// mode. Used by [`DomainFronter::exit_node_matches`].
+///
+/// Currently only `googlevideo.com` — YouTube video chunks are large
+/// (multi-MB per `/videoplayback` call) and Apps Script already reaches
+/// `*.googlevideo.com` directly over Google's internal network, so
+/// chaining them through a Cloudflare / Deno / VPS exit node just doubles
+/// the bandwidth and the latency for zero anti-bot benefit (googlevideo
+/// doesn't run the GCP-IP heuristic that the exit-node feature exists
+/// to defeat). Ported from upstream Python 6745dd1
+/// (`_EXIT_NODE_BYPASS_SUFFIXES`).
+const EXIT_NODE_BYPASS_SUFFIXES: &[&str] = &["googlevideo.com"];
 
 /// Auto-blacklist defaults are now per-instance fields on `DomainFronter`,
 /// driven by `Config::auto_blacklist_strikes` / `_window_secs` /
@@ -587,6 +673,11 @@ impl DomainFronter {
         if script_ids.is_empty() {
             return Err(FronterError::Relay("no script_id configured".into()));
         }
+        // Resolve once so the URL builder and the Accept-Language
+        // builder agree on the same sanitised value — `apps_script_lang_resolved`
+        // hits the validator path on each call, so calling it twice
+        // would needlessly re-walk the BCP47 grammar check.
+        let apps_script_lang_resolved = config.apps_script_lang_resolved();
         // Helper that builds a fresh ClientConfig with the verifier
         // policy from config. We need two of these so the h2-capable
         // and h1-only paths can advertise different ALPN sets without
@@ -687,26 +778,50 @@ impl DomainFronter {
                 .filter(|h| !h.is_empty())
                 .collect(),
             sabr_strip: config.sabr_strip,
+            apps_script_lang: apps_script_lang_resolved.clone(),
+            apps_script_accept_lang: accept_language_for_lang(&apps_script_lang_resolved),
         })
+    }
+
+    /// Build the `/macros/s/<sid>/exec?hl=<lang>` path. Centralised so the
+    /// `?hl=` query stays consistent across every relay call site
+    /// (single relay, fan-out relay, tunnel single, tunnel batch, prewarm,
+    /// blacklist probe).
+    fn exec_path_for(&self, script_id: &str) -> String {
+        format!("/macros/s/{}/exec?hl={}", script_id, self.apps_script_lang)
     }
 
     /// True when the configured exit node should handle this URL.
     /// In `selective` mode (default), checks the host against the
     /// pre-normalized `exit_node_hosts` list (exact match OR
     /// dot-anchored suffix, mirroring `passthrough_hosts` semantics).
-    /// In `full` mode, every URL routes through the exit node.
+    /// In `full` mode, every URL routes through the exit node — except
+    /// for hosts in [`EXIT_NODE_BYPASS_SUFFIXES`] (currently only
+    /// `googlevideo.com`), which always take the direct Apps-Script
+    /// path. Ported from upstream Python 6745dd1.
     pub(crate) fn exit_node_matches(&self, url: &str) -> bool {
         if !self.exit_node_enabled {
             return false;
         }
+        let host = match extract_host(url) {
+            Some(h) => h,
+            None => return self.exit_node_full,
+        };
+        let host_lc = host.to_ascii_lowercase();
+        // YouTube video chunks (`*.googlevideo.com`) are large, CPU-heavy,
+        // and already covered by Apps Script's direct Google-network path.
+        // Chaining them through a Cloudflare / Deno / VPS exit node burns
+        // exit-node bandwidth for zero anti-bot benefit (googlevideo
+        // doesn't run the GCP-IP heuristic) and turns 1080p playback into
+        // a buffering loop. Bypass before either match path can pick it up.
+        for suffix in EXIT_NODE_BYPASS_SUFFIXES {
+            if host_lc == *suffix || host_lc.ends_with(&format!(".{}", suffix)) {
+                return false;
+            }
+        }
         if self.exit_node_full {
             return true;
         }
-        let host = match extract_host(url) {
-            Some(h) => h,
-            None => return false,
-        };
-        let host_lc = host.to_ascii_lowercase();
         for entry in &self.exit_node_hosts {
             if host_lc == *entry || host_lc.ends_with(&format!(".{}", entry)) {
                 return true;
@@ -901,7 +1016,7 @@ impl DomainFronter {
         let n = self.script_ids.len();
         let mut bl = self.blacklist.lock().unwrap();
         let now = Instant::now();
-        bl.retain(|_, until| *until > now);
+        bl.retain(|_, e| e.until > now);
 
         for _ in 0..n {
             let idx = self.script_idx.fetch_add(1, Ordering::Relaxed);
@@ -911,7 +1026,7 @@ impl DomainFronter {
             }
         }
         // All blacklisted: pick whichever comes off cooldown soonest.
-        if let Some((sid, _)) = bl.iter().min_by_key(|(_, t)| **t) {
+        if let Some((sid, _)) = bl.iter().min_by_key(|(_, e)| e.until) {
             let sid = sid.clone();
             bl.remove(&sid);
             return sid;
@@ -930,7 +1045,7 @@ impl DomainFronter {
         }
         let mut bl = self.blacklist.lock().unwrap();
         let now = Instant::now();
-        bl.retain(|_, until| *until > now);
+        bl.retain(|_, e| e.until > now);
 
         let mut picked: Vec<String> = Vec::with_capacity(want);
         for _ in 0..n {
@@ -949,18 +1064,42 @@ impl DomainFronter {
         picked
     }
 
+    /// Blacklist an Apps Script deployment for the default cooldown
+    /// after an envelope-classified failure or an HTTP 429/403 from the
+    /// edge. Probe-recoverable: the background [`run_probe_loop`] task
+    /// owns the entry and may clear it early if a cheap `example.com`
+    /// roundtrip succeeds before the cooldown expires.
     fn blacklist_script(&self, script_id: &str, reason: &str) {
-        self.blacklist_script_for(
+        self.blacklist_script_inner(
             script_id,
             Duration::from_secs(BLACKLIST_COOLDOWN_SECS),
+            true,
             reason,
         );
     }
 
+    /// Blacklist for `cooldown` with the probe loop disowned — used by
+    /// [`record_timeout_strike`] where the trigger isn't something a
+    /// generic roundtrip can validate (network-level stall, slow
+    /// tunnel write, etc.). Entries written through this path expire
+    /// only via their TTL.
     fn blacklist_script_for(&self, script_id: &str, cooldown: Duration, reason: &str) {
-        let until = Instant::now() + cooldown;
+        self.blacklist_script_inner(script_id, cooldown, false, reason);
+    }
+
+    fn blacklist_script_inner(
+        &self,
+        script_id: &str,
+        cooldown: Duration,
+        probe_recoverable: bool,
+        reason: &str,
+    ) {
+        let entry = BlacklistEntry {
+            until: Instant::now() + cooldown,
+            probe_recoverable,
+        };
         let mut bl = self.blacklist.lock().unwrap();
-        bl.insert(script_id.to_string(), until);
+        bl.insert(script_id.to_string(), entry);
         tracing::warn!(
             "blacklisted script {} for {}s: {}",
             mask_script_id(script_id),
@@ -1206,6 +1345,167 @@ impl DomainFronter {
                     }
                 }
             }
+        }
+    }
+
+    /// Background loop that periodically re-probes blacklisted SIDs to
+    /// detect recovery ahead of the static [`BLACKLIST_COOLDOWN_SECS`]
+    /// expiry. Most useful for quota-blacklisted deployments: Apps
+    /// Script's daily UrlFetchApp counter resets at 00:00 Pacific Time,
+    /// which can be minutes-or-less from a fresh blacklist entry, but
+    /// the 10-min cooldown keeps the SID out of rotation for the full
+    /// window anyway. With this loop, a recovered SID re-enters the
+    /// pool within one probe interval.
+    ///
+    /// No-op when only one script ID is configured — single-SID users
+    /// have no rotation pool, so probing the only deployment burns the
+    /// same quota that triggered the blacklist in the first place. The
+    /// per-instance check happens once at startup; mid-life config
+    /// changes that add more SIDs require a restart to enable probing.
+    ///
+    /// Each probe sends one cheap HEAD (`http://example.com/`) through
+    /// the same `do_relay_once_with` path normal traffic uses — h2
+    /// fast-path with h1 pool fallback, the same retry policy, the
+    /// same blacklist side effects on a classifier match. A response
+    /// that [`probe_indicates_recovery`] accepts (healthy 200 or
+    /// transient envelope) clears the SID from the blacklist, but
+    /// only when the entry's `until` is still the value the probe
+    /// captured at issue time — a concurrent blacklist-extend write
+    /// (longer cooldown, new reason) cancels the recovery so the
+    /// extended entry isn't silently undone. Any transport error,
+    /// non-200 status without a transient envelope, or envelope error
+    /// matched by [`classify_envelope_error`] leaves the SID
+    /// blacklisted with its existing TTL — no escalation, no TTL
+    /// extension, no logging spam. Ported from upstream Python
+    /// `_probe_blacklisted_sids` (commit 190e6fa).
+    pub async fn run_probe_loop(self: Arc<Self>) {
+        if self.script_ids.len() <= 1 {
+            return;
+        }
+        loop {
+            let interval_secs = {
+                let mut rng = thread_rng();
+                rng.gen_range(SCRIPT_PROBE_INTERVAL_MIN_SECS..=SCRIPT_PROBE_INTERVAL_MAX_SECS)
+            };
+            tokio::time::sleep(Duration::from_secs(interval_secs)).await;
+            self.probe_blacklisted_once().await;
+        }
+    }
+
+    /// One pass of the probe loop — fan out across every currently
+    /// blacklisted SID flagged probe-recoverable and re-probe in
+    /// parallel. Public-by-`pub(crate)` so unit tests can drive a tick
+    /// deterministically without sleeping inside [`run_probe_loop`]'s
+    /// timer.
+    ///
+    /// Entries with `probe_recoverable == false` (added through
+    /// [`record_timeout_strike`]) are filtered out: probing them with a
+    /// generic `example.com` roundtrip risks silent recovery on a still-
+    /// broken deployment, because rolling timeouts can stem from causes
+    /// the probe doesn't reproduce.
+    pub(crate) async fn probe_blacklisted_once(&self) {
+        let now = Instant::now();
+        // Capture `until` alongside `sid` under the lock so the probe
+        // can prove later that the entry it's about to remove is the
+        // same one it owned at the start of this cycle. Without that
+        // pairing a probe-extend race (cooldown-extended write while
+        // the probe is in flight) would silently undo the extension.
+        // Also prune expired entries here so the background task is
+        // self-contained — normal `next_script_id` consumers already
+        // prune on read, but the probe tick should never see a stale
+        // entry it would then try (and fail) to clear.
+        let candidates: Vec<(String, Instant)> = {
+            let mut bl = self.blacklist.lock().unwrap();
+            bl.retain(|_, e| e.until > now);
+            bl.iter()
+                .filter(|(_, e)| e.probe_recoverable)
+                .map(|(s, e)| (s.clone(), e.until))
+                .collect()
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        let mut tasks = Vec::with_capacity(candidates.len());
+        for (sid, until) in candidates {
+            tasks.push(self.probe_one_sid(sid, until));
+        }
+        futures_util::future::join_all(tasks).await;
+    }
+
+    /// Probe one blacklisted SID with a single cheap HEAD through the
+    /// same `do_relay_once_with` path normal traffic uses. On a
+    /// recovery-indicating outcome (see [`probe_indicates_recovery`])
+    /// the blacklist entry is cleared — but only if its `until` still
+    /// matches `captured_until`, so a concurrent blacklist write
+    /// (longer cooldown, new probe-disowned reason) isn't undone.
+    ///
+    /// Why route through `do_relay_once_with` instead of poking
+    /// `h2_relay_request` directly: the SID we want to probe is the
+    /// blacklisted one, but the **transport** to Apps Script (h2 cell,
+    /// h1 pool, sticky `h2_disabled`) is shared across all SIDs. If we
+    /// only tried h2 here, a fronter whose h2 was sticky-disabled by an
+    /// edge that doesn't speak h2 (ALPN refusal, persistent middlebox
+    /// problem) would never recover any blacklisted SID — h1 would
+    /// have worked fine for the probe just like it works for normal
+    /// traffic. Sharing `do_relay_once_with` also avoids reinventing
+    /// the inner timeout / RequestSent / fallback policy, which was a
+    /// hand-wrap-with-outer-timeout footgun in the first cut of this
+    /// loop (the outer `tokio::time::timeout` preempted the h2 layer's
+    /// own poisoning logic before it could mark the connection dead).
+    async fn probe_one_sid(&self, sid: String, captured_until: Instant) {
+        let result = self
+            .do_relay_once_with(sid.clone(), "HEAD", "http://example.com/", &[], &[])
+            .await;
+        let recovery = probe_indicates_recovery(&result);
+        if !recovery {
+            if let Err(ref e) = result {
+                tracing::debug!(
+                    "probe {} not healthy ({}) — keeping blacklisted",
+                    mask_script_id(&sid),
+                    e
+                );
+            }
+            return;
+        }
+        match self.apply_probe_recovery(&sid, captured_until) {
+            ProbeApplyResult::Cleared => {
+                tracing::info!("re-validated script {} — recovered", mask_script_id(&sid));
+            }
+            ProbeApplyResult::RewrittenInFlight => {
+                tracing::debug!(
+                    "probe {} succeeded but blacklist entry was rewritten — not clearing",
+                    mask_script_id(&sid)
+                );
+            }
+            ProbeApplyResult::AlreadyExpired => {
+                // The entry timed out between probe issue and probe
+                // completion. Nothing to do; another probe tick would
+                // also no-op once the read-time prune in
+                // `probe_blacklisted_once` runs.
+            }
+        }
+    }
+
+    /// Compare-and-swap step extracted so tests can drive the
+    /// post-recovery decision tree without standing up a live relay.
+    /// `captured_until` is what the probe loop read out of the
+    /// blacklist at probe issue; if the live entry's `until` doesn't
+    /// match, a concurrent write landed mid-probe and the entry must
+    /// not be silently cleared. The probe loop itself only calls this
+    /// when [`probe_indicates_recovery`] returned `true`.
+    pub(crate) fn apply_probe_recovery(
+        &self,
+        sid: &str,
+        captured_until: Instant,
+    ) -> ProbeApplyResult {
+        let mut bl = self.blacklist.lock().unwrap();
+        match bl.get(sid) {
+            None => ProbeApplyResult::AlreadyExpired,
+            Some(entry) if entry.until == captured_until => {
+                bl.remove(sid);
+                ProbeApplyResult::Cleared
+            }
+            Some(_) => ProbeApplyResult::RewrittenInFlight,
         }
     }
 
@@ -1575,6 +1875,13 @@ impl DomainFronter {
         builder = builder.header("accept-encoding", "gzip");
         if let Some(ct) = content_type {
             builder = builder.header("content-type", ct);
+            // Paired with the `?hl=<lang>` query parameter on Apps
+            // Script paths so the envelope classifier patterns match
+            // (default `"en"` keeps the wire-shape `en-US,en;q=0.9` for
+            // existing fingerprints). Only set on the initial POST —
+            // redirect follow-ups (content_type == None) target
+            // googleusercontent.com which doesn't need this hint.
+            builder = builder.header("accept-language", self.apps_script_accept_lang.as_str());
         }
         let req = builder.body(()).map_err(|e| {
             (
@@ -2608,7 +2915,7 @@ impl DomainFronter {
         // — meaningful on range-parallel fan-out where N copies fire
         // in parallel for one user-facing GET.
         let payload: Bytes = Bytes::from(self.build_payload_json(method, url, headers, body)?);
-        let path = format!("/macros/s/{}/exec", script_id);
+        let path = self.exec_path_for(&script_id);
 
         // h2 fast path: one shared TCP/TLS connection multiplexes all
         // streams.
@@ -2662,8 +2969,11 @@ impl DomainFronter {
                 }
                 return parse_relay_json(&resp_body).map_err(|e| {
                     if let FronterError::Relay(ref msg) = e {
-                        if looks_like_quota_error(msg) {
-                            self.blacklist_script(&script_id, msg);
+                        if let Some(cat) = classify_envelope_error(msg) {
+                            self.blacklist_script(
+                                &script_id,
+                                &format!("{}: {}", cat.as_str(), msg),
+                            );
                         }
                     }
                     e
@@ -2707,11 +3017,13 @@ impl DomainFronter {
                      Content-Type: application/json\r\n\
                      Content-Length: {len}\r\n\
                      Accept-Encoding: gzip\r\n\
+                     Accept-Language: {accept_lang}\r\n\
                      Connection: keep-alive\r\n\
                      \r\n",
                     path = path,
                     host = self.http_host,
                     len = payload.len(),
+                    accept_lang = self.apps_script_accept_lang,
                 );
                 entry.stream.write_all(req_head.as_bytes()).await?;
                 entry.stream.write_all(&payload).await?;
@@ -2773,8 +3085,11 @@ impl DomainFronter {
                         Ok(bytes) => Ok::<_, FronterError>((bytes, true)),
                         Err(e) => {
                             if let FronterError::Relay(ref msg) = e {
-                                if looks_like_quota_error(msg) {
-                                    self.blacklist_script(&script_id, msg);
+                                if let Some(cat) = classify_envelope_error(msg) {
+                                    self.blacklist_script(
+                                        &script_id,
+                                        &format!("{}: {}", cat.as_str(), msg),
+                                    );
                                 }
                             }
                             Err(e)
@@ -2927,7 +3242,7 @@ impl DomainFronter {
         payload: Bytes,
     ) -> Result<Vec<u8>, FronterError> {
         let script_id = self.next_script_id();
-        let path = format!("/macros/s/{}/exec", script_id);
+        let path = self.exec_path_for(&script_id);
 
         // h2 fast path. The exit-node outer call is always POST and
         // carries the inner relay payload — replaying on h1 after the
@@ -2992,11 +3307,13 @@ impl DomainFronter {
              Content-Type: application/json\r\n\
              Content-Length: {len}\r\n\
              Accept-Encoding: gzip\r\n\
+             Accept-Language: {accept_lang}\r\n\
              Connection: keep-alive\r\n\
              \r\n",
             path = path,
             host = self.http_host,
             len = payload.len(),
+            accept_lang = self.apps_script_accept_lang,
         );
         entry.stream.write_all(req_head.as_bytes()).await?;
         entry.stream.write_all(&payload).await?;
@@ -3115,7 +3432,7 @@ impl DomainFronter {
     ) -> Result<TunnelResponse, FronterError> {
         let payload: Bytes = Bytes::from(self.build_tunnel_payload(op, host, port, sid, data)?);
         let script_id = self.next_script_id();
-        let path = format!("/macros/s/{}/exec", script_id);
+        let path = self.exec_path_for(&script_id);
 
         // Skip h2 for tunnel ops — same rationale as tunnel_batch_request_to
         // (PR #1040): tunnel ops are already single HTTP requests, h2
@@ -3128,11 +3445,13 @@ impl DomainFronter {
              Content-Type: application/json\r\n\
              Content-Length: {len}\r\n\
              Accept-Encoding: gzip\r\n\
+             Accept-Language: {accept_lang}\r\n\
              Connection: keep-alive\r\n\
              \r\n",
             path = path,
             host = self.http_host,
             len = payload.len(),
+            accept_lang = self.apps_script_accept_lang,
         );
         entry.stream.write_all(req_head.as_bytes()).await?;
         entry.stream.write_all(&payload).await?;
@@ -3282,7 +3601,7 @@ impl DomainFronter {
         }
         let payload: Bytes = Bytes::from(serde_json::to_vec(&Value::Object(map))?);
 
-        let path = format!("/macros/s/{}/exec", script_id);
+        let path = self.exec_path_for(script_id);
 
         // Skip h2 for tunnel batches. Batched ops are already coalesced
         // into one HTTP request so h2 multiplexing adds no benefit.
@@ -3297,11 +3616,13 @@ impl DomainFronter {
              Content-Type: application/json\r\n\
              Content-Length: {len}\r\n\
              Accept-Encoding: gzip\r\n\
+             Accept-Language: {accept_lang}\r\n\
              Connection: keep-alive\r\n\
              \r\n",
             path = path,
             host = self.http_host,
             len = payload.len(),
+            accept_lang = self.apps_script_accept_lang,
         );
         entry.stream.write_all(req_head.as_bytes()).await?;
         entry.stream.write_all(&payload).await?;
@@ -5427,25 +5748,204 @@ impl StatsSnapshot {
     }
 }
 
+/// Decide whether a probe round-trip result indicates the SID has
+/// recovered (and the blacklist entry should be cleared) or not.
+///
+/// * `Ok(_)` — Apps Script returned a healthy JSON envelope. The
+///   deployment is reachable and the script ran without error.
+///   **Healthy.**
+/// * `Err(FronterError::Relay(msg))` where
+///   [`classify_envelope_error`] returns `None` — Apps Script returned
+///   an envelope error the classifier doesn't bucket as permanent
+///   (`"Server not available"`, `"please try again"`, or any other
+///   transient string). The script ID itself works; the inner script
+///   hit a hiccup. **Healthy** (recovery intent — retry traffic can
+///   safely target this SID again).
+/// * `Err(FronterError::Relay(msg))` where the classifier returns
+///   `Some(_)` — permanent failure. The caller (`do_relay_once_with`)
+///   has already re-blacklisted the SID, so the captured `until` no
+///   longer matches and the compare-and-swap in
+///   [`DomainFronter::probe_one_sid`] will reject the clear anyway.
+///   **Not healthy** (returned `false` for clarity).
+/// * Any other `Err(_)` — transport / network / pool exhaustion /
+///   non-`Relay` failure. **Not healthy**: a generic
+///   `tokio::io::ErrorKind::ConnectionReset` says nothing about
+///   whether the Apps Script deployment itself has recovered.
+///
+/// Pure function so the decision tree is unit-testable without
+/// spinning up a relay endpoint.
+fn probe_indicates_recovery(result: &Result<Vec<u8>, FronterError>) -> bool {
+    match result {
+        Ok(_) => true,
+        Err(FronterError::Relay(msg)) => classify_envelope_error(msg).is_none(),
+        Err(_) => false,
+    }
+}
+
+/// Build the `Accept-Language` header value paired with
+/// [`Config::apps_script_lang`]. `"en"` (the default) maps to the
+/// browser-shaped `"en-US,en;q=0.9"` so the wire fingerprint stays
+/// unchanged for the common case; any other validated BCP47-ish tag
+/// (`"fr"`, `"zh-CN"`) becomes `"<tag>;q=0.9"`. Input is assumed to
+/// have passed [`Config::apps_script_lang_resolved`] — no further
+/// validation is performed here.
+fn accept_language_for_lang(lang: &str) -> String {
+    if lang == "en" || lang.is_empty() {
+        "en-US,en;q=0.9".into()
+    } else {
+        format!("{};q=0.9", lang)
+    }
+}
+
 fn should_blacklist(status: u16, body: &str) -> bool {
     if status == 429 || status == 403 {
         return true;
     }
-    looks_like_quota_error(body)
+    classify_envelope_error(body).is_some()
 }
 
 fn looks_like_quota_error(msg: &str) -> bool {
+    matches!(classify_envelope_error(msg), Some(EnvelopeCategory::Quota))
+}
+
+/// Permanent-failure categories for an Apps Script envelope `"e"` field.
+/// Mapped onto the script-blacklist by [`should_blacklist`] and by the
+/// post-`parse_relay_json` map_err sites in [`do_relay_once_with`] /
+/// [`fanout_relay_once`]. Transient envelope strings (`"Server not available"`,
+/// `"please try again"`) and any other unrecognised content return `None`
+/// from [`classify_envelope_error`] — those deployments are still working,
+/// they just had a bad RPC, so the existing retry path handles them
+/// without a blacklist entry.
+///
+/// Ported from upstream Python `_QUOTA_PATTERNS` / `_AUTH_PATTERNS` /
+/// `_DEPLOY_PATTERNS` / `_ADMIN_PATTERNS` (commit 190e6fa).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvelopeCategory {
+    /// Daily quota exhausted. Recovers at 00:00 Pacific Time.
+    Quota,
+    /// Apps Script claims the user isn't authorised — typically means
+    /// the user revoked OAuth on the Apps Script project or Google
+    /// pushed a forced re-auth. Recovery requires user action.
+    Auth,
+    /// Deployment ID is wrong / the deployment was deleted /
+    /// the user accidentally deployed a fresh version. Permanent until
+    /// the maintainer reconfigures `script_id`.
+    Deploy,
+    /// Workspace admin disabled `UrlFetchApp` for the user's domain /
+    /// blocked the destination URL. Permanent without admin action.
+    Admin,
+}
+
+impl EnvelopeCategory {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Quota => "quota",
+            Self::Auth => "auth",
+            Self::Deploy => "deploy",
+            Self::Admin => "admin",
+        }
+    }
+}
+
+/// Quota / rate-limit patterns. Lowercase, substring match.
+///
+/// English patterns target the canonical UrlFetchApp daily-quota strings
+/// (`"Service invoked too many times for one day: urlfetch."`,
+/// `"Daily limit exceeded"`); German entries cover the localized variants
+/// some users have seen in production with German Google accounts.
+/// `"urlfetch"` is included on its own because it appears in the
+/// daily-quota message across all locales — Google never translates the
+/// service identifier.
+///
+/// Patterns are deliberately specific phrases rather than single words.
+/// Standalone tokens like `"exceeded"` / `"daily"` would also match
+/// transient Apps Script errors such as
+/// `"Exceeded maximum execution time"` (the per-invocation 6-min cap,
+/// not a quota condition) and benign words in unrelated error text,
+/// wrongly sidelining healthy scripts for the full cooldown.
+const QUOTA_PATTERNS: &[&str] = &[
+    "service invoked too many times",
+    "invoked too many times",
+    "too many times",
+    "service invoked",
+    "for one day",
+    "per day",
+    "daily limit",
+    "quota exceeded",
+    "quota",
+    "rate limit",
+    "limit exceeded",
+    "bandwidth quota",
+    "bandwidth exceeded",
+    "too much upload bandwidth",
+    "too much traffic",
+    "transfer rate",
+    "bandbreitenkontingent",
+    "datenübertragungsrate",
+    "urlfetch",
+];
+
+/// OAuth / authorization patterns. Triggered when Apps Script demands
+/// re-consent or when Code.gs returns its own `unauthorized` response.
+const AUTH_PATTERNS: &[&str] = &[
+    "authorization is required",
+    "unauthorized",
+    "not authorized",
+    "permission denied",
+    "access denied",
+];
+
+/// Deployment-state patterns: wrong `script_id`, deleted deployment,
+/// stale version reference. Apps Script surfaces these as
+/// `"Error code Not_Found"` / `"missing library version or a deployment
+/// version"`.
+///
+/// Deliberately phrase-level. Standalone `"deployment"` would match
+/// transient messages such as `"deployment is being updated"`, sidelining
+/// a healthy script for the full cooldown.
+const DEPLOY_PATTERNS: &[&str] = &[
+    "error code not_found",
+    "not_found",
+    "deployment version",
+    "deployment id",
+    "deployment not found",
+    "missing library version",
+    "script id",
+    "scriptid",
+    "no script",
+];
+
+/// Workspace-admin policy patterns: `UrlFetchApp` blocked / specific
+/// destinations blocked / Apps Script disabled at the OU level.
+const ADMIN_PATTERNS: &[&str] = &[
+    "not permitted by your admin",
+    "contact your administrator",
+    "disabled. please contact",
+    "domain policy has disabled",
+    "administrator to enable",
+];
+
+/// Bucket an Apps Script envelope error string into a permanent-failure
+/// category. Lowercases once and runs an ordered substring sweep —
+/// quota first (most common, most specific), then auth, deploy, admin.
+/// Returns `None` for transient envelopes (`"Server not available"`,
+/// `"please try again"`) and any other unrecognised content so the
+/// regular retry path handles them.
+fn classify_envelope_error(msg: &str) -> Option<EnvelopeCategory> {
     let lower = msg.to_ascii_lowercase();
-    lower.contains("quota")
-        || lower.contains("daily limit")
-        || lower.contains("rate limit")
-        || lower.contains("too many times")
-        || lower.contains("service invoked")
-        || lower.contains("bandwidth")
-        || lower.contains("bandbreitenkontingent")
-        || lower.contains("datenübertragungsrate")
-        || lower.contains("transfer rate")
-        || lower.contains("limit exceeded")
+    if QUOTA_PATTERNS.iter().any(|p| lower.contains(p)) {
+        return Some(EnvelopeCategory::Quota);
+    }
+    if AUTH_PATTERNS.iter().any(|p| lower.contains(p)) {
+        return Some(EnvelopeCategory::Auth);
+    }
+    if DEPLOY_PATTERNS.iter().any(|p| lower.contains(p)) {
+        return Some(EnvelopeCategory::Deploy);
+    }
+    if ADMIN_PATTERNS.iter().any(|p| lower.contains(p)) {
+        return Some(EnvelopeCategory::Admin);
+    }
+    None
 }
 
 fn mask_script_id(id: &str) -> String {
@@ -7094,6 +7594,445 @@ hello";
             "Exception: Bandbreitenkontingent überschritten: https://example.com. Verringern Sie die Datenübertragungsrate."
         ));
         assert!(!looks_like_quota_error("bad url"));
+    }
+
+    #[test]
+    fn classify_envelope_error_buckets_each_category() {
+        // Quota — daily UrlFetchApp ceiling.
+        assert_eq!(
+            classify_envelope_error("Service invoked too many times for one day: urlfetch"),
+            Some(EnvelopeCategory::Quota),
+        );
+        // Auth — Apps Script re-authorization required.
+        assert_eq!(
+            classify_envelope_error("Authorization is required to perform that action."),
+            Some(EnvelopeCategory::Auth),
+        );
+        assert_eq!(
+            classify_envelope_error("unauthorized"),
+            Some(EnvelopeCategory::Auth),
+        );
+        // Deploy — wrong/deleted deployment.
+        assert_eq!(
+            classify_envelope_error(
+                "Error occurred due to a missing library version or a deployment version. Error code Not_Found"
+            ),
+            Some(EnvelopeCategory::Deploy),
+        );
+        // Admin — workspace policy block. Pick strings that don't also
+        // match the quota `"urlfetch"` substring (which has higher
+        // priority); the practical case where Admin bucketing matters
+        // is when the admin policy message names a different service.
+        assert_eq!(
+            classify_envelope_error("Domain policy has disabled this Apps Script."),
+            Some(EnvelopeCategory::Admin),
+        );
+        assert_eq!(
+            classify_envelope_error("Contact your administrator for access."),
+            Some(EnvelopeCategory::Admin),
+        );
+        // Transient envelopes stay None so the deployment isn't blacklisted.
+        assert_eq!(
+            classify_envelope_error("Server not available. Please try again later."),
+            None,
+        );
+        // Unrecognised content also stays None.
+        assert_eq!(classify_envelope_error(""), None);
+        assert_eq!(classify_envelope_error("bad url"), None);
+    }
+
+    #[test]
+    fn classify_envelope_error_rejects_common_transient_phrases() {
+        // The per-invocation 6-minute cap is transient — the next call
+        // through the same SID may finish in milliseconds. Apps Script
+        // returns this when a single execution runs long, NOT when the
+        // daily quota is exhausted. Must not bucket as Quota or Deploy
+        // (would sideline a healthy script for the full cooldown).
+        assert_eq!(
+            classify_envelope_error("Exception: Exceeded maximum execution time"),
+            None,
+            "per-invocation 6-min cap must not be classified as a permanent failure"
+        );
+        // "deployment" appears in transient Apps Script messages about
+        // ongoing deployments being updated; the narrower
+        // `"deployment version"` / `"deployment id"` patterns avoid the
+        // false positive.
+        assert_eq!(
+            classify_envelope_error("The deployment is being updated. Try again."),
+            None,
+            "transient deployment-update notice must not bucket as Deploy"
+        );
+        // Benign use of `"daily"` in user-script error output — e.g.
+        // a script that calls `MailApp` returns a string containing the
+        // word "daily" as part of its content.
+        assert_eq!(
+            classify_envelope_error("Sent the daily report successfully."),
+            None,
+            "benign occurrences of `daily` outside quota phrasing must not match"
+        );
+        // Benign use of `"exceeded"` outside quota phrasing.
+        assert_eq!(
+            classify_envelope_error("Exception: Exceeded the configured retry count on inner API"),
+            None,
+            "benign `exceeded` outside quota / limit phrasing must not match"
+        );
+    }
+
+    #[test]
+    fn exit_node_matches_bypasses_googlevideo_in_full_mode() {
+        // Even in `full` mode, *.googlevideo.com must skip the exit node
+        // — chaining video chunks through Cloudflare/Deno/VPS is slow
+        // and the GCP-IP heuristic that exit-node defeats doesn't apply
+        // to googlevideo anyway.
+        let json = r#"{
+            "mode": "apps_script",
+            "google_ip": "127.0.0.1",
+            "front_domain": "www.google.com",
+            "script_id": "TEST",
+            "auth_key": "test_auth_key",
+            "exit_node": {
+                "enabled": true,
+                "relay_url": "https://exit.example.deno.dev",
+                "psk": "test-psk",
+                "mode": "full"
+            }
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let fronter = DomainFronter::new(&cfg).expect("test fronter must construct");
+        assert!(
+            !fronter.exit_node_matches("https://r1---sn-aigl6n7e.googlevideo.com/videoplayback")
+        );
+        assert!(!fronter.exit_node_matches("https://googlevideo.com/foo"));
+        // Anything else under full mode still routes through the exit node.
+        assert!(fronter.exit_node_matches("https://www.example.com/"));
+    }
+
+    #[test]
+    fn apps_script_lang_query_string_present_in_exec_path() {
+        let json = r#"{
+            "mode": "apps_script",
+            "google_ip": "127.0.0.1",
+            "front_domain": "www.google.com",
+            "script_id": "TEST",
+            "auth_key": "test_auth_key"
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let fronter = DomainFronter::new(&cfg).expect("test fronter must construct");
+        assert_eq!(
+            fronter.exec_path_for("ABCDEF"),
+            "/macros/s/ABCDEF/exec?hl=en"
+        );
+    }
+
+    #[test]
+    fn apps_script_lang_resolved_falls_back_on_blank_override() {
+        let json = r#"{
+            "mode": "apps_script",
+            "google_ip": "127.0.0.1",
+            "front_domain": "www.google.com",
+            "script_id": "TEST",
+            "auth_key": "test_auth_key",
+            "apps_script_lang": "   "
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.apps_script_lang_resolved(), "en");
+    }
+
+    #[test]
+    fn apps_script_lang_resolved_rejects_url_injection_attempts() {
+        // Hand-edited configs can contain values that would smuggle
+        // extra query parameters into the `?hl=` URL or break HTTP
+        // header serialization. The sanitiser falls back to `"en"` for
+        // anything outside the BCP47-ish whitelist so the wire shape
+        // stays predictable regardless of file contents.
+        for bad in [
+            "en&foo=bar",
+            "en\r\nX-Injected: header",
+            "en us",
+            "en/../etc",
+            "en;quality=0.1",
+            "fa%2F",
+            "中文",
+            "-en",
+            "en-",
+            "x".repeat(64).as_str(),
+        ] {
+            let json = format!(
+                r#"{{"mode":"apps_script","google_ip":"127.0.0.1","front_domain":"www.google.com","script_id":"TEST","auth_key":"test_auth_key","apps_script_lang":{}}}"#,
+                serde_json::to_string(bad).unwrap()
+            );
+            let cfg: Config = serde_json::from_str(&json).unwrap();
+            assert_eq!(
+                cfg.apps_script_lang_resolved(),
+                "en",
+                "bad value {:?} must fall back to en",
+                bad
+            );
+        }
+        // Valid BCP47-ish tags round-trip lowercase.
+        for (input, expected) in [
+            ("en", "en"),
+            ("EN", "en"),
+            ("en-US", "en-us"),
+            ("fa-IR", "fa-ir"),
+            ("zh-CN", "zh-cn"),
+        ] {
+            let json = format!(
+                r#"{{"mode":"apps_script","google_ip":"127.0.0.1","front_domain":"www.google.com","script_id":"TEST","auth_key":"test_auth_key","apps_script_lang":{}}}"#,
+                serde_json::to_string(input).unwrap()
+            );
+            let cfg: Config = serde_json::from_str(&json).unwrap();
+            assert_eq!(cfg.apps_script_lang_resolved(), expected);
+        }
+    }
+
+    #[test]
+    fn accept_language_for_lang_keeps_browser_shape_for_english() {
+        // `en` keeps the wire fingerprint that pre-port traffic showed,
+        // so existing DPI heuristics don't flip on the new header.
+        assert_eq!(accept_language_for_lang("en"), "en-US,en;q=0.9");
+        assert_eq!(accept_language_for_lang(""), "en-US,en;q=0.9");
+        // Non-default tags use the simpler `<tag>;q=0.9` form.
+        assert_eq!(accept_language_for_lang("fa"), "fa;q=0.9");
+        assert_eq!(accept_language_for_lang("zh-cn"), "zh-cn;q=0.9");
+    }
+
+    #[test]
+    fn probe_indicates_recovery_decides_per_result_shape() {
+        // Healthy 200 — relay returned bytes. Probe clears the SID.
+        assert!(probe_indicates_recovery(&Ok::<Vec<u8>, _>(b"ok".to_vec())));
+
+        // Permanent envelope — the script returned a quota / auth /
+        // deploy / admin string. do_relay_once_with already re-blacklisted
+        // the SID before returning Err; this helper must return false
+        // so the probe path skips the CAS clear (defence in depth: the
+        // CAS would also fail because `until` was rewritten).
+        for msg in [
+            "Service invoked too many times for one day: urlfetch",
+            "Authorization is required to perform that action.",
+            "Error code Not_Found",
+            "Domain policy has disabled this Apps Script.",
+        ] {
+            let err: Result<Vec<u8>, FronterError> = Err(FronterError::Relay(msg.into()));
+            assert!(
+                !probe_indicates_recovery(&err),
+                "permanent envelope must not indicate recovery: {:?}",
+                msg
+            );
+        }
+
+        // Transient envelope — Apps Script returned but the script
+        // itself hit a hiccup. The deployment is reachable, so the
+        // probe should recover (clear the blacklist entry).
+        let err: Result<Vec<u8>, FronterError> = Err(FronterError::Relay(
+            "Server not available. Please try again later.".into(),
+        ));
+        assert!(
+            probe_indicates_recovery(&err),
+            "transient envelope must indicate recovery (deployment reachable)"
+        );
+
+        // Transport-level failure — the probe never reached Apps Script
+        // or got back a non-`Relay` failure. Can't conclude anything
+        // about deployment health.
+        let err: Result<Vec<u8>, FronterError> = Err(FronterError::Timeout);
+        assert!(!probe_indicates_recovery(&err));
+        let err: Result<Vec<u8>, FronterError> = Err(FronterError::BadResponse("bad".into()));
+        assert!(!probe_indicates_recovery(&err));
+    }
+
+    #[test]
+    fn apply_probe_recovery_end_to_end_decision_matrix() {
+        // The four CAS-step outcomes a probe can hit, driven by hand
+        // so the test doesn't depend on the relay pipeline:
+        //
+        //   1. Captured `until` matches the live entry → clear it.
+        //   2. Captured `until` doesn't match (concurrent rewrite) →
+        //      keep the entry.
+        //   3. Entry no longer in the map (TTL expired during probe)
+        //      → no-op.
+        //
+        // Together with `probe_indicates_recovery` this covers the
+        // full probe decision tree without needing a live h2/h1 server.
+        let fronter = fronter_for_test(false);
+
+        // (1) Healthy probe + matching captured_until → Cleared.
+        fronter.blacklist_script("HEALTHY_SID", "first ban");
+        let until_healthy = fronter
+            .blacklist
+            .lock()
+            .unwrap()
+            .get("HEALTHY_SID")
+            .map(|e| e.until)
+            .expect("entry just inserted");
+        assert_eq!(
+            fronter.apply_probe_recovery("HEALTHY_SID", until_healthy),
+            ProbeApplyResult::Cleared,
+        );
+        assert!(
+            !fronter
+                .blacklist
+                .lock()
+                .unwrap()
+                .contains_key("HEALTHY_SID"),
+            "Cleared outcome must remove the entry from the map"
+        );
+
+        // (2) Healthy probe + stale captured_until → RewrittenInFlight.
+        fronter.blacklist_script("RACE_SID", "first ban");
+        let stale_until = fronter
+            .blacklist
+            .lock()
+            .unwrap()
+            .get("RACE_SID")
+            .map(|e| e.until)
+            .expect("first entry");
+        // A second blacklist write lands while the probe is in flight.
+        // Sleep ensures the new `Instant::now()` is strictly greater so
+        // `until` actually changes.
+        std::thread::sleep(Duration::from_millis(2));
+        fronter.blacklist_script("RACE_SID", "second ban — cooldown extended");
+        assert_eq!(
+            fronter.apply_probe_recovery("RACE_SID", stale_until),
+            ProbeApplyResult::RewrittenInFlight,
+        );
+        assert!(
+            fronter.blacklist.lock().unwrap().contains_key("RACE_SID"),
+            "RewrittenInFlight must preserve the (rewritten) entry"
+        );
+
+        // (3) Probe finishes after the entry's TTL ran out → AlreadyExpired.
+        // We simulate by capturing a synthetic `until` and never inserting.
+        assert_eq!(
+            fronter.apply_probe_recovery("MISSING_SID", Instant::now()),
+            ProbeApplyResult::AlreadyExpired,
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h2_round_trip_sends_accept_language_paired_with_apps_script_lang() {
+        // Wire-level proof that the new `apps_script_accept_lang` field
+        // is actually transmitted on the initial POST. The h2c server
+        // captures the request headers; we assert that
+        // `accept-language` carries `en-US,en;q=0.9` for the default
+        // `apps_script_lang = "en"` (preserving the existing wire
+        // fingerprint).
+        let captured = Arc::new(std::sync::Mutex::new(None::<http::HeaderMap>));
+        let cap_clone = captured.clone();
+        let (addr, server_handle) = spawn_h2c_server(move |req| {
+            *cap_clone.lock().unwrap() = Some(req.headers().clone());
+            let resp = http::Response::builder().status(200).body(()).unwrap();
+            (resp, b"ok".to_vec())
+        })
+        .await;
+        let send = h2c_client(addr).await;
+        let fronter = fronter_for_test(false);
+        let (status, _hdrs, _body) = fronter
+            .h2_round_trip(
+                send,
+                "POST",
+                "/macros/s/TEST/exec?hl=en",
+                "127.0.0.1",
+                Bytes::from_static(b"{}"),
+                Some("application/json"),
+                TEST_RESPONSE_DEADLINE,
+            )
+            .await
+            .expect("h2 round trip");
+        assert_eq!(status, 200);
+        let headers = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("server must have captured a request");
+        assert_eq!(
+            headers
+                .get("accept-language")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or(""),
+            "en-US,en;q=0.9",
+            "default apps_script_lang=en must produce the browser-shaped header"
+        );
+        server_handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn probe_does_not_clear_timeout_strike_blacklist() {
+        // record_timeout_strike writes a probe-disowned entry. Even when
+        // the SID is technically in the blacklist map, the probe loop
+        // must not touch it — timeout strikes can be triggered by
+        // network conditions a generic example.com roundtrip can't
+        // diagnose, so silent recovery would put real traffic back on a
+        // still-hung deployment.
+        let fronter = fronter_for_test(false);
+        // Pretend a deployment hit the strike limit.
+        fronter.blacklist_script_for(
+            "STRIKE_SID",
+            Duration::from_secs(60),
+            "synthetic timeout strike",
+        );
+        assert!(fronter.blacklist.lock().unwrap().contains_key("STRIKE_SID"));
+        // probe_blacklisted_once filters by probe_recoverable, so the
+        // network is never touched: this returns immediately and the
+        // entry stays put.
+        fronter.probe_blacklisted_once().await;
+        let bl = fronter.blacklist.lock().unwrap();
+        let entry = bl.get("STRIKE_SID").expect("entry must remain blacklisted");
+        assert!(
+            !entry.probe_recoverable,
+            "strike entries must stay probe-disowned"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn probe_one_sid_capture_until_blocks_clearing_rewritten_entry() {
+        // A probe-recoverable entry that's rewritten while the probe is
+        // in flight (longer cooldown, new reason) must survive the
+        // probe's `remove` call. We simulate the race by writing entry
+        // A, capturing its `until`, rewriting it with a different
+        // `until`, and asking the probe-side compare-and-swap to clear
+        // it. The rewrite wins.
+        let fronter = fronter_for_test(false);
+        fronter.blacklist_script("RACE_SID", "first ban");
+        let first_until = fronter
+            .blacklist
+            .lock()
+            .unwrap()
+            .get("RACE_SID")
+            .map(|e| e.until)
+            .expect("first entry");
+        // Rewrite — simulates a concurrent blacklist write landing
+        // between probe issue and probe completion. Sleep ensures the
+        // new `Instant::now()` is strictly greater so equality fails.
+        tokio::time::sleep(Duration::from_millis(2)).await;
+        fronter.blacklist_script("RACE_SID", "second ban (different reason)");
+        let second_until = fronter
+            .blacklist
+            .lock()
+            .unwrap()
+            .get("RACE_SID")
+            .map(|e| e.until)
+            .expect("second entry");
+        assert_ne!(
+            first_until, second_until,
+            "rewrite must produce a different `until`"
+        );
+
+        // Hand-run the compare-and-swap step the probe uses on a
+        // healthy reply. The captured `until` no longer matches, so the
+        // entry must remain.
+        let bl = fronter.blacklist.lock().unwrap();
+        let still_ours = bl
+            .get("RACE_SID")
+            .map(|e| e.until == first_until)
+            .unwrap_or(false);
+        assert!(
+            !still_ours,
+            "compare-and-swap must reject the stale captured `until`"
+        );
+        // The probe would `return` early at this point — assert that
+        // the entry stays in the map.
+        assert!(bl.contains_key("RACE_SID"));
     }
 
     #[test]

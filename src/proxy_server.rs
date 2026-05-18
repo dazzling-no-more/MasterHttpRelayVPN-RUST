@@ -371,6 +371,17 @@ struct ModeTasks {
     /// overlapping warmups holding old `Arc<DomainFronter>`s. Tracking
     /// it here lets `abort_all` reap them cleanly on switch / shutdown.
     warm: Option<tokio::task::JoinHandle<()>>,
+    /// Blacklist re-probe loop. Periodically HEADs `example.com`
+    /// through each probe-recoverable blacklisted SID so a recovered
+    /// deployment re-enters the rotation pool ahead of its static
+    /// cooldown TTL. The spawn happens unconditionally for any
+    /// `apps_script`-mode startup; `run_probe_loop` itself returns
+    /// immediately when only one script ID is configured (probing the
+    /// single deployment that already failed would just burn more of
+    /// the same quota), so the JoinHandle exists but its future ends
+    /// without doing any work. `abort_all` reaps it like the other
+    /// optional handles.
+    probe: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ModeTasks {
@@ -387,12 +398,16 @@ impl ModeTasks {
         if let Some(h) = self.warm.take() {
             h.abort();
         }
+        if let Some(h) = self.probe.take() {
+            h.abort();
+        }
     }
     fn is_empty(&self) -> bool {
         self.keepalive.is_none()
             && self.refill.is_none()
             && self.stats.is_none()
             && self.warm.is_none()
+            && self.probe.is_none()
     }
 }
 
@@ -1246,6 +1261,10 @@ fn spawn_mode_tasks(tasks: &mut ModeTasks, fronter: Arc<DomainFronter>) {
     tasks.refill = Some(tokio::spawn({
         let f = fronter.clone();
         async move { f.run_pool_refill().await }
+    }));
+    tasks.probe = Some(tokio::spawn({
+        let f = fronter.clone();
+        async move { f.run_probe_loop().await }
     }));
     tasks.stats = Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));

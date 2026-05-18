@@ -486,6 +486,21 @@ pub struct Config {
     #[serde(default = "default_request_timeout_secs")]
     pub request_timeout_secs: u64,
 
+    /// Language code appended to Apps Script `/macros/s/<sid>/exec` calls
+    /// as `?hl=<lang>` and paired with `Accept-Language` on the relay
+    /// POST. Default `"en"` forces Google's frontend error pages and
+    /// quota/auth/deploy envelope strings into English so the
+    /// [`envelope error classifier`](`looks_like_quota_error` and
+    /// friends) can pattern-match them reliably regardless of the user's
+    /// browser locale. Change only if you specifically want non-English
+    /// Apps Script error pages for debugging — the classifier patterns
+    /// are English-only, so any other value disables auth/deploy/admin
+    /// auto-blacklisting (quota still works because the German strings
+    /// are explicitly listed). Ported from upstream Python `apps_script_lang`
+    /// (commit 00edfe9).
+    #[serde(default = "default_apps_script_lang")]
+    pub apps_script_lang: String,
+
     /// Verbatim JSON for any config.json key this build doesn't model
     /// (e.g. fields shipped by a newer build of the desktop UI, or
     /// keys hand-edited by the user that haven't graduated to a real
@@ -755,6 +770,15 @@ fn default_auto_blacklist_cooldown_secs() -> u64 {
 /// hard-coded `BATCH_TIMEOUT` and Apps Script's typical response cliff.
 fn default_request_timeout_secs() -> u64 {
     30
+}
+
+/// Default for `apps_script_lang`: `"en"`. English forces Apps Script /
+/// Google frontend to emit error strings the envelope classifier knows
+/// how to bucket (quota / auth / deploy / admin). Sanitised at use-site
+/// by [`Config::apps_script_lang_resolved`] so an empty / whitespace
+/// override doesn't disable the `?hl=` query parameter.
+fn default_apps_script_lang() -> String {
+    "en".into()
 }
 
 /// Default for `sabr_strip`: `false`. Flipped from `true` after #977
@@ -1134,6 +1158,55 @@ impl Config {
         }
         Vec::new()
     }
+
+    /// Sanitised `apps_script_lang` — trimmed, lowercased, and validated
+    /// as a BCP47-ish language tag (ASCII letters, optional single
+    /// hyphen-separated region, ≤ 10 chars). Falls back to `"en"` for
+    /// empty / whitespace / malformed input so a hand-edited config
+    /// can't smuggle `&` / `\r\n` / `%` into the `?hl=` query string
+    /// or the `Accept-Language` header. Centralised so the URL builder
+    /// and the relay header path agree on what value to use.
+    pub fn apps_script_lang_resolved(&self) -> String {
+        sanitize_apps_script_lang(&self.apps_script_lang).unwrap_or_else(|| "en".into())
+    }
+}
+
+/// Whitelist-validate a user-supplied `apps_script_lang`. Returns the
+/// normalised value when it parses as a BCP47-ish tag, `None` otherwise
+/// so callers can fall back to `"en"`. The allowed grammar is:
+///
+/// * 1–8 ASCII letters (e.g. `en`, `eng`)
+/// * optionally followed by `-` and 1–8 more ASCII letters / digits
+///   (e.g. `en-US`, `zh-CN`, `pt-BR`)
+///
+/// Anything else — special characters, embedded whitespace, empty
+/// segments around hyphens, length over 10, non-ASCII — is rejected.
+/// This keeps the value safe to interpolate into URL query strings and
+/// HTTP header values without further encoding.
+fn sanitize_apps_script_lang(raw: &str) -> Option<String> {
+    let v = raw.trim().to_ascii_lowercase();
+    if v.is_empty() || v.len() > 10 {
+        return None;
+    }
+    let mut parts = v.split('-');
+    let head = parts.next()?;
+    if head.is_empty() || head.len() > 8 || !head.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    if let Some(region) = parts.next() {
+        if region.is_empty()
+            || region.len() > 8
+            || !region.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            return None;
+        }
+    }
+    if parts.next().is_some() {
+        // Reject `xx-yy-zz` — Apps Script only honours the primary tag
+        // and the extra subtags add attack surface for no benefit.
+        return None;
+    }
+    Some(v)
 }
 
 #[cfg(test)]

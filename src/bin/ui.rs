@@ -526,6 +526,11 @@ struct FormState {
     auto_blacklist_window_secs: u64,
     auto_blacklist_cooldown_secs: u64,
     request_timeout_secs: u64,
+    /// Apps Script error-page locale (`?hl=<lang>` + paired
+    /// `Accept-Language`). Config-only round-trip — power-user file
+    /// edit, no UI editor yet. Default `"en"` keeps the envelope
+    /// classifier matching English Apps Script error strings.
+    apps_script_lang: String,
     /// Optional second-hop exit node for CF-anti-bot bypass (chatgpt.com /
     /// claude.ai / grok.com / x.com). Config-only — no UI editor yet.
     /// See `assets/exit_node/` for the generic exit-node handler.
@@ -699,6 +704,7 @@ fn load_form() -> (FormState, Option<String>) {
             auto_blacklist_window_secs: c.auto_blacklist_window_secs,
             auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
             request_timeout_secs: c.request_timeout_secs,
+            apps_script_lang: c.apps_script_lang.clone(),
             exit_node: c.exit_node.clone(),
             direct_mode: c.direct_mode.clone(),
             // The editor buffer is the only persistent representation
@@ -791,6 +797,7 @@ impl FormState {
             auto_blacklist_window_secs: 30,
             auto_blacklist_cooldown_secs: 120,
             request_timeout_secs: 30,
+            apps_script_lang: "en".into(),
             exit_node: rahgozar::config::ExitNodeConfig::default(),
             direct_mode: rahgozar::config::DirectModeConfig::default(),
             custom_params_buffer: Vec::new(),
@@ -905,6 +912,7 @@ const MODELED_CONFIG_KEYS: &[&str] = &[
     "auto_blacklist_window_secs",
     "auto_blacklist_cooldown_secs",
     "request_timeout_secs",
+    "apps_script_lang",
     "exit_node",
     "direct_mode",
 ];
@@ -1105,6 +1113,10 @@ impl FormState {
             auto_blacklist_window_secs: self.auto_blacklist_window_secs,
             auto_blacklist_cooldown_secs: self.auto_blacklist_cooldown_secs,
             request_timeout_secs: self.request_timeout_secs,
+            // Apps Script error-page locale. Config-only round-trip
+            // (no UI editor); the file-edited value flows through here
+            // so a hand-edited `apps_script_lang` survives Save.
+            apps_script_lang: self.apps_script_lang.clone(),
             // Exit-node config (CF-anti-bot bypass for chatgpt.com / claude.ai
             // / grok.com / x.com). Round-trip through FormState — config-only
             // editing for now, UI editor planned for v1.9.x desktop UI batch.
@@ -1302,6 +1314,11 @@ struct ConfigWire<'a> {
     auto_blacklist_cooldown_secs: u64,
     #[serde(skip_serializing_if = "is_default_timeout_secs")]
     request_timeout_secs: u64,
+    /// Apps Script error-page locale (`?hl=<lang>`). Skip when the
+    /// value matches the compiled default `"en"` so configs that
+    /// haven't been hand-edited stay clean.
+    #[serde(skip_serializing_if = "is_default_apps_script_lang")]
+    apps_script_lang: &'a str,
     /// HTTP/2 multiplexing kill switch. Default false (h2 active); only
     /// emitted on save when the user has explicitly disabled h2, so
     /// unchanged configs stay clean.
@@ -1366,6 +1383,9 @@ fn is_default_cooldown_secs(v: &u64) -> bool {
 }
 fn is_default_timeout_secs(v: &u64) -> bool {
     *v == 30
+}
+fn is_default_apps_script_lang(v: &&str) -> bool {
+    v.is_empty() || v.eq_ignore_ascii_case("en")
 }
 fn is_default_exit_node(en: &&rahgozar::config::ExitNodeConfig) -> bool {
     !en.enabled
@@ -1467,6 +1487,7 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             auto_blacklist_window_secs: c.auto_blacklist_window_secs,
             auto_blacklist_cooldown_secs: c.auto_blacklist_cooldown_secs,
             request_timeout_secs: c.request_timeout_secs,
+            apps_script_lang: c.apps_script_lang.as_str(),
             force_http1: c.force_http1,
             exit_node: &c.exit_node,
             direct_mode: &c.direct_mode,
@@ -5675,12 +5696,17 @@ mod tests {
             "auto_blacklist_window_secs": 99,
             "auto_blacklist_cooldown_secs": 999,
             "request_timeout_secs": 31,
+            "apps_script_lang": "fa",
             "exit_node": {
               "enabled": true,
               "relay_url": "https://a.example",
               "psk": "K",
               "hosts": ["b.example"],
               "mode": "selective"
+            },
+            "direct_mode": {
+              "enabled": true,
+              "fronts": ["www.example.com"]
             }
         }"##;
         let cfg: Config = serde_json::from_str(json).unwrap();
