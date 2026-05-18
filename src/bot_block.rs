@@ -12,19 +12,37 @@
 //!   `errors.edgesuite.net`, `Server: AkamaiGHost`) on the same
 //!   heuristic. unity.com is the canonical example.
 //!
-//! The fix is always the same: route the host through `exit_node.hosts`
-//! so the destination sees an exit-node IP. This module surfaces the
-//! hint at log-level WARN once per host per process, so a user reading
-//! their own log can self-diagnose without filing a ticket.
+//! On the Apps-Script-direct path, the fix is to route the host
+//! through `exit_node.hosts` so the destination sees an exit-node IP
+//! instead of a Google datacenter IP. On the exit-node path (when the
+//! same response comes back blocked even after routing), the host is
+//! already in `hosts` — the fix there is to switch the exit-node
+//! deployment to a host with a non-GCP outbound IP. This module
+//! surfaces the matching hint at log-level WARN once per host per
+//! detection path, so a user reading their own log can self-diagnose
+//! without filing a ticket.
 //!
-//! Hooked into the relay path at exactly one point —
-//! `domain_fronter::DomainFronter::relay_uncoalesced` — so every
-//! Apps Script response that returns bytes to a caller is scanned.
-//! The exit-node short-circuit upstream of `relay_uncoalesced` skips
-//! detection on intentionally-routed-around hosts, which is the
-//! correct behaviour: a CF challenge through the user's own exit node
-//! is a different problem class and shouldn't be conflated with the
-//! Apps-Script-outbound block heuristic.
+//! Hooked into the relay path at two points:
+//!
+//! 1. `relay_uncoalesced` (Apps Script direct response). Every Apps
+//!    Script response that returns bytes to a caller is scanned. The
+//!    exit-node short-circuit returns earlier in `relay()` and skips
+//!    this detection — those responses get the second hook below
+//!    instead, with a different hint.
+//! 2. The `Ok(bytes)` branch in `relay()`'s exit-node match. When a
+//!    response that *did* route through the user's own exit-node
+//!    still carries a CF/Akamai block, it means the exit-node's own
+//!    outbound IP is on the CDN's blocklist for that site — the most
+//!    common offender being Deno Deploy, whose outbound is GCP IP
+//!    space that CF flags for sites like `claude.ai`. The hint points
+//!    at switching the exit-node deployment to a non-GCP host
+//!    (fly.io / VPS) rather than at `exit_node.hosts`, because adding
+//!    a host that's already in the list does nothing.
+//!
+//! Both hooks dedup per-host per-process using separate sets, so a
+//! user who hits both paths for the same host (Apps Script block →
+//! adds to `hosts` → exit-node block) still sees the second hint on
+//! the next page load instead of being silenced by the first warn.
 
 use std::collections::HashSet;
 use std::sync::{Mutex, OnceLock};
@@ -123,6 +141,37 @@ pub fn note_if_blocked(host: &str, response: &[u8]) {
     );
 }
 
+/// Same shape as `note_if_blocked` but for responses that already
+/// came back through the user's exit node. The hint is different:
+/// the host is already in `exit_node.hosts`, so adding it again is
+/// a no-op. The actual fix is to switch the exit-node deployment to
+/// a host with a non-GCP outbound IP (fly.io or VPS), because the
+/// current exit-node host's IP is itself on the CDN's blocklist for
+/// this site. Deduped against a separate set so a user who hit the
+/// Apps-Script-path warn first and added the host to `hosts` will
+/// still see this second hint on the next page load instead of being
+/// silenced by the earlier dedupe.
+pub fn note_if_blocked_via_exit_node(host: &str, response: &[u8]) {
+    let Some(cdn) = detect(response) else {
+        return;
+    };
+    let host = normalize_host(host);
+    if !mark_first_seen(seen_set_exit_node(), &host) {
+        return;
+    }
+    tracing::warn!(
+        "{} returned a {} bot-block even through your exit node — \
+         the exit-node host's outbound IP is itself on {}'s blocklist \
+         for this site. Switch your exit-node deployment to a host with \
+         a non-GCP outbound IP (fly.io or a small VPS using \
+         assets/exit_node/wrapper.ts) and update relay_url in config.json \
+         (see assets/exit_node/README.md, Hosting options section).",
+        host,
+        cdn,
+        cdn,
+    );
+}
+
 /// Lowercase + strip the trailing FQDN dot. The dispatcher elsewhere
 /// in the codebase normalises hosts the same way; without this,
 /// `example.com` and `example.com.` would warn separately.
@@ -139,6 +188,11 @@ fn mark_first_seen(set: &Mutex<HashSet<String>>, host: &str) -> bool {
 }
 
 fn seen_set() -> &'static Mutex<HashSet<String>> {
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn seen_set_exit_node() -> &'static Mutex<HashSet<String>> {
     static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     SEEN.get_or_init(|| Mutex::new(HashSet::new()))
 }
@@ -281,6 +335,102 @@ mod tests {
         assert!(!mark_first_seen(&set, "a.example"));
         assert!(mark_first_seen(&set, "b.example"));
         assert!(!mark_first_seen(&set, "b.example"));
+    }
+
+    #[test]
+    fn both_hints_fire_for_same_host_through_public_api() {
+        // Drives both public entry points end-to-end with log capture
+        // to verify two things at once:
+        //
+        //   1. `note_if_blocked` and `note_if_blocked_via_exit_node`
+        //      dedupe against *separate* sets — sharing one would
+        //      silently suppress the second hint, which is the more
+        //      actionable one (the first hint's fix is "add to
+        //      exit_node.hosts," and the user has just done that;
+        //      now they need to know the exit-node deployment itself
+        //      is also blocked).
+        //   2. The exit-node hint is materially different from the
+        //      Apps-Script hint — pointing at switching the
+        //      exit-node deployment, not at editing the hosts list.
+        //
+        // Poking the private seen-set helpers directly (an earlier
+        // version of this test) doesn't catch a regression where the
+        // public function accidentally calls `seen_set()` instead of
+        // `seen_set_exit_node()`; the public-API + log-capture shape
+        // does.
+        use std::sync::{Arc, Mutex};
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone, Default)]
+        struct LogCapture(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for LogCapture {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for LogCapture {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let capture = LogCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .with_target(false)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // Use a host string distinctive enough that no other test can
+        // have inserted it into either global seen-set before us. The
+        // sets are process-wide statics with no reset hook, so a
+        // collision would silence the warn and falsely fail this test.
+        let host = "double-block-test.rahgozar.invalid";
+        let body = b"HTTP/1.1 403 Forbidden\r\n\
+                     Server: cloudflare\r\n\
+                     cf-mitigated: challenge\r\n\r\n\
+                     <html><body>Just a moment...</body></html>";
+
+        // First: Apps-Script-path warn.
+        note_if_blocked(host, body);
+        // Second: exit-node-path warn for the SAME host. Must fire
+        // even though the Apps-Script warn already used this host —
+        // that's the whole point of having two separate seen-sets.
+        note_if_blocked_via_exit_node(host, body);
+
+        let log = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+
+        // Both warns must appear in the log.
+        let apps_script_marker = "add \"double-block-test.rahgozar.invalid\" to exit_node.hosts";
+        let exit_node_marker = "even through your exit node";
+        assert!(
+            log.contains(apps_script_marker),
+            "Apps-Script-path warn missing from log: {}",
+            log
+        );
+        assert!(
+            log.contains(exit_node_marker),
+            "exit-node-path warn missing from log — likely the public function \
+             deduped against the wrong set: {}",
+            log
+        );
+
+        // And the messages must be distinct — guards against a
+        // copy-paste regression where the new function emits the old
+        // hint text.
+        assert!(
+            !log.matches(apps_script_marker).nth(1).is_some(),
+            "Apps-Script hint appeared twice — exit-node function may \
+             be emitting the wrong message: {}",
+            log
+        );
     }
 
     #[test]

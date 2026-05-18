@@ -1883,6 +1883,14 @@ impl DomainFronter {
                         bytes.len() as u64,
                         t0.elapsed().as_nanos() as u64,
                     );
+                    // Bot-block detection for the exit-node path —
+                    // rationale + hint shape lives in `bot_block`'s
+                    // module docs. This branch is the parallel hook to
+                    // the one in `relay_uncoalesced`, which the
+                    // exit-node short-circuit bypasses.
+                    if let Some(host) = extract_host(url) {
+                        crate::bot_block::note_if_blocked_via_exit_node(&host, &bytes);
+                    }
                     return bytes;
                 }
                 Err(e) if !e.is_retryable() => {
