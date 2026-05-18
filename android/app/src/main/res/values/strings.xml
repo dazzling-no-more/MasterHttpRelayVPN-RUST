@@ -121,6 +121,22 @@
     <string name="snack_update_apk_empty">Downloaded APK was empty.</string>
     <string name="snack_update_apk_size_mismatch">Downloaded APK size mismatch (%1$d of %2$d bytes).</string>
 
+    <!-- Foreground-service notification.
+         Title swaps between active/paused. Body shows live stats while running
+         (Apps Script relay modes only — direct/full-only fall back to the ports
+         line). Action labels appear on the notification buttons. -->
+    <string name="notif_title_active">rahgozar VPN is active</string>
+    <string name="notif_title_paused">rahgozar VPN is paused</string>
+    <string name="notif_paused_body">Tap Resume to reconnect</string>
+    <!-- "%1$d calls today · 12.3 MB · resets in 5h 30m" — daily Pacific-time
+         quota counters lifted from Native.statsJson. -->
+    <string name="notif_running_stats">%1$d calls today  ·  %2$s  ·  resets in %3$dh %4$dm</string>
+    <!-- Fallback when no Apps-Script-relay stats are available (direct mode etc). -->
+    <string name="notif_running_ports">HTTP 127.0.0.1:%1$d  ·  SOCKS5 127.0.0.1:%2$d</string>
+    <string name="notif_action_stop">Stop</string>
+    <string name="notif_action_pause">Pause</string>
+    <string name="notif_action_resume">Resume</string>
+
     <!-- Usage today card -->
     <string name="sec_usage_today">Usage today (estimated)</string>
     <string name="label_calls_today">calls today</string>

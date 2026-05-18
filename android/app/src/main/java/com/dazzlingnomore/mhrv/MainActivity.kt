@@ -192,10 +192,14 @@ class MainActivity : AppCompatActivity() {
                 // case. That second call was firing onDestroy() while the
                 // mhrv-teardown thread was still running, racing two threads
                 // through the lifecycle and crashing on tap-to-disconnect.
-                // The teardown thread's idempotency guard (tornDown
-                // AtomicBoolean) protects against double-teardown of native
-                // state, but it can't protect against OS-level lifecycle
-                // races on stopSelf vs stopService. ACTION_STOP alone is
+                // The service's runTeardown CAS-claims a teardownInProgress
+                // slot; a second concurrent caller (onDestroy racing the
+                // mhrv-teardown thread, etc.) skips fast rather than
+                // blocking on lifecycleLock. The first caller still
+                // synchronises with startEverything via the lock, so the
+                // native side is never half-torn-down under a fresh start.
+                // None of that protects against OS-level lifecycle races
+                // on stopSelf vs stopService though — ACTION_STOP alone is
                 // enough for both the live-service and zombie cases —
                 // startService creates a fresh service in the new process
                 // for zombies, runs teardown (no-op on already-clean state)

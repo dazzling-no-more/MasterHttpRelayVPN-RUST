@@ -107,6 +107,20 @@
     <string name="snack_update_apk_size_mismatch">اندازهٔ APK دانلودشده ناهماهنگ است (%1$d از %2$d بایت).</string>
 
     <!-- Usage today card -->
+    <!-- اعلان سرویس پیش‌زمینه — عنوان، متن و دکمه‌های Pause/Resume/Stop -->
+    <string name="notif_title_active">رهگذر فعال است</string>
+    <!-- "متوقف" / "توقف" share the same root as the Stop action, which
+         makes "rahgozar stopped" read like "Stop was pressed." Use the
+         distinct-root "مکث" (the same word the Pause action button
+         shows) so users see "in pause state" vs "stop / resume." -->
+    <string name="notif_title_paused">رهگذر در حالت مکث</string>
+    <string name="notif_paused_body">برای اتصال مجدد، «ادامه» را بزنید</string>
+    <string name="notif_running_stats">درخواست امروز: %1$d  ·  %2$s  ·  ریست تا %3$d ساعت و %4$d دقیقه</string>
+    <string name="notif_running_ports">HTTP 127.0.0.1:%1$d  ·  SOCKS5 127.0.0.1:%2$d</string>
+    <string name="notif_action_stop">توقف</string>
+    <string name="notif_action_pause">مکث</string>
+    <string name="notif_action_resume">ادامه</string>
+
     <string name="sec_usage_today">مصرف امروز (تخمینی)</string>
     <string name="label_calls_today">درخواست‌های امروز</string>
     <string name="label_bytes_today">بایت امروز</string>
