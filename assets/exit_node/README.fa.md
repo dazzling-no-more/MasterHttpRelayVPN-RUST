@@ -92,14 +92,16 @@ config مثال کامل در
 
 | Host | توضیحات |
 |---|---|
-| **Deno Deploy** ([deno.com/deploy](https://deno.com/deploy)) | free tier برای personal use کافی است. با `deployctl deploy --prod exit_node.ts` یا GitHub Actions deploy کنید. همان web-standard API. |
-| **fly.io** | free tier با محدودیت. handler رو در یک server thin بسته‌بندی کنید (`Deno.serve(handler)` برای Deno یا یک Express wrapper برای Node) + Dockerfile اضافه کنید. IP دائم، region جغرافیایی قابل انتخاب. |
-| **VPS شخصی خودت** | از فایل آماده [`wrapper.ts`](wrapper.ts) استفاده کن: `deno run --allow-net --allow-env --allow-read wrapper.ts`. خودکار Deno / Bun / Node 22+ تشخیص می‌ده. حداکثر کنترل، ~۳-۵ دلار در ماه. |
+| **Deno Deploy** ([deno.com/deploy](https://deno.com/deploy)) | سریع‌ترین setup؛ free tier برای personal use کافی است. با `deployctl deploy --prod exit_node.ts` یا GitHub Actions deploy کنید. **نکته مهم:** Deno Deploy روی Google Cloud Platform اجرا می‌شود، پس outbound IPهایش گاهی برای سایت‌هایی مثل `claude.ai` روی CF bot blocklist هستند. برای `chatgpt.com` / `x.com` / `grok.com` در اکثر regionها کار می‌کند؛ اگر سایتی حتی بعد از فعال کردن exit-node همچنان CF challenge نشان می‌دهد، به host غیر-GCP (fly.io یا VPS) سوییچ کنید. |
+| **fly.io** | free tier با محدودیت. handler رو در یک server thin بسته‌بندی کنید (`Deno.serve(handler)` برای Deno یا یک Express wrapper برای Node) + Dockerfile اضافه کنید. IP دائم، region جغرافیایی قابل انتخاب. outbound غیر-GCP — کیس‌هایی که Deno Deploy نمی‌پوشاند را می‌پوشاند. |
+| **VPS شخصی خودت** | از فایل آماده [`wrapper.ts`](wrapper.ts) استفاده کن: `deno run --allow-net --allow-env --allow-read wrapper.ts`. خودکار Deno / Bun / Node 22+ تشخیص می‌ده. حداکثر کنترل، ~۳-۵ دلار در ماه، تمیزترین outbound IP — تا الان برای همه سایت‌های CF-blocked کار کرده. |
 | **Cloudflare Workers** | **کمک نمی‌کنه.** CF Workers از IP space خود CF خروج می‌کنن، که CF anti-bot هنوز به‌عنوان worker-internal flag می‌کنه. |
 
-برای اکثر کاربرانی که مسیر local رو اجرا می‌کنن، Deno Deploy
-سریع‌ترین setup است. برای deployment طولانی‌مدت تحت کنترل کامل
-خودت، VPS کوچک شخصی ایده‌آل است.
+Deno Deploy سریع‌ترین راه به یک setup کارا است؛ اگر متوجه شدید
+سایتی حتی بعد از اضافه‌شدن به `hosts` همچنان CF challenge می‌گیرد،
+همان `exit_node.ts` را روی یک VPS کوچک (~۳-۵ دلار/ماه) redeploy
+کنید تا یک outbound IP تمیز غیر-GCP داشته باشید که CF آن را flag
+نمی‌کند.
 
 ## انتخاب `selective` vs `full`
 
@@ -165,12 +167,29 @@ POST).
 یا destination slow. region متفاوت رو امتحان کنید، یا latency
 trade-off رو accept کنید.
 
-**سایت همچنان CF challenge نشون می‌ده بعد از enable exit node** — CF
-IP host شما رو هم flag کرده. بعضی hosting provider‌ها outbound IP
-space‌شون روی CF bot blocklist است. workarounds: host دیگه امتحان
-کنید (VPS شخصی شما clean IP می‌ده)، یا سایت رو به `passthrough_hosts`
-اضافه کنید (MITM رو bypass می‌کنه؛ از real IP ISP شما استفاده
-می‌کنه).
+**سایت همچنان CF challenge نشون می‌ده بعد از اضافه شدن به `hosts`** —
+host‌ای که exit-node رو روش deploy کردید، خودش برای آن سایت روی CF
+bot blocklist است. شایع‌ترین کیس Deno Deploy است: outbound IPهای آن
+Google Cloud Platform هستند و CF بعضی از آن‌ها رو برای سایت‌هایی مثل
+`claude.ai` flag می‌کنه، حتی اگر برای `chatgpt.com` / `x.com` کار
+کنه. راه‌حل: همان `exit_node.ts` را روی host‌ی با outbound غیر-GCP
+(fly.io یا VPS کوچک) redeploy کنید و `relay_url` را به URL جدید
+اشاره دهید. توجه: `passthrough_hosts` در سناریوی کاربر معمولی
+رهگذر **راه‌حل نیست** — این سایت‌ها در سطح ISP ایران هم بلاک هستند،
+پس bypass کردن MITM رهگذر (که `passthrough_hosts` انجام می‌دهد)
+باعث می‌شود صفحه به‌جای نمایش CF challenge، اصلاً load نشود.
+
+**سایت Google با خطای 403 "Your client does not have permission to
+get URL / from this server" برمی‌گردد** (مثل `aistudio.google.com`،
+`ai.google.dev`) — این یک sanctions block از طرف Google است، نه
+bot block. Google این محدودیت را در لایه‌ی account/policy برای
+کاربران ایرانی اعمال می‌کند، پس هیچ‌کدام از مسیر Apps Script
+عادی و مسیر exit-node آن را به‌تنهایی fix نمی‌کنند: outbound Apps
+Script خودش Google IP است، و حتی یک exit-node IP تمیز غیر-ایرانی
+هم اگر با Google account ایرانی استفاده شود رد می‌شود. راه‌حل
+بیرون از config رهگذر است: یک Google account غیر-ایرانی به‌همراه
+یک exit-node IP غیر-ایرانی. اضافه‌کردن این hostها به
+`exit_node.hosts` ارزشی ندارد.
 
 ## همچنین ببینید
 

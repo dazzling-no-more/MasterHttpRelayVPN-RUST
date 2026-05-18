@@ -92,14 +92,15 @@ sign up for and trust:
 
 | Host | Notes |
 |---|---|
-| **Deno Deploy** ([deno.com/deploy](https://deno.com/deploy)) | Free tier covers personal use. Deploy via `deployctl deploy --prod exit_node.ts` or via GitHub Actions. Same web-standard API as the script expects. |
-| **fly.io** | Free tier with limits. Wrap the handler in a thin server (`Deno.serve(handler)` for Deno or an Express wrapper for Node) + add a Dockerfile. Persistent IPs, picks geographic region. |
-| **Your own VPS** | Use the included [`wrapper.ts`](wrapper.ts): `deno run --allow-net --allow-env --allow-read wrapper.ts`. Auto-detects Deno / Bun / Node 22+. Most control, ~$3-5/mo. |
+| **Deno Deploy** ([deno.com/deploy](https://deno.com/deploy)) | Fastest setup; free tier covers personal use. Deploy via `deployctl deploy --prod exit_node.ts` or GitHub Actions. **Caveat:** Deno Deploy runs on Google Cloud Platform, so its outbound IPs are sometimes on CF's bot blocklist for sites like `claude.ai`. Works fine for `chatgpt.com` / `x.com` / `grok.com` in most regions; if a specific site still shows CF challenges after enabling the exit-node, switch to a non-GCP host (fly.io or VPS). |
+| **fly.io** | Free tier with limits. Wrap the handler in a thin server (`Deno.serve(handler)` for Deno or an Express wrapper for Node) + add a Dockerfile. Persistent IPs, picks geographic region. Non-GCP outbound — covers cases Deno Deploy misses. |
+| **Your own VPS** | Use the included [`wrapper.ts`](wrapper.ts): `deno run --allow-net --allow-env --allow-read wrapper.ts`. Auto-detects Deno / Bun / Node 22+. Most control, ~$3-5/mo, cleanest outbound IP — works for every CF-blocked site so far. |
 | **Cloudflare Workers** | **Doesn't help.** CF Workers exit through CF's own IP space, which CF anti-bot still flags as worker-internal traffic. |
 
-For most users running locally, Deno Deploy is the fastest setup. For
-a long-term deployment you control end-to-end, your own small VPS is
-ideal.
+Deno Deploy is the quickest path to a working setup; if you find any
+site still hits a CF challenge after adding it to `hosts`, redeploy
+the same `exit_node.ts` on a small VPS (~$3-5/mo) for a clean
+non-GCP outbound IP that CF doesn't flag.
 
 ## `selective` vs `full`
 
@@ -176,11 +177,29 @@ expects POST).
 destination is slow. Try a different region, or accept the latency
 trade-off.
 
-**Site still shows a CF challenge after enabling the exit node** —
-CF has flagged your host's IP too. Some hosting providers' outbound
-IP space is on CF's bot blocklist. Workarounds: try a different host
-(your own VPS gives you a clean IP), or add the affected site to
-`passthrough_hosts` to bypass the MITM and use your real ISP IP.
+**Site still shows a CF challenge after adding it to `hosts`** —
+the host you deployed the exit-node on is itself on CF's bot
+blocklist for that site. The most common case is Deno Deploy: its
+outbound IPs are Google Cloud Platform IPs, and CF flags some of
+them for sites like `claude.ai` even though they pass for
+`chatgpt.com` / `x.com`. Fix: redeploy the same `exit_node.ts` on
+a host with a non-GCP outbound — fly.io or a small VPS — and point
+`relay_url` at the new URL. `passthrough_hosts` is **not** a
+workaround here for the canonical use case: those sites are also
+blocked at the Iran ISP level, so bypassing rahgozar's MITM (which
+is what `passthrough_hosts` does) makes the page fail to load
+entirely instead of showing a CF challenge.
+
+**Google service returns 403 "Your client does not have permission
+to get URL / from this server"** (e.g. `aistudio.google.com`,
+`ai.google.dev`) — this is a Google sanctions block, not a bot
+block. Google enforces it at the account/policy layer for Iranian
+users, so neither the normal Apps Script path nor the exit-node
+fixes it on its own: Apps Script's outbound IS a Google IP, and
+even a clean non-Iran exit-node IP gets refused if the Google
+account is tied to Iran. Workaround sits outside rahgozar's
+config: a non-Iran Google account paired with a non-Iran exit-node
+IP. There's no value in adding these hosts to `exit_node.hosts`.
 
 ## See also
 
