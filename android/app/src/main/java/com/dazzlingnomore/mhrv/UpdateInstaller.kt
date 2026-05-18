@@ -7,6 +7,9 @@ import android.os.Build
 import android.provider.Settings
 import androidx.core.content.FileProvider
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.io.File
@@ -65,6 +68,45 @@ object UpdateInstaller {
         val url: String,
         val sizeBytes: Long,
     )
+
+    /**
+     * Last-known "update available" result, set by the auto-check on
+     * first composition and cleared after the user hands the APK to the
+     * OS installer. Drives the badge on the version button so the
+     * indicator survives the auto-snackbar disappearing and activity
+     * recreation (rotation, language change). Process-scoped — fine
+     * because a fresh process always re-runs the auto-check.
+     */
+    private val _pendingUpdate = MutableStateFlow<State.Available?>(null)
+    val pendingUpdate: StateFlow<State.Available?> = _pendingUpdate.asStateFlow()
+
+    fun markPendingUpdate(state: State.Available) {
+        _pendingUpdate.value = state
+    }
+
+    fun clearPendingUpdate() {
+        _pendingUpdate.value = null
+    }
+
+    /**
+     * In-flight guard for the snackbar offer + download + install handoff.
+     * Without this, two fast taps on the version button (or a tap layered
+     * on top of the auto-check's offer) launch two coroutines that each
+     * run `downloadApk`, which deletes everything in the updates cache
+     * dir before writing — so a second download can yank the first's
+     * file out from under it. The flag is process-scoped to match
+     * [pendingUpdate]; the coroutine acquires it and releases in a
+     * `finally`, so cancellation (activity destroyed) still releases.
+     */
+    private val _offerInFlight = MutableStateFlow(false)
+    val offerInFlight: StateFlow<Boolean> = _offerInFlight.asStateFlow()
+
+    /** Atomic acquire — returns true only for the caller that wins the race. */
+    fun tryAcquireOffer(): Boolean = _offerInFlight.compareAndSet(expect = false, update = true)
+
+    fun releaseOffer() {
+        _offerInFlight.value = false
+    }
 
     private fun safeUpdateAssetName(name: String): String =
         name

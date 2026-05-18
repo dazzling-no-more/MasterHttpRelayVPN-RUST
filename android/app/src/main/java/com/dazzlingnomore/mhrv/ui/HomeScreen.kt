@@ -144,9 +144,13 @@ fun HomeScreen(
 
     // One-shot auto update check on first composition. Silent if we're
     // already on the latest (no point nagging about a network miss or an
-    // up-to-date install); surfaces a snackbar only when a newer tag is
-    // available. rememberSaveable so it doesn't re-fire on every config
-    // change / rotation.
+    // up-to-date install); surfaces a snackbar AND sets the pending-update
+    // state that drives the badge on the version button — the badge stays
+    // visible after the snackbar auto-dismisses so the user can act on
+    // the update later. rememberSaveable so it doesn't re-fire on every
+    // config change / rotation; the badge state itself lives in the
+    // UpdateInstaller singleton so it survives the activity recreation
+    // that rememberSaveable's gate would otherwise skip refreshing.
     var autoUpdateChecked by rememberSaveable { mutableStateOf(false) }
     LaunchedEffect(autoUpdateChecked) {
         if (autoUpdateChecked) return@LaunchedEffect
@@ -157,9 +161,13 @@ fun HomeScreen(
             }
         val state = UpdateInstaller.parseCheckResult(json)
         if (state is UpdateInstaller.State.Available) {
+            UpdateInstaller.markPendingUpdate(state)
             offerInstall(ctx, scope, snackbar, state)
         }
     }
+
+    val pendingUpdate by UpdateInstaller.pendingUpdate.collectAsState()
+    val offerInFlight by UpdateInstaller.offerInFlight.collectAsState()
 
     // Gate Start/Stop on the service's actual state transition rather
     // than a fixed timer. The previous 2s cooldown was shorter than the
@@ -256,41 +264,91 @@ fun HomeScreen(
                         )
                     }
 
-                    // Tap the version label to check for updates.
+                    // Tap the version label to check for updates. When the
+                    // auto-check has already found a newer release, the
+                    // BadgedBox draws a red dot on the corner and tapping
+                    // skips the re-check and jumps straight to the install
+                    // snackbar.
                     var checking by remember { mutableStateOf(false) }
-                    TextButton(
-                        onClick = {
-                            if (checking) return@TextButton
-                            checking = true
-                            scope.launch {
-                                val json =
-                                    withContext(Dispatchers.IO) {
-                                        runCatching { Native.checkUpdate() }.getOrNull()
-                                    }
-                                val state = UpdateInstaller.parseCheckResult(json)
-                                if (state is UpdateInstaller.State.Available) {
-                                    offerInstall(ctx, scope, snackbar, state)
-                                } else {
-                                    snackbar.showSnackbar(
-                                        summarizeUpdateCheck(json),
-                                        withDismissAction = true,
-                                    )
-                                }
-                                checking = false
+                    BadgedBox(
+                        badge = {
+                            if (pendingUpdate != null) {
+                                Badge(containerColor = ErrRed)
                             }
                         },
                         modifier = Modifier.padding(end = 4.dp),
                     ) {
-                        Text(
-                            text =
-                                if (checking) {
-                                    stringResource(R.string.tb_check_update_checking)
-                                } else {
-                                    stringResource(R.string.tb_version_prefix) +
-                                        runCatching { Native.version() }.getOrDefault("?")
-                                },
-                            style = MaterialTheme.typography.labelMedium,
-                        )
+                        TextButton(
+                            enabled = !checking && !offerInFlight,
+                            onClick = {
+                                // Cheap UI guard — `offerInstall` also calls
+                                // `tryAcquireOffer` so two taps that race past
+                                // the recompose window still can't both win.
+                                if (checking || offerInFlight) return@TextButton
+                                // Always re-check on tap, even when `pendingUpdate`
+                                // is already set: the cached state can go stale
+                                // (asset URL expires, release replaced, a newer
+                                // release lands, a previously-unsupported ABI
+                                // gains an asset). The badge stays driven by the
+                                // most recent successful check; the next call
+                                // here either confirms it, refreshes it, or
+                                // clears it (when the latest is now UpToDate).
+                                checking = true
+                                scope.launch {
+                                    try {
+                                        val json =
+                                            withContext(Dispatchers.IO) {
+                                                runCatching { Native.checkUpdate() }.getOrNull()
+                                            }
+                                        val state = UpdateInstaller.parseCheckResult(json)
+                                        when (state) {
+                                            is UpdateInstaller.State.Available -> {
+                                                UpdateInstaller.markPendingUpdate(state)
+                                                offerInstall(ctx, scope, snackbar, state)
+                                            }
+
+                                            is UpdateInstaller.State.UpToDate -> {
+                                                // Clear the badge: the cached
+                                                // "available" state is no longer
+                                                // accurate. Surface the result so
+                                                // the user knows the tap did
+                                                // something.
+                                                UpdateInstaller.clearPendingUpdate()
+                                                snackbar.showSnackbar(
+                                                    summarizeUpdateCheck(json),
+                                                    withDismissAction = true,
+                                                )
+                                            }
+
+                                            else -> {
+                                                // Error / offline: leave the
+                                                // existing badge alone (a prior
+                                                // successful check may still be
+                                                // valid) and just surface the
+                                                // failure for this attempt.
+                                                snackbar.showSnackbar(
+                                                    summarizeUpdateCheck(json),
+                                                    withDismissAction = true,
+                                                )
+                                            }
+                                        }
+                                    } finally {
+                                        checking = false
+                                    }
+                                }
+                            },
+                        ) {
+                            Text(
+                                text =
+                                    if (checking) {
+                                        stringResource(R.string.tb_check_update_checking)
+                                    } else {
+                                        stringResource(R.string.tb_version_prefix) +
+                                            runCatching { Native.version() }.getOrDefault("?")
+                                    },
+                                style = MaterialTheme.typography.labelMedium,
+                            )
+                        }
                     }
                 },
             )
@@ -1349,85 +1407,102 @@ private fun offerInstall(
     state: UpdateInstaller.State.Available,
 ) {
     scope.launch {
-        val asset = state.asset
-        if (asset == null) {
-            snackbar.showSnackbar(
-                ctx.getString(
-                    R.string.snack_update_available_url,
-                    state.current,
-                    state.latest,
-                    state.releaseUrl,
-                ),
-                withDismissAction = true,
-            )
-            return@launch
-        }
-
-        val msg =
-            ctx.getString(
-                R.string.snack_update_available,
-                state.current,
-                state.latest,
-            )
-        val result =
-            snackbar.showSnackbar(
-                message = msg,
-                actionLabel = ctx.getString(R.string.btn_install),
-                withDismissAction = true,
-                duration = SnackbarDuration.Indefinite,
-            )
-        if (result != SnackbarResult.ActionPerformed) return@launch
-
-        if (!UpdateInstaller.canInstallUnknownApps(ctx)) {
-            UpdateInstaller.openUnknownSourcesSettings(ctx)
-            snackbar.showSnackbar(
-                ctx.getString(R.string.snack_update_enable_unknown_apps),
-                withDismissAction = true,
-            )
-            return@launch
-        }
-
-        // `showSnackbar` is a suspend fun that suspends until the snackbar
-        // is dismissed or replaced. With Indefinite + no action button +
-        // no dismiss button, the only way to release that suspension is
-        // a sibling coroutine cancelling/replacing it — running the
-        // download on the same coroutine would deadlock here.
-        val snackJob =
-            scope.launch {
+        // Drop the call if another offer/download/install is already in
+        // flight. Without this, repeated taps on the version button (with
+        // the badge cached) queue duplicate coroutines that race inside
+        // `downloadApk` — which wipes the updates cache dir before writing.
+        if (!UpdateInstaller.tryAcquireOffer()) return@launch
+        try {
+            val asset = state.asset
+            if (asset == null) {
                 snackbar.showSnackbar(
                     ctx.getString(
-                        R.string.snack_update_downloading,
-                        asset.sizeBytes.toDouble() / 1_048_576.0,
+                        R.string.snack_update_available_url,
+                        state.current,
+                        state.latest,
+                        state.releaseUrl,
                     ),
-                    withDismissAction = false,
+                    withDismissAction = true,
+                )
+                return@launch
+            }
+
+            val msg =
+                ctx.getString(
+                    R.string.snack_update_available,
+                    state.current,
+                    state.latest,
+                )
+            val result =
+                snackbar.showSnackbar(
+                    message = msg,
+                    actionLabel = ctx.getString(R.string.btn_install),
+                    withDismissAction = true,
                     duration = SnackbarDuration.Indefinite,
                 )
-            }
-        val dl =
-            try {
-                UpdateInstaller.downloadApk(ctx, asset)
-            } finally {
-                snackJob.cancel()
-            }
-        when (dl) {
-            is UpdateInstaller.State.ReadyToInstall -> {
-                runCatching { UpdateInstaller.launchInstaller(ctx, dl.apk) }
-                    .onFailure {
-                        snackbar.showSnackbar(
-                            ctx.getString(
-                                R.string.snack_update_open_installer_failed,
-                                it.message ?: "",
-                            ),
-                            withDismissAction = true,
-                        )
-                    }
+            if (result != SnackbarResult.ActionPerformed) return@launch
+
+            if (!UpdateInstaller.canInstallUnknownApps(ctx)) {
+                UpdateInstaller.openUnknownSourcesSettings(ctx)
+                snackbar.showSnackbar(
+                    ctx.getString(R.string.snack_update_enable_unknown_apps),
+                    withDismissAction = true,
+                )
+                return@launch
             }
 
-            is UpdateInstaller.State.Failed -> {
-                snackbar.showSnackbar(dl.reason, withDismissAction = true)
-            }
+            // `showSnackbar` is a suspend fun that suspends until the snackbar
+            // is dismissed or replaced. With Indefinite + no action button +
+            // no dismiss button, the only way to release that suspension is
+            // a sibling coroutine cancelling/replacing it — running the
+            // download on the same coroutine would deadlock here.
+            val snackJob =
+                scope.launch {
+                    snackbar.showSnackbar(
+                        ctx.getString(
+                            R.string.snack_update_downloading,
+                            asset.sizeBytes.toDouble() / 1_048_576.0,
+                        ),
+                        withDismissAction = false,
+                        duration = SnackbarDuration.Indefinite,
+                    )
+                }
+            val dl =
+                try {
+                    UpdateInstaller.downloadApk(ctx, asset)
+                } finally {
+                    snackJob.cancel()
+                }
+            when (dl) {
+                is UpdateInstaller.State.ReadyToInstall -> {
+                    runCatching { UpdateInstaller.launchInstaller(ctx, dl.apk) }
+                        .onSuccess {
+                            // OS installer is now showing the "Update existing
+                            // app?" dialog — the user has clearly seen the
+                            // update, so drop the badge. Stale-but-cleared is
+                            // better than stuck-on after they cancel the OS
+                            // dialog; if they want it back, the version-button
+                            // tap re-checks fresh.
+                            UpdateInstaller.clearPendingUpdate()
+                        }.onFailure {
+                            snackbar.showSnackbar(
+                                ctx.getString(
+                                    R.string.snack_update_open_installer_failed,
+                                    it.message ?: "",
+                                ),
+                                withDismissAction = true,
+                            )
+                        }
+                }
 
-            else -> { /* unreachable for downloadApk's return type */ }
+                is UpdateInstaller.State.Failed -> {
+                    snackbar.showSnackbar(dl.reason, withDismissAction = true)
+                }
+
+                else -> { /* unreachable for downloadApk's return type */ }
+            }
+        } finally {
+            UpdateInstaller.releaseOffer()
         }
     }
 }

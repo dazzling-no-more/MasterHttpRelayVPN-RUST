@@ -173,6 +173,7 @@ fn main() -> eframe::Result<()> {
                 profiles_load_ok,
                 save_as_dialog: None,
                 manage_dialog: None,
+                auto_update_dispatched: false,
             }))
         }),
     )
@@ -233,6 +234,15 @@ struct UiState {
     /// probe, then the resolved outcome.
     last_update_check: Option<UpdateProbeState>,
     last_update_check_at: Option<Instant>,
+    /// Monotonic dispatch counter for `Cmd::CheckUpdate`. Bumped (under
+    /// the state lock) every time a check is dispatched; the spawned
+    /// task captures the value it was assigned and discards its own
+    /// result if a newer check has been dispatched since. Without this,
+    /// the slow startup auto-check (over the Direct route, sometimes
+    /// stalled by ISP-level GitHub blocks) can race a manual tunneled
+    /// re-check and overwrite a fresher UpdateAvailable with a stale
+    /// Offline/Error result.
+    update_check_seq: u64,
     /// Set while a download of a release asset is in flight. `None` when
     /// idle or after a completed download has been acknowledged.
     download_in_progress: bool,
@@ -339,9 +349,15 @@ enum Cmd {
     /// to the latest tag. Result is written to UiState::last_update_check.
     /// `route` controls whether the request goes direct or is tunnelled
     /// through our local HTTP proxy (useful when the user's ISP IP has
-    /// exhausted GitHub's unauthenticated rate limit).
+    /// exhausted GitHub's unauthenticated rate limit). `quiet` is true
+    /// for the once-per-process startup check: it skips the visible
+    /// "Checking for updates…" InFlight state and only publishes the
+    /// result to UI state when an update is actually available — mirrors
+    /// the Android `autoUpdateChecked` behavior. Manual taps set it to
+    /// false so the user sees full feedback (in-flight, then result).
     CheckUpdate {
         route: rahgozar::update_check::Route,
+        quiet: bool,
     },
     /// Download a release asset to ~/Downloads. Fires when the user clicks
     /// the "Download update" button after a successful CheckUpdate surfaces
@@ -393,6 +409,14 @@ struct App {
     save_as_dialog: Option<SaveAsState>,
     /// Modal state for the "Manage profiles" window.
     manage_dialog: Option<ManageState>,
+    /// One-shot guard for the silent update check we fire on the very
+    /// first `update()` call. Mirrors the Android `autoUpdateChecked`
+    /// rememberSaveable — silent if we're already on the latest tag,
+    /// surfaces the persistent "Update available" line + the gold dot
+    /// on the version label when a newer tag is published. Held on the
+    /// UI struct (not in `Shared`) because it's strictly a UI-thread
+    /// once-per-process flag — the bg thread doesn't need it.
+    auto_update_dispatched: bool,
 }
 
 #[derive(Default)]
@@ -1801,6 +1825,21 @@ impl eframe::App for App {
         }
         ctx.request_repaint_after(Duration::from_millis(500));
 
+        // One-shot silent update check on first frame. Mirrors the
+        // Android side: silent if we're already on latest, otherwise the
+        // result lands in `last_update_check` and drives the gold dot on
+        // the version label + the persistent "Install update" line
+        // below. Route is Direct on this first call (proxy isn't running
+        // yet at startup); the user's manual re-checks will pick up the
+        // tunneled route automatically.
+        if !self.auto_update_dispatched {
+            self.auto_update_dispatched = true;
+            let route = self.update_check_route();
+            // quiet=true: skip the "Checking…" line and only surface the
+            // result to UI state if it's UpdateAvailable. Mirrors Android.
+            let _ = self.cmd_tx.send(Cmd::CheckUpdate { route, quiet: true });
+        }
+
         // Drain a pending mode-switch revert signal. The background
         // thread sets this when `switch_mode` rejects the new config
         // (typically build_mode_state failing, e.g. DomainFronter::new
@@ -1829,6 +1868,21 @@ impl eframe::App for App {
 
             // ── Header row: project name, version (→ github), status pill ─
             let running = self.shared.state.lock().unwrap().running;
+            // Snapshot the latest-known available release (if any) so we can
+            // render a gold dot next to the version label whenever the
+            // auto-check or a manual check has surfaced an UpdateAvailable.
+            // The transient status line below already renders the "Install
+            // update" button — the dot is the persistent cue that survives
+            // the 10s TTL and tells the user "there's something pending".
+            let pending_latest: Option<String> = {
+                use rahgozar::update_check::UpdateCheck;
+                match &self.shared.state.lock().unwrap().last_update_check {
+                    Some(UpdateProbeState::Done(UpdateCheck::UpdateAvailable { latest, .. })) => {
+                        Some(latest.clone())
+                    }
+                    _ => None,
+                }
+            };
             ui.horizontal(|ui| {
                 ui.hyperlink_to(
                     egui::RichText::new("rahgozar").size(20.0).strong(),
@@ -1843,6 +1897,17 @@ impl eframe::App for App {
                         VERSION
                     ),
                 );
+                if let Some(latest) = pending_latest {
+                    ui.add_space(-4.0);
+                    ui.small(
+                        egui::RichText::new("●")
+                            .color(egui::Color32::from_rgb(220, 170, 80)),
+                    )
+                    .on_hover_text(format!(
+                        "Update v{} available — click 'Install update' below to install.",
+                        latest
+                    ));
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let (fill, dot, label) = if running {
                         (
@@ -3244,33 +3309,63 @@ impl eframe::App for App {
                          running version. When the proxy is running, the request is tunnelled \
                          through it — so GitHub sees an Apps Script IP instead of your ISP IP \
                          (different rate-limit bucket, and works even if GitHub is blocked on \
-                         your network). No background polling — only fires when you click."
+                         your network). A silent check also fires once on app launch; tap here \
+                         to re-check (e.g. after starting the proxy so the request can tunnel)."
                     )
                     .clicked()
                 {
                     let route = self.update_check_route();
-                    let _ = self.cmd_tx.send(Cmd::CheckUpdate { route });
+                    let _ = self.cmd_tx.send(Cmd::CheckUpdate {
+                        route,
+                        quiet: false,
+                    });
                 }
                 let _ = ACCENT_HOVER; // silence unused const warning if it occurs
             });
 
             // ── Transient status line ─────────────────────────────────────
-            // One compact line at most. Everything auto-hides after 10s so
-            // stale messages don't keep pushing the log panel off-screen.
-            // Priority: update-check in flight > fresh test msg > fresh CA
-            // result > update-check result. Old/expired entries are dropped.
+            // One compact line at most. Most rows auto-hide after 10s so
+            // stale messages don't keep pushing the log panel off-screen,
+            // but the update-related rows are sticky in specific ways:
+            //   - UpdateAvailable stays visible until the user installs
+            //   - A successful install staging stays until "Restart now"
+            // Priority (top wins): check in flight > install state >
+            // download state > test msg > CA trust > update-check result.
+            // Install/download in-flight or staged shadow the sticky
+            // UpdateAvailable offer so completed actions are visible
+            // instead of being hidden by the still-applicable offer.
+            // Fresh test / CA results outrank the sticky offer too — the
+            // user just clicked a button and wants to see the result; after
+            // their TTL expires, the offer reappears.
             const TRANSIENT_TTL: Duration = Duration::from_secs(10);
             let (test_msg_fresh, ca_trusted_fresh, update_check_fresh, download_fresh, install_fresh) = {
                 let s = self.shared.state.lock().unwrap();
+                // `UpdateAvailable` is sticky: the user needs the Install
+                // button to stay visible until they act on it, not just for
+                // 10s after the auto-check. UpToDate / Error / Offline still
+                // honour the TTL so they don't pin a stale message on screen.
+                let update_check_visible = match &s.last_update_check {
+                    Some(UpdateProbeState::InFlight) => true,
+                    Some(UpdateProbeState::Done(rahgozar::update_check::UpdateCheck::UpdateAvailable { .. })) => true,
+                    _ => s
+                        .last_update_check_at
+                        .map_or(false, |t| t.elapsed() < TRANSIENT_TTL),
+                };
                 (
                     s.last_test_msg_at
                         .map_or(false, |t| t.elapsed() < TRANSIENT_TTL),
                     s.ca_trusted_at
                         .map_or(false, |t| t.elapsed() < TRANSIENT_TTL),
-                    s.last_update_check_at
-                        .map_or(false, |t| t.elapsed() < TRANSIENT_TTL),
-                    s.last_download_at
-                        .map_or(false, |t| t.elapsed() < TRANSIENT_TTL),
+                    update_check_visible,
+                    // Mirror install_fresh: an in-flight download keeps the
+                    // download branch active even before `last_download_at`
+                    // gets stamped, so a download started while the sticky
+                    // UpdateAvailable row is showing has somewhere visible
+                    // to render its "Downloading…" indicator (without this,
+                    // it would fall back to the offer row underneath).
+                    s.download_in_progress
+                        || s.last_download_at
+                            .map_or(false, |t| t.elapsed() < TRANSIENT_TTL),
                     // Install state stays "fresh" for as long as a successful
                     // staging is parked — TTL only applies to errors. We need
                     // the "Restart now" button to remain visible until the
@@ -3292,90 +3387,14 @@ impl eframe::App for App {
                         .color(egui::Color32::GRAY),
                 );
                 shown_any = true;
-            } else if update_check_fresh {
-                let done = self.shared.state.lock().unwrap().last_update_check.clone();
-                if let Some(UpdateProbeState::Done(r)) = done {
-                    use rahgozar::update_check::UpdateCheck;
-                    let color = match &r {
-                        UpdateCheck::UpToDate { .. } => OK_GREEN,
-                        UpdateCheck::UpdateAvailable { .. } => {
-                            egui::Color32::from_rgb(220, 170, 80)
-                        }
-                        _ => ERR_RED,
-                    };
-                    ui.horizontal(|ui| {
-                        ui.small(egui::RichText::new(r.summary()).color(color));
-                        if let UpdateCheck::UpdateAvailable {
-                            release_url, asset, ..
-                        } = &r
-                        {
-                            ui.hyperlink_to("open release", release_url);
-                            if let Some(a) = asset {
-                                let (dl_in_flight, install_in_flight) = {
-                                    let s = self.shared.state.lock().unwrap();
-                                    (s.download_in_progress, s.install_in_progress)
-                                };
-                                if dl_in_flight {
-                                    ui.small(
-                                        egui::RichText::new("downloading…")
-                                            .color(egui::Color32::GRAY),
-                                    );
-                                } else if install_in_flight {
-                                    ui.small(
-                                        egui::RichText::new("installing…")
-                                            .color(egui::Color32::GRAY),
-                                    );
-                                } else {
-                                    // Primary action: Install (download + verify
-                                    // + extract + stage + restart). Secondary:
-                                    // plain download, for users who'd rather
-                                    // place the asset in Downloads and apply it
-                                    // by hand.
-                                    let install_btn = egui::Button::new(
-                                        egui::RichText::new(format!(
-                                            "⟳ Install update ({:.1} MB)",
-                                            a.size_bytes as f64 / 1_048_576.0
-                                        ))
-                                        .color(egui::Color32::WHITE),
-                                    )
-                                    .fill(ACCENT)
-                                    .rounding(4.0);
-                                    if ui.add(install_btn).clicked() {
-                                        let route = self.update_check_route();
-                                        let _ = self.cmd_tx.send(Cmd::InstallUpdate {
-                                            route,
-                                            url: a.download_url.clone(),
-                                            name: a.name.clone(),
-                                        });
-                                    }
-                                    if ui.small_button(format!(
-                                        "download only ({:.1} MB)",
-                                        a.size_bytes as f64 / 1_048_576.0
-                                    ))
-                                    .clicked()
-                                    {
-                                        let route = self.update_check_route();
-                                        let _ = self.cmd_tx.send(Cmd::DownloadUpdate {
-                                            route,
-                                            url: a.download_url.clone(),
-                                            name: a.name.clone(),
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    });
-                    shown_any = true;
-                }
-            } else if test_msg_fresh && !last_test_msg.is_empty() {
-                let color = if last_test_msg.starts_with("Test passed") {
-                    OK_GREEN
-                } else {
-                    ERR_RED
-                };
-                ui.small(egui::RichText::new(last_test_msg).color(color));
-                shown_any = true;
             } else if install_fresh {
+                // Install action shadows the sticky UpdateAvailable offer
+                // below: while installing, on success ("Update staged →
+                // Restart now"), or on a recent error, the user needs to
+                // see the install state — not the offer they already
+                // accepted. The offer row reappears automatically once
+                // an install error expires from the TTL and the user can
+                // try again.
                 let install_state = {
                     let s = self.shared.state.lock().unwrap();
                     (s.install_in_progress, s.last_install.clone())
@@ -3417,34 +3436,61 @@ impl eframe::App for App {
                 }
                 shown_any = true;
             } else if download_fresh {
-                let dl = self.shared.state.lock().unwrap().last_download.clone();
-                match dl {
-                    Some(Ok(path)) => {
-                        ui.horizontal(|ui| {
-                            ui.small(
-                                egui::RichText::new(format!("Downloaded → {}", path.display()))
+                // Same shadowing as install_fresh — keeps a completed
+                // "Downloaded → /path" line visible instead of the
+                // sticky offer hiding it. During an in-flight download
+                // we render "Downloading…" unconditionally so a stale
+                // prior `last_download` (within TTL of a re-download)
+                // doesn't show through.
+                let (in_progress, dl) = {
+                    let s = self.shared.state.lock().unwrap();
+                    (s.download_in_progress, s.last_download.clone())
+                };
+                if in_progress {
+                    ui.small(
+                        egui::RichText::new("Downloading…").color(egui::Color32::GRAY),
+                    );
+                } else {
+                    match dl {
+                        Some(Ok(path)) => {
+                            ui.horizontal(|ui| {
+                                ui.small(
+                                    egui::RichText::new(format!(
+                                        "Downloaded → {}",
+                                        path.display()
+                                    ))
                                     .color(OK_GREEN),
+                                );
+                                if ui.small_button("show in folder").clicked() {
+                                    reveal_in_file_manager(&path);
+                                }
+                            });
+                        }
+                        Some(Err(msg)) => {
+                            ui.small(
+                                egui::RichText::new(format!("Download failed: {}", msg))
+                                    .color(ERR_RED),
                             );
-                            if ui.small_button("show in folder").clicked() {
-                                reveal_in_file_manager(&path);
-                            }
-                        });
-                    }
-                    Some(Err(msg)) => {
-                        ui.small(
-                            egui::RichText::new(format!("Download failed: {}", msg))
-                                .color(ERR_RED),
-                        );
-                    }
-                    None => {
-                        ui.small(
-                            egui::RichText::new("Downloading…")
-                                .color(egui::Color32::GRAY),
-                        );
+                        }
+                        None => {}
                     }
                 }
                 shown_any = true;
+            } else if test_msg_fresh && !last_test_msg.is_empty() {
+                // Fresh direct-action feedback outranks the sticky
+                // UpdateAvailable offer below: the user just clicked Test
+                // and wants to see the result. After the 10s TTL it
+                // disappears and the offer reappears.
+                let color = if last_test_msg.starts_with("Test passed") {
+                    OK_GREEN
+                } else {
+                    ERR_RED
+                };
+                ui.small(egui::RichText::new(last_test_msg).color(color));
+                shown_any = true;
             } else if ca_trusted_fresh {
+                // Same reasoning as test_msg_fresh — fresh direct action
+                // wins over the sticky offer for the duration of its TTL.
                 match ca_trusted {
                     Some(true) => {
                         ui.small(
@@ -3463,6 +3509,71 @@ impl eframe::App for App {
                     None => {}
                 }
                 shown_any = true;
+            } else if update_check_fresh {
+                // Last in the chain because UpdateAvailable is sticky —
+                // it has no TTL and would otherwise indefinitely hide
+                // any transient direct-action feedback above it.
+                let done = self.shared.state.lock().unwrap().last_update_check.clone();
+                if let Some(UpdateProbeState::Done(r)) = done {
+                    use rahgozar::update_check::UpdateCheck;
+                    let color = match &r {
+                        UpdateCheck::UpToDate { .. } => OK_GREEN,
+                        UpdateCheck::UpdateAvailable { .. } => {
+                            egui::Color32::from_rgb(220, 170, 80)
+                        }
+                        _ => ERR_RED,
+                    };
+                    ui.horizontal(|ui| {
+                        ui.small(egui::RichText::new(r.summary()).color(color));
+                        if let UpdateCheck::UpdateAvailable {
+                            release_url, asset, ..
+                        } = &r
+                        {
+                            ui.hyperlink_to("open release", release_url);
+                            if let Some(a) = asset {
+                                // In-flight install/download states are
+                                // intercepted by the `install_fresh` /
+                                // `download_fresh` branches above; this
+                                // row only ever renders the action
+                                // buttons. Primary: Install (download +
+                                // verify + extract + stage + restart).
+                                // Secondary: plain download.
+                                let install_btn = egui::Button::new(
+                                    egui::RichText::new(format!(
+                                        "⟳ Install update ({:.1} MB)",
+                                        a.size_bytes as f64 / 1_048_576.0
+                                    ))
+                                    .color(egui::Color32::WHITE),
+                                )
+                                .fill(ACCENT)
+                                .rounding(4.0);
+                                if ui.add(install_btn).clicked() {
+                                    let route = self.update_check_route();
+                                    let _ = self.cmd_tx.send(Cmd::InstallUpdate {
+                                        route,
+                                        url: a.download_url.clone(),
+                                        name: a.name.clone(),
+                                    });
+                                }
+                                if ui
+                                    .small_button(format!(
+                                        "download only ({:.1} MB)",
+                                        a.size_bytes as f64 / 1_048_576.0
+                                    ))
+                                    .clicked()
+                                {
+                                    let route = self.update_check_route();
+                                    let _ = self.cmd_tx.send(Cmd::DownloadUpdate {
+                                        route,
+                                        url: a.download_url.clone(),
+                                        name: a.name.clone(),
+                                    });
+                                }
+                            }
+                        }
+                    });
+                    shown_any = true;
+                }
             }
             // Reserve a line of space even when empty so the log below doesn't
             // jump when a transient message appears / disappears.
@@ -4904,24 +5015,50 @@ fn background_thread(shared: Arc<Shared>, rx: Receiver<Cmd>) {
                     st.ca_trusted_at = Some(Instant::now());
                 });
             }
-            Ok(Cmd::CheckUpdate { route }) => {
+            Ok(Cmd::CheckUpdate { route, quiet }) => {
                 let shared2 = shared.clone();
-                {
+                // Bump the seq under the lock so that a manual check
+                // dispatched right after this auto-check captures a higher
+                // value — the older task's result is then dropped when it
+                // returns (could be much later if the Direct route is
+                // hanging on a GitHub block). Skip the visible InFlight
+                // state for quiet checks so the user doesn't see a
+                // "Checking…" flicker on every launch.
+                let my_seq = {
                     let mut st = shared2.state.lock().unwrap();
-                    st.last_update_check = Some(UpdateProbeState::InFlight);
-                    st.last_update_check_at = Some(Instant::now());
-                }
+                    st.update_check_seq = st.update_check_seq.wrapping_add(1);
+                    if !quiet {
+                        st.last_update_check = Some(UpdateProbeState::InFlight);
+                        st.last_update_check_at = Some(Instant::now());
+                    }
+                    st.update_check_seq
+                };
                 rt.spawn(async move {
                     let result = rahgozar::update_check::check(route).await;
                     push_log(
                         &shared2,
                         &format!("[ui] update check: {}", result.summary()),
                     );
-                    {
-                        let mut st = shared2.state.lock().unwrap();
-                        st.last_update_check = Some(UpdateProbeState::Done(result));
-                        st.last_update_check_at = Some(Instant::now());
+                    let mut st = shared2.state.lock().unwrap();
+                    // Drop our result if a newer check has been dispatched
+                    // since we started — even if we won the wall-clock
+                    // race, the newer dispatcher has a more up-to-date
+                    // route and the user has clearly moved on.
+                    if st.update_check_seq != my_seq {
+                        return;
                     }
+                    // Quiet checks only surface UpdateAvailable. UpToDate
+                    // / Error / Offline are logged above (single source
+                    // of truth for "what happened") but don't paint UI.
+                    let is_available = matches!(
+                        &result,
+                        rahgozar::update_check::UpdateCheck::UpdateAvailable { .. }
+                    );
+                    if quiet && !is_available {
+                        return;
+                    }
+                    st.last_update_check = Some(UpdateProbeState::Done(result));
+                    st.last_update_check_at = Some(Instant::now());
                 });
             }
             Ok(Cmd::DownloadUpdate { route, url, name }) => {
