@@ -23,12 +23,33 @@ use bytes::{Bytes, BytesMut};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot, Semaphore};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore, TryAcquireError};
 
 use crate::domain_fronter::{BatchOp, DomainFronter, FronterError, TunnelResponse};
 
 /// Apps Script allows 30 concurrent executions per account / deployment.
 const CONCURRENCY_PER_DEPLOYMENT: usize = 30;
+
+/// Idle long-polls are useful for push latency, but letting them occupy all
+/// 30 Apps Script executions makes real connect/upload batches wait behind
+/// empty polls. Cap pure-idle batches below the account limit so active
+/// traffic always has a few reserved slots.
+const RESERVED_ACTIVE_PER_DEPLOYMENT: usize = 6;
+const IDLE_CONCURRENCY_PER_DEPLOYMENT: usize =
+    CONCURRENCY_PER_DEPLOYMENT - RESERVED_ACTIVE_PER_DEPLOYMENT;
+
+/// Low-priority idle batches never queue on the total semaphore. They hold
+/// only their idle permit and periodically try the total pool, which keeps
+/// Tokio's fair semaphore queue available for active batches.
+///
+/// Trade-off: under sustained heavy active load that holds all 30 total
+/// permits for longer than `DomainFronter::batch_timeout()`, idle batches
+/// in this spin-loop will see their session-side `reply_rx` time out and
+/// reset the session. We accept that — the alternative (queuing idle
+/// batches on the fair semaphore queue) blocks active connect/upload work
+/// behind empty long-polls and is the bug this two-tier setup exists to
+/// avoid.
+const IDLE_BATCH_PERMIT_RETRY_MS: u64 = 25;
 
 /// Maximum total base64-encoded payload bytes in a single batch request.
 /// Apps Script accepts up to 50 MB per fetch, but the tunnel-node must
@@ -72,6 +93,31 @@ const INFLIGHT_ACTIVE: usize = 4;
 
 /// Max sessions that can run at elevated pipeline depth per deployment.
 const MAX_ELEVATED_PER_DEPLOYMENT: u64 = 30;
+
+/// Delay between poll refills while a session is active / optimistic.
+const ACTIVE_REFILL_DELAY_MS: u64 = 1000;
+
+/// After this many consecutive empty responses at idle depth, start leaving
+/// a gap with no outstanding long-poll. This trades server-push latency for
+/// Apps Script quota on sockets that have gone quiet.
+///
+/// Below this threshold `refill_delay` returns `Duration::ZERO`, so a
+/// returning empty long-poll is immediately replaced by another. The
+/// tunnel-node's 4s long-poll provides the natural cadence — zero-delay
+/// refill keeps freshly-idle sessions back-to-back-polled (good push
+/// latency for sessions likely to receive data soon) without spamming
+/// because the long-poll itself doesn't return for ~4 s. The pre-rewrite
+/// behavior added a 1 s gap here; we drop that gap until the ramp kicks
+/// in at `IDLE_REFILL_DELAY_START_EMPTY` empties.
+const IDLE_REFILL_DELAY_START_EMPTY: u32 = 4;
+
+/// Idle refill delay ramps by this amount every few empty responses.
+const IDLE_REFILL_DELAY_STEP_MS: u64 = 1000;
+
+/// Cap for the client-side no-poll gap on long-idle TCP sessions. With the
+/// tunnel-node's 4s long-poll, this cuts idle poll rate by more than half
+/// without making push-only sockets feel completely dead.
+const IDLE_REFILL_DELAY_MAX_MS: u64 = 7000;
 
 /// Capacity of the bounded MuxMsg channel between `TunnelMux::send_sync`
 /// and `mux_loop`. Sized for ~256 active-sending sessions at the per-
@@ -388,19 +434,21 @@ fn normalize_cache_host(host: &str) -> String {
 // Multiplexer
 // ---------------------------------------------------------------------------
 
-/// Reply payload for ops that go through `fire_batch`. The `String` is the
-/// `script_id` of the deployment that processed the batch — needed by
+/// Reply payload for ops that go through `fire_batch` — which is now
+/// every non-close op, including plain `Connect`. The `String` is the
+/// `script_id` of the deployment that processed the batch, needed by
 /// `tunnel_loop`'s legacy-detection and per-deployment skip-when-idle
-/// decisions, which can't reach `fire_batch`'s local `script_id` any
-/// other way. Plain `Connect` doesn't go through `fire_batch` and keeps
-/// the simpler reply type.
+/// decisions which can't reach `fire_batch`'s local `script_id` any
+/// other way. `connect_plain` ignores the script_id (`_script_id` in
+/// the destructure at `connect_plain`) since legacy detection happens
+/// only after the first data reply.
 type BatchedReply = oneshot::Sender<Result<(TunnelResponse, String), String>>;
 
 enum MuxMsg {
     Connect {
         host: String,
         port: u16,
-        reply: oneshot::Sender<Result<TunnelResponse, String>>,
+        reply: BatchedReply,
     },
     ConnectData {
         host: String,
@@ -453,6 +501,21 @@ struct PendingOp {
     encode_empty: bool,
     seq: Option<u64>,
     wseq: Option<u64>,
+}
+
+#[derive(Clone)]
+struct DeploymentSemaphores {
+    total: Arc<Semaphore>,
+    idle: Arc<Semaphore>,
+}
+
+impl DeploymentSemaphores {
+    fn new(total_permits: usize, idle_permits: usize) -> Self {
+        Self {
+            total: Arc::new(Semaphore::new(total_permits)),
+            idle: Arc::new(Semaphore::new(idle_permits)),
+        }
+    }
 }
 
 pub struct TunnelMux {
@@ -574,9 +637,11 @@ impl TunnelMux {
             );
         }
         tracing::info!(
-            "tunnel mux: {} deployment(s), {} concurrent per deployment",
+            "tunnel mux: {} deployment(s), {} concurrent per deployment ({} idle long-poll slots, {} active-reserved)",
             unique_n,
-            CONCURRENCY_PER_DEPLOYMENT
+            CONCURRENCY_PER_DEPLOYMENT,
+            IDLE_CONCURRENCY_PER_DEPLOYMENT,
+            RESERVED_ACTIVE_PER_DEPLOYMENT,
         );
         let step = if coalesce_step_ms > 0 {
             coalesce_step_ms
@@ -926,15 +991,20 @@ async fn mux_loop(
 ) {
     let coalesce_step = Duration::from_millis(coalesce_step_ms);
     let coalesce_max = Duration::from_millis(coalesce_max_ms);
-    // One semaphore per deployment ID, each allowing 30 concurrent requests.
-    let sems: Arc<HashMap<String, Arc<Semaphore>>> = Arc::new(
+    // One total semaphore per deployment ID (30 concurrent requests), plus
+    // one smaller idle-poll semaphore so pure empty long-polls cannot occupy
+    // every Apps Script execution slot for that account.
+    let sems: Arc<HashMap<String, DeploymentSemaphores>> = Arc::new(
         fronter
             .script_id_list()
             .iter()
             .map(|id| {
                 (
                     id.clone(),
-                    Arc::new(Semaphore::new(CONCURRENCY_PER_DEPLOYMENT)),
+                    DeploymentSemaphores::new(
+                        CONCURRENCY_PER_DEPLOYMENT,
+                        IDLE_CONCURRENCY_PER_DEPLOYMENT,
+                    ),
                 )
             })
             .collect(),
@@ -975,27 +1045,38 @@ async fn mux_loop(
             }
         }
 
-        // Split: plain connects go parallel, data-bearing ops get batched.
+        // All non-close ops (Connect, ConnectData, Data, UdpOpen, UdpData)
+        // share the batch accumulator and the per-deployment permit pool.
+        // Close ops have no reply channel — they're collected separately
+        // and appended to the trailing batch so they ride the same fetch.
         let mut accum = BatchAccum::new();
         let mut close_sids: Vec<String> = Vec::new();
 
         for msg in msgs {
             match msg {
                 MuxMsg::Connect { host, port, reply } => {
-                    let f = fronter.clone();
-                    tokio::spawn(async move {
-                        let result = f
-                            .tunnel_request("connect", Some(&host), Some(port), None, None)
-                            .await;
-                        match result {
-                            Ok(resp) => {
-                                let _ = reply.send(Ok(resp));
-                            }
-                            Err(e) => {
-                                let _ = reply.send(Err(format!("{}", e)));
-                            }
-                        }
-                    });
+                    // Plain connect (no first-payload data) is batched
+                    // alongside data ops. This adds up to `coalesce_max_ms`
+                    // of latency per new TCP, in exchange for sharing the
+                    // per-deployment permit pool with data ops instead of
+                    // spawning a free-floating fetch that bypassed the
+                    // semaphore entirely. `connect_data` (the bundled-
+                    // first-bytes variant SOCKS5+HTTPS callers prefer) was
+                    // always batched; only plain CONNECT is affected.
+                    // `encode_empty: false` is fine here — `encode_pending`
+                    // only honors that flag when `data.is_some()`, and a
+                    // connect op always carries `data: None`.
+                    let op = PendingOp {
+                        op: "connect",
+                        sid: None,
+                        host: Some(host),
+                        port: Some(port),
+                        data: None,
+                        encode_empty: false,
+                        seq: None,
+                        wseq: None,
+                    };
+                    accum.push_or_fire(op, 0, reply, &sems, &fronter).await;
                 }
                 MuxMsg::ConnectData {
                     host,
@@ -1134,7 +1215,7 @@ impl BatchAccum {
         op: PendingOp,
         op_bytes: usize,
         reply: BatchedReply,
-        sems: &Arc<HashMap<String, Arc<Semaphore>>>,
+        sems: &Arc<HashMap<String, DeploymentSemaphores>>,
         fronter: &Arc<DomainFronter>,
     ) {
         if should_fire(self.pending_ops.len(), self.payload_bytes, op_bytes) {
@@ -1173,6 +1254,88 @@ fn should_fire(pending_len: usize, payload_bytes: usize, op_bytes: usize) -> boo
     pending_len > 0
         && (pending_len >= MAX_BATCH_OPS
             || payload_bytes.saturating_add(op_bytes) > MAX_BATCH_PAYLOAD_BYTES)
+}
+
+fn is_idle_poll_batch(ops: &[PendingOp]) -> bool {
+    !ops.is_empty()
+        && ops
+            .iter()
+            .all(|op| matches!(op.op, "data" | "udp_data") && op.data.is_none())
+}
+
+/// True for the IDLE pipeline depth. Centralized so every site that
+/// branches on "is this session idle?" uses the same predicate — earlier
+/// drafts had `> INFLIGHT_IDLE` and `== INFLIGHT_IDLE` in adjacent blocks,
+/// which is correct today but silently diverges if `INFLIGHT_IDLE` ever
+/// stops being the smallest depth.
+fn is_idle_depth(max_inflight: usize) -> bool {
+    max_inflight == INFLIGHT_IDLE
+}
+
+/// Should an empty-poll refill be suppressed? Used in two refill arms in
+/// `tunnel_loop` — extracted so the predicate (and its threshold,
+/// `IDLE_REFILL_DELAY_START_EMPTY`) cannot drift between sites.
+///
+/// We suppress the refill on legacy-only deployments once an idle-depth
+/// session has accumulated `IDLE_REFILL_DELAY_START_EMPTY` empty replies,
+/// provided there's nothing else to send and the client socket is still
+/// open. On a legacy server the empty poll returns immediately and burns
+/// quota; on long-poll deployments it costs nothing, so the gate is
+/// scoped to `all_servers_legacy`.
+fn should_suppress_empty_refill(
+    has_buffered_upload: bool,
+    client_closed: bool,
+    max_inflight: usize,
+    consecutive_empty: u32,
+    all_servers_legacy: bool,
+) -> bool {
+    !has_buffered_upload
+        && !client_closed
+        && is_idle_depth(max_inflight)
+        && consecutive_empty >= IDLE_REFILL_DELAY_START_EMPTY
+        && all_servers_legacy
+}
+
+async fn acquire_total_permit(
+    sem: Arc<Semaphore>,
+    idle_batch: bool,
+) -> Result<OwnedSemaphorePermit, String> {
+    if !idle_batch {
+        return sem
+            .acquire_owned()
+            .await
+            .map_err(|_| "batch semaphore closed".to_string());
+    }
+
+    // Spin-poll instead of queuing on the fair semaphore queue. Each
+    // iteration clones the Arc so `try_acquire_owned` can consume it on
+    // success; the atomic bump at 25 ms cadence is negligible compared to
+    // any per-batch HTTP work and lets us reuse tokio's `Closed` detection
+    // instead of reimplementing it via `is_closed`. (We *must* call
+    // `try_acquire_owned` every iteration — short-circuiting on
+    // `available_permits() == 0` silently swallows `Closed` for a
+    // closed-but-empty semaphore and the loop sleeps forever.)
+    loop {
+        match Arc::clone(&sem).try_acquire_owned() {
+            Ok(p) => return Ok(p),
+            Err(TryAcquireError::NoPermits) => {
+                tokio::time::sleep(Duration::from_millis(IDLE_BATCH_PERMIT_RETRY_MS)).await;
+            }
+            Err(TryAcquireError::Closed) => return Err("batch semaphore closed".into()),
+        }
+    }
+}
+
+fn refill_delay(max_inflight: usize, consecutive_empty: u32) -> Duration {
+    if !is_idle_depth(max_inflight) {
+        return Duration::from_millis(ACTIVE_REFILL_DELAY_MS);
+    }
+    if consecutive_empty < IDLE_REFILL_DELAY_START_EMPTY {
+        return Duration::ZERO;
+    }
+    let empty_over = consecutive_empty - IDLE_REFILL_DELAY_START_EMPTY;
+    let ramp_steps = (empty_over / 4) as u64 + 1;
+    Duration::from_millis((ramp_steps * IDLE_REFILL_DELAY_STEP_MS).min(IDLE_REFILL_DELAY_MAX_MS))
 }
 
 /// Exact base64-encoded length of `n` raw bytes (standard padding):
@@ -1218,7 +1381,7 @@ fn encode_pending(p: PendingOp) -> BatchOp {
 /// (empty polls). Sessions whose batch times out re-poll on the next
 /// tick — same recovery surface as pre-#1088.
 async fn fire_batch(
-    sems: &Arc<HashMap<String, Arc<Semaphore>>>,
+    sems: &Arc<HashMap<String, DeploymentSemaphores>>,
     fronter: &Arc<DomainFronter>,
     pending_ops: Vec<PendingOp>,
     data_replies: Vec<(usize, BatchedReply)>,
@@ -1233,14 +1396,41 @@ async fn fire_batch(
     // back-pressure on the upstream HTTP path comes from the spawned
     // tasks queuing on the semaphore, each holding only its own ops.
     let script_id = fronter.next_script_id();
-    let sem = sems
+    // `sems` is built from the exact list `next_script_id` rotates over
+    // (see `mux_loop`), so a miss here means the fronter's script-id set
+    // drifted out of sync with the semaphore map — a real bug, not a
+    // recoverable state. Falling back to a fresh isolated semaphore would
+    // silently drop per-deployment back-pressure.
+    let slots = sems
         .get(&script_id)
         .cloned()
-        .unwrap_or_else(|| Arc::new(Semaphore::new(CONCURRENCY_PER_DEPLOYMENT)));
+        .expect("script_id from fronter must be present in per-deployment semaphore map");
     let f = fronter.clone();
+    let idle_batch = is_idle_poll_batch(&pending_ops);
 
     tokio::spawn(async move {
-        let permit = sem.acquire_owned().await.unwrap();
+        let idle_permit = if idle_batch {
+            match slots.idle.clone().acquire_owned().await {
+                Ok(p) => Some(p),
+                Err(_) => {
+                    for (_, reply) in data_replies {
+                        let _ = reply.send(Err("idle semaphore closed".into()));
+                    }
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+        let permit = match acquire_total_permit(slots.total.clone(), idle_batch).await {
+            Ok(p) => p,
+            Err(e) => {
+                for (_, reply) in data_replies {
+                    let _ = reply.send(Err(e.clone()));
+                }
+                return;
+            }
+        };
         pipeline_debug::batch_acquire();
         struct BatchGuard;
         impl Drop for BatchGuard {
@@ -1248,8 +1438,13 @@ async fn fire_batch(
                 pipeline_debug::batch_release();
             }
         }
+        // Hold both permits (and the metrics guard) alive until this task
+        // ends so the deployment slots stay reserved for the entire batch
+        // round-trip. `_idle_permit` shadows an `Option`; for active
+        // batches it is `None` and a no-op at drop.
         let _batch_guard = BatchGuard;
         let _permit = permit;
+        let _idle_permit = idle_permit;
         let t0 = std::time::Instant::now();
         let n_ops = pending_ops.len();
 
@@ -1438,7 +1633,7 @@ pub async fn tunnel_connection(
     pipeline_debug::session_start(&sid);
 
     // Run the first-response write + tunnel_loop inside an async block so
-    // any io-error propagates via `?` without bypassing the Close below.
+    // any io-error propagates via `?` without bypassing the cleanup below.
     // We deliberately don't use a Drop guard for Close: a Drop impl can't
     // .await cleanly, and tokio::spawn from inside Drop is unreliable
     // during runtime shutdown. The explicit send below covers every
@@ -1453,21 +1648,28 @@ pub async fn tunnel_connection(
                         "tunnel session {}: bad base64 in connect_data response",
                         sid
                     );
-                    return Ok(());
+                    return Ok(TunnelEnd::NeedsClose);
                 }
             }
             if resp.eof.unwrap_or(false) {
-                return Ok(());
+                return Ok(TunnelEnd::RemoteEof);
             }
         }
         tunnel_loop(&mut sock, &sid, mux, pending_client_data).await
     }
     .await;
 
-    mux.send(MuxMsg::Close { sid: sid.clone() }).await;
+    if !matches!(result, Ok(TunnelEnd::RemoteEof)) {
+        mux.send(MuxMsg::Close { sid: sid.clone() }).await;
+    } else {
+        tracing::debug!(
+            "tunnel session {}: remote eof already reaped session; skipping close op",
+            sid
+        );
+    }
     pipeline_debug::session_end(&sid);
     tracing::info!("tunnel session {} closed for {}:{}", sid, host, port);
-    result
+    result.map(|_| ())
 }
 
 enum ConnectDataOutcome {
@@ -1488,7 +1690,7 @@ async fn connect_plain(host: &str, port: u16, mux: &Arc<TunnelMux>) -> std::io::
     .await;
 
     match reply_rx.await {
-        Ok(Ok(resp)) => {
+        Ok(Ok((resp, _script_id))) => {
             if let Some(ref e) = resp.e {
                 tracing::error!("tunnel connect error for {}:{}: {}", host, port, e);
                 // Only cache here: `resp.e` is the tunnel-node's own connect()
@@ -1630,12 +1832,22 @@ struct InflightMeta {
     send_at: Instant,
 }
 
+enum TunnelEnd {
+    /// The tunnel-node returned EOF in a data response. The node removes
+    /// the session in that same batch, so sending an extra `close` would
+    /// only burn one more Apps Script fetch.
+    RemoteEof,
+    /// The local client closed first or the tunnel ended on an error.
+    /// Send an explicit close so the tunnel-node can free resources now.
+    NeedsClose,
+}
+
 async fn tunnel_loop(
     sock: &mut TcpStream,
     sid: &str,
     mux: &Arc<TunnelMux>,
     pending_client_data: Option<Bytes>,
-) -> std::io::Result<()> {
+) -> std::io::Result<TunnelEnd> {
     let (mut reader, mut writer) = sock.split();
 
     let inflight_cap = INFLIGHT_ACTIVE;
@@ -1823,16 +2035,24 @@ async fn tunnel_loop(
     }
 
     // Timer for staggered refill polls — fires in the select, never blocks.
+    // Active sessions refill after a short fixed gap. Long-idle sessions
+    // gradually leave a larger no-poll gap after repeated empty replies to
+    // save Apps Script quota.
     let mut refill_at: Option<std::pin::Pin<Box<tokio::time::Sleep>>> = None;
-    let mut refill_steps: u32 = 0;
 
-    // Arm the refill timer if we still owe pre-fill slots. The select
-    // loop's refill arm already paces subsequent polls (100 ms steps,
-    // emit after 10 steps ≈ 1 s separation) — same cadence the old
-    // synchronous loop produced, just non-blocking.
+    // Arm the refill timer if we still owe pre-fill slots. We bootstrap
+    // with `ACTIVE_REFILL_DELAY_MS` (1 s) here because the session has
+    // just started — there is no `consecutive_empty` history yet. After
+    // the first reply lands, the reply arm and the refill arm both use
+    // `refill_delay(max_inflight, consecutive_empty)`: that returns
+    // `ACTIVE_REFILL_DELAY_MS` while max_inflight is non-idle, collapses
+    // to zero only at IDLE depth with `consecutive_empty < IDLE_REFILL_
+    // DELAY_START_EMPTY` (back-to-back long-polling), and then ramps to
+    // `IDLE_REFILL_DELAY_MAX_MS` under sustained idleness.
     if inflight.len() < max_inflight {
-        refill_at = Some(Box::pin(tokio::time::sleep(Duration::from_millis(100))));
-        refill_steps = 0;
+        refill_at = Some(Box::pin(tokio::time::sleep(Duration::from_millis(
+            ACTIVE_REFILL_DELAY_MS,
+        ))));
     }
 
     // Read buffer for client socket.
@@ -1878,12 +2098,14 @@ async fn tunnel_loop(
 
         // When inflight is empty and we haven't seen eof, read from
         // client or send an empty poll to keep the session alive.
-        if inflight.is_empty() && !eof_seen {
+        if inflight.is_empty() && !eof_seen && refill_at.is_none() {
             let all_legacy = mux.all_servers_legacy();
 
             // If all servers are legacy and we've had many consecutive
-            // empties, wait for client data before sending.
-            if all_legacy && consecutive_empty > 3 && !client_closed {
+            // empties, wait for client data before sending. Threshold
+            // shared with `should_suppress_empty_refill` so the two idle-
+            // gate sites stay in lockstep.
+            if all_legacy && consecutive_empty >= IDLE_REFILL_DELAY_START_EMPTY && !client_closed {
                 read_buf.reserve(65536);
                 match reader.read_buf(&mut read_buf).await {
                     Ok(0) => break,
@@ -1927,30 +2149,32 @@ async fn tunnel_loop(
         tokio::select! {
             biased;
 
-            // Refill timer: 100ms steps, send empty poll after 10 steps
-            // (1s) for batch separation.
+            // Refill timer: pace empty polls so idle sessions do not spin
+            // a new Apps Script batch immediately after every empty long-poll.
             _ = async { refill_at.as_mut().unwrap().await }, if refill_at.is_some() => {
                 refill_at = None;
                 if !eof_seen && inflight.len() < max_inflight {
-                    refill_steps += 1;
-
-                    if refill_steps >= 10 {
-                        // Check buffered upload first — merge into a data
-                        // op instead of sending an empty poll.
-                        if let Some(data) = buffered_upload.take() {
-                            let (meta, reply_rx) = send_data_op(sid, data, &mut next_send_seq, &mut next_data_write_seq, mux);
-                            inflight.push(wrap_reply(meta, reply_rx, reply_timeout));
-                        } else {
-                            let (meta, reply_rx) = send_empty_poll(sid, &mut next_send_seq, mux);
-                            inflight.push(wrap_reply(meta, reply_rx, reply_timeout));
-                        }
-                        refill_steps = 0;
-
-                        if inflight.len() < max_inflight && max_inflight > INFLIGHT_IDLE {
-                            refill_at = Some(Box::pin(tokio::time::sleep(Duration::from_millis(100))));
-                        }
+                    if should_suppress_empty_refill(
+                        buffered_upload.is_some(),
+                        client_closed,
+                        max_inflight,
+                        consecutive_empty,
+                        mux.all_servers_legacy(),
+                    ) {
+                        continue;
+                    }
+                    // Check buffered upload first — merge into a data op
+                    // instead of sending an empty poll.
+                    if let Some(data) = buffered_upload.take() {
+                        let (meta, reply_rx) = send_data_op(sid, data, &mut next_send_seq, &mut next_data_write_seq, mux);
+                        inflight.push(wrap_reply(meta, reply_rx, reply_timeout));
                     } else {
-                        refill_at = Some(Box::pin(tokio::time::sleep(Duration::from_millis(100))));
+                        let (meta, reply_rx) = send_empty_poll(sid, &mut next_send_seq, mux);
+                        inflight.push(wrap_reply(meta, reply_rx, reply_timeout));
+                    }
+
+                    if inflight.len() < max_inflight && !is_idle_depth(max_inflight) {
+                        refill_at = Some(Box::pin(tokio::time::sleep(refill_delay(max_inflight, consecutive_empty))));
                     }
                 }
             }
@@ -2104,7 +2328,7 @@ async fn tunnel_loop(
                         );
                         if resp_has_seq {
                             let prev = max_inflight;
-                            if consecutive_empty >= 2 && max_inflight > INFLIGHT_IDLE {
+                            if consecutive_empty >= 2 && !is_idle_depth(max_inflight) {
                                 max_inflight = INFLIGHT_IDLE.min(inflight_cap);
                                 if is_elevated {
                                     let n = mux.elevated_sessions.fetch_sub(1, Ordering::Relaxed);
@@ -2175,10 +2399,18 @@ async fn tunnel_loop(
                             && inflight.len() < max_inflight
                             && refill_at.is_none()
                         {
-                            refill_at = Some(Box::pin(tokio::time::sleep(
-                                if max_inflight > INFLIGHT_IDLE { Duration::from_millis(100) } else { Duration::ZERO }
-                            )));
-                            refill_steps = 0;
+                            if !should_suppress_empty_refill(
+                                buffered_upload.is_some(),
+                                client_closed,
+                                max_inflight,
+                                consecutive_empty,
+                                mux.all_servers_legacy(),
+                            ) {
+                                refill_at = Some(Box::pin(tokio::time::sleep(refill_delay(
+                                    max_inflight,
+                                    consecutive_empty,
+                                ))));
+                            }
                         }
                     }
                     ReplyOutcome::BatchErr(e) => {
@@ -2259,7 +2491,11 @@ async fn tunnel_loop(
         let n = mux.elevated_sessions.fetch_sub(1, Ordering::Relaxed);
         pipeline_debug::set_elevated(n.saturating_sub(1));
     }
-    Ok(())
+    Ok(if eof_seen {
+        TunnelEnd::RemoteEof
+    } else {
+        TunnelEnd::NeedsClose
+    })
 }
 
 enum WriteOutcome {
@@ -2644,8 +2880,16 @@ mod tests {
 
         // Build `sems` with one entry for the only deployment, capacity 1.
         let sem = Arc::new(Semaphore::new(1));
-        let sems: Arc<HashMap<String, Arc<Semaphore>>> =
-            Arc::new(std::iter::once(("X".to_string(), sem.clone())).collect());
+        let sems: Arc<HashMap<String, DeploymentSemaphores>> = Arc::new(
+            std::iter::once((
+                "X".to_string(),
+                DeploymentSemaphores {
+                    total: sem.clone(),
+                    idle: Arc::new(Semaphore::new(1)),
+                },
+            ))
+            .collect(),
+        );
 
         // Saturate by holding the sole permit forever.
         let hog_task = tokio::spawn({
@@ -3015,6 +3259,297 @@ mod tests {
         assert!(should_fire(10, MAX_BATCH_PAYLOAD_BYTES - 100, 101,));
         // Sum overflow well past the cap: fire.
         assert!(should_fire(10, MAX_BATCH_PAYLOAD_BYTES, 1,));
+    }
+
+    #[test]
+    fn idle_poll_batch_detection_only_matches_empty_polls() {
+        let poll = |op| PendingOp {
+            op,
+            sid: Some("sid".into()),
+            host: None,
+            port: None,
+            data: None,
+            encode_empty: false,
+            seq: Some(1),
+            wseq: None,
+        };
+        assert!(is_idle_poll_batch(&[poll("data")]));
+        assert!(is_idle_poll_batch(&[poll("data"), poll("udp_data")]));
+
+        let upload = PendingOp {
+            data: Some(Bytes::from_static(b"x")),
+            ..poll("data")
+        };
+        assert!(!is_idle_poll_batch(&[upload]));
+
+        let connect = PendingOp {
+            op: "connect",
+            sid: None,
+            host: Some("example.com".into()),
+            port: Some(443),
+            data: None,
+            encode_empty: false,
+            seq: None,
+            wseq: None,
+        };
+        assert!(!is_idle_poll_batch(&[connect]));
+        assert!(!is_idle_poll_batch(&[]));
+    }
+
+    #[test]
+    fn idle_refill_delay_ramps_after_repeated_empty_replies() {
+        assert_eq!(refill_delay(INFLIGHT_OPTIMIST, 99), Duration::from_secs(1));
+        assert_eq!(refill_delay(INFLIGHT_IDLE, 0), Duration::ZERO);
+        assert_eq!(refill_delay(INFLIGHT_IDLE, 3), Duration::ZERO);
+        assert_eq!(refill_delay(INFLIGHT_IDLE, 4), Duration::from_secs(1));
+        assert_eq!(refill_delay(INFLIGHT_IDLE, 8), Duration::from_secs(2));
+        assert_eq!(refill_delay(INFLIGHT_IDLE, 64), Duration::from_secs(7));
+    }
+
+    /// Sanity check on `is_idle_depth`: today `INFLIGHT_IDLE == 1`, but the
+    /// predicate is centralized precisely so the test catches a drift if
+    /// the constant ever moves.
+    #[test]
+    fn is_idle_depth_matches_only_inflight_idle() {
+        assert!(is_idle_depth(INFLIGHT_IDLE));
+        assert!(!is_idle_depth(INFLIGHT_OPTIMIST));
+        assert!(!is_idle_depth(INFLIGHT_ACTIVE));
+    }
+
+    /// Active-batch path goes through the fair semaphore queue.
+    #[tokio::test]
+    async fn acquire_total_permit_active_waits_on_fair_queue() {
+        let sem = Arc::new(Semaphore::new(1));
+        let permit = acquire_total_permit(sem.clone(), false)
+            .await
+            .expect("permit");
+        assert_eq!(sem.available_permits(), 0);
+        drop(permit);
+        assert_eq!(sem.available_permits(), 1);
+    }
+
+    /// Idle-batch path spin-polls and only succeeds once a permit is
+    /// released — never queues. Without the spin loop, idle batches would
+    /// occupy fair-queue slots that the next active arrival is entitled
+    /// to.
+    #[tokio::test]
+    async fn acquire_total_permit_idle_spins_until_permit_available() {
+        let sem = Arc::new(Semaphore::new(1));
+        let hog = sem.clone().acquire_owned().await.expect("hog permit");
+
+        let task_sem = sem.clone();
+        let task = tokio::spawn(async move { acquire_total_permit(task_sem, true).await });
+
+        // Give the task time to enter its first spin iteration. Two retry
+        // intervals is plenty.
+        tokio::time::sleep(Duration::from_millis(IDLE_BATCH_PERMIT_RETRY_MS * 2)).await;
+        assert!(
+            !task.is_finished(),
+            "idle batch must not acquire while total pool is saturated"
+        );
+
+        drop(hog);
+
+        // Bound: at most one full retry interval (plus scheduling slack)
+        // between release and acquisition.
+        let permit =
+            tokio::time::timeout(Duration::from_millis(IDLE_BATCH_PERMIT_RETRY_MS * 4), task)
+                .await
+                .expect("idle batch should acquire within one retry tick of release")
+                .expect("task panicked")
+                .expect("acquire result");
+        drop(permit);
+        assert_eq!(sem.available_permits(), 1);
+    }
+
+    /// Concurrency invariant: an active batch arriving *after* an idle
+    /// batch has started spinning still wins the next released permit,
+    /// because the idle batch is in a sleep loop and not on the fair
+    /// queue. This is the whole point of the two-tier design.
+    #[tokio::test]
+    async fn idle_batch_does_not_block_queued_active_batch() {
+        let sem = Arc::new(Semaphore::new(1));
+        let hog = sem.clone().acquire_owned().await.expect("hog permit");
+
+        let idle_sem = sem.clone();
+        let idle = tokio::spawn(async move { acquire_total_permit(idle_sem, true).await });
+
+        // Let the idle task fall into its sleep loop before the active
+        // arrival, so we know the active task is queued *after* it.
+        tokio::time::sleep(Duration::from_millis(IDLE_BATCH_PERMIT_RETRY_MS * 2)).await;
+
+        let active_sem = sem.clone();
+        let active = tokio::spawn(async move { acquire_total_permit(active_sem, false).await });
+
+        // Brief yield so the active task reaches its `acquire_owned().await`.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        drop(hog);
+
+        let active_permit = tokio::time::timeout(Duration::from_millis(100), active)
+            .await
+            .expect("active should acquire promptly after release")
+            .expect("task panicked")
+            .expect("acquire result");
+        assert!(
+            !idle.is_finished(),
+            "idle batch must not jump ahead of a queued active batch"
+        );
+
+        drop(active_permit);
+
+        let idle_permit =
+            tokio::time::timeout(Duration::from_millis(IDLE_BATCH_PERMIT_RETRY_MS * 4), idle)
+                .await
+                .expect("idle should acquire after active releases")
+                .expect("task panicked")
+                .expect("acquire result");
+        drop(idle_permit);
+    }
+
+    /// Closed semaphore surfaces as an `Err` through both paths instead of
+    /// hanging forever.
+    #[tokio::test]
+    async fn acquire_total_permit_surfaces_closed_semaphore() {
+        let sem = Arc::new(Semaphore::new(0));
+        sem.close();
+        assert!(acquire_total_permit(sem.clone(), false).await.is_err());
+        assert!(acquire_total_permit(sem, true).await.is_err());
+    }
+
+    /// Wire-shape regression for the new plain-CONNECT batching path. The
+    /// pre-batching code spawned a free-floating `tunnel_request("connect",
+    /// host, port, None, None)` — now plain Connect rides `BatchAccum` and
+    /// must encode as a `BatchOp { op: "connect", host, port, d: None }`.
+    /// If `encode_pending`'s `(data, encode_empty)` match arm ever decides
+    /// to emit `Some("")` for connect (e.g. by setting `encode_empty: true`
+    /// at the call site), tunnel-node sees the wrong shape — covered here
+    /// so the regression can't ship silently.
+    #[test]
+    fn encode_pending_connect_emits_no_data_field() {
+        let op = PendingOp {
+            op: "connect",
+            sid: None,
+            host: Some("api.example.com".into()),
+            port: Some(443),
+            data: None,
+            encode_empty: false,
+            seq: None,
+            wseq: None,
+        };
+        let b = encode_pending(op);
+        assert_eq!(b.op, "connect");
+        assert_eq!(b.sid, None);
+        assert_eq!(b.host, Some("api.example.com".into()));
+        assert_eq!(b.port, Some(443));
+        assert_eq!(
+            b.d, None,
+            "connect must serialize with no `d` field; an empty-string `d` \
+             would be interpreted by tunnel-node as a zero-byte upload"
+        );
+        assert_eq!(b.seq, None);
+        assert_eq!(b.wseq, None);
+    }
+
+    /// Happy-path regression for `connect_plain` against the batched
+    /// reply shape. Pre-batching the reply channel was
+    /// `oneshot::Sender<Result<TunnelResponse, String>>`; it is now the
+    /// `BatchedReply` tuple `(TunnelResponse, script_id)`. Without this
+    /// test the only coverage of `connect_plain`'s unwrap is the negative-
+    /// cache path which only exercises `Ok(Err(_))`. Server-speaks-first
+    /// ports (FTP/SMTP/IMAP) and the preread-timeout fallback both reach
+    /// `connect_plain` rather than `connect_data`, so a typo in the tuple
+    /// destructure here would break those flows silently.
+    #[tokio::test]
+    async fn connect_plain_unwraps_batched_reply_to_sid() {
+        let (mux, mut rx) = mux_for_test();
+        let mux_for_task = mux.clone();
+        let task =
+            tokio::spawn(async move { connect_plain("api.example.com", 443, &mux_for_task).await });
+
+        let msg = rx
+            .recv()
+            .await
+            .expect("connect_plain must enqueue a MuxMsg::Connect");
+        let (host, port, reply) = match msg {
+            MuxMsg::Connect { host, port, reply } => (host, port, reply),
+            other => panic!("expected Connect, got {:?}", std::mem::discriminant(&other)),
+        };
+        assert_eq!(host, "api.example.com");
+        assert_eq!(port, 443);
+
+        // Deliver the batched (TunnelResponse, script_id) reply shape.
+        let resp = TunnelResponse {
+            sid: Some("session-abc".into()),
+            d: None,
+            pkts: None,
+            eof: None,
+            e: None,
+            code: None,
+            seq: None,
+        };
+        let _ = reply.send(Ok((resp, "deployment-X".into())));
+
+        let sid = task
+            .await
+            .expect("connect_plain task")
+            .expect("connect_plain should succeed");
+        assert_eq!(sid, "session-abc");
+    }
+
+    /// `should_suppress_empty_refill` shapes the predicate for two
+    /// adjacent refill arms; the threshold lives in
+    /// `IDLE_REFILL_DELAY_START_EMPTY` rather than being open-coded as
+    /// `> 3`. Verify each gate triggers/clears independently so a future
+    /// refactor that drops one input doesn't quietly broaden the
+    /// suppression window.
+    #[test]
+    fn should_suppress_empty_refill_requires_every_gate() {
+        // All gates aligned for suppression.
+        assert!(should_suppress_empty_refill(
+            /* has_buffered_upload */ false,
+            /* client_closed */ false,
+            INFLIGHT_IDLE,
+            IDLE_REFILL_DELAY_START_EMPTY,
+            /* all_servers_legacy */ true,
+        ));
+
+        // Each gate breaks suppression on its own.
+        assert!(!should_suppress_empty_refill(
+            true,
+            false,
+            INFLIGHT_IDLE,
+            IDLE_REFILL_DELAY_START_EMPTY,
+            true
+        ));
+        assert!(!should_suppress_empty_refill(
+            false,
+            true,
+            INFLIGHT_IDLE,
+            IDLE_REFILL_DELAY_START_EMPTY,
+            true
+        ));
+        assert!(!should_suppress_empty_refill(
+            false,
+            false,
+            INFLIGHT_OPTIMIST,
+            IDLE_REFILL_DELAY_START_EMPTY,
+            true
+        ));
+        assert!(!should_suppress_empty_refill(
+            false,
+            false,
+            INFLIGHT_IDLE,
+            IDLE_REFILL_DELAY_START_EMPTY - 1,
+            true
+        ));
+        assert!(!should_suppress_empty_refill(
+            false,
+            false,
+            INFLIGHT_IDLE,
+            IDLE_REFILL_DELAY_START_EMPTY,
+            false
+        ));
     }
 
     /// Reply indices must point at the slot the op occupies *within its
