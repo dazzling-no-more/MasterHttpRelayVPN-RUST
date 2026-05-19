@@ -99,12 +99,12 @@ object CaInstall {
      * Downloads collection, so the user needs to navigate to
      * `Android/data/<pkg>/files/Download/` themselves.
      *
-     * Returns a human-readable location string ("Downloads/mhrv-ca.crt" or
+     * Returns a human-readable location string ("Downloads/rahgozar-ca.crt" or
      * the filesystem path) on success, null on failure.
      */
     fun saveToDownloads(
         ctx: Context,
-        displayName: String = "mhrv-ca.crt",
+        displayName: String = "rahgozar-ca.crt",
     ): String? {
         val der = readDer(ctx) ?: return null
         // Rewrap as PEM so users can open the file in a text editor and
@@ -147,7 +147,7 @@ object CaInstall {
                 }
             }
         // Delete any previous copy with the same name before inserting, so
-        // we don't accumulate `mhrv-ca (1).crt`, `mhrv-ca (2).crt` on repeat
+        // we don't accumulate `rahgozar-ca (1).crt`, `rahgozar-ca (2).crt` on repeat
         // installs (MediaStore appends suffixes instead of overwriting).
         try {
             val sel = "${MediaStore.MediaColumns.DISPLAY_NAME}=?"

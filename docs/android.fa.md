@@ -156,7 +156,7 @@ VpnService TUN  ──► tun2proxy (داخل فرایند)
 ۱. در برنامه روی **Install MITM certificate** بزنید.
 ۲. دیالوگ تأیید `fingerprint` گواهی را نشان می‌دهد. **Install** را بزنید.
 ۳. برنامه:
-   - یک نسخهٔ `PEM` در مسیر `Downloads/mhrv-ca.crt` ذخیره می‌کند
+   - یک نسخهٔ `PEM` در مسیر `Downloads/rahgozar-ca.crt` ذخیره می‌کند
    - برنامهٔ **Settings** اندروید را باز می‌کند
 ۴. **اگر قفل صفحه ندارید** — اندروید از شما می‌خواهد الان یکی تنظیم کنید. مجبورید. این الزام `OS` برای نصب هر گواهی کاربری است. بعد از نصب می‌توانید قفل را بردارید؛ گواهی معتبر می‌ماند.
 ۵. در `Settings`، روی **نوار جست‌وجو** بالا بزنید و `CA certificate` را تایپ کنید. نتیجه‌ای که **CA certificate** نوشته را باز کنید (یا روی بعضی `OEM`ها «Install CA certificate»).
@@ -166,7 +166,7 @@ VpnService TUN  ──► tun2proxy (داخل فرایند)
    دلیل اینکه می‌گوییم `search` کنید: مسیر منو روی Pixel / Samsung / Xiaomi / … کاملاً متفاوت است، ولی همه‌شان توی نتیجهٔ جست‌وجوی `CA certificate` پیدایش می‌کنند.
 
 ۶. اندروید هشدار می‌دهد **«Your network may be monitored by an unknown third party»**. ما هستیم. **Install anyway** بزنید.
-۷. **Downloads** را انتخاب کنید → روی `mhrv-ca.crt` بزنید. یک اسم دوستانه بدهید (یا پیش‌فرض را قبول کنید). **OK**.
+۷. **Downloads** را انتخاب کنید → روی `rahgozar-ca.crt` بزنید. یک اسم دوستانه بدهید (یا پیش‌فرض را قبول کنید). **OK**.
 ۸. به برنامهٔ `rahgozar` برگردید. یک `snackbar` پایین تأیید می‌کند **Certificate installed ✓** — برنامه با مقایسهٔ `fingerprint` در `AndroidCAStore` مطمئن می‌شود نصب شده.
 
    اگر گفت «not yet installed»، مرحلهٔ ۵ را دوباره انجام دهید.

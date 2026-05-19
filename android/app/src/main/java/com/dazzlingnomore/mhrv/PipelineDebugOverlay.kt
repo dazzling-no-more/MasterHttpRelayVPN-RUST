@@ -81,7 +81,7 @@ class PipelineDebugOverlay(
 
         val titleTv =
             TextView(context).apply {
-                text = "Pipeline Debug"
+                text = context.getString(R.string.debug_pipeline_title)
                 setTextColor(Color.argb(220, 100, 255, 100))
                 textSize = 11f
             }
@@ -231,8 +231,10 @@ class PipelineDebugOverlay(
                 val maxBatch = obj.optInt("max_batch_slots", 0)
 
                 val sessions = obj.optInt("active_sessions", 0)
-                tvElevated.text = "Sessions: $sessions  Elevated: $elevated / $maxElev"
-                tvBatches.text = "Batches: $batches / $maxBatch"
+                tvElevated.text =
+                    context.getString(R.string.debug_overlay_sessions_fmt, sessions, elevated, maxElev)
+                tvBatches.text =
+                    context.getString(R.string.debug_overlay_batches_fmt, batches, maxBatch)
 
                 val sessArr = obj.optJSONArray("sessions")
                 val sessLines =

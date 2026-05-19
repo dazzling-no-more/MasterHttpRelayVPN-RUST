@@ -105,14 +105,14 @@ fun ConfigSharingBar(
         ) {
             Icon(Icons.Default.ContentPaste, null, modifier = Modifier.size(18.dp))
             Spacer(Modifier.width(4.dp))
-            Text("Paste")
+            Text(stringResource(R.string.btn_paste))
         }
         OutlinedButton(
             onClick = {
                 val opts =
                     ScanOptions().apply {
                         setDesiredBarcodeFormats(ScanOptions.QR_CODE)
-                        setPrompt("Scan mhrv config QR code")
+                        setPrompt(ctx.getString(R.string.qr_scan_prompt))
                         setBeepEnabled(false)
                         setOrientationLocked(true)
                     }
@@ -153,12 +153,12 @@ fun ConfigSharingBar(
                     if (qrBitmap != null) {
                         Image(
                             bitmap = qrBitmap.asImageBitmap(),
-                            contentDescription = "QR code",
+                            contentDescription = stringResource(R.string.cd_qr_code),
                             modifier = Modifier.size(260.dp),
                         )
                     } else {
                         Text(
-                            "Config too large for QR code",
+                            stringResource(R.string.qr_config_too_large),
                             style = MaterialTheme.typography.bodySmall,
                         )
                     }
@@ -197,7 +197,7 @@ fun ConfigSharingBar(
                             // Save QR bitmap to cache dir and share both image + text.
                             val intent =
                                 if (qrBitmap != null) {
-                                    val file = java.io.File(ctx.cacheDir, "mhrv-config-qr.png")
+                                    val file = java.io.File(ctx.cacheDir, "rahgozar-config-qr.png")
                                     file.outputStream().use { qrBitmap.compress(Bitmap.CompressFormat.PNG, 100, it) }
                                     val uri =
                                         androidx.core.content.FileProvider.getUriForFile(
@@ -217,14 +217,19 @@ fun ConfigSharingBar(
                                         putExtra(android.content.Intent.EXTRA_TEXT, encoded)
                                     }
                                 }
-                            ctx.startActivity(android.content.Intent.createChooser(intent, "Share config"))
+                            ctx.startActivity(
+                                android.content.Intent.createChooser(
+                                    intent,
+                                    ctx.getString(R.string.share_config_chooser_title),
+                                ),
+                            )
                         }) {
                             Icon(Icons.Default.Share, null, modifier = Modifier.size(18.dp))
                             Spacer(Modifier.width(4.dp))
-                            Text("Share")
+                            Text(stringResource(R.string.btn_share))
                         }
                         TextButton(onClick = { showExportDialog = false }) {
-                            Text("Close")
+                            Text(stringResource(R.string.btn_close))
                         }
                     }
                 }
@@ -283,12 +288,12 @@ private fun ImportConfirmDialog(
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    "Importing routes your traffic through the deployment IDs in this config. Only import from trusted sources.",
+                    stringResource(R.string.dialog_import_warning_text),
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.error,
                 )
                 Text(
-                    "Mode: $modeLabel\nDeployments: ${ids.size}\n$preview",
+                    stringResource(R.string.dialog_import_summary_fmt, modeLabel, ids.size, preview),
                     style = MaterialTheme.typography.bodySmall,
                 )
                 Text(
@@ -298,7 +303,7 @@ private fun ImportConfirmDialog(
             }
         },
         confirmButton = {
-            TextButton(onClick = onConfirm) { Text("Import") }
+            TextButton(onClick = onConfirm) { Text(stringResource(R.string.btn_import)) }
         },
         dismissButton = {
             TextButton(onClick = onDismiss) { Text(stringResource(R.string.btn_cancel)) }

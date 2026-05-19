@@ -144,7 +144,7 @@ The proxy terminates TLS locally (re-encrypts before routing through Apps Script
 1. In the app, tap **Install MITM certificate**.
 2. The confirmation dialog shows the certificate fingerprint. Tap **Install**.
 3. The app:
-   - saves a PEM copy to `Downloads/mhrv-ca.crt`
+   - saves a PEM copy to `Downloads/rahgozar-ca.crt`
    - opens the Android **Settings** app
 4. **If you don't have a screen lock** — Android will prompt you to set one now. You have to. User CAs require it. You can remove it after install; the cert stays trusted.
 5. In Settings, tap the **search bar** at the top and type `CA certificate`. Open the result labelled **"CA certificate"** (or "Install CA certificate" on some OEMs).
@@ -154,7 +154,7 @@ The proxy terminates TLS locally (re-encrypts before routing through Apps Script
    Searching is more reliable than navigating menus: Pixel/Samsung/Xiaomi all bury CA install under different paths, but all of them index it under "CA certificate" in search.
 
 6. Android warns **"Your network may be monitored by an unknown third party"**. That's us. Tap **Install anyway**.
-7. Pick **Downloads** → tap **mhrv-ca.crt**. Give it a friendly name (or accept the default). Tap **OK**.
+7. Pick **Downloads** → tap **rahgozar-ca.crt**. Give it a friendly name (or accept the default). Tap **OK**.
 8. Switch back to the rahgozar app. A snackbar confirms **Certificate installed ✓** — the app verifies by fingerprint against `AndroidCAStore`.
 
    If it says "not yet installed", repeat step 5.

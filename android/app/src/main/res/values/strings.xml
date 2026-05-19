@@ -41,14 +41,65 @@
     <string name="mode_vpn_tun">VPN (TUN) — routes every app</string>
     <string name="mode_proxy_only">Proxy only — configure per-app</string>
 
+    <!-- Mode dropdown (apps_script / direct / full) -->
+    <string name="sec_mode">Mode</string>
+    <string name="mode_apps_script_label">Apps Script (MITM)</string>
+    <string name="mode_direct_label">Direct (no relay)</string>
+    <string name="mode_full_label">Full tunnel (no cert)</string>
+    <string name="help_mode_apps_script">Full DPI bypass through your deployed Apps Script relay.</string>
+    <string name="help_mode_direct">No Apps Script relay. Google traffic uses TLS-fragmentation direct dial (no MITM cert needed) and falls back to the SNI-rewrite tunnel if fragmentation can\'t beat your DPI. Useful as a bootstrap to open script.google.com and deploy Code.gs.</string>
+    <string name="help_mode_full">All traffic tunneled end-to-end through Apps Script + remote tunnel node. No certificate needed.</string>
+
+    <!-- Deployment URL list -->
+    <string name="field_deployment_url_index">#%1$d</string>
+    <string name="btn_add_url">+ Add</string>
+
+    <!-- SNI latency display -->
+    <string name="sni_latency_ms_fmt">%1$d ms</string>
+
+    <!-- Upstream SOCKS5 placeholder -->
+    <string name="placeholder_host_port">host:port</string>
+
+    <!-- Pipeline-debug stats card + system overlay -->
+    <string name="debug_pipeline_title">Pipeline Debug</string>
+    <string name="debug_elevated">Elevated</string>
+    <string name="debug_batches_inflight">Batches in-flight</string>
+    <string name="debug_events">Events</string>
+    <string name="debug_overlay_sessions_fmt">Sessions: %1$d  Elevated: %2$d / %3$d</string>
+    <string name="debug_overlay_batches_fmt">Batches: %1$d / %2$d</string>
+
+    <!-- App picker dialog -->
+    <string name="dialog_pick_apps_title_fmt">Pick apps (%1$d selected)</string>
+    <string name="field_search">Search</string>
+    <string name="checkbox_show_system_apps">Show system apps</string>
+
+    <!-- Config sharing: QR / paste / share / import -->
+    <string name="btn_paste">Paste</string>
+    <string name="qr_scan_prompt">Scan rahgozar config QR code</string>
+    <string name="cd_qr_code">QR code</string>
+    <string name="qr_config_too_large">Config too large for QR code</string>
+    <string name="dialog_import_warning_text">Importing routes your traffic through the deployment IDs in this config. Only import from trusted sources.</string>
+    <string name="dialog_import_summary_fmt">Mode: %1$s\nDeployments: %2$d\n%3$s</string>
+    <string name="btn_import">Import</string>
+    <string name="btn_share">Share</string>
+    <string name="share_config_chooser_title">Share config</string>
+
     <!-- App splitting -->
     <string name="split_all">All apps</string>
     <string name="split_only">Only selected apps</string>
     <string name="split_except">All except selected</string>
     <string name="split_pick_apps">Pick apps…</string>
 
-    <!-- Install dialog title -->
+    <!-- Install dialog title + body -->
     <string name="dialog_install_mitm_title">Install MITM certificate?</string>
+    <string name="dialog_install_mitm_body_1">rahgozar creates a local certificate authority so it can decrypt and re-encrypt HTTPS traffic before tunnelling it through the Apps Script relay. Without this CA installed as trusted, apps will show certificate errors.</string>
+    <string name="dialog_install_mitm_body_2">On Android 11+ the system removed the inline install path, so tapping Install will: (1) save a PEM copy to Downloads/rahgozar-ca.crt, (2) open the Settings app.\n\nInside Settings, tap the search bar and type \"CA certificate\". Open the result labelled \"CA certificate\" (NOT \"VPN &amp; app user certificate\" or \"Wi-Fi certificate\"). Pick rahgozar-ca.crt from Downloads when prompted. If you don\'t have a screen lock, Android will ask you to add one first — that\'s an OS requirement for installing any user CA.</string>
+    <string name="dialog_install_mitm_subject_fmt">Subject: %1$s</string>
+    <string name="dialog_install_mitm_subject_unknown">(unknown)</string>
+    <string name="dialog_install_mitm_cert_unavailable">Could not read the CA cert yet. Tap Start once so the proxy generates it, then come back.</string>
+    <string name="snack_ca_installed">Certificate installed ✓</string>
+    <string name="snack_ca_not_installed_with_path">Certificate not yet installed. Saved to %1$s. In Settings, search for \"CA certificate\" and install from there — NOT \"VPN &amp; app user certificate\" or \"Wi-Fi\".</string>
+    <string name="snack_ca_not_installed_retry">Certificate not yet installed. Tap Install again to retry.</string>
 
     <!-- Language toggle -->
     <string name="lang_toggle_cd">Switch language</string>
@@ -215,5 +266,5 @@
     <string name="fronting_edge_mismatch_warning">⚠ Only list domains you know are served by the same edge as the SNI above — a mismatch returns wrong-cert errors or a default page.</string>
 
     <!-- "How to use" guide body. Localized — FA copy lives in values-fa. -->
-    <string name="help_how_to_use">1. Paste one or more Apps Script deployment URLs (or bare IDs) and your auth_key.\n2. Tap Install MITM certificate. Confirm the dialog — the cert is saved to Downloads/mhrv-ca.crt and the Settings app opens. Use Settings\' search bar to find \"CA certificate\", tap that result (NOT \"VPN &amp; app user certificate\" or \"Wi-Fi\"), and pick mhrv-ca.crt from Downloads. You\'ll be asked to set a screen lock if you don\'t have one (Android requirement).\n3. Before tapping Start, expand \"SNI pool + tester\" and hit \"Test all\". If every entry times out, your google_ip is unreachable — replace it with one that resolves locally (e.g. `nslookup www.google.com` on any working device).\n4. Tap Start. Accept the VPN prompt. The full TUN bridge routes every app on the device through the proxy — no per-app setup needed.\n5. If Chrome shows \"504 Relay timeout\": your Apps Script deployment isn\'t responding. Redeploy the script, grab the new /exec URL, and paste it above. Watch Live logs for \"Relay timeout\" vs \"connect:\" errors to tell which layer is failing.\n\nKnown limitation — Cloudflare Turnstile (\"Verify you are human\") will loop endlessly on most CF-protected sites. Every Apps Script request uses a rotating Google-datacenter egress IP + a fixed \"Google-Apps-Script\" User-Agent + a Google TLS fingerprint. The cf_clearance cookie is bound to the (IP, UA, JA3) tuple the challenge was solved against, so the NEXT request — from a different egress IP — gets re-challenged. Nothing in this app can fix that; it\'s inherent to Apps Script as a relay. Sites that only gate the initial page load (not every request) will work after one solve.</string>
+    <string name="help_how_to_use">1. Paste one or more Apps Script deployment URLs (or bare IDs) and your auth_key.\n2. Tap Install MITM certificate. Confirm the dialog — the cert is saved to Downloads/rahgozar-ca.crt and the Settings app opens. Use Settings\' search bar to find \"CA certificate\", tap that result (NOT \"VPN &amp; app user certificate\" or \"Wi-Fi\"), and pick rahgozar-ca.crt from Downloads. You\'ll be asked to set a screen lock if you don\'t have one (Android requirement).\n3. Before tapping Start, expand \"SNI pool + tester\" and hit \"Test all\". If every entry times out, your google_ip is unreachable — replace it with one that resolves locally (e.g. `nslookup www.google.com` on any working device).\n4. Tap Start. Accept the VPN prompt. The full TUN bridge routes every app on the device through the proxy — no per-app setup needed.\n5. If Chrome shows \"504 Relay timeout\": your Apps Script deployment isn\'t responding. Redeploy the script, grab the new /exec URL, and paste it above. Watch Live logs for \"Relay timeout\" vs \"connect:\" errors to tell which layer is failing.\n\nKnown limitation — Cloudflare Turnstile (\"Verify you are human\") will loop endlessly on most CF-protected sites. Every Apps Script request uses a rotating Google-datacenter egress IP + a fixed \"Google-Apps-Script\" User-Agent + a Google TLS fingerprint. The cf_clearance cookie is bound to the (IP, UA, JA3) tuple the challenge was solved against, so the NEXT request — from a different egress IP — gets re-challenged. Nothing in this app can fix that; it\'s inherent to Apps Script as a relay. Sites that only gate the initial page load (not every request) will work after one solve.</string>
 </resources>

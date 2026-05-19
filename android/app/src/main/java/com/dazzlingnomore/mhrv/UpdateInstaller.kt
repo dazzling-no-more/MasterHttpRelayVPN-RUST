@@ -114,7 +114,7 @@ object UpdateInstaller {
             .substringAfterLast('\\')
             .replace("..", "_")
             .replace(Regex("""[\p{Cntrl}]"""), "_")
-            .ifBlank { "mhrv-update.apk" }
+            .ifBlank { "rahgozar-update.apk" }
 
     /**
      * Parse the JSON `Native.checkUpdate()` returns into a `State`. Pure

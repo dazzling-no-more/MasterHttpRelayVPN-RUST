@@ -41,14 +41,65 @@
     <string name="mode_vpn_tun">VPN (TUN) — همهٔ برنامه‌ها رد می‌شوند</string>
     <string name="mode_proxy_only">فقط پروکسی — تنظیم per-app توسط کاربر</string>
 
+    <!-- Mode dropdown (apps_script / direct / full) -->
+    <string name="sec_mode">حالت</string>
+    <string name="mode_apps_script_label">Apps Script (MITM)</string>
+    <string name="mode_direct_label">مستقیم (بدون رله)</string>
+    <string name="mode_full_label">تونل کامل (بدون گواهی)</string>
+    <string name="help_mode_apps_script">دور زدن کامل DPI از طریق رلهٔ Apps Script که خودتان deploy کرده‌اید.</string>
+    <string name="help_mode_direct">بدون رلهٔ Apps Script. ترافیک گوگل از مسیر تماس مستقیم با تکه‌بندی TLS رد می‌شود (نیاز به گواهی MITM ندارد) و اگر تکه‌بندی نتواند DPI شما را رد کند به تونل SNI-rewrite برمی‌گردد. برای باز کردن script.google.com و deploy کردن Code.gs مفید است.</string>
+    <string name="help_mode_full">همهٔ ترافیک به‌صورت end-to-end از Apps Script + گرهٔ تونل از راه دور عبور می‌کند. به گواهی نیاز نیست.</string>
+
+    <!-- Deployment URL list -->
+    <string name="field_deployment_url_index">#%1$d</string>
+    <string name="btn_add_url">افزودن +</string>
+
+    <!-- SNI latency display -->
+    <string name="sni_latency_ms_fmt">%1$d میلی‌ثانیه</string>
+
+    <!-- Upstream SOCKS5 placeholder -->
+    <string name="placeholder_host_port">host:port</string>
+
+    <!-- Pipeline-debug stats card + system overlay -->
+    <string name="debug_pipeline_title">دیباگ خط لوله</string>
+    <string name="debug_elevated">ارتقایافته</string>
+    <string name="debug_batches_inflight">دسته‌های در حال پردازش</string>
+    <string name="debug_events">رویدادها</string>
+    <string name="debug_overlay_sessions_fmt">نشست: %1$d  ارتقا: %2$d / %3$d</string>
+    <string name="debug_overlay_batches_fmt">دسته‌ها: %1$d / %2$d</string>
+
+    <!-- App picker dialog -->
+    <string name="dialog_pick_apps_title_fmt">انتخاب برنامه‌ها (%1$d انتخاب شده)</string>
+    <string name="field_search">جست‌وجو</string>
+    <string name="checkbox_show_system_apps">نمایش برنامه‌های سیستمی</string>
+
+    <!-- Config sharing: QR / paste / share / import -->
+    <string name="btn_paste">جای‌گذاری</string>
+    <string name="qr_scan_prompt">اسکن کد QR پیکربندی rahgozar</string>
+    <string name="cd_qr_code">کد QR</string>
+    <string name="qr_config_too_large">پیکربندی برای کد QR بیش از حد بزرگ است</string>
+    <string name="dialog_import_warning_text">با ایمپورت، ترافیک شما از طریق شناسه‌های deployment داخل این پیکربندی رد می‌شود. فقط از منابع معتمد ایمپورت کنید.</string>
+    <string name="dialog_import_summary_fmt">حالت: %1$s\nDeployment ها: %2$d\n%3$s</string>
+    <string name="btn_import">ایمپورت</string>
+    <string name="btn_share">اشتراک‌گذاری</string>
+    <string name="share_config_chooser_title">اشتراک‌گذاری پیکربندی</string>
+
     <!-- App splitting -->
     <string name="split_all">همهٔ برنامه‌ها</string>
     <string name="split_only">فقط برنامه‌های انتخاب‌شده</string>
     <string name="split_except">همه به‌جز برنامه‌های انتخاب‌شده</string>
     <string name="split_pick_apps">انتخاب برنامه‌ها…</string>
 
-    <!-- Install dialog title -->
+    <!-- Install dialog title + body -->
     <string name="dialog_install_mitm_title">نصب گواهی MITM؟</string>
+    <string name="dialog_install_mitm_body_1">رهگذر یک مرجع گواهی محلی می‌سازد تا بتواند ترافیک HTTPS را قبل از عبور از رلهٔ Apps Script رمزگشایی و دوباره رمزنگاری کند. بدون نصب این CA به‌عنوان معتمد، برنامه‌ها خطای گواهی نشان می‌دهند.</string>
+    <string name="dialog_install_mitm_body_2">در اندروید ۱۱ به بالا، سیستم مسیر نصب درون‌برنامه‌ای را حذف کرده، پس با زدن «نصب»: (۱) یک نسخهٔ PEM در Downloads/rahgozar-ca.crt ذخیره می‌شود، (۲) برنامهٔ Settings باز می‌شود.\n\nداخل Settings، در نوار جست‌وجو «CA certificate» را تایپ کنید. روی نتیجهٔ با عنوان «CA certificate» بزنید (نه «VPN &amp; app user certificate» و نه «Wi-Fi certificate»). از Downloads فایل rahgozar-ca.crt را انتخاب کنید. اگر قفل صفحه ندارید، اندروید ابتدا از شما می‌خواهد یکی تنظیم کنید — این الزام سیستم برای نصب هر CA کاربر است.</string>
+    <string name="dialog_install_mitm_subject_fmt">موضوع: %1$s</string>
+    <string name="dialog_install_mitm_subject_unknown">(نامشخص)</string>
+    <string name="dialog_install_mitm_cert_unavailable">گواهی CA هنوز قابل خواندن نیست. یک بار «اتصال» را بزنید تا پروکسی آن را تولید کند، سپس برگردید.</string>
+    <string name="snack_ca_installed">گواهی نصب شد ✓</string>
+    <string name="snack_ca_not_installed_with_path">گواهی هنوز نصب نشده. در %1$s ذخیره شد. در Settings عبارت «CA certificate» را جست‌وجو کنید و از همان مسیر نصب کنید — نه «VPN &amp; app user certificate» و نه «Wi-Fi».</string>
+    <string name="snack_ca_not_installed_retry">گواهی هنوز نصب نشده. برای تلاش دوباره، «نصب» را بزنید.</string>
 
     <!-- Language toggle -->
     <string name="lang_toggle_cd">تغییر زبان</string>
@@ -90,6 +141,21 @@
 
     <!-- Live logs -->
     <string name="logs_lines_count">%1$d خط</string>
+
+    <!-- Config import/export -->
+    <string name="btn_import_clipboard">جای‌گذاری پیکربندی از کلیپ‌بورد</string>
+    <string name="btn_export_config">خروجی پیکربندی</string>
+    <string name="btn_export_qr">نمایش کد QR</string>
+    <string name="btn_scan_qr">اسکن کد QR</string>
+    <string name="btn_copy_hash">کپی در کلیپ‌بورد</string>
+    <string name="snack_config_imported">پیکربندی ایمپورت شد</string>
+    <string name="snack_config_copied">پیکربندی در کلیپ‌بورد کپی شد</string>
+    <string name="snack_invalid_config">پیکربندی نامعتبر در کلیپ‌بورد</string>
+    <string name="dialog_export_title">خروجی پیکربندی</string>
+    <string name="dialog_export_warning">این شامل auth_key شماست. فقط با افراد معتمد به اشتراک بگذارید.</string>
+    <string name="dialog_import_title">ایمپورت پیکربندی؟</string>
+    <string name="dialog_import_body">این جایگزین تنظیمات فعلی شما می‌شود.</string>
+    <string name="label_camera_permission">برای اسکن کد QR، دسترسی به دوربین لازم است</string>
 
     <!-- Snackbar -->
     <string name="snack_google_ip_updated">google_ip به %1$s به‌روزرسانی شد</string>
@@ -193,5 +259,5 @@
     <string name="fronting_edge_mismatch_warning">⚠ فقط دامنه‌هایی را وارد کن که می‌دانی روی همان edge SNI بالا میزبانی می‌شوند — در غیر این صورت خطای cert نادرست یا صفحهٔ پیش‌فرض دریافت می‌کنی.</string>
 
     <!-- "How to use" guide body. Localized — EN copy lives in values. -->
-    <string name="help_how_to_use">۱. یک یا چند آدرس deployment از Apps Script (یا فقط ID خام) و همراه آن auth_key خود را جای‌گذاری کنید.\n۲. روی «نصب گواهی MITM» بزنید و پیام تأیید را قبول کنید — گواهی در Downloads/mhrv-ca.crt ذخیره می‌شود و برنامهٔ Settings باز می‌شود. داخل Settings از نوار جست‌وجو «CA certificate» را پیدا کنید و روی همان نتیجه بزنید (نه «VPN &amp; app user certificate» و نه «Wi-Fi»)، سپس mhrv-ca.crt را از Downloads انتخاب کنید. اگر قفل صفحه ندارید، اندروید می‌خواهد یکی تنظیم کنید (الزام سیستم).\n۳. قبل از Start، بخش «مجموعهٔ SNI + تستر» را باز کنید و «تست همه» را بزنید. اگر همه تایم‌اوت شدند یعنی google_ip در دسترس نیست — آن را با یک IP جایگزین کنید که روی شبکهٔ سالم resolve می‌شود (مثلاً `nslookup www.google.com` روی هر دستگاه سالم).\n۴. Start را بزنید و درخواست VPN را تأیید کنید. پل TUN کامل، تمام برنامه‌های دستگاه را خودکار از پروکسی رد می‌کند — نیاز به تنظیم per-app نیست.\n۵. اگر Chrome پیام «504 Relay timeout» نشان داد: deployment شما پاسخ نمی‌دهد. اسکریپت را دوباره deploy کنید، URL جدید /exec را بگیرید و بالا جای‌گذاری کنید. در «لاگ زنده» ببینید خطا از نوع «Relay timeout» است یا «connect:» — نوع خطا مشخص می‌کند کدام لایه مقصر است.\n\nمحدودیت شناخته‌شده — Cloudflare Turnstile («Verify you are human») روی اکثر سایت‌های پشت Cloudflare به‌طور بی‌پایان loop می‌زند. هر درخواست Apps Script از یک IP خروجی چرخشی دیتاسنتر گوگل + یک User-Agent ثابت «Google-Apps-Script» + اثرانگشت TLS گوگل عبور می‌کند. کوکی cf_clearance به tuple (IP, UA, JA3) مربوط به زمان حل چالش گره خورده است، پس درخواست بعدی — از یک IP خروجی متفاوت — دوباره چالش می‌خورد. این مسئله در این برنامه قابل‌حل نیست؛ ذات رلهٔ Apps Script است. سایت‌هایی که فقط بارگذاری اولیه را gate می‌کنند (نه هر درخواست) بعد از یک بار حل، کار خواهند کرد.</string>
+    <string name="help_how_to_use">۱. یک یا چند آدرس deployment از Apps Script (یا فقط ID خام) و همراه آن auth_key خود را جای‌گذاری کنید.\n۲. روی «نصب گواهی MITM» بزنید و پیام تأیید را قبول کنید — گواهی در Downloads/rahgozar-ca.crt ذخیره می‌شود و برنامهٔ Settings باز می‌شود. داخل Settings از نوار جست‌وجو «CA certificate» را پیدا کنید و روی همان نتیجه بزنید (نه «VPN &amp; app user certificate» و نه «Wi-Fi»)، سپس rahgozar-ca.crt را از Downloads انتخاب کنید. اگر قفل صفحه ندارید، اندروید می‌خواهد یکی تنظیم کنید (الزام سیستم).\n۳. قبل از Start، بخش «مجموعهٔ SNI + تستر» را باز کنید و «تست همه» را بزنید. اگر همه تایم‌اوت شدند یعنی google_ip در دسترس نیست — آن را با یک IP جایگزین کنید که روی شبکهٔ سالم resolve می‌شود (مثلاً `nslookup www.google.com` روی هر دستگاه سالم).\n۴. Start را بزنید و درخواست VPN را تأیید کنید. پل TUN کامل، تمام برنامه‌های دستگاه را خودکار از پروکسی رد می‌کند — نیاز به تنظیم per-app نیست.\n۵. اگر Chrome پیام «504 Relay timeout» نشان داد: deployment شما پاسخ نمی‌دهد. اسکریپت را دوباره deploy کنید، URL جدید /exec را بگیرید و بالا جای‌گذاری کنید. در «لاگ زنده» ببینید خطا از نوع «Relay timeout» است یا «connect:» — نوع خطا مشخص می‌کند کدام لایه مقصر است.\n\nمحدودیت شناخته‌شده — Cloudflare Turnstile («Verify you are human») روی اکثر سایت‌های پشت Cloudflare به‌طور بی‌پایان loop می‌زند. هر درخواست Apps Script از یک IP خروجی چرخشی دیتاسنتر گوگل + یک User-Agent ثابت «Google-Apps-Script» + اثرانگشت TLS گوگل عبور می‌کند. کوکی cf_clearance به tuple (IP, UA, JA3) مربوط به زمان حل چالش گره خورده است، پس درخواست بعدی — از یک IP خروجی متفاوت — دوباره چالش می‌خورد. این مسئله در این برنامه قابل‌حل نیست؛ ذات رلهٔ Apps Script است. سایت‌هایی که فقط بارگذاری اولیه را gate می‌کنند (نه هر درخواست) بعد از یک بار حل، کار خواهند کرد.</string>
 </resources>

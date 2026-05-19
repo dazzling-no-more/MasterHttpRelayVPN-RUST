@@ -129,7 +129,7 @@ class MainActivity : AppCompatActivity() {
         // shim), so fingerprint verification is our ground truth.
         var pendingFingerprint by remember { mutableStateOf<ByteArray?>(null) }
         // Human-readable path where we saved the cert copy (e.g.
-        // "Downloads/mhrv-ca.crt"). Shown in the outcome snackbar so the
+        // "Downloads/rahgozar-ca.crt"). Shown in the outcome snackbar so the
         // user knows where to find it if they need to install manually
         // or share it.
         var pendingDownloadPath by remember { mutableStateOf<String?>(null) }

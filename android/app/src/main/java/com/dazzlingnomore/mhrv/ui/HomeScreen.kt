@@ -204,20 +204,14 @@ fun HomeScreen(
         val msg =
             when (o) {
                 is CaInstallOutcome.Installed -> {
-                    "Certificate installed ✓"
+                    ctx.getString(R.string.snack_ca_installed)
                 }
 
                 is CaInstallOutcome.NotInstalled -> {
-                    buildString {
-                        append("Certificate not yet installed.")
-                        if (!o.downloadPath.isNullOrBlank()) {
-                            append(" Saved to ${o.downloadPath}. ")
-                            append(
-                                "In Settings, search for \"CA certificate\" and install from there — NOT \"VPN & app user certificate\" or \"Wi-Fi\".",
-                            )
-                        } else {
-                            append(" Tap Install again to retry.")
-                        }
+                    if (!o.downloadPath.isNullOrBlank()) {
+                        ctx.getString(R.string.snack_ca_not_installed_with_path, o.downloadPath)
+                    } else {
+                        ctx.getString(R.string.snack_ca_not_installed_retry)
                     }
                 }
 
@@ -232,7 +226,7 @@ fun HomeScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("rahgozar") },
+                title = { Text(stringResource(R.string.app_name)) },
                 actions = {
                     // Language toggle — cycles AUTO → FA → EN → AUTO.
                     // Saving writes to config.json and triggers activity
@@ -385,7 +379,7 @@ fun HomeScreen(
                 onSnackbar = { snackbar.showSnackbar(it) },
             )
 
-            SectionHeader("Mode")
+            SectionHeader(stringResource(R.string.sec_mode))
             ModeDropdown(
                 mode = cfg.mode,
                 onChange = { persist(cfg.copy(mode = it)) },
@@ -752,25 +746,16 @@ fun HomeScreen(
             title = { Text(stringResource(R.string.dialog_install_mitm_title)) },
             text = {
                 Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(
-                        "rahgozar creates a local certificate authority so it can decrypt " +
-                            "and re-encrypt HTTPS traffic before tunnelling it through the Apps " +
-                            "Script relay. Without this CA installed as trusted, apps will show " +
-                            "certificate errors.",
-                    )
-                    Text(
-                        "On Android 11+ the system removed the inline install path, so " +
-                            "tapping Install will: (1) save a PEM copy to Downloads/mhrv-ca.crt, " +
-                            "(2) open the Settings app.\n\n" +
-                            "Inside Settings, tap the search bar and type \"CA certificate\". " +
-                            "Open the result labelled \"CA certificate\" (NOT \"VPN & app user " +
-                            "certificate\" or \"Wi-Fi certificate\"). Pick mhrv-ca.crt from " +
-                            "Downloads when prompted. If you don't have a screen lock, Android " +
-                            "will ask you to add one first — that's an OS requirement for " +
-                            "installing any user CA.",
-                    )
+                    Text(stringResource(R.string.dialog_install_mitm_body_1))
+                    Text(stringResource(R.string.dialog_install_mitm_body_2))
                     if (fp != null) {
-                        Text("Subject: ${cn ?: "(unknown)"}", style = MaterialTheme.typography.labelMedium)
+                        Text(
+                            stringResource(
+                                R.string.dialog_install_mitm_subject_fmt,
+                                cn ?: stringResource(R.string.dialog_install_mitm_subject_unknown),
+                            ),
+                            style = MaterialTheme.typography.labelMedium,
+                        )
                         Text(
                             text = "SHA-256: ${CaInstall.fingerprintHex(fp)}",
                             style = MaterialTheme.typography.labelSmall,
@@ -778,8 +763,7 @@ fun HomeScreen(
                         )
                     } else {
                         Text(
-                            "Could not read the CA cert yet. Tap Start once so the " +
-                                "proxy generates it, then come back.",
+                            stringResource(R.string.dialog_install_mitm_cert_unavailable),
                             color = MaterialTheme.colorScheme.error,
                         )
                     }
@@ -792,10 +776,12 @@ fun HomeScreen(
                         if (fp != null) onInstallCaConfirmed()
                     },
                     enabled = fp != null,
-                ) { Text("Install") }
+                ) { Text(stringResource(R.string.btn_install)) }
             },
             dismissButton = {
-                TextButton(onClick = { showInstallDialog = false }) { Text("Cancel") }
+                TextButton(onClick = { showInstallDialog = false }) {
+                    Text(stringResource(R.string.btn_cancel))
+                }
             },
         )
     }
@@ -1019,7 +1005,7 @@ private fun DeploymentIdsField(
                     modifier = Modifier.weight(1f),
                     singleLine = true,
                     textStyle = MaterialTheme.typography.bodySmall,
-                    label = { Text("#${index + 1}") },
+                    label = { Text(stringResource(R.string.field_deployment_url_index, index + 1)) },
                 )
                 IconButton(
                     onClick = {
@@ -1061,7 +1047,7 @@ private fun DeploymentIdsField(
                 enabled = enabled && newEntry.isNotBlank(),
                 contentPadding = PaddingValues(horizontal = 12.dp),
             ) {
-                Text("+ Add")
+                Text(stringResource(R.string.btn_add_url))
             }
         }
 
@@ -1083,9 +1069,9 @@ private fun ModeDropdown(
     mode: Mode,
     onChange: (Mode) -> Unit,
 ) {
-    val labelApps = "Apps Script (MITM)"
-    val labelDirect = "Direct (no relay)"
-    val labelFull = "Full tunnel (no cert)"
+    val labelApps = stringResource(R.string.mode_apps_script_label)
+    val labelDirect = stringResource(R.string.mode_direct_label)
+    val labelFull = stringResource(R.string.mode_full_label)
     val currentLabel =
         when (mode) {
             Mode.APPS_SCRIPT -> labelApps
@@ -1103,7 +1089,7 @@ private fun ModeDropdown(
                 value = currentLabel,
                 onValueChange = {},
                 readOnly = true,
-                label = { Text("Mode") },
+                label = { Text(stringResource(R.string.sec_mode)) },
                 trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
                 modifier = Modifier.fillMaxWidth().menuAnchor(),
             )
@@ -1137,17 +1123,9 @@ private fun ModeDropdown(
 
         val help =
             when (mode) {
-                Mode.APPS_SCRIPT -> {
-                    "Full DPI bypass through your deployed Apps Script relay."
-                }
-
-                Mode.DIRECT -> {
-                    "No Apps Script relay. Google traffic uses TLS-fragmentation direct dial (no MITM cert needed) and falls back to the SNI-rewrite tunnel if fragmentation can't beat your DPI. Useful as a bootstrap to open script.google.com and deploy Code.gs."
-                }
-
-                Mode.FULL -> {
-                    "All traffic tunneled end-to-end through Apps Script + remote tunnel node. No certificate needed."
-                }
+                Mode.APPS_SCRIPT -> stringResource(R.string.help_mode_apps_script)
+                Mode.DIRECT -> stringResource(R.string.help_mode_direct)
+                Mode.FULL -> stringResource(R.string.help_mode_full)
             }
         Text(
             help,
@@ -1367,7 +1345,10 @@ private fun ProbeBadge(state: ProbeState) {
                     modifier = Modifier.size(16.dp),
                 )
                 Spacer(Modifier.width(2.dp))
-                Text("${state.latencyMs} ms", style = MaterialTheme.typography.labelSmall)
+                Text(
+                    stringResource(R.string.sni_latency_ms_fmt, state.latencyMs),
+                    style = MaterialTheme.typography.labelSmall,
+                )
             }
         }
 
@@ -2158,7 +2139,7 @@ private fun AdvancedSettings(
             value = cfg.upstreamSocks5,
             onValueChange = { onChange(cfg.copy(upstreamSocks5 = it)) },
             label = { Text(stringResource(R.string.adv_upstream_socks5)) },
-            placeholder = { Text("host:port") },
+            placeholder = { Text(stringResource(R.string.placeholder_host_port)) },
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
             supportingText = {
@@ -2553,14 +2534,14 @@ private fun PipelineDebugCard() {
             verticalArrangement = Arrangement.spacedBy(4.dp),
         ) {
             Text(
-                "Pipeline Debug",
+                stringResource(R.string.debug_pipeline_title),
                 style = MaterialTheme.typography.titleSmall,
             )
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
-                Text("Elevated", style = MaterialTheme.typography.bodySmall)
+                Text(stringResource(R.string.debug_elevated), style = MaterialTheme.typography.bodySmall)
                 Text(
                     "$elevated / $maxElevated",
                     style = MaterialTheme.typography.bodySmall,
@@ -2571,7 +2552,7 @@ private fun PipelineDebugCard() {
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
-                Text("Batches in-flight", style = MaterialTheme.typography.bodySmall)
+                Text(stringResource(R.string.debug_batches_inflight), style = MaterialTheme.typography.bodySmall)
                 Text(
                     "$batches / $maxBatches",
                     style = MaterialTheme.typography.bodySmall,
@@ -2580,7 +2561,7 @@ private fun PipelineDebugCard() {
             }
             if (events.isNotEmpty()) {
                 Spacer(Modifier.height(4.dp))
-                Text("Events", style = MaterialTheme.typography.labelSmall)
+                Text(stringResource(R.string.debug_events), style = MaterialTheme.typography.labelSmall)
                 Box(
                     modifier =
                         Modifier
