@@ -14,6 +14,8 @@
 //! want a `Vec<u8>` back.
 
 use std::collections::HashMap;
+
+use arc_swap::ArcSwap;
 // AtomicU64 via portable-atomic: native on 64-bit / armv7, spinlock-
 // backed on mipsel (MIPS32 has no 64-bit atomic instructions). API
 // is identical to std::sync::atomic::AtomicU64 so call sites need
@@ -210,6 +212,15 @@ const BUFFERED_STITCH_MAX_BYTES: u64 = 64 * 1024 * 1024;
 struct PoolEntry {
     stream: PooledStream,
     created: Instant,
+    /// The `connect_host` snapshot this socket was opened against.
+    /// `run_ip_health` swaps `connect_host` to a fresh `Arc<String>`
+    /// when the active IP becomes unreachable; entries opened against
+    /// a prior snapshot are stale because they're still bound to the
+    /// old IP. `acquire` / `release` / `run_pool_refill` test
+    /// `Arc::ptr_eq` against the current snapshot and drop on
+    /// mismatch so the pool can't accumulate connections to a
+    /// just-swapped-out IP. The Arc clone is cheap (refcount bump).
+    host: Arc<String>,
 }
 
 /// Single shared HTTP/2 connection to the Google edge. One TCP/TLS
@@ -239,6 +250,15 @@ struct H2Cell {
     created: Instant,
     generation: u64,
     dead: Arc<AtomicBool>,
+    /// The `connect_host` snapshot the h2 connection was opened
+    /// against. Compared via `Arc::ptr_eq` against the live
+    /// `connect_host` on every cache read so a heartbeat swap that
+    /// landed in the window between "open completed → cell stored"
+    /// and "swap-path runs `*h2_cell = None`" can still be detected
+    /// — ensure_h2's reader paths reject the cached entry and
+    /// reopen against the new host. See `connect_host` doc-comment
+    /// for the rationale.
+    host: Arc<String>,
 }
 
 /// "Did this request reach Apps Script?" signal carried out of every
@@ -289,7 +309,23 @@ impl From<OpenH2Error> for FronterError {
 }
 
 pub struct DomainFronter {
-    connect_host: String,
+    /// Active Google front IP for TCP+TLS open. `ArcSwap` so the
+    /// background heartbeat loop (`run_ip_health`) can swap in a fresh
+    /// candidate when the current IP becomes unreachable, without
+    /// locking out the hot `open()` / `open_h2()` paths that read it
+    /// on every connection.
+    ///
+    /// Each swap installs a *fresh* `Arc<String>`. Code that needs to
+    /// detect "did the host change while I was opening?" captures
+    /// `Arc<String>` via `load_full()` before calling `open()` (or
+    /// receives it back from `open()` / `open_h2()`) and compares
+    /// pointer identity with `Arc::ptr_eq` against a later
+    /// `load_full()`. That gives a single atomic
+    /// "host-state-changed" signal — no separate generation counter,
+    /// no torn read between host and version. Pool entries also
+    /// carry their opening Arc so `acquire` / `release` /
+    /// `run_pool_refill` can drop stale connections.
+    connect_host: ArcSwap<String>,
     /// Pool of SNI domains to rotate through per outbound connection. All of
     /// them must be hosted on the same Google edge as `connect_host` (that's
     /// the whole point of domain fronting). Rotating across several of them
@@ -311,6 +347,14 @@ pub struct DomainFronter {
     /// response cache isn't busted by the constantly-changing `features`
     /// / `fieldToggles` params.
     normalize_x_graphql: bool,
+    /// Opt-in: allow `br` / `zstd` in the outbound `Accept-Encoding`
+    /// forwarded to destinations through Apps Script, and decode such
+    /// bodies on the way back. When `false` (the historical default),
+    /// `filter_forwarded_headers` strips br/zstd from client
+    /// `Accept-Encoding` so destinations only ever respond with
+    /// gzip/identity that `UrlFetchApp` auto-decodes. See
+    /// `Config::allow_brotli_zstd` for the full rationale.
+    allow_brotli_zstd: bool,
     /// Set once we've emitted the "UnknownIssuer means ISP MITM" hint,
     /// so we don't spam it every time a cert-validation error repeats.
     cert_hint_shown: std::sync::atomic::AtomicBool,
@@ -717,7 +761,7 @@ impl DomainFronter {
         let tls_connector_h1 = TlsConnector::from(Arc::new(tls_h1));
 
         Ok(Self {
-            connect_host: config.google_ip.clone(),
+            connect_host: ArcSwap::from_pointee(config.google_ip.clone()),
             sni_hosts: build_sni_pool_for(
                 &config.front_domain,
                 config.sni_hosts.as_deref().unwrap_or(&[]),
@@ -727,6 +771,7 @@ impl DomainFronter {
             auth_key: config.auth_key.clone(),
             parallel_relay: config.parallel_relay as usize,
             normalize_x_graphql: config.normalize_x_graphql,
+            allow_brotli_zstd: config.allow_brotli_zstd,
             cert_hint_shown: std::sync::atomic::AtomicBool::new(false),
             script_ids,
             script_idx: AtomicUsize::new(0),
@@ -1191,10 +1236,23 @@ impl DomainFronter {
         self.sni_hosts[i].clone()
     }
 
-    async fn open(&self) -> Result<PooledStream, FronterError> {
-        // Bounded TCP+TLS open. See `H1_OPEN_TIMEOUT_SECS`.
-        let work = async {
-            let tcp = TcpStream::connect((self.connect_host.as_str(), 443u16)).await?;
+    /// Open a TCP+TLS connection to the current `connect_host`.
+    /// Returns the stream plus the `Arc<String>` snapshot of the host
+    /// the connection was opened against — callers cache that
+    /// alongside the stream so `acquire` / `release` /
+    /// `run_pool_refill` can later detect "did `run_ip_health` swap
+    /// the host while we were opening?" via a single `Arc::ptr_eq`
+    /// check against the current snapshot. No separate generation
+    /// counter; the Arc identity is the version.
+    async fn open(&self) -> Result<(PooledStream, Arc<String>), FronterError> {
+        // Bounded TCP+TLS open. See `H1_OPEN_TIMEOUT_SECS`. Snapshot
+        // the host once at the top so the returned Arc is exactly the
+        // one the socket was opened against — even if `connect_host`
+        // swaps mid-connect, this Arc reflects the actual peer.
+        let host = self.connect_host.load_full();
+        let host_for_async = host.clone();
+        let work = async move {
+            let tcp = TcpStream::connect((host_for_async.as_str(), 443u16)).await?;
             let _ = tcp.set_nodelay(true);
             let sni = self.next_sni();
             let name = ServerName::try_from(sni)?;
@@ -1207,7 +1265,8 @@ impl DomainFronter {
             Ok::<_, FronterError>(tls)
         };
         match tokio::time::timeout(Duration::from_secs(H1_OPEN_TIMEOUT_SECS), work).await {
-            Ok(r) => r,
+            Ok(Ok(s)) => Ok((s, host)),
+            Ok(Err(e)) => Err(e),
             Err(_) => Err(FronterError::Relay(format!(
                 "h1 open timed out after {}s",
                 H1_OPEN_TIMEOUT_SECS
@@ -1252,13 +1311,21 @@ impl DomainFronter {
                 tokio::time::sleep(Duration::from_millis(500)).await;
             }
             match self.open().await {
-                Ok(s) => {
+                Ok((s, host)) => {
                     let entry = PoolEntry {
                         stream: s,
                         created: Instant::now() - Duration::from_secs(8 * i as u64),
+                        host,
                     };
                     let mut pool = self.pool.lock().await;
-                    if pool.len() < POOL_MAX {
+                    // Skip if a heartbeat swap landed during the open
+                    // — the freshly opened socket would target the
+                    // pre-swap IP. The pool was cleared by the swap;
+                    // pushing here would re-poison it.
+                    let current = self.connect_host.load_full();
+                    if !Arc::ptr_eq(&entry.host, &current) {
+                        tracing::debug!("pool warm: dropping post-swap stale connection");
+                    } else if pool.len() < POOL_MAX {
                         pool.push(entry);
                         warmed += 1;
                     }
@@ -1329,13 +1396,24 @@ impl DomainFronter {
                 if healthy >= target {
                     break;
                 }
+                // `open()` returns the `Arc<String>` snapshot the
+                // socket was opened against. Under the pool lock,
+                // compare it to the live `connect_host` — Arc
+                // pointer mismatch means `run_ip_health` swapped
+                // hosts during our open, so this socket would target
+                // a just-decommissioned IP. Drop it rather than
+                // poison the freshly-cleared pool with a stale entry.
                 match self.open().await {
-                    Ok(s) => {
+                    Ok((s, host)) => {
                         let mut pool = self.pool.lock().await;
-                        if pool.len() < POOL_MAX {
+                        let current = self.connect_host.load_full();
+                        if !Arc::ptr_eq(&host, &current) {
+                            tracing::debug!("pool refill: dropping post-swap stale connection");
+                        } else if pool.len() < POOL_MAX {
                             pool.push(PoolEntry {
                                 stream: s,
                                 created: Instant::now(),
+                                host,
                             });
                         }
                     }
@@ -1389,6 +1467,117 @@ impl DomainFronter {
             };
             tokio::time::sleep(Duration::from_secs(interval_secs)).await;
             self.probe_blacklisted_once().await;
+        }
+    }
+
+    /// Background heartbeat for the active Google front IP. Probes
+    /// `connect_host:443` on a fixed interval; after
+    /// `failure_threshold` consecutive failures, runs a fresh
+    /// `scan_ips::rescan_and_pick` and swaps `connect_host` to the
+    /// first reachable alternative. Existing pool entries are dropped
+    /// on swap so subsequent opens go to the new IP — in-flight
+    /// requests on already-open sockets continue against the old IP
+    /// and drain naturally.
+    ///
+    /// Returns immediately when the user has disabled the heartbeat
+    /// via `heartbeat_enabled = false`. The `config_for_rescan` clone
+    /// captures only the IP-scan-relevant fields at spawn time;
+    /// runtime config edits aren't picked up (mirrors `run_probe_loop`
+    /// /  `run_pool_refill` — config changes require a restart).
+    pub async fn run_ip_health(
+        self: Arc<Self>,
+        enabled: bool,
+        interval_secs: u64,
+        failure_threshold: u32,
+        config_for_rescan: Config,
+    ) {
+        if !enabled {
+            return;
+        }
+        let interval = Duration::from_secs(interval_secs.max(1));
+        // `heartbeat_failure_threshold = 0` would be surprising —
+        // "threshold zero" reads as "never trigger" to most users
+        // but the comparison would also be satisfied at the very
+        // first probe failure, rescanning on every blip. Clamp to 1
+        // and log so a config typo surfaces in the log instead of
+        // silently picking the most-aggressive behaviour.
+        let failure_threshold = if failure_threshold == 0 {
+            tracing::warn!(
+                "ip-health: heartbeat_failure_threshold=0 clamped to 1 (rescan on first probe failure)"
+            );
+            1
+        } else {
+            failure_threshold
+        };
+        let validation = config_for_rescan.google_ip_validation;
+        let verify_ssl = config_for_rescan.verify_ssl;
+        let mut consecutive_failures: u32 = 0;
+        loop {
+            tokio::time::sleep(interval).await;
+            let current = self.connect_host.load().to_string();
+            // Probe with the same SNI rotation pool real connections
+            // use, not `config.front_domain` alone. Users who override
+            // `sni_hosts` (e.g. dropping a blocked default) would
+            // otherwise see the heartbeat fail forever on an SNI the
+            // proxy never actually opens against, false-flagging a
+            // working IP and triggering pointless rescans.
+            let sni = self.next_sni();
+            let ok = crate::scan_ips::heartbeat_probe(&current, &sni, validation, verify_ssl).await;
+            if ok {
+                if consecutive_failures > 0 {
+                    tracing::info!("ip-health: {} recovered", current);
+                    consecutive_failures = 0;
+                }
+                continue;
+            }
+            consecutive_failures += 1;
+            tracing::warn!(
+                "ip-health: probe failed for {} ({}/{})",
+                current,
+                consecutive_failures,
+                failure_threshold
+            );
+            if consecutive_failures < failure_threshold {
+                continue;
+            }
+            tracing::warn!(
+                "ip-health: {} unreachable, rescanning for replacement",
+                current
+            );
+            // Rescan validates candidates against the relay's actual
+            // SNI rotation pool — see `rescan_and_pick` doc-comment
+            // for the why. Cloning lazily here (only on rescan
+            // trigger) keeps the common-case probe loop allocation-
+            // free.
+            let rescan_snis = self.sni_hosts.clone();
+            let picked = crate::scan_ips::rescan_and_pick(&config_for_rescan, &rescan_snis).await;
+            match picked {
+                Some(next) if next != current => {
+                    tracing::warn!("ip-health: swapping {} -> {}", current, next);
+                    // The atomic Arc swap is the single source of
+                    // truth: any subsequent `connect_host.load_full`
+                    // returns the new Arc, and any pool/cell entry
+                    // that captured the old Arc fails `Arc::ptr_eq`
+                    // against the new one. No separate generation
+                    // counter to keep coherent with the host. Clear
+                    // pool + h2 cell after the store so a concurrent
+                    // open that races the swap also lands the
+                    // ptr_eq-mismatch path under the pool / cell
+                    // lock.
+                    self.connect_host.store(Arc::new(next));
+                    self.pool.lock().await.clear();
+                    *self.h2_cell.lock().await = None;
+                    consecutive_failures = 0;
+                }
+                Some(_) => {
+                    tracing::warn!("ip-health: no alternative reachable, keeping {}", current);
+                    consecutive_failures = 0;
+                }
+                None => {
+                    tracing::error!("ip-health: rescan found zero reachable IPs");
+                    consecutive_failures = 0;
+                }
+            }
         }
     }
 
@@ -1550,10 +1739,17 @@ impl DomainFronter {
     }
 
     async fn acquire(&self) -> Result<PoolEntry, FronterError> {
+        // Evict expired AND stale-host entries, then hand out the
+        // freshest survivor. A heartbeat swap clears the pool, but a
+        // request that started on the old host could still release
+        // its entry afterwards — the host-Arc check rejects those
+        // before they're handed back to a new caller.
         {
             let mut pool = self.pool.lock().await;
-            // Evict expired, then hand out the freshest (most remaining TTL).
-            pool.retain(|e| e.created.elapsed().as_secs() < POOL_TTL_SECS);
+            let current = self.connect_host.load_full();
+            pool.retain(|e| {
+                e.created.elapsed().as_secs() < POOL_TTL_SECS && Arc::ptr_eq(&e.host, &current)
+            });
             if !pool.is_empty() {
                 // Freshest = smallest elapsed time. swap_remove is O(1).
                 let freshest = pool
@@ -1565,10 +1761,31 @@ impl DomainFronter {
                 return Ok(pool.swap_remove(freshest));
             }
         }
-        let stream = self.open().await?;
+        // Fall-through: no pooled entry, open a fresh one. Same
+        // ptr_eq check as `run_pool_refill` / `release`: if a swap
+        // landed during the open, the resulting socket targets the
+        // old IP. Retry exactly once with the new host (covers the
+        // common "swap-during-open" case) — if a second swap races
+        // in too, fall through to handing out the stale connection
+        // rather than spinning. The caller's response-parse error
+        // handling + h1-fallback path catches a connection that
+        // fails immediately.
+        let (stream, host) = self.open().await?;
+        let current = self.connect_host.load_full();
+        if Arc::ptr_eq(&host, &current) {
+            return Ok(PoolEntry {
+                stream,
+                created: Instant::now(),
+                host,
+            });
+        }
+        tracing::debug!("acquire: post-open swap detected, retrying open against new host");
+        drop(stream);
+        let (stream, host) = self.open().await?;
         Ok(PoolEntry {
             stream,
             created: Instant::now(),
+            host,
         })
     }
 
@@ -1577,6 +1794,16 @@ impl DomainFronter {
             return;
         }
         let mut pool = self.pool.lock().await;
+        // Reject entries whose host no longer matches the live
+        // snapshot — they were opened against an IP that
+        // `run_ip_health` has since swapped away from, and pushing
+        // them back into the pool would re-poison it with stale
+        // sockets after the swap-clear.
+        let current = self.connect_host.load_full();
+        if !Arc::ptr_eq(&entry.host, &current) {
+            tracing::debug!("pool release: dropping post-swap stale connection");
+            return;
+        }
         if pool.len() < POOL_MAX {
             pool.push(entry);
         }
@@ -1621,8 +1848,10 @@ impl DomainFronter {
         {
             let cell = self.h2_cell.lock().await;
             if let Some(c) = cell.as_ref() {
+                let current = self.connect_host.load_full();
                 if c.created.elapsed().as_secs() < H2_CONN_TTL_SECS
                     && !c.dead.load(Ordering::Relaxed)
+                    && Arc::ptr_eq(&c.host, &current)
                 {
                     return Some((c.send.clone(), c.generation));
                 }
@@ -1654,8 +1883,10 @@ impl DomainFronter {
         {
             let cell = self.h2_cell.lock().await;
             if let Some(c) = cell.as_ref() {
+                let current = self.connect_host.load_full();
                 if c.created.elapsed().as_secs() < H2_CONN_TTL_SECS
                     && !c.dead.load(Ordering::Relaxed)
+                    && Arc::ptr_eq(&c.host, &current)
                 {
                     return Some((c.send.clone(), c.generation));
                 }
@@ -1665,11 +1896,21 @@ impl DomainFronter {
         // Bounded handshake. A blackholed connect target can stall
         // for many seconds otherwise, eating the outer budget that
         // should be reserved for an h1 fallback round-trip.
+        //
+        // `open_h2` returns the `Arc<String>` snapshot of the host
+        // the connection was opened against. Before caching, we
+        // compare it against the *current* `connect_host` snapshot
+        // with `Arc::ptr_eq`. Mismatch means `run_ip_health` swapped
+        // hosts during the handshake; caching this `SendRequest`
+        // would pin subsequent requests to the dead IP. Hand it back
+        // to the caller anyway (one stray request against the old
+        // IP is strictly less bad than dropping a working connection
+        // outright; h1 fallback will recover if it fails).
         let open_result =
             tokio::time::timeout(Duration::from_secs(H2_OPEN_TIMEOUT_SECS), self.open_h2()).await;
 
-        let (send, dead) = match open_result {
-            Ok(Ok(pair)) => pair,
+        let (send, dead, host_used) = match open_result {
+            Ok(Ok(triple)) => triple,
             Ok(Err(OpenH2Error::AlpnRefused)) => {
                 // Definitive: this peer doesn't speak h2. Sticky-disable
                 // so we never re-attempt the handshake.
@@ -1700,11 +1941,18 @@ impl DomainFronter {
         let generation = self.h2_generation.fetch_add(1, Ordering::Relaxed) + 1;
         *self.h2_open_failed_at.lock().await = None;
         let mut cell = self.h2_cell.lock().await;
+        let host_now = self.connect_host.load_full();
+        if !Arc::ptr_eq(&host_used, &host_now) {
+            tracing::debug!("ensure_h2: refusing to cache post-swap stale connection");
+            *cell = None;
+            return Some((send, generation));
+        }
         *cell = Some(H2Cell {
             send: send.clone(),
             created: Instant::now(),
             generation,
             dead,
+            host: host_used,
         });
         Some((send, generation))
     }
@@ -1716,13 +1964,15 @@ impl DomainFronter {
     /// driver flips when the h2 `Connection` future ends.
     async fn open_h2(
         &self,
-    ) -> Result<(h2::client::SendRequest<Bytes>, Arc<AtomicBool>), OpenH2Error> {
-        let tcp = TcpStream::connect((self.connect_host.as_str(), 443u16)).await?;
+    ) -> Result<(h2::client::SendRequest<Bytes>, Arc<AtomicBool>, Arc<String>), OpenH2Error> {
+        let host = self.connect_host.load_full();
+        let tcp = TcpStream::connect((host.as_str(), 443u16)).await?;
         let _ = tcp.set_nodelay(true);
         let sni = self.next_sni();
         let name = ServerName::try_from(sni)?;
         let tls = self.tls_connector.connect(name, tcp).await?;
-        Self::h2_handshake_post_tls(tls).await
+        let (send, dead) = Self::h2_handshake_post_tls(tls).await?;
+        Ok((send, dead, host))
     }
 
     /// Post-TLS portion of the h2 open path: ALPN check + h2 handshake
@@ -2967,7 +3217,7 @@ impl DomainFronter {
                         status, body_txt
                     )));
                 }
-                return parse_relay_json(&resp_body).map_err(|e| {
+                return parse_relay_json(&resp_body, self.allow_brotli_zstd).map_err(|e| {
                     if let FronterError::Relay(ref msg) = e {
                         if let Some(cat) = classify_envelope_error(msg) {
                             self.blacklist_script(
@@ -3081,7 +3331,7 @@ impl DomainFronter {
                             status, body_txt
                         )));
                     }
-                    match parse_relay_json(&resp_body) {
+                    match parse_relay_json(&resp_body, self.allow_brotli_zstd) {
                         Ok(bytes) => Ok::<_, FronterError>((bytes, true)),
                         Err(e) => {
                             if let FronterError::Relay(ref msg) = e {
@@ -3181,7 +3431,7 @@ impl DomainFronter {
 
         // exit-node's JSON envelope: {s: u16, h: {...}, b: "<base64>"} on
         // success, {e: "..."} on its own internal error.
-        parse_exit_node_response(&app_body)
+        parse_exit_node_response(&app_body, self.allow_brotli_zstd)
     }
 
     /// Build the inner-layer payload that the exit node will execute.
@@ -3198,7 +3448,7 @@ impl DomainFronter {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Result<Vec<u8>, FronterError> {
-        let filtered = filter_forwarded_headers(headers);
+        let filtered = filter_forwarded_headers_with_brotli_zstd(headers, self.allow_brotli_zstd);
         let hmap = if filtered.is_empty() {
             None
         } else {
@@ -3373,7 +3623,7 @@ impl DomainFronter {
         headers: &[(String, String)],
         body: &[u8],
     ) -> Result<Vec<u8>, FronterError> {
-        let filtered = filter_forwarded_headers(headers);
+        let filtered = filter_forwarded_headers_with_brotli_zstd(headers, self.allow_brotli_zstd);
         let hmap = if filtered.is_empty() {
             None
         } else {
@@ -3758,8 +4008,12 @@ impl DomainFronter {
     }
 }
 
-/// Strip connection-specific headers (matches Code.gs SKIP_HEADERS) and
-/// strip Accept-Encoding: br (Apps Script can't decompress brotli).
+/// Strip connection-specific headers (matches Code.gs SKIP_HEADERS) and,
+/// by default, strip `br` / `zstd` from Accept-Encoding (Apps Script's
+/// `UrlFetchApp` auto-decompresses gzip but neither of those). Opt-in
+/// via `Config::allow_brotli_zstd` to let br/zstd flow through;
+/// `parse_relay_json` / `parse_exit_node_response` then decode the
+/// resulting bodies on the way back.
 /// Extract the host (no scheme, no port, no path) from a URL string.
 /// Returns None for malformed / scheme-less inputs.
 /// Trim X/Twitter GraphQL URLs down to just the `variables=` query param,
@@ -4504,7 +4758,7 @@ fn looks_like_exit_node_envelope(bytes: &[u8]) -> bool {
 /// We synthesize a complete HTTP/1.1 response from these fields so the
 /// MITM TLS write-back path sees the same shape it gets from the regular
 /// Apps Script relay (status line + headers + body).
-fn parse_exit_node_response(body: &[u8]) -> Result<Vec<u8>, FronterError> {
+fn parse_exit_node_response(body: &[u8], allow_brotli_zstd: bool) -> Result<Vec<u8>, FronterError> {
     // Defensive: if Apps Script accidentally prepends an HTTP-framing
     // prefix (status line + headers terminated by `\r\n\r\n`) before
     // the JSON envelope, skip past it before parsing. Normally Code.gs
@@ -4541,7 +4795,7 @@ fn parse_exit_node_response(body: &[u8]) -> Result<Vec<u8>, FronterError> {
         .map(|n| n as u16)
         .unwrap_or(502);
     let body_b64 = v.get("b").and_then(|x| x.as_str()).unwrap_or("");
-    let body_bytes = if body_b64.is_empty() {
+    let mut body_bytes = if body_b64.is_empty() {
         Vec::new()
     } else {
         B64.decode(body_b64).map_err(|e| {
@@ -4569,20 +4823,99 @@ fn parse_exit_node_response(body: &[u8]) -> Result<Vec<u8>, FronterError> {
         ));
     }
 
-    // Reconstruct headers. Skip hop-by-hop / would-double-up headers
-    // (Content-Length comes from our own length count below; the outer
-    // Apps Script transport already handled Transfer-Encoding/chunked).
-    const SKIP_RESPONSE_HEADERS: &[&str] = &[
+    // Mirror parse_relay_json's decode-or-preserve policy for
+    // Content-Encoding. Background: exit-node runtimes built on
+    // `fetch` (Deno Deploy, modern Cloudflare Workers, recent Node)
+    // auto-decompress gzip and brotli BUT NOT zstd — so a
+    // destination served zstd reaches the relay as raw zstd bytes
+    // with `Content-Encoding: zstd` intact. Stripping the header
+    // unconditionally (as the pre-v2.1 code did) then delivers raw
+    // zstd to the browser as plaintext, corrupting the page.
+    //
+    // The new logic:
+    //   - Single-token gzip / br / identity / no header → strip
+    //     (body is plain because the fetch runtime decoded it).
+    //   - Single-token zstd with `allow_brotli_zstd` on → try to
+    //     decode here; strip on success, preserve header on
+    //     failure (browser tries its own decoder, browser surfaces
+    //     a real error rather than rahgozar silently corrupting).
+    //   - Single-token br with `allow_brotli_zstd` on → same
+    //     try-decode-then-strip-or-preserve, in case a runtime
+    //     somewhere doesn't auto-decode br either.
+    //   - Anything else (multi-token chain, unknown encoding,
+    //     decode failure) → preserve, let the browser try.
+    //
+    // When `allow_brotli_zstd` is off, the inner-request filter
+    // strips `br`/`zstd` from outbound Accept-Encoding, so
+    // destinations only ever respond with gzip/identity and the
+    // historical "always strip" assumption holds for everything we
+    // see here.
+    // When `allow_brotli_zstd` is OFF we stay in legacy mode: the
+    // inner-request filter stripped br/zstd from outbound
+    // Accept-Encoding, so destinations only ever respond with
+    // gzip/identity, and fetch-based exit-node runtimes
+    // auto-decoded gzip server-side — the body reaching us is
+    // always plain. Strip Content-Encoding unconditionally, just
+    // like the pre-v2.1 code.
+    //
+    // When the flag is ON, br/zstd CAN reach us as raw bytes (some
+    // exit-node runtimes don't auto-decode zstd), so apply the same
+    // decode-or-preserve policy parse_relay_json uses.
+    let mut strip_content_encoding = true;
+    if allow_brotli_zstd && !body_bytes.is_empty() {
+        if let Some(headers_obj) = v.get("h").and_then(|x| x.as_object()) {
+            let enc_owned = headers_obj
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+                .and_then(|(_, val)| header_string_value(val));
+            if let Some(raw_enc) = enc_owned.as_deref() {
+                let tokens: Vec<String> = raw_enc
+                    .split(',')
+                    .map(|t| t.trim().to_ascii_lowercase())
+                    .filter(|t| !t.is_empty() && t != "identity")
+                    .collect();
+                if tokens.is_empty() {
+                    strip_content_encoding = true;
+                } else if tokens.len() == 1 {
+                    match tokens[0].as_str() {
+                        "gzip" => {
+                            // fetch runtime auto-decoded — body plain.
+                            strip_content_encoding = true;
+                        }
+                        "br" => match decode_brotli(&body_bytes) {
+                            Ok(d) => {
+                                body_bytes = d;
+                                strip_content_encoding = true;
+                            }
+                            Err(_) => {
+                                strip_content_encoding = false;
+                            }
+                        },
+                        "zstd" => match decode_zstd(&body_bytes) {
+                            Ok(d) => {
+                                body_bytes = d;
+                                strip_content_encoding = true;
+                            }
+                            Err(_) => {
+                                strip_content_encoding = false;
+                            }
+                        },
+                        _ => {
+                            strip_content_encoding = false;
+                        }
+                    }
+                } else {
+                    strip_content_encoding = false;
+                }
+            }
+        }
+    }
+
+    const BASE_SKIP_RESPONSE_HEADERS: &[&str] = &[
         "content-length",
         "transfer-encoding",
         "connection",
         "keep-alive",
-        // The exit node's fetch() auto-decompresses gzip/br/deflate, so
-        // the destination's Content-Encoding header is stale by the time
-        // it reaches us — forwarding it to the browser as-is causes
-        // ERR_CONTENT_DECODING_FAILED (the browser tries to decompress
-        // already-plain bytes). Matches the skip in parse_relay_json.
-        "content-encoding",
     ];
 
     let mut out = Vec::with_capacity(body_bytes.len() + 256);
@@ -4593,7 +4926,10 @@ fn parse_exit_node_response(body: &[u8]) -> Result<Vec<u8>, FronterError> {
     if let Some(headers_obj) = v.get("h").and_then(|x| x.as_object()) {
         for (k, v_val) in headers_obj {
             let lc = k.to_ascii_lowercase();
-            if SKIP_RESPONSE_HEADERS.contains(&lc.as_str()) {
+            if BASE_SKIP_RESPONSE_HEADERS.contains(&lc.as_str()) {
+                continue;
+            }
+            if lc == "content-encoding" && strip_content_encoding {
                 continue;
             }
             if let Some(val_str) = v_val.as_str() {
@@ -4976,7 +5312,22 @@ fn build_sni_pool(primary: &str) -> Vec<String> {
     build_sni_pool_for(primary, &[])
 }
 
+/// Back-compat facade for callers pinned to the pre-v2.1 signature.
+/// Equivalent to `filter_forwarded_headers_with_brotli_zstd(headers,
+/// false)`, i.e. the historical strip-br/zstd behaviour. Internal
+/// rahgozar code uses the `_with_brotli_zstd` variant directly so the
+/// `allow_brotli_zstd` config flag actually has effect; the public
+/// no-flag entry point is preserved purely so downstream crates
+/// linking against `rahgozar::domain_fronter::filter_forwarded_headers`
+/// don't break on this point release.
 pub fn filter_forwarded_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    filter_forwarded_headers_with_brotli_zstd(headers, false)
+}
+
+pub fn filter_forwarded_headers_with_brotli_zstd(
+    headers: &[(String, String)],
+    allow_brotli_zstd: bool,
+) -> Vec<(String, String)> {
     const SKIP: &[&str] = &[
         // Hop-by-hop / framing — must not be forwarded across the proxy.
         "host",
@@ -5016,6 +5367,13 @@ pub fn filter_forwarded_headers(headers: &[(String, String)]) -> Vec<(String, St
                 return None;
             }
             if lk == "accept-encoding" {
+                if allow_brotli_zstd {
+                    // User opted in: forward br/zstd through to the
+                    // destination. `parse_relay_json` decodes any
+                    // resulting encoded body before stripping the
+                    // `Content-Encoding` header for browser delivery.
+                    return Some((k.clone(), v.clone()));
+                }
                 let cleaned = strip_brotli_from_accept_encoding(v);
                 if cleaned.is_empty() {
                     return None;
@@ -5027,6 +5385,12 @@ pub fn filter_forwarded_headers(headers: &[(String, String)]) -> Vec<(String, St
         .collect()
 }
 
+/// Strip `br` and `zstd` from an `Accept-Encoding` header value.
+/// Name is historical (added when only brotli was in scope);
+/// implementation also drops `zstd` because `UrlFetchApp` doesn't
+/// auto-decompress that either — see `Config::allow_brotli_zstd`
+/// for the policy this enforces by default. q-values
+/// (`br;q=0.5`) are recognised and dropped along with their token.
 fn strip_brotli_from_accept_encoding(value: &str) -> String {
     let parts: Vec<&str> = value.split(',').map(str::trim).collect();
     let kept: Vec<&str> = parts
@@ -5042,6 +5406,36 @@ fn strip_brotli_from_accept_encoding(value: &str) -> String {
         })
         .collect();
     kept.join(", ")
+}
+
+/// Normalise an Apps Script JSON header value to its string form.
+///
+/// `getAllHeaders()` returns header values as either a plain string
+/// (the common case) or, for headers that appeared multiple times in
+/// the upstream response, a JSON array of strings. The historical
+/// header-handling paths in this module assumed string-only — array
+/// forms silently fell through, which is fine for headers we
+/// pass-through but catastrophic for `Content-Encoding` where the
+/// downstream code makes a strip-or-keep decision based on the
+/// recognised value.
+///
+/// Array values are joined with `", "` to mimic the comma-form
+/// fold-multi-value-headers convention; downstream tokenisers split
+/// on `','` anyway. `Null` / number / object / unparseable arrays
+/// return `None` (treated by callers as "header absent").
+fn header_string_value(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Array(arr) => {
+            let parts: Vec<&str> = arr.iter().filter_map(|item| item.as_str()).collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join(", "))
+            }
+        }
+        _ => None,
+    }
 }
 
 fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
@@ -5311,6 +5705,102 @@ fn decode_gzip(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
     Ok(out)
 }
 
+/// Hard cap on decompressed output for `decode_brotli` / `decode_zstd`.
+/// The inputs are origin-controlled bytes, so a tiny payload could in
+/// principle decode to many gigabytes (compression-bomb / zip-bomb
+/// pattern). Cap matches Apps Script's ~50 MB response ceiling so a
+/// legitimate body never trips it but a malicious bomb does. Hit on
+/// the cap is treated as a decode failure by callers, who deliver the
+/// raw bytes through with `Content-Encoding` preserved so the browser
+/// can decide what to do.
+const MAX_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Decode a `Content-Encoding: br` body. Pure-Rust via the `brotli`
+/// crate's `Decompressor` reader, bounded by `MAX_DECOMPRESSED_BYTES`
+/// so a compression-bomb upstream can't blow the relay's heap. Used
+/// only when `allow_brotli_zstd` is on — see
+/// [`Config::allow_brotli_zstd`] for the policy rationale.
+fn decode_brotli(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::Read;
+    let mut out = Vec::with_capacity(data.len() * 2);
+    brotli::Decompressor::new(data, 4096)
+        .take(MAX_DECOMPRESSED_BYTES + 1)
+        .read_to_end(&mut out)?;
+    if out.len() as u64 > MAX_DECOMPRESSED_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "brotli payload exceeds size cap",
+        ));
+    }
+    Ok(out)
+}
+
+/// Decode a `Content-Encoding: zstd` body, bounded by
+/// `MAX_DECOMPRESSED_BYTES` in two distinct ways:
+///
+/// 1. **Frame-header pre-check.** Zstd frames declare a *window
+///    size* and (optionally) a *content size*; `ruzstd` will
+///    allocate a decode buffer proportional to the declared window
+///    even before any output flows. A hostile origin can ship a tiny
+///    body that declares a multi-GiB window and force the decoder to
+///    pre-allocate huge buffers, defeating an output-side cap. We
+///    parse the frame header first, reject anything that declares a
+///    window or a content size larger than the cap, and only then
+///    hand the bytes to the streaming decoder.
+/// 2. **Output-side cap.** `.take(MAX+1)` on the streaming-decode
+///    read end so a frame that decodes to more than the cap (only
+///    possible if the declared window was below the cap but the
+///    actual payload still overruns) is rejected on the way out.
+///
+/// Used only when `allow_brotli_zstd` is on. See `decode_brotli` for
+/// the parallel bomb-defence on brotli.
+fn decode_zstd(data: &[u8]) -> Result<Vec<u8>, std::io::Error> {
+    use std::io::Read;
+    // Frame-header pre-check on a temporary cursor. The streaming
+    // decoder below re-parses the header itself from a fresh slice,
+    // so the cursor advance here is throwaway work.
+    let mut header_cursor = std::io::Cursor::new(data);
+    let (frame, _bytes_read) = ruzstd::frame::read_frame_header(&mut header_cursor)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}", e)))?;
+    let window_size = frame.header.window_size().map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("zstd window invalid: {:?}", e),
+        )
+    })?;
+    if window_size > MAX_DECOMPRESSED_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "zstd window exceeds size cap",
+        ));
+    }
+    // Declared content size is u64; the zstd format uses 0 as
+    // "unknown" when single_segment is not set, but a real
+    // single-segment frame with declared size 0 is a zero-byte
+    // payload and is harmless either way. A non-zero declaration
+    // above the cap is a clear bomb signal — reject.
+    let declared_content = frame.header.frame_content_size();
+    if declared_content > MAX_DECOMPRESSED_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "zstd declared content size exceeds cap",
+        ));
+    }
+    let decoder = ruzstd::StreamingDecoder::new(data)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{}", e)))?;
+    let mut out = Vec::with_capacity(data.len() * 2);
+    decoder
+        .take(MAX_DECOMPRESSED_BYTES + 1)
+        .read_to_end(&mut out)?;
+    if out.len() as u64 > MAX_DECOMPRESSED_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "zstd payload exceeds size cap",
+        ));
+    }
+    Ok(out)
+}
+
 fn find_double_crlf(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
@@ -5368,7 +5858,7 @@ fn is_h2_fronting_refusal_status(status: u16) -> bool {
 }
 
 /// Parse the JSON envelope from Apps Script and build a raw HTTP response.
-fn parse_relay_json(body: &[u8]) -> Result<Vec<u8>, FronterError> {
+fn parse_relay_json(body: &[u8], allow_brotli_zstd: bool) -> Result<Vec<u8>, FronterError> {
     let text = std::str::from_utf8(body)
         .map_err(|_| FronterError::BadResponse("non-utf8 json".into()))?
         .trim();
@@ -5426,28 +5916,128 @@ fn parse_relay_json(body: &[u8]) -> Result<Vec<u8>, FronterError> {
 
     let status = data.s.unwrap_or(200);
     let status_text = status_text(status);
-    let resp_body = match data.b {
+    let mut resp_body = match data.b {
         Some(b) => B64
             .decode(b)
             .map_err(|e| FronterError::BadResponse(format!("bad relay body base64: {}", e)))?,
         None => Vec::new(),
     };
 
+    // Decide whether to strip `Content-Encoding` from the response
+    // delivered to the browser, and decode brotli/zstd bodies when
+    // the user has opted in.
+    //
+    // The historical logic stripped `Content-Encoding` unconditionally
+    // because Apps Script's `UrlFetchApp` auto-decodes gzip
+    // server-side, so by the time bodies reach us they were always
+    // plain — leaving the header would have browsers retry
+    // decompression on plaintext and fail with
+    // `ERR_CONTENT_DECODING_FAILED`. That assumption holds only for
+    // gzip (and missing/identity headers). With `allow_brotli_zstd`
+    // we may now see real br/zstd bytes here, so the strip becomes
+    // conditional:
+    //
+    //   - Single-token `gzip` / `identity` / no header: strip (body
+    //     is plain because Apps Script auto-decoded or never encoded).
+    //   - Single-token `br` / `zstd` with the flag on and a
+    //     successful decode: strip (we just produced plain bytes).
+    //   - Anything else (decode failure, size-cap exceeded, multi-
+    //     token chain like `gzip, br` whose peel-order we can't
+    //     prove): keep `Content-Encoding` so the browser can try its
+    //     own decoders. Better an honest decode error than corrupted
+    //     bytes silently delivered.
+    let mut strip_content_encoding = true;
+    if !resp_body.is_empty() {
+        if let Some(hmap) = data.h.as_ref() {
+            // `getAllHeaders()` in Apps Script can serialise a
+            // repeated header either as a JSON string (single value
+            // or comma-joined) OR as a JSON array of strings. The
+            // historical code only matched the string form, which
+            // meant an array-form `content-encoding: ["br"]` was
+            // silently invisible: we wouldn't decode, but the BASE
+            // strip-list above would still strip the header,
+            // corrupting the body delivered to the browser. Normalise
+            // both shapes through `header_string_value` so the same
+            // decode-or-preserve decision logic below covers both.
+            let enc_owned = hmap
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case("content-encoding"))
+                .and_then(|(_, v)| header_string_value(v));
+            if let Some(raw_enc) = enc_owned.as_deref() {
+                let tokens: Vec<String> = raw_enc
+                    .split(',')
+                    .map(|t| t.trim().to_ascii_lowercase())
+                    .filter(|t| !t.is_empty() && t != "identity")
+                    .collect();
+                if tokens.is_empty() {
+                    // header was just "identity" or whitespace — body is plain.
+                    strip_content_encoding = true;
+                } else if tokens.len() == 1 {
+                    match tokens[0].as_str() {
+                        "gzip" => {
+                            // Apps Script auto-decoded; body is plain.
+                            strip_content_encoding = true;
+                        }
+                        "br" if allow_brotli_zstd => match decode_brotli(&resp_body) {
+                            Ok(d) => {
+                                resp_body = d;
+                                strip_content_encoding = true;
+                            }
+                            Err(_) => {
+                                strip_content_encoding = false;
+                            }
+                        },
+                        "zstd" if allow_brotli_zstd => match decode_zstd(&resp_body) {
+                            Ok(d) => {
+                                resp_body = d;
+                                strip_content_encoding = true;
+                            }
+                            Err(_) => {
+                                strip_content_encoding = false;
+                            }
+                        },
+                        _ => {
+                            // Unknown single-token encoding (e.g. "deflate"
+                            // — UrlFetchApp doesn't auto-decode that
+                            // either) or br/zstd with the flag off.
+                            // Pass the header through so the browser can
+                            // try.
+                            strip_content_encoding = false;
+                        }
+                    }
+                } else {
+                    // Multi-token chain (e.g. "gzip, br"). We don't
+                    // know which layer Apps Script peeled and which
+                    // it left, so don't guess — leave header intact.
+                    strip_content_encoding = false;
+                }
+            }
+        }
+    }
+
     let mut out = Vec::with_capacity(resp_body.len() + 256);
     out.extend_from_slice(format!("HTTP/1.1 {} {}\r\n", status, status_text).as_bytes());
 
-    const SKIP: &[&str] = &[
+    // `content-encoding` is conditionally stripped: when we just
+    // decoded the body, the header is stale and must go (otherwise
+    // browsers retry decoding plaintext and fail with
+    // `ERR_CONTENT_DECODING_FAILED`). When we did NOT decode — flag
+    // off, decode failed, or unrecognised encoding chain — keep the
+    // header so the browser can try its own decoders.
+    const BASE_SKIP: &[&str] = &[
         "transfer-encoding",
         "connection",
         "keep-alive",
         "content-length",
-        "content-encoding",
     ];
 
     if let Some(hmap) = data.h {
         for (k, v) in hmap {
             let lk = k.to_ascii_lowercase();
-            if SKIP.contains(&lk.as_str()) {
+            if BASE_SKIP.contains(&lk.as_str()) {
+                continue;
+            }
+            if lk == "content-encoding" && strip_content_encoding {
                 continue;
             }
             match v {
@@ -6224,7 +6814,8 @@ mod tests {
         // write-back path sees the same shape it gets from the regular
         // Apps Script relay.
         let envelope = br#"{"s":200,"h":{"content-type":"application/json","x-cf-cache":"DYNAMIC"},"b":"eyJtZXNzYWdlIjoiaGVsbG8ifQ=="}"#;
-        let raw = parse_exit_node_response(envelope).expect("envelope unwrap should succeed");
+        let raw =
+            parse_exit_node_response(envelope, false).expect("envelope unwrap should succeed");
         let raw_str = String::from_utf8_lossy(&raw);
         assert!(raw_str.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(raw_str.contains("content-type: application/json\r\n"));
@@ -6243,7 +6834,7 @@ mod tests {
         // tells the user what went wrong (placeholder PSK, bad URL,
         // unauthorized, etc.).
         let envelope = br#"{"e":"unauthorized"}"#;
-        let err = parse_exit_node_response(envelope).expect_err("must surface error");
+        let err = parse_exit_node_response(envelope, false).expect_err("must surface error");
         let msg = format!("{}", err);
         assert!(msg.contains("unauthorized"), "got: {}", msg);
         assert!(msg.contains("exit node"), "got: {}", msg);
@@ -6260,7 +6851,7 @@ mod tests {
         // before synthesising the HTTP response.
         let envelope =
             br#"{"s":200,"h":{"content-type":"text/html","content-encoding":"br","x-served-by":"edge-1"},"b":"PGgxPmhpPC9oMT4="}"#;
-        let raw = parse_exit_node_response(envelope)
+        let raw = parse_exit_node_response(envelope, false)
             .expect("envelope unwrap should succeed even with stale content-encoding");
         let raw_str = String::from_utf8_lossy(&raw);
         assert!(raw_str.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -6295,8 +6886,8 @@ mod tests {
             r#"{{"s":200,"h":{{"content-type":"application/json"}},"b":"{}"}}"#,
             inner_b64
         );
-        let err =
-            parse_exit_node_response(outer.as_bytes()).expect_err("double-wrap must be detected");
+        let err = parse_exit_node_response(outer.as_bytes(), false)
+            .expect_err("double-wrap must be detected");
         let msg = format!("{}", err);
         assert!(
             msg.contains("double-wrapped") && msg.contains("Code.gs"),
@@ -6317,9 +6908,77 @@ mod tests {
             r#"{{"s":200,"h":{{"content-type":"application/json"}},"b":"{}"}}"#,
             api_b64
         );
-        let raw = parse_exit_node_response(envelope.as_bytes())
+        let raw = parse_exit_node_response(envelope.as_bytes(), false)
             .expect("non-envelope JSON body must pass through unchanged");
         assert!(raw.ends_with(api_body));
+    }
+
+    #[test]
+    fn parse_exit_node_response_decodes_zstd_body_when_flag_on() {
+        // Regression guard for the dropped-decode bug: when the user
+        // has opted in to brotli/zstd, the inner-request filter
+        // forwards `Accept-Encoding: zstd` to destinations through
+        // the exit-node. fetch-based exit-node runtimes (Deno
+        // Deploy, Cloudflare Workers, Node) auto-decompress gzip
+        // and brotli but NOT zstd — so a zstd response from the
+        // destination reaches us as raw zstd bytes with
+        // `Content-Encoding: zstd` intact. The historical "always
+        // strip content-encoding" code would then deliver raw zstd
+        // to the browser as plaintext, corrupting the page.
+        //
+        // With the flag on, parse_exit_node_response must decode
+        // the zstd body and strip the now-stale Content-Encoding
+        // header — same decode-or-preserve policy parse_relay_json
+        // uses.
+        //
+        // Fixture: a minimal zstd frame for "hello zstd"
+        // (round-tripped through decode_zstd_roundtrip's fixture).
+        let frame = B64
+            .decode("KLUv/SAKUQAAaGVsbG8genN0ZA==")
+            .expect("known-good zstd frame base64");
+        let b64 = B64.encode(&frame);
+        let envelope = format!(
+            r#"{{"s":200,"h":{{"content-type":"text/plain","content-encoding":"zstd"}},"b":"{}"}}"#,
+            b64
+        );
+        let raw = parse_exit_node_response(envelope.as_bytes(), true)
+            .expect("exit-node envelope unwrap should decode zstd when flag is on");
+        let raw_str = String::from_utf8_lossy(&raw);
+        // Body must be the decoded plain text.
+        assert!(raw_str.ends_with("hello zstd"), "got: {}", raw_str);
+        // Stale content-encoding must be stripped after successful
+        // decode (so the browser doesn't try to decode plaintext
+        // and fail).
+        assert!(
+            !raw_str.to_ascii_lowercase().contains("content-encoding"),
+            "content-encoding must be stripped after exit-node zstd decode, got: {}",
+            raw_str
+        );
+    }
+
+    #[test]
+    fn parse_exit_node_response_preserves_zstd_header_when_flag_off() {
+        // Symmetric negative test: with the flag OFF, the inner
+        // request filter strips br/zstd from outbound
+        // Accept-Encoding, so destinations shouldn't return zstd in
+        // the first place. But if one slips through (or future
+        // exit-node runtime behaviour changes), the legacy "always
+        // strip" branch must not silently corrupt the body. The
+        // flag-off branch matches the historical pre-v2.1 behaviour
+        // (assume runtime decoded, strip header) — this test pins
+        // it so a refactor of the decode-or-preserve policy doesn't
+        // accidentally drift the legacy path.
+        let envelope = br#"{"s":200,"h":{"content-encoding":"zstd"},"b":"PGgxPmhpPC9oMT4="}"#;
+        let raw = parse_exit_node_response(envelope, false)
+            .expect("legacy mode must not error on zstd header");
+        let raw_str = String::from_utf8_lossy(&raw);
+        // Legacy: header stripped, body passed through (raw bytes).
+        // This is the historical behaviour the comment block above
+        // the new logic preserves.
+        assert!(
+            !raw_str.to_ascii_lowercase().contains("content-encoding"),
+            "legacy mode strips content-encoding unconditionally"
+        );
     }
 
     #[test]
@@ -6331,7 +6990,7 @@ mod tests {
         // anyway rather than failing with "not valid JSON".
         let prefixed = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n\
             {\"s\":200,\"h\":{\"content-type\":\"application/json\"},\"b\":\"eyJvayI6dHJ1ZX0=\"}";
-        let raw = parse_exit_node_response(prefixed)
+        let raw = parse_exit_node_response(prefixed, false)
             .expect("envelope unwrap should tolerate a leading HTTP framing prefix");
         let raw_str = String::from_utf8_lossy(&raw);
         assert!(raw_str.starts_with("HTTP/1.1 200 OK\r\n"));
@@ -6466,6 +7125,8 @@ mod tests {
             ("User-Agent".into(), "Mozilla/5.0".into()),
             ("Accept".into(), "text/html".into()),
         ];
+        // Use the back-compat single-arg facade — this test pins the
+        // behaviour external callers see at that signature.
         let out = filter_forwarded_headers(&input);
         let keys: Vec<String> = out.iter().map(|(k, _)| k.to_ascii_lowercase()).collect();
         // All identity-revealing headers must be dropped.
@@ -6606,6 +7267,253 @@ mod tests {
     }
 
     #[test]
+    fn filter_forwarded_headers_strips_brotli_when_flag_off() {
+        let input = vec![(
+            "Accept-Encoding".to_string(),
+            "gzip, deflate, br, zstd".to_string(),
+        )];
+        let out = filter_forwarded_headers_with_brotli_zstd(&input, false);
+        let ae = out
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
+            .expect("accept-encoding should survive the filter");
+        assert_eq!(ae.1, "gzip, deflate");
+    }
+
+    #[test]
+    fn filter_forwarded_headers_preserves_brotli_when_flag_on() {
+        let input = vec![(
+            "Accept-Encoding".to_string(),
+            "gzip, deflate, br, zstd".to_string(),
+        )];
+        let out = filter_forwarded_headers_with_brotli_zstd(&input, true);
+        let ae = out
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case("accept-encoding"))
+            .expect("accept-encoding should survive the filter");
+        assert_eq!(ae.1, "gzip, deflate, br, zstd");
+    }
+
+    #[test]
+    fn decode_brotli_roundtrip() {
+        use brotli::enc::BrotliEncoderParams;
+        let plain = b"hello brotli world hello brotli world";
+        let mut encoded = Vec::new();
+        let params = BrotliEncoderParams::default();
+        brotli::BrotliCompress(&mut &plain[..], &mut encoded, &params)
+            .expect("brotli encode for test");
+        let decoded = decode_brotli(&encoded).expect("brotli decode");
+        assert_eq!(decoded, plain);
+    }
+
+    #[test]
+    fn parse_relay_json_decodes_brotli_body_when_flag_on() {
+        use brotli::enc::BrotliEncoderParams;
+        let plain = b"<h1>hi from brotli</h1>";
+        let mut encoded = Vec::new();
+        brotli::BrotliCompress(
+            &mut &plain[..],
+            &mut encoded,
+            &BrotliEncoderParams::default(),
+        )
+        .expect("brotli encode for test");
+        let b64 = B64.encode(&encoded);
+        let body = format!(
+            r#"{{"s":200,"h":{{"content-type":"text/html","content-encoding":"br"}},"b":"{}"}}"#,
+            b64
+        );
+        let raw = parse_relay_json(body.as_bytes(), true).unwrap();
+        let s = String::from_utf8_lossy(&raw);
+        // Decoded body must reach the client.
+        assert!(s.ends_with("<h1>hi from brotli</h1>"));
+        // Content-Encoding is stripped on forward — see SKIP in parse_relay_json.
+        assert!(
+            !s.to_ascii_lowercase().contains("content-encoding"),
+            "content-encoding must be stripped after decode, got: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn parse_relay_json_leaves_brotli_body_when_flag_off() {
+        // With the flag off, a br body that somehow arrives gets
+        // delivered verbatim AND `Content-Encoding: br` is preserved
+        // on the way out so the browser can try its own decoder
+        // (instead of seeing a stripped header + raw brotli bytes,
+        // which would silently corrupt the page). Different from the
+        // pre-feature behaviour where content-encoding was always
+        // stripped — that was only correct under the strip-policy
+        // assumption that no br/zstd ever reached the relay.
+        use brotli::enc::BrotliEncoderParams;
+        let plain = b"<h1>raw brotli bytes</h1>";
+        let mut encoded = Vec::new();
+        brotli::BrotliCompress(
+            &mut &plain[..],
+            &mut encoded,
+            &BrotliEncoderParams::default(),
+        )
+        .expect("brotli encode for test");
+        let b64 = B64.encode(&encoded);
+        let body = format!(
+            r#"{{"s":200,"h":{{"content-encoding":"br"}},"b":"{}"}}"#,
+            b64
+        );
+        let raw = parse_relay_json(body.as_bytes(), false).unwrap();
+        let s = String::from_utf8_lossy(&raw);
+        assert!(
+            s.to_ascii_lowercase().contains("content-encoding: br"),
+            "content-encoding must be preserved when we cannot decode, got: {}",
+            s
+        );
+        let sep = b"\r\n\r\n";
+        let sep_pos = raw.windows(4).position(|w| w == sep).expect("crlfcrlf");
+        let body_bytes = &raw[sep_pos + 4..];
+        assert_eq!(body_bytes, encoded.as_slice());
+    }
+
+    #[test]
+    fn parse_relay_json_strips_gzip_content_encoding() {
+        // Apps Script's UrlFetchApp auto-decodes gzip server-side, so
+        // a body with `Content-Encoding: gzip` reaching us is already
+        // plaintext. The header must be stripped on forward —
+        // otherwise the browser retries decompression on plaintext
+        // and fails with ERR_CONTENT_DECODING_FAILED. Regression
+        // guard against the multi-token refactor.
+        let body =
+            r#"{"s":200,"h":{"content-encoding":"gzip","content-type":"text/plain"},"b":"aGk="}"#;
+        let raw = parse_relay_json(body.as_bytes(), false).unwrap();
+        let s = String::from_utf8_lossy(&raw);
+        assert!(
+            !s.to_ascii_lowercase().contains("content-encoding"),
+            "gzip content-encoding must be stripped (AS auto-decoded), got: {}",
+            s
+        );
+        assert!(s.ends_with("hi"));
+    }
+
+    #[test]
+    fn parse_relay_json_preserves_unknown_encoding() {
+        // Unknown single-token encoding (here: `deflate`, which Apps
+        // Script does NOT auto-decode) should leave the header AND
+        // the body untouched. Letting it through preserves the
+        // browser's chance to decode; stripping the header would
+        // corrupt the page silently.
+        let plain = b"raw deflate bytes";
+        let b64 = B64.encode(plain);
+        let body = format!(
+            r#"{{"s":200,"h":{{"content-encoding":"deflate"}},"b":"{}"}}"#,
+            b64
+        );
+        let raw = parse_relay_json(body.as_bytes(), true).unwrap();
+        let s = String::from_utf8_lossy(&raw);
+        assert!(
+            s.to_ascii_lowercase().contains("content-encoding: deflate"),
+            "unknown encoding must be preserved, got: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn parse_relay_json_preserves_multi_token_encoding_chain() {
+        // `gzip, br` is ambiguous: we don't know which layer Apps
+        // Script peeled. Refuse to decode either way and pass the
+        // header through.
+        let body = r#"{"s":200,"h":{"content-encoding":"gzip, br"},"b":"aGk="}"#;
+        let raw = parse_relay_json(body.as_bytes(), true).unwrap();
+        let s = String::from_utf8_lossy(&raw);
+        assert!(
+            s.to_ascii_lowercase().contains("content-encoding"),
+            "multi-token encoding chain must be preserved, got: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn decode_zstd_roundtrip() {
+        // Hand-build a minimal zstd frame by round-tripping through
+        // the brotli/zstd test data the `ruzstd` crate ships — we
+        // don't have a Rust-only encoder to use here. Skipping the
+        // round-trip encode and instead using a small known-good
+        // zstd-compressed blob, encoded once with the `zstd` CLI:
+        // `printf 'hello zstd' | zstd -c | base64`.
+        // Frame for "hello zstd" (10 bytes).
+        let frame = B64
+            .decode("KLUv/SAKUQAAaGVsbG8genN0ZA==")
+            .expect("known-good zstd frame base64");
+        let decoded = decode_zstd(&frame).expect("zstd decode");
+        assert_eq!(decoded, b"hello zstd");
+    }
+
+    #[test]
+    fn parse_relay_json_decodes_zstd_body_when_flag_on() {
+        // Same fixture as decode_zstd_roundtrip above, threaded
+        // through parse_relay_json so we exercise the integration
+        // path (header detect, decode, content-encoding strip).
+        let frame = B64
+            .decode("KLUv/SAKUQAAaGVsbG8genN0ZA==")
+            .expect("known-good zstd frame base64");
+        let b64 = B64.encode(&frame);
+        let body = format!(
+            r#"{{"s":200,"h":{{"content-encoding":"zstd","content-type":"text/plain"}},"b":"{}"}}"#,
+            b64
+        );
+        let raw = parse_relay_json(body.as_bytes(), true).unwrap();
+        let s = String::from_utf8_lossy(&raw);
+        assert!(s.ends_with("hello zstd"));
+        assert!(
+            !s.to_ascii_lowercase().contains("content-encoding"),
+            "zstd content-encoding must be stripped after decode, got: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn decode_zstd_rejects_oversized_window_declaration() {
+        // Hand-crafted minimal zstd frame header declaring a window
+        // size far above `MAX_DECOMPRESSED_BYTES`. The frame-header
+        // pre-check in `decode_zstd` must reject this BEFORE the
+        // streaming decoder is created — that's the bomb defence
+        // the reviewer's audit flagged (an output-side `.take()` cap
+        // alone wouldn't stop a hostile origin from forcing the
+        // decoder to pre-allocate a huge internal buffer).
+        //
+        // Byte breakdown:
+        //   28 B5 2F FD  — zstd magic number
+        //   00           — Frame_Header_Descriptor:
+        //                  Single_Segment=0, no FCS, no DID
+        //   F0           — Window_Descriptor: exp=30, mantissa=0
+        //                  → window = 2^(10+30) = 1 TiB
+        // (No further bytes; we never get past the header check.)
+        let frame = [0x28, 0xB5, 0x2F, 0xFD, 0x00, 0xF0];
+        let err = decode_zstd(&frame).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let msg = err.to_string();
+        assert!(
+            msg.contains("window"),
+            "error must identify the window-size violation, got: {}",
+            msg
+        );
+    }
+
+    #[test]
+    fn decode_brotli_rejects_oversize_bomb() {
+        // Build a brotli payload that decodes to more than
+        // `MAX_DECOMPRESSED_BYTES`. Using a highly-repetitive input
+        // so the encoded form stays tiny.
+        use brotli::enc::BrotliEncoderParams;
+        let plain = vec![0u8; (MAX_DECOMPRESSED_BYTES as usize) + 1];
+        let mut encoded = Vec::new();
+        brotli::BrotliCompress(
+            &mut &plain[..],
+            &mut encoded,
+            &BrotliEncoderParams::default(),
+        )
+        .expect("brotli encode");
+        let err = decode_brotli(&encoded).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
     fn redirect_absolute_url() {
         let (p, h) = parse_redirect("https://script.googleusercontent.com/abc?x=1");
         assert_eq!(p, "/abc?x=1");
@@ -6622,7 +7530,7 @@ mod tests {
     #[test]
     fn parse_relay_basic_json() {
         let body = r#"{"s":200,"h":{"Content-Type":"text/plain"},"b":"SGVsbG8="}"#;
-        let raw = parse_relay_json(body.as_bytes()).unwrap();
+        let raw = parse_relay_json(body.as_bytes(), false).unwrap();
         let s = String::from_utf8_lossy(&raw);
         assert!(s.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(s.contains("Content-Type: text/plain\r\n"));
@@ -7566,14 +8474,14 @@ hello";
     #[test]
     fn parse_relay_error_field() {
         let body = r#"{"e":"unauthorized"}"#;
-        let err = parse_relay_json(body.as_bytes()).unwrap_err();
+        let err = parse_relay_json(body.as_bytes(), false).unwrap_err();
         assert!(matches!(err, FronterError::Relay(_)));
     }
 
     #[test]
     fn parse_relay_rejects_invalid_body_base64() {
         let body = r#"{"s":200,"b":"***not-base64***"}"#;
-        let err = parse_relay_json(body.as_bytes()).unwrap_err();
+        let err = parse_relay_json(body.as_bytes(), false).unwrap_err();
         assert!(matches!(err, FronterError::BadResponse(_)));
     }
 
@@ -7705,6 +8613,185 @@ hello";
         assert!(!fronter.exit_node_matches("https://googlevideo.com/foo"));
         // Anything else under full mode still routes through the exit node.
         assert!(fronter.exit_node_matches("https://www.example.com/"));
+    }
+
+    // ─── Heartbeat / IP-swap invariants ───────────────────────
+    //
+    // The full `run_ip_health` loop sleeps for a real interval and
+    // calls into `scan_ips::heartbeat_probe` (real network), so unit-
+    // testing the loop end-to-end isn't tractable. These tests pin
+    // the *individual invariants* the loop relies on so a refactor
+    // that breaks them fails CI before users see broken failover.
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn host_swap_changes_arc_pointer() {
+        // The whole staleness-detection design rests on this:
+        // every swap installs a *fresh* `Arc<String>`, so
+        // `Arc::ptr_eq` against a pre-swap snapshot returns false.
+        // If a future refactor reuses the same Arc instance (e.g.
+        // mutates it in place), every `ptr_eq` check in the module
+        // silently regresses to "always equal" and stale connections
+        // sneak back into the pool. This test fails first.
+        let fronter = fronter_for_test(false);
+        let before = fronter.connect_host.load_full();
+        fronter.connect_host.store(Arc::new("127.0.0.2".into()));
+        let after = fronter.connect_host.load_full();
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "swap must install a fresh Arc — staleness detection depends on it"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ensure_h2_rejects_cached_cell_with_stale_host() {
+        // The race the host tag defends against: a heartbeat swap
+        // lands between an h2 open completing (cell stored with the
+        // old host Arc) and the swap-path's `*h2_cell = None`. A
+        // reader hitting `ensure_h2` in that window would otherwise
+        // return the cached SendRequest bound to the just-
+        // decommissioned IP. With the host tag, the
+        // `Arc::ptr_eq(&cell.host, &current)` check rejects the
+        // stale entry and reopens.
+        //
+        // Setup: seed a healthy-looking cell with a synthetic
+        // *stale* host Arc, then swap `connect_host` to a fresh
+        // Arc. ensure_h2 must see the mismatch and refuse the
+        // cell, NOT return the stale SendRequest. We pin
+        // `h2_open_failed_at` to keep the reopen path from
+        // attempting a real handshake (the test is about cell
+        // rejection, not about reopen flow).
+        let (addr, server_handle) = spawn_h2c_echo_server().await;
+        let send = h2c_client(addr).await;
+        let fronter = fronter_for_test(false);
+        let stale_host: Arc<String> = Arc::new("127.0.0.99".into());
+        {
+            let mut cell = fronter.h2_cell.lock().await;
+            *cell = Some(H2Cell {
+                send,
+                created: Instant::now(),
+                generation: 42,
+                dead: Arc::new(AtomicBool::new(false)),
+                host: stale_host.clone(),
+            });
+        }
+        // Swap to a different Arc — current host now mismatches the
+        // cell's host tag.
+        fronter.connect_host.store(Arc::new("127.0.0.100".into()));
+        // Pin the failure backoff so the reopen short-circuits
+        // without real network. We're only asserting the cell-read
+        // path rejects the stale entry.
+        *fronter.h2_open_failed_at.lock().await = Some(Instant::now());
+
+        let result = fronter.ensure_h2().await;
+        assert!(
+            result.is_none(),
+            "ensure_h2 must refuse a cell whose host Arc no longer matches connect_host"
+        );
+        server_handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn ensure_h2_accepts_cached_cell_with_matching_host() {
+        // Positive control for the test above — confirms that the
+        // host-tag check doesn't reject a legitimately fresh cell.
+        // Without this, a regression that hard-codes the host check
+        // to always-mismatch would silently pass the
+        // stale-rejection test but break the cache entirely.
+        let (addr, server_handle) = spawn_h2c_echo_server().await;
+        let send = h2c_client(addr).await;
+        let fronter = fronter_for_test(false);
+        let current_host = fronter.connect_host.load_full();
+        {
+            let mut cell = fronter.h2_cell.lock().await;
+            *cell = Some(H2Cell {
+                send,
+                created: Instant::now(),
+                generation: 99,
+                dead: Arc::new(AtomicBool::new(false)),
+                host: current_host,
+            });
+        }
+        let result = fronter.ensure_h2().await;
+        assert!(
+            result.is_some(),
+            "ensure_h2 must return a cached cell whose host matches connect_host"
+        );
+        let (_send, gen) = result.unwrap();
+        assert_eq!(gen, 99, "should return the cached generation, not reopen");
+        server_handle.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn rescan_returns_none_on_empty_sni_list() {
+        // Defence-in-depth: if for any reason `sni_hosts` is empty
+        // (constructor invariants currently prevent this — see
+        // `build_sni_pool_for` — but a future refactor could break
+        // that), `rescan_and_pick` short-circuits to None instead of
+        // probing IPs against a vacuous SNI set.
+        let json = r#"{
+            "mode": "apps_script",
+            "google_ip": "127.0.0.1",
+            "front_domain": "www.google.com",
+            "script_id": "TEST",
+            "auth_key": "test_auth_key"
+        }"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let picked = crate::scan_ips::rescan_and_pick(&cfg, &[]).await;
+        assert!(picked.is_none());
+    }
+
+    #[test]
+    fn header_string_value_normalizes_string_and_array() {
+        // Apps Script `getAllHeaders()` returns repeated headers as
+        // either a string (single value or comma-folded) OR a JSON
+        // array of strings. parse_relay_json's strip-or-keep
+        // decision must see both shapes the same way.
+        let s: Value = serde_json::from_str(r#""br""#).unwrap();
+        assert_eq!(header_string_value(&s).as_deref(), Some("br"));
+
+        let a: Value = serde_json::from_str(r#"["br"]"#).unwrap();
+        assert_eq!(header_string_value(&a).as_deref(), Some("br"));
+
+        let chain: Value = serde_json::from_str(r#"["gzip","br"]"#).unwrap();
+        assert_eq!(header_string_value(&chain).as_deref(), Some("gzip, br"));
+
+        // Numeric / null / mixed-non-string array → None.
+        let n: Value = serde_json::from_str("42").unwrap();
+        assert_eq!(header_string_value(&n), None);
+        let nl: Value = serde_json::from_str("null").unwrap();
+        assert_eq!(header_string_value(&nl), None);
+        let mixed: Value = serde_json::from_str("[42]").unwrap();
+        assert_eq!(header_string_value(&mixed), None);
+    }
+
+    #[test]
+    fn parse_relay_json_handles_array_form_content_encoding() {
+        // `Content-Encoding: ["br"]` (array form) must take the
+        // same decode path as `Content-Encoding: "br"`. Regression
+        // guard for the pre-fix bug where array-form encoding was
+        // silently invisible to the decode logic but still stripped
+        // by the base SKIP list, corrupting the body.
+        use brotli::enc::BrotliEncoderParams;
+        let plain = b"<h1>array-form brotli</h1>";
+        let mut encoded = Vec::new();
+        brotli::BrotliCompress(
+            &mut &plain[..],
+            &mut encoded,
+            &BrotliEncoderParams::default(),
+        )
+        .expect("brotli encode");
+        let b64 = B64.encode(&encoded);
+        let body = format!(
+            r#"{{"s":200,"h":{{"content-encoding":["br"]}},"b":"{}"}}"#,
+            b64
+        );
+        let raw = parse_relay_json(body.as_bytes(), true).unwrap();
+        let s = String::from_utf8_lossy(&raw);
+        assert!(s.ends_with("<h1>array-form brotli</h1>"));
+        assert!(
+            !s.to_ascii_lowercase().contains("content-encoding"),
+            "array-form br must take the strip path after successful decode"
+        );
     }
 
     #[test]
@@ -8078,7 +9165,7 @@ hello";
     #[test]
     fn parse_relay_array_set_cookie() {
         let body = r#"{"s":200,"h":{"Set-Cookie":["a=1","b=2"]},"b":""}"#;
-        let raw = parse_relay_json(body.as_bytes()).unwrap();
+        let raw = parse_relay_json(body.as_bytes(), false).unwrap();
         let s = String::from_utf8_lossy(&raw);
         assert!(s.contains("Set-Cookie: a=1\r\n"));
         assert!(s.contains("Set-Cookie: b=2\r\n"));
@@ -8149,7 +9236,7 @@ hello";
         // to fail with `key must be a string at line 2`.
         let inner_json = r#"{"s":200,"h":{},"b":""}"#;
         let wrapped = build_goog_script_init_wrapper(inner_json);
-        let raw = parse_relay_json(wrapped.as_bytes()).unwrap();
+        let raw = parse_relay_json(wrapped.as_bytes(), false).unwrap();
         let s = String::from_utf8_lossy(&raw);
         assert!(s.starts_with("HTTP/1.1 200 "), "got: {}", s);
     }
@@ -8337,6 +9424,7 @@ hello";
                 created: Instant::now(),
                 generation: 2,
                 dead: Arc::new(AtomicBool::new(false)),
+                host: fronter.connect_host.load_full(),
             });
         }
         // Task A poisons with stale gen=1.
@@ -8383,6 +9471,7 @@ hello";
                 created: Instant::now(), // well within TTL
                 generation: 1,
                 dead: dead.clone(),
+                host: fronter.connect_host.load_full(),
             });
         }
 
@@ -8842,6 +9931,7 @@ hello";
                 created: Instant::now(),
                 generation: 7,
                 dead: Arc::new(AtomicBool::new(false)),
+                host: fronter.connect_host.load_full(),
             });
         }
         // Pretend a round-trip just incremented h2_calls (which is

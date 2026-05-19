@@ -382,6 +382,26 @@ struct ModeTasks {
     /// without doing any work. `abort_all` reaps it like the other
     /// optional handles.
     probe: Option<tokio::task::JoinHandle<()>>,
+    /// Heartbeat loop for the active Google front IP. Probes the
+    /// current `connect_host` on a fixed interval and swaps in a fresh
+    /// candidate via `scan_ips::rescan_and_pick` after
+    /// `heartbeat_failure_threshold` consecutive failures.
+    ///
+    /// Spawned for **every mode that has a `DomainFronter`** — both
+    /// `apps_script` and `full`. Full mode's `TunnelMux` makes Apps
+    /// Script calls through the same `connect_host` Google front IP,
+    /// so an ISP-newly-filtered datacenter range breaks Full mode the
+    /// same way it breaks apps_script: every tunnel batch fails until
+    /// the user restarts and re-runs `scan-ips`. Sharing the heartbeat
+    /// across both modes recovers Full mode users automatically
+    /// instead of leaving them with the worse failure mode. `direct`
+    /// mode has no fronter and no Apps Script dependency, so the task
+    /// isn't spawned there.
+    ///
+    /// `run_ip_health` itself returns immediately when the user has
+    /// set `heartbeat_enabled = false`, so the JoinHandle exists but
+    /// the future ends without work.
+    health: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl ModeTasks {
@@ -401,6 +421,9 @@ impl ModeTasks {
         if let Some(h) = self.probe.take() {
             h.abort();
         }
+        if let Some(h) = self.health.take() {
+            h.abort();
+        }
     }
     fn is_empty(&self) -> bool {
         self.keepalive.is_none()
@@ -408,6 +431,7 @@ impl ModeTasks {
             && self.stats.is_none()
             && self.warm.is_none()
             && self.probe.is_none()
+            && self.health.is_none()
     }
 }
 
@@ -444,6 +468,15 @@ pub struct RuntimeState {
     /// `switch_lock` and bails — guaranteeing no new tasks get spawned
     /// after Stop has aborted the current ones.
     stopped: AtomicBool,
+    /// Latest config snapshot, kept so background tasks spawned via
+    /// `spawn_mode_tasks` (currently `run_ip_health`) can read
+    /// scan/heartbeat knobs without RuntimeState having to thread
+    /// every field individually. `switch_mode` overwrites this on
+    /// every successful swap so a heartbeat task spawned after a
+    /// switch sees the new config; tasks spawned earlier captured
+    /// the prior snapshot at spawn time and aren't retroactively
+    /// updated (mirrors `run_pool_refill` / `run_probe_loop`).
+    config: ArcSwap<Config>,
 }
 
 pub struct RewriteCtx {
@@ -1242,7 +1275,7 @@ fn resolve_coalesce(config: &Config) -> (u64, u64) {
 /// `Cmd::Start` flipping `running = true` and `run()` reaching its
 /// startup spawn point; without the abort-first contract, the switch's
 /// tasks would be silently dropped by `run()`'s subsequent overwrite.
-fn spawn_mode_tasks(tasks: &mut ModeTasks, fronter: Arc<DomainFronter>) {
+fn spawn_mode_tasks(tasks: &mut ModeTasks, fronter: Arc<DomainFronter>, config: &Config) {
     tasks.abort_all();
     // Pre-warm — runs to completion and exits, but tracked so a switch
     // landing inside its window can abort the old warmup along with the
@@ -1265,6 +1298,17 @@ fn spawn_mode_tasks(tasks: &mut ModeTasks, fronter: Arc<DomainFronter>) {
     tasks.probe = Some(tokio::spawn({
         let f = fronter.clone();
         async move { f.run_probe_loop().await }
+    }));
+    tasks.health = Some(tokio::spawn({
+        let f = fronter.clone();
+        let enabled = config.heartbeat_enabled;
+        let interval_secs = config.heartbeat_interval_secs;
+        let threshold = config.heartbeat_failure_threshold;
+        let cfg = config.clone();
+        async move {
+            f.run_ip_health(enabled, interval_secs, threshold, cfg)
+                .await
+        }
     }));
     tasks.stats = Some(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -1332,6 +1376,7 @@ impl RuntimeState {
             coalesce_max_ms: AtomicU64::new(coalesce_max),
             switch_lock: Mutex::new(()),
             stopped: AtomicBool::new(false),
+            config: ArcSwap::from_pointee(config.clone()),
         }))
     }
 
@@ -1458,7 +1503,8 @@ impl RuntimeState {
             if let Some(f) = self.bundle.load().fronter.clone() {
                 let mut tasks = self.mode_tasks.lock().await;
                 if tasks.is_empty() {
-                    spawn_mode_tasks(&mut tasks, f);
+                    let cfg = self.config.load_full();
+                    spawn_mode_tasks(&mut tasks, f, &cfg);
                 }
             }
         }
@@ -1680,6 +1726,11 @@ impl RuntimeState {
             tunnel_mux: new_mux,
         }));
 
+        // Refresh stored config snapshot before spawning so the new
+        // mode_tasks (notably `run_ip_health`) read the post-switch
+        // values rather than the construction-time ones.
+        self.config.store(Arc::new(new_config.clone()));
+
         if let Some(f) = new_fronter {
             let mut tasks = self.mode_tasks.lock().await;
             // Tasks could only land here on a stopped runtime if a Stop
@@ -1687,7 +1738,7 @@ impl RuntimeState {
             // arm takes `switch_lock` and sets `stopped` before
             // releasing). The early check inside `switch_lock` makes
             // that impossible by construction; spawn unconditionally.
-            spawn_mode_tasks(&mut tasks, f);
+            spawn_mode_tasks(&mut tasks, f, new_config);
         }
 
         tracing::warn!(
@@ -6931,46 +6982,85 @@ mod tests {
         // fires SwitchMode between `running = true` and run()'s post-bind
         // task spawn, run() must not silently leak the switch's task
         // handles. spawn_mode_tasks aborts prior entries first.
-        let (state, _tmp) = make_runtime_state(&switch_test_apps_script_config()).await;
+        let cfg = switch_test_apps_script_config();
+        let (state, _tmp) = make_runtime_state(&cfg).await;
         let fronter = state.bundle.load().fronter.clone().expect("apps_script");
 
-        // First pass — populate the bag and grab an `AbortHandle` for the
-        // keepalive task. `AbortHandle::is_finished()` reads the same
-        // completion bit as `JoinHandle::is_finished`, so it's the right
-        // signal to observe whether the next `spawn_mode_tasks` actually
-        // aborted the original.
-        let prior_abort = {
+        // First pass — populate the bag and grab `AbortHandle`s for
+        // every long-lived task in the set. `AbortHandle::is_finished()`
+        // reads the same completion bit as `JoinHandle::is_finished`,
+        // so it's the right signal to observe whether the next
+        // `spawn_mode_tasks` actually aborted each prior handle.
+        //
+        // Why every task, not just keepalive: `abort_all` / `is_empty`
+        // both touch every field on `ModeTasks`, and a refactor that
+        // forgets one (e.g. adds a new task field and forgets to wire
+        // it into `abort_all`) would silently leak handles on every
+        // switch. Earlier this test only captured `keepalive`, and the
+        // `health` field was added without test coverage — exactly the
+        // shape of bug this regression guard exists to catch.
+        let (prior_keepalive, prior_refill, prior_health, prior_probe) = {
             let mut tasks = state.mode_tasks.lock().await;
-            spawn_mode_tasks(&mut tasks, fronter.clone());
-            tasks
+            spawn_mode_tasks(&mut tasks, fronter.clone(), &cfg);
+            let keepalive = tasks
                 .keepalive
                 .as_ref()
                 .expect("keepalive spawned")
-                .abort_handle()
+                .abort_handle();
+            let refill = tasks
+                .refill
+                .as_ref()
+                .expect("refill spawned")
+                .abort_handle();
+            let health = tasks
+                .health
+                .as_ref()
+                .expect("health spawned")
+                .abort_handle();
+            let probe = tasks.probe.as_ref().expect("probe spawned").abort_handle();
+            (keepalive, refill, health, probe)
         };
-        assert!(
-            !prior_abort.is_finished(),
-            "prior keepalive should still be running before respawn"
-        );
+        for (name, h) in [
+            ("keepalive", &prior_keepalive),
+            ("refill", &prior_refill),
+            ("health", &prior_health),
+            ("probe", &prior_probe),
+        ] {
+            assert!(
+                !h.is_finished(),
+                "prior {} should still be running before respawn",
+                name,
+            );
+        }
 
         // Second pass — must abort the first set.
         {
             let mut tasks = state.mode_tasks.lock().await;
-            spawn_mode_tasks(&mut tasks, fronter);
+            spawn_mode_tasks(&mut tasks, fronter, &cfg);
         }
 
-        // Tokio's abort is cooperative — yield once so the runtime can
-        // mark the prior task as finished before we inspect it.
-        for _ in 0..32 {
-            if prior_abort.is_finished() {
-                break;
+        // Tokio's abort is cooperative — yield a few times so the
+        // runtime can mark each prior task as finished before we
+        // inspect them. Loop bound is generous; in practice one or
+        // two yields is enough.
+        for (name, h) in [
+            ("keepalive", &prior_keepalive),
+            ("refill", &prior_refill),
+            ("health", &prior_health),
+            ("probe", &prior_probe),
+        ] {
+            for _ in 0..32 {
+                if h.is_finished() {
+                    break;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
+            assert!(
+                h.is_finished(),
+                "spawn_mode_tasks must abort the previous {} handle",
+                name,
+            );
         }
-        assert!(
-            prior_abort.is_finished(),
-            "spawn_mode_tasks must abort the previous keepalive handle",
-        );
 
         state.mode_tasks.lock().await.abort_all();
     }

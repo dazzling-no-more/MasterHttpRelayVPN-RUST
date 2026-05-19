@@ -334,6 +334,55 @@ logread -e rahgozar -f       # تمام لاگ
 
 اگر `sni_hosts` تنظیم نشود، pool خودکار پیش‌فرض استفاده می‌شود. `rahgozar test-sni` را اجرا کن تا قبل از ذخیره ببینی چه چیزی از شبکه‌ات کار می‌کند.
 
+## ضربان قلب IP — مانیتور خودکار سلامت
+
+<!-- per-paragraph RTL: each Persian paragraph must start with a Persian word so paragraph-level RTL auto-detection works -->
+<div dir="rtl">
+
+رله به همان `google_ip` که در کانفیگ تنظیم کرده‌ای TLS باز می‌کند. وقتی ISP وسط جلسه آن رنج دیتاسنتر را تازه فیلتر کند، همهٔ open‌ها fail می‌شوند تا اینکه برنامه را restart کنی و دوباره `scan-ips` بزنی. مانیتور پس‌زمینهٔ ضربان قلب این شکاف را خودکار پر می‌کند.
+
+عملکرد چنین است: هر `heartbeat_interval_secs` ثانیه (پیش‌فرض ۳۰) رله یک probe ساده TCP+TLS+HEAD به `google_ip:443` می‌فرستد با یک SNI از pool چرخشی‌ات. بعد از `heartbeat_failure_threshold` (پیش‌فرض ۳) شکست متوالی، همان scan_ips معمول را اجرا می‌کند، اولین IP کاندیدی که با هر SNI از `sni_hosts` تأیید شود انتخاب می‌کند، در حافظه `google_ip` را عوض می‌کند، و pool اتصال + کش h2 را پاک می‌کند تا open‌های بعدی به IP جدید بروند. درخواست‌های در حال انجام روی IP قبلی به‌طور طبیعی drain می‌شوند. تعویض فقط در حافظه است — `config.json` روی دیسک دست‌نخورده می‌ماند.
+
+هزینه‌اش کم است: یک TLS handshake هر ۳۰ ثانیه (حدود ۲ کیلوبایت بالا + ۵ کیلوبایت پایین روی سیم) وقتی IP سالم است. زمانی که probe موفق باشد no-op می‌شود.
+
+تنظیمات کانفیگ:
+
+```json
+{
+  "heartbeat_enabled": true,
+  "heartbeat_interval_secs": 30,
+  "heartbeat_failure_threshold": 3
+}
+```
+
+پیش‌فرض‌ها همان چیزی است که شیپ می‌شود. برای خاموش‌کردن `heartbeat_enabled: false` بگذار. روی شبکه‌های ناپایدار `heartbeat_interval_secs` را پایین بیاور تا تشخیص سریع‌تر شود؛ روی شبکه‌هایی که خود TLS handshake گران است آن را (یا threshold را) بالا ببر. مقدار ۰ برای threshold به ۱ کلیپ می‌شود و در لاگ هشدار ثبت می‌گردد.
+
+وقتی swap اتفاق می‌افتد در لاگ `WARN ip-health: swapping <old> -> <new>` می‌بینی. اگر rescan مرتب اجرا شود ولی هیچ‌وقت swap موفق نشود (`ip-health: rescan found zero reachable IPs`)، یعنی گوگل اصلاً از شبکه‌ات قابل دسترسی نیست — restart کمک نمی‌کند، نیاز به خروج متفاوتی داری (Full Tunnel + VPS، exit_node و غیره).
+
+</div>
+
+## رمزگشایی opt-in برای brotli / zstd
+
+<div dir="rtl">
+
+به‌طور پیش‌فرض rahgozar قبل از forward به Apps Script مقادیر `br` و `zstd` را از Accept-Encoding خروجی حذف می‌کند. دلیلش این است: UrlFetchApp فقط gzip را server-side auto-decompress می‌کند و br/zstd را نمی‌شناسد؛ اگر مقصد brotli بفرستد، Apps Script بایت‌های brotli خام را به رله می‌دهد، که در نسخه‌های قبلی رمزگشای آن را نداشت و آن بایت‌های آسیب‌دیده را به‌عنوان plaintext به مرورگرت تحویل می‌داد.
+
+نسخهٔ v2.1+ رمزگشای brotli + zstd را شیپ کرده، پشت یک flag کانفیگ:
+
+```json
+{ "allow_brotli_zstd": true }
+```
+
+با flag روشن، رله اجازه می‌دهد `br` و `zstd` در Accept-Encoding خروجی باشند، بدنهٔ پاسخ را server-side قبل از اینکه مرورگر ببیند رمزگشایی می‌کند، و فقط در صورت موفقیت رمزگشایی `Content-Encoding` را strip می‌کند (در صورت شکست یا encoding chain ناشناخته، هدر را نگه می‌دارد تا مرورگر خودش امتحان کند).
+
+این چه زمانی کمک می‌کند: سایت‌هایی که CDN آنها brotli را به gzip ترجیح می‌دهند. تا حدود ۲۰٪ payload کوچک‌تر روی leg مقصد → Apps Script.
+
+این چه زمانی زیاد کمک نمی‌کند: بیشتر CDN‌هایی که با `User-Agent: Mozilla/5.0... Apps-Script` کار می‌کنند به‌طور پیش‌فرض روی gzip fallback می‌کنند. Leg از Apps Script → rahgozar صرف‌نظر از encoding داخلی gzipped JSON است، پس برد روی سیم در نهایت کوچک‌تر از چیزی است که اعداد leg مقصد نشان می‌دهند.
+
+چرا opt-in: رفتار دقیق UrlFetchApp با encoding‌های غیر-gzip از تجربه استخراج شده نه از داکیومنت. روشن کن، سایت‌هایت را تست کن، اگر مشکلی شد گزارش بده. خروجی رمزگشایی‌شده روی ۶۴ مگابایت کلیپ می‌شود تا در برابر مقصدهای compression-bomb دفاع کند.
+
+</div>
+
 ## چه چیز پیاده شده و چه چیز نه
 
 این پورت روی **حالت `apps_script`** تمرکز دارد — تنها حالتی که در سال ۲۰۲۶ مقابل سانسورگر مدرن قابل اتکاست.
@@ -395,9 +444,9 @@ HTML یوتیوب سریع می‌آید (از تونل بازنویسی SNI)، 
 
 برای مرور متنی خوب است، برای ۱۰۸۰p دردناک. چند `script_id` بچرخان برای هد روم بیشتر، یا VPN واقعی برای ویدیو.
 
-### Brotli حذف می‌شود
+### Brotli / zstd به‌طور پیش‌فرض حذف می‌شود
 
-از هدر `Accept-Encoding` ‏`br` حذف می‌شود. Apps Script gzip را decompress می‌کند ولی Brotli نه؛ forward کردن `br` پاسخ را خراب می‌کند. سربار حجمی جزئی.
+از هدر `Accept-Encoding` به‌طور پیش‌فرض `br` و `zstd` حذف می‌شود. Apps Script فقط gzip را server-side auto-decompress می‌کند و br/zstd را نمی‌شناسد؛ forward کردن آنها بدنهٔ پاسخ را خراب می‌کند. برای فعال‌کردن رمزگشایی client-side، `allow_brotli_zstd: true` را در کانفیگ بگذار — جزئیات و trade-off‌ها در [بخش اختصاصی بالاتر](#رمزگشایی-opt-in-برای-brotli--zstd).
 
 ### WebSocket کار نمی‌کند
 

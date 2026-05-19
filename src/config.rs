@@ -150,6 +150,58 @@ pub struct Config {
 
     #[serde(default = "default_google_ip_validation")]
     pub google_ip_validation: bool,
+
+    /// Background heartbeat for the active `google_ip`. When the current
+    /// front IP becomes unreachable mid-session (ISP filter newly applied
+    /// to that datacenter range, blackhole, etc.), the relay keeps trying
+    /// to open new connections to the dead address until the user
+    /// restarts. With heartbeat on, a background task probes
+    /// `google_ip:443` every `heartbeat_interval_secs` and, after
+    /// `heartbeat_failure_threshold` consecutive failures, runs a fresh
+    /// `scan_ips` pass and swaps in the first working candidate. Existing
+    /// pool entries are cleared on swap so subsequent opens use the new
+    /// IP. Default `true` — the swap is a no-op when the active IP is
+    /// healthy, so cost is one cheap TLS handshake per interval.
+    #[serde(default = "default_heartbeat_enabled")]
+    pub heartbeat_enabled: bool,
+
+    /// Seconds between heartbeat probes of the active `google_ip`.
+    /// Default 30 — same cadence NovaProxy uses, balances detection
+    /// latency against background-noise traffic.
+    #[serde(default = "default_heartbeat_interval_secs")]
+    pub heartbeat_interval_secs: u64,
+
+    /// Consecutive probe failures before the heartbeat triggers a
+    /// rescan + IP swap. Default 3 — at the default 30s interval, that's
+    /// ~90s of unreachability before action, which filters transient
+    /// network blips without leaving the user stuck for long. Set to 1
+    /// for fast-fail; higher values for noisy networks.
+    ///
+    /// `0` is treated as `1` at runtime (with a warning logged on
+    /// startup): the literal reading would be "rescan on every probe
+    /// failure," which is the same behaviour as `1` once you account
+    /// for the comparison being `consecutive_failures >= threshold`.
+    /// Not rejected at config validation — a typo here is recoverable
+    /// at runtime and shouldn't block startup. See
+    /// `DomainFronter::run_ip_health` for the clamp.
+    #[serde(default = "default_heartbeat_failure_threshold")]
+    pub heartbeat_failure_threshold: u32,
+
+    /// Opt-in: allow `br` and `zstd` in the outbound `Accept-Encoding`
+    /// header sent to destinations through Apps Script, and decode
+    /// brotli/zstd response bodies on the way back. When `false`
+    /// (default) the historical strip-policy applies: br/zstd are
+    /// removed from client Accept-Encoding before forwarding, so
+    /// destinations only ever respond with gzip/identity (which
+    /// `UrlFetchApp` auto-decodes). When `true`, destinations may send
+    /// brotli/zstd, rahgozar decodes the body before stripping the
+    /// `Content-Encoding` header for browser delivery. Saves bandwidth
+    /// on the destination → Apps Script leg for sites whose CDNs prefer
+    /// brotli over gzip. Opt-in because `UrlFetchApp`'s exact handling
+    /// of non-gzip encodings is empirically derived rather than
+    /// documented — flip on, test your sites, report regressions.
+    #[serde(default)]
+    pub allow_brotli_zstd: bool,
     /// When true, GET requests to `x.com/i/api/graphql/<hash>/<op>?variables=…`
     /// have their query trimmed to just the `variables=` param before being
     /// relayed. The `features` / `fieldToggles` params that X ships with
@@ -707,6 +759,28 @@ fn default_scan_batch_size() -> usize {
 }
 fn default_google_ip_validation() -> bool {
     true
+}
+
+/// Source of truth for `heartbeat_enabled`'s default. Public so the
+/// UI side (`src/bin/ui.rs`'s `FormState` defaults + `ConfigWire`
+/// skip-if-default predicate) can reference this value instead of
+/// re-encoding the literal — a config-only tweak here would
+/// otherwise silently drift the UI save behaviour away from the
+/// runtime default.
+pub fn default_heartbeat_enabled() -> bool {
+    true
+}
+
+/// Source of truth for `heartbeat_interval_secs`'s default. See
+/// `default_heartbeat_enabled` for the why-it's-pub rationale.
+pub fn default_heartbeat_interval_secs() -> u64 {
+    30
+}
+
+/// Source of truth for `heartbeat_failure_threshold`'s default. See
+/// `default_heartbeat_enabled` for the why-it's-pub rationale.
+pub fn default_heartbeat_failure_threshold() -> u32 {
+    3
 }
 
 /// Default for `tunnel_doh`: `true` (DoH stays inside the tunnel).
@@ -1743,6 +1817,8 @@ mod rt_tests {
     fn round_trip_all_current_fields() {
         // Regression guard: make sure a config written by the UI (all current
         // optional fields present and populated) loads back cleanly.
+        // Includes the v2.1+ heartbeat + brotli/zstd knobs so this test
+        // actually pins what its name advertises.
         let json = r#"{
   "mode": "apps_script",
   "google_ip": "216.239.38.120",
@@ -1760,7 +1836,11 @@ mod rt_tests {
   "fetch_ips_from_api": true,
   "max_ips_to_scan": 50,
   "scan_batch_size": 100,
-  "google_ip_validation": true
+  "google_ip_validation": true,
+  "heartbeat_enabled": false,
+  "heartbeat_interval_secs": 17,
+  "heartbeat_failure_threshold": 5,
+  "allow_brotli_zstd": true
 }"#;
         let tmp = std::env::temp_dir().join("mhrv-rt-test.json");
         std::fs::write(&tmp, json).unwrap();
@@ -1775,6 +1855,13 @@ mod rt_tests {
             &vec!["www.google.com".to_string(), "drive.google.com".to_string()]
         );
         assert_eq!(cfg.fetch_ips_from_api, true);
+        // Heartbeat / brotli-zstd round-trip: a hand-edited config
+        // must preserve user-set values, not silently snap back to
+        // defaults.
+        assert_eq!(cfg.heartbeat_enabled, false);
+        assert_eq!(cfg.heartbeat_interval_secs, 17);
+        assert_eq!(cfg.heartbeat_failure_threshold, 5);
+        assert_eq!(cfg.allow_brotli_zstd, true);
         let _ = std::fs::remove_file(&tmp);
     }
 

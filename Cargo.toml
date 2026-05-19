@@ -54,6 +54,20 @@ rand = "0.8"
 h2 = "0.4"
 http = "1"
 flate2 = "1"
+# Brotli + zstd decoders for the opt-in `allow_brotli_zstd` config flag.
+# Pure-Rust crates so they don't add C cross-compile pain for the Android /
+# musl / openwrt release builds.
+#   brotli   → encoder + decoder, but we only use the decoder
+#   ruzstd   → decoder-only, matches our usage
+#
+# ruzstd is pinned to >= 0.7.3 to exclude 0.7.0..=0.7.2 (RUSTSEC-2024-0400 /
+# GHSA-x3f4-45xf-rjm7: RingBuffer length miscalculation causes uninit /
+# OOB reads on crafted input — exploitable since allow_brotli_zstd lets
+# origin-controlled bytes reach the decoder). The 0.8.x line is a
+# separate audit (frame-header API moved) and is deliberately not bumped
+# in the same commit as the security pin.
+brotli = { version = "7", default-features = false, features = ["std"] }
+ruzstd = "0.7.3"
 directories = "5"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 minisign-verify = "0.2"

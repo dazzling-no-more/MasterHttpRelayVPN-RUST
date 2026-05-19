@@ -564,6 +564,17 @@ struct FormState {
     /// so Save preserves hand-edited `direct_mode` blocks in
     /// `config.json`.
     direct_mode: rahgozar::config::DirectModeConfig,
+    /// Heartbeat IP-health knobs. Config-only round-trip; no UI editor
+    /// yet. Defaults match `default_heartbeat_*` in src/config.rs:
+    /// enabled=true, 30s interval, 3-failure threshold. See
+    /// `domain_fronter::DomainFronter::run_ip_health`.
+    heartbeat_enabled: bool,
+    heartbeat_interval_secs: u64,
+    heartbeat_failure_threshold: u32,
+    /// Opt-in brotli/zstd handling. Config-only round-trip; no UI
+    /// editor yet. Default false (= historical strip-policy active).
+    /// See `Config::allow_brotli_zstd`.
+    allow_brotli_zstd: bool,
     // (No raw `extras` field on FormState anymore — the
     // `custom_params_buffer` below is the editor's source of truth,
     // and [`to_config`] rebuilds `Config::extras` from it on save via
@@ -731,6 +742,10 @@ fn load_form() -> (FormState, Option<String>) {
             apps_script_lang: c.apps_script_lang.clone(),
             exit_node: c.exit_node.clone(),
             direct_mode: c.direct_mode.clone(),
+            heartbeat_enabled: c.heartbeat_enabled,
+            heartbeat_interval_secs: c.heartbeat_interval_secs,
+            heartbeat_failure_threshold: c.heartbeat_failure_threshold,
+            allow_brotli_zstd: c.allow_brotli_zstd,
             // The editor buffer is the only persistent representation
             // of `Config::extras` on the UI side — there's no longer
             // a separate `FormState.extras` field. `to_config()` builds
@@ -824,6 +839,14 @@ impl FormState {
             apps_script_lang: "en".into(),
             exit_node: rahgozar::config::ExitNodeConfig::default(),
             direct_mode: rahgozar::config::DirectModeConfig::default(),
+            // Source-of-truth lives in src/config.rs's
+            // `default_heartbeat_*` helpers — route through them so a
+            // config-only tweak there propagates to the UI save path
+            // without a parallel edit here.
+            heartbeat_enabled: rahgozar::config::default_heartbeat_enabled(),
+            heartbeat_interval_secs: rahgozar::config::default_heartbeat_interval_secs(),
+            heartbeat_failure_threshold: rahgozar::config::default_heartbeat_failure_threshold(),
+            allow_brotli_zstd: false,
             custom_params_buffer: Vec::new(),
             hosts_passthrough: std::collections::HashMap::new(),
             enable_batching: false,
@@ -939,6 +962,10 @@ const MODELED_CONFIG_KEYS: &[&str] = &[
     "apps_script_lang",
     "exit_node",
     "direct_mode",
+    "heartbeat_enabled",
+    "heartbeat_interval_secs",
+    "heartbeat_failure_threshold",
+    "allow_brotli_zstd",
 ];
 
 /// True when `key` collides with a modeled Config field. Trimmed,
@@ -1149,6 +1176,14 @@ impl FormState {
             // for now; preserve hand-edited blocks across UI saves the
             // same way exit_node does.
             direct_mode: self.direct_mode.clone(),
+            // Heartbeat IP-health + opt-in brotli/zstd. Config-only
+            // round-trips; UI editors planned. Preserves hand-edited
+            // values across Save the same way the other power-user
+            // knobs above do.
+            heartbeat_enabled: self.heartbeat_enabled,
+            heartbeat_interval_secs: self.heartbeat_interval_secs,
+            heartbeat_failure_threshold: self.heartbeat_failure_threshold,
+            allow_brotli_zstd: self.allow_brotli_zstd,
             // Custom-parameters editor: the buffer is the authoritative
             // source for `extras` on save. Rows with a blank key are
             // dropped; values that don't parse as JSON are stored as
@@ -1387,6 +1422,29 @@ struct ConfigWire<'a> {
     #[serde(skip_serializing_if = "is_default_direct_mode")]
     direct_mode: &'a rahgozar::config::DirectModeConfig,
 
+    /// Heartbeat IP-health monitor. Default is sourced from
+    /// `config::default_heartbeat_enabled()`; skip when matching that
+    /// default so untouched configs stay clean. Power-user knob — no
+    /// UI editor yet.
+    #[serde(skip_serializing_if = "is_default_heartbeat_enabled")]
+    heartbeat_enabled: bool,
+    /// Heartbeat probe interval. Default sourced from
+    /// `config::default_heartbeat_interval_secs()`; skip when
+    /// matching that default so untouched configs stay clean.
+    #[serde(skip_serializing_if = "is_default_heartbeat_interval")]
+    heartbeat_interval_secs: u64,
+    /// Heartbeat failure threshold. Default sourced from
+    /// `config::default_heartbeat_failure_threshold()`; skip when
+    /// matching that default so untouched configs stay clean.
+    #[serde(skip_serializing_if = "is_default_heartbeat_threshold")]
+    heartbeat_failure_threshold: u32,
+    /// Opt-in brotli/zstd response decoding. Default `false` (= keep
+    /// the historical strip-policy that prevents non-gzip encodings
+    /// from reaching the relay). Only emitted when the user has
+    /// explicitly enabled it.
+    #[serde(skip_serializing_if = "is_false")]
+    allow_brotli_zstd: bool,
+
     /// Verbatim passthrough of unknown / future config.json keys
     /// captured at load time. Re-emitted via `#[serde(flatten)]`
     /// so a Save-config or Save-as-profile round-trip preserves
@@ -1407,6 +1465,20 @@ fn is_default_cooldown_secs(v: &u64) -> bool {
 }
 fn is_default_timeout_secs(v: &u64) -> bool {
     *v == 30
+}
+// Skip-serialize predicates for heartbeat fields route through the
+// config-layer source-of-truth helpers (`config::default_heartbeat_*`)
+// rather than re-encoding the literal defaults here. Re-encoding would
+// silently drift the UI save behaviour away from the runtime default
+// the next time someone tweaks the values in config.rs.
+fn is_default_heartbeat_enabled(v: &bool) -> bool {
+    *v == rahgozar::config::default_heartbeat_enabled()
+}
+fn is_default_heartbeat_interval(v: &u64) -> bool {
+    *v == rahgozar::config::default_heartbeat_interval_secs()
+}
+fn is_default_heartbeat_threshold(v: &u32) -> bool {
+    *v == rahgozar::config::default_heartbeat_failure_threshold()
 }
 fn is_default_apps_script_lang(v: &&str) -> bool {
     v.is_empty() || v.eq_ignore_ascii_case("en")
@@ -1521,6 +1593,10 @@ impl<'a> From<&'a Config> for ConfigWire<'a> {
             enable_batching: c.enable_batching,
             coalesce_step_ms: c.coalesce_step_ms,
             coalesce_max_ms: c.coalesce_max_ms,
+            heartbeat_enabled: c.heartbeat_enabled,
+            heartbeat_interval_secs: c.heartbeat_interval_secs,
+            heartbeat_failure_threshold: c.heartbeat_failure_threshold,
+            allow_brotli_zstd: c.allow_brotli_zstd,
         }
     }
 }
@@ -5844,7 +5920,11 @@ mod tests {
             "direct_mode": {
               "enabled": true,
               "fronts": ["www.example.com"]
-            }
+            },
+            "heartbeat_enabled": false,
+            "heartbeat_interval_secs": 17,
+            "heartbeat_failure_threshold": 9,
+            "allow_brotli_zstd": true
         }"##;
         let cfg: Config = serde_json::from_str(json).unwrap();
         let wire = ConfigWire::from(&cfg);

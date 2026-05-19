@@ -340,6 +340,46 @@ Either:
 
 Leaving `sni_hosts` unset gives you the default auto-pool. Run `rahgozar test-sni` to verify what works from your network.
 
+## Background IP-health monitor (heartbeat)
+
+The relay opens TLS to whatever `google_ip` is set in your config. When an ISP newly filters that specific datacenter range mid-session, all opens fail until you restart and re-run `scan-ips`. The background heartbeat closes that gap automatically.
+
+**What it does.** Every `heartbeat_interval_secs` (default 30 s) the relay sends one TCP+TLS+HEAD probe to `google_ip:443` with an SNI from your rotation pool. On `heartbeat_failure_threshold` (default 3) consecutive failures, it runs the same `scan_ips` pass the `scan-ips` subcommand uses, picks the first reachable candidate that validates against any SNI in your `sni_hosts` pool, swaps `google_ip` in-memory, and clears the connection pool + h2 cache so subsequent opens target the new IP. In-flight requests on the old IP drain naturally. The swap is in-memory only — `config.json` on disk is unchanged.
+
+**Cost.** One TLS handshake every 30 s (≈ 2 KB up + 5 KB down on the wire) when the IP is healthy. No-op when probes succeed.
+
+**Config knobs:**
+
+```json
+{
+  "heartbeat_enabled": true,
+  "heartbeat_interval_secs": 30,
+  "heartbeat_failure_threshold": 3
+}
+```
+
+Defaults match what's shipped. Set `heartbeat_enabled: false` to opt out. Lower `heartbeat_interval_secs` for faster detection on flaky networks; raise it (or raise the threshold) on networks where TLS handshakes are themselves expensive. A threshold of 0 is clamped to 1 with a log warning.
+
+When the swap fires, you'll see `WARN ip-health: swapping <old> -> <new>` in the log. Persistent rescans without a successful swap (`ip-health: rescan found zero reachable IPs`) mean Google is unreachable from your network entirely — restarting won't help, you need a different exit (Full Tunnel + VPS, exit_node, etc.).
+
+## Opt-in brotli / zstd response decoding
+
+By default rahgozar strips `br` and `zstd` from outbound `Accept-Encoding` headers before forwarding to Apps Script. The reason: `UrlFetchApp` auto-decompresses gzip server-side but doesn't recognise br or zstd; if a destination served brotli, Apps Script would deliver raw brotli bytes to the relay, which historically had no decoder and would pass the corrupted bytes to your browser as plaintext.
+
+v2.1+ ships brotli + zstd decoders, gated behind a config flag:
+
+```json
+{ "allow_brotli_zstd": true }
+```
+
+With the flag on, the relay allows `br` and `zstd` in forwarded `Accept-Encoding`, decodes the response body server-side before the browser sees it, and strips `Content-Encoding` only when decode succeeds (failure or unrecognised chain → header preserved so the browser can try).
+
+**When this helps:** sites whose CDN prefers brotli over gzip. Up to ~20% smaller payloads on the destination → Apps Script leg.
+
+**When this doesn't help much:** most CDNs serving `User-Agent: Mozilla/5.0... Apps-Script` already fall back to gzip. The Apps Script → rahgozar leg is gzipped JSON regardless of what the inner body uses, so wire-level wins end up smaller than the destination-leg numbers suggest.
+
+**Why opt-in:** `UrlFetchApp`'s exact handling of non-gzip encodings is empirically derived rather than documented. Flip on, test your sites, report regressions. Decoded output is capped at 64 MiB to defend against compression-bomb destinations.
+
 ## What's implemented and what isn't
 
 This port focuses on the **`apps_script` mode** — the only one that reliably works against a modern censor in 2026. Implemented:
@@ -385,7 +425,7 @@ These are inherent to the Apps Script + domain-fronting approach, not bugs in th
 
 - **User-Agent fixed to `Google-Apps-Script`** for traffic through the relay. `UrlFetchApp.fetch()` doesn't allow override. Sites that detect bots (Google search, some CAPTCHAs) serve degraded / no-JS pages. Workaround: add the affected domain to the `hosts` map so it's routed through the SNI-rewrite tunnel with your real browser's UA. `google.com`, `youtube.com`, `fonts.googleapis.com` are already there.
 - **Video playback slow and quota-limited** for anything through the relay. YouTube HTML loads fast (SNI-rewrite tunnel), but `googlevideo.com` chunks go through Apps Script. Free tier: ~20k `UrlFetchApp` calls / day, 50 MB body cap per fetch. Fine for text browsing, painful for 1080p. Rotate multiple `script_id`s for headroom, or use a real VPN for video.
-- **Brotli stripped** from forwarded `Accept-Encoding`. Apps Script can decompress gzip but not `br`; forwarding `br` would garble responses. Minor size overhead.
+- **Brotli stripped** from forwarded `Accept-Encoding` by default. Apps Script auto-decompresses gzip but not `br`/`zstd`; forwarding either would garble responses. Set `allow_brotli_zstd: true` to opt in to client-side decoding — see [the dedicated section above](#opt-in-brotli--zstd-response-decoding) for trade-offs.
 - **WebSockets don't work** through the relay — it's request / response JSON. Sites that upgrade to WS fail (ChatGPT streaming, Discord voice, etc.).
 - **HSTS-preloaded / hard-pinned sites** reject the MITM cert. Most sites are fine; a handful aren't.
 - **Google / YouTube 2FA and sensitive logins** may trigger "unrecognized device" warnings because requests originate from Google's Apps Script IPs, not yours. Log in once via the tunnel (`google.com` is in the rewrite list) to avoid this.

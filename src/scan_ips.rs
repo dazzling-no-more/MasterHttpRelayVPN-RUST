@@ -9,7 +9,7 @@ use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
 use tokio_rustls::rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+use tokio_rustls::rustls::{ClientConfig, DigitallySignedStruct, RootCertStore, SignatureScheme};
 use tokio_rustls::TlsConnector;
 
 use crate::config::Config;
@@ -268,44 +268,99 @@ pub async fn fetch_google_ips(config: &Config) -> Vec<String> {
     }
 }
 
-async fn fetch_and_validate_google_ips(
-    sni: &str,
+/// Produce candidate Google front IPs WITHOUT validating them
+/// against an SNI. Used by `rescan_and_pick`, which then runs its
+/// own SNI-pool-aware validation pass — `fetch_google_ips`'s
+/// implicit `validate_ips(&config.front_domain, ...)` would
+/// pre-filter dynamic candidates against a SNI that may itself be
+/// blocked for the user, throwing away IPs that would work against
+/// their actual rotation pool. Honours the same `fetch_ips_from_api`
+/// static-or-dynamic switch; falls back to the static `CANDIDATE_IPS`
+/// list if dynamic discovery fails.
+pub async fn fetch_google_ip_candidates(config: &Config) -> Vec<String> {
+    if !config.fetch_ips_from_api {
+        return CANDIDATE_IPS.iter().map(|s| s.to_string()).collect();
+    }
+    match discover_google_ip_candidates(config.max_ips_to_scan).await {
+        Ok(ips) if !ips.is_empty() => ips,
+        Ok(_) => {
+            // Empty result means CIDR fetch returned but produced no
+            // usable IPs (e.g. goog.json schema drift). Distinct from
+            // the Err branch below so heartbeat-rescan debugging can
+            // tell the two failure modes apart.
+            tracing::debug!(
+                "heartbeat candidate discovery returned empty CIDR set; \
+                 using static CANDIDATE_IPS fallback"
+            );
+            CANDIDATE_IPS.iter().map(|s| s.to_string()).collect()
+        }
+        Err(e) => {
+            // Network error reaching goog.json, DNS failure, etc.
+            // Static fallback keeps the heartbeat functional even
+            // when dynamic discovery is down — the user-facing
+            // failure mode is "rescan picks from the 28 baked-in IPs
+            // instead of the freshest CIDRs," which is far better
+            // than "rescan errors out and stale IP stays active."
+            tracing::debug!(
+                "heartbeat candidate discovery failed: {}; \
+                 using static CANDIDATE_IPS fallback",
+                e
+            );
+            CANDIDATE_IPS.iter().map(|s| s.to_string()).collect()
+        }
+    }
+}
+
+/// Pure-discovery helper: pull Google CIDR blocks, expand to
+/// individual IPs, shuffle, take up to `max_ips`. No validation —
+/// callers decide which SNI(s) to test against.
+async fn discover_google_ip_candidates(
     max_ips: usize,
-    batch_size: usize,
-    google_ip_validation: bool,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    build_candidate_ip_pool(max_ips).await
+}
+
+/// Shared discovery logic for both the user-facing `scan-ips`
+/// subcommand and the background heartbeat rescan: resolve famous
+/// Google IPs to map priority CIDR blocks, fetch the full CIDR list,
+/// expand to individual IPs, shuffle priority + other lists, and
+/// truncate to `max_ips` (priority entries first).
+///
+/// Intermediate progress is logged at `debug` so the heartbeat
+/// rescan path stays quiet on default log levels; the user-facing
+/// "Selected N IPs to test, testing in K batches..." line is logged
+/// in `fetch_and_validate_google_ips` so it still shows up at info
+/// level when a user runs `rahgozar scan-ips`.
+async fn build_candidate_ip_pool(
+    max_ips: usize,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let famous_ips = resolve_famous_domains().await;
-    tracing::info!(
+    tracing::debug!(
         "Resolved {} IPs from famous Google domains",
         famous_ips.len()
     );
 
     let cidrs = fetch_google_cidrs().await?;
-    tracing::info!("Fetched {} CIDR blocks from goog.json", cidrs.len());
+    tracing::debug!("Fetched {} CIDR blocks from goog.json", cidrs.len());
 
     let priority_cidrs = find_matching_cidrs(&famous_ips, &cidrs);
-    tracing::info!("Found {} CIDRs containing famous IPs", priority_cidrs.len());
+    tracing::debug!("Found {} CIDRs containing famous IPs", priority_cidrs.len());
 
     let mut priority_ips = Vec::new();
     for cidr in &priority_cidrs {
         priority_ips.extend(cidr_to_ips(cidr));
     }
-
     let mut other_ips = Vec::new();
     for cidr in &cidrs {
         if !priority_cidrs.contains(cidr) {
             other_ips.extend(cidr_to_ips(cidr));
         }
     }
-
-    tracing::info!(
+    tracing::debug!(
         "Extracted {} priority IPs and {} other IPs",
         priority_ips.len(),
         other_ips.len()
     );
-
-    let priority_ips_len = priority_ips.len();
-    let other_ips_len = other_ips.len();
 
     // Scope the rng so it's dropped before any subsequent `.await` — rand's
     // ThreadRng isn't Send, so holding it across an await would error out
@@ -322,15 +377,23 @@ async fn fetch_and_validate_google_ips(
         let remaining = max_ips - candidate_ips.len();
         candidate_ips.extend(other_ips.into_iter().take(remaining));
     }
-
     if candidate_ips.is_empty() {
         return Err("No valid IPs extracted from CIDRs".into());
     }
+    Ok(candidate_ips)
+}
+
+async fn fetch_and_validate_google_ips(
+    sni: &str,
+    max_ips: usize,
+    batch_size: usize,
+    google_ip_validation: bool,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let candidate_ips = build_candidate_ip_pool(max_ips).await?;
     let total_batches = (candidate_ips.len() + batch_size - 1) / batch_size;
     tracing::info!(
-        "Selected {} IPs to test (from {} total), testing in {} batches...",
+        "Selected {} IPs to test, testing in {} batches...",
         candidate_ips.len(),
-        priority_ips_len + other_ips_len,
         total_batches
     );
 
@@ -585,6 +648,94 @@ async fn validate_ips(ips: &[String], sni: &str, google_ip_validation: bool) -> 
 
     working
 }
+/// Single-IP TCP+TLS+HEAD probe with the standard `gws` / `x-google-`
+/// header validation, used by the background heartbeat loop in
+/// `domain_fronter` to confirm the active front IP is still
+/// reachable.
+///
+/// `verify_ssl` mirrors the relay's `config.verify_ssl`: when on,
+/// the probe uses the system root CA store, matching what real
+/// connections do — otherwise the heartbeat could mark an IP
+/// healthy that fails cert validation on the relay path (e.g. an
+/// ISP-injected MITM that completes the TLS handshake but presents
+/// a non-Google cert). When off, the probe uses `NoVerify` to mirror
+/// the relay's "skip verification" mode.
+///
+/// Builds a fresh TLS connector each call so callers don't have to
+/// thread one through; this costs ~one alloc per probe which is well
+/// below the heartbeat interval's noise floor.
+pub async fn heartbeat_probe(
+    ip: &str,
+    sni: &str,
+    google_ip_validation: bool,
+    verify_ssl: bool,
+) -> bool {
+    let tls_cfg = if verify_ssl {
+        let mut roots = RootCertStore::empty();
+        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    } else {
+        ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoVerify))
+            .with_no_client_auth()
+    };
+    let connector = TlsConnector::from(Arc::new(tls_cfg));
+    quick_probe(ip, sni, connector, google_ip_validation).await
+}
+
+/// Re-scan candidate Google front IPs and return the first reachable
+/// one, used by the background heartbeat loop when the active IP fails
+/// `heartbeat_failure_threshold` consecutive probes. Mirrors the IP set
+/// `run()` would scan (config-driven static fallback or goog.json
+/// dynamic, whichever the config selects).
+///
+/// `probe_snis` is the candidate SNI pool to validate against. A
+/// candidate IP counts as reachable as soon as ANY listed SNI gets a
+/// healthy probe response — that mirrors what real connections do
+/// (the relay rotates through `sni_hosts`), so users who configured a
+/// custom SNI pool specifically because `front_domain` is blocked
+/// can still recover. Pass `&[config.front_domain.clone()]` to opt
+/// out of rotation. An empty slice degenerates to no-op (None).
+/// Returns `None` when no candidate is reachable — caller should
+/// retain the current IP and keep probing rather than swap to
+/// nothing.
+pub async fn rescan_and_pick(config: &Config, probe_snis: &[String]) -> Option<String> {
+    if probe_snis.is_empty() {
+        return None;
+    }
+    // Use the unvalidated candidate fetcher rather than
+    // `fetch_google_ips`, which pre-validates against
+    // `config.front_domain`. If the user's front_domain is itself
+    // blocked (the whole reason they configured a custom
+    // `sni_hosts` pool), that pre-validation throws away IPs that
+    // would in fact work against their actual rotation pool. The
+    // SNI-loop below is our validation step instead.
+    let ips = fetch_google_ip_candidates(config).await;
+    // Honour `scan_batch_size` so the heartbeat doesn't burst more
+    // simultaneous handshakes than the user-tunable `scan-ips`
+    // subcommand would. Users who lowered the batch size to reduce
+    // network burstiness expect that to apply to the background
+    // rescan too. `validate_ips` already caps concurrency at
+    // CONCURRENCY within each batch, so this only affects how many
+    // batches we issue back-to-back. Each batch checks all SNIs
+    // before moving on, and we short-circuit as soon as any
+    // (IP, SNI) pair handshakes successfully — typical case
+    // terminates inside the first batch.
+    let batch_size = config.scan_batch_size.max(1);
+    for chunk in ips.chunks(batch_size) {
+        for sni in probe_snis {
+            let working = validate_ips(chunk, sni, config.google_ip_validation).await;
+            if let Some(ip) = working.into_iter().next() {
+                return Some(ip);
+            }
+        }
+    }
+    None
+}
+
 async fn quick_probe(
     ip: &str,
     sni: &str,
