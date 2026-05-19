@@ -77,18 +77,36 @@ mod tests {
             !groups.is_empty(),
             "curated bundle should ship at least one group"
         );
-        // github-central owns `objects-origin.githubusercontent.com`.
-        // It must come before fastly, otherwise fastly's
-        // `githubusercontent.com` suffix entry would eat the request
-        // under first-match-wins (`match_fronting_group` returns the
-        // first matching group and never retries the rest on dial
-        // failure).
+        // The github-* groups must come before fastly, otherwise
+        // fastly's `githubusercontent.com` suffix entry would eat their
+        // requests under first-match-wins (`match_fronting_group`
+        // returns the first matching group and never retries the rest
+        // on dial failure). github-central owns
+        // `objects-origin.githubusercontent.com`; github-uploads owns
+        // `alambic-origin.githubusercontent.com` and
+        // `camo-origin.githubusercontent.com`.
         let pos = |n: &str| groups.iter().position(|g| g.name == n);
-        let github_central = pos("github-central").expect("github-central present");
         let fastly = pos("fastly").expect("fastly present");
+        for gh in &["github-central", "github-uploads"] {
+            let idx = pos(gh).unwrap_or_else(|| panic!("{} present", gh));
+            assert!(
+                idx < fastly,
+                "{} must precede fastly for first-match-wins",
+                gh
+            );
+        }
+        // github-uploads must also precede the broad `github` group:
+        // `github` lists bare `github.com` in its domains, and the
+        // matcher's dot-anchored suffix rule means `github.com` matches
+        // `uploads.github.com` too. If `github` ran first, the new
+        // upload route would be dead code (see review of
+        // patterniha-v20 sync, 2026-05-19).
+        let github_uploads = pos("github-uploads").expect("github-uploads present");
+        let github = pos("github").expect("github present");
         assert!(
-            github_central < fastly,
-            "github-central must precede fastly for first-match-wins"
+            github_uploads < github,
+            "github-uploads must precede github — bare `github.com` would otherwise \
+             shadow the *.github.com upload subdomains under first-match-wins"
         );
     }
 
@@ -118,8 +136,15 @@ mod tests {
             "vercel.com",
             // GitHub-direct routes
             "gist.github.com",
+            "github.com",
+            "www.github.com",
             "objects-origin.githubusercontent.com",
+            "collector.github.com",
             "alive.github.com",
+            // GitHub uploads / release-asset paths (patterniha v20)
+            "uploads.github.com",
+            "alambic-origin.githubusercontent.com",
+            "camo-origin.githubusercontent.com",
             // Other curated edges
             "netlify.app",
             "pmc.ncbi.nlm.nih.gov",
@@ -128,6 +153,68 @@ mod tests {
                 all_domains.contains(expected),
                 "curated bundle must cover `{}` — regressions here usually mean an edit dropped a domain (see PR #1191 / pypi.org)",
                 expected,
+            );
+        }
+    }
+
+    /// First-match winner test. `curated_covers_user_facing_routes`
+    /// only checks that a domain *appears somewhere* in the bundle —
+    /// it would happily pass if a later group's domain was shadowed
+    /// by an earlier group's broader suffix. This test exercises the
+    /// real production matcher (`match_fronting_group` over
+    /// `FrontingGroupResolved::from_config`) and pins which group
+    /// actually wins for each host, catching ordering regressions
+    /// like the patterniha-v20-sync bug where bare `github.com` in
+    /// the `github` group shadowed `uploads.github.com` because
+    /// `github` ran before `github-uploads`.
+    #[test]
+    fn curated_first_match_winners() {
+        use crate::proxy_server::{match_fronting_group, FrontingGroupResolved};
+        use std::sync::Arc;
+        let curated = curated_fronting_groups().expect("curated.json parses");
+        let resolved: Vec<Arc<FrontingGroupResolved>> = curated
+            .iter()
+            .map(|g| {
+                Arc::new(
+                    FrontingGroupResolved::from_config(g)
+                        .unwrap_or_else(|e| panic!("group {} resolves: {}", g.name, e)),
+                )
+            })
+            .collect();
+        let cases: &[(&str, &str)] = &[
+            // GitHub edge — explicit per-host routing under the broad
+            // `github.com` suffix in the `github` group; ordering is
+            // what makes this work.
+            ("uploads.github.com", "github-uploads"),
+            ("alambic-origin.githubusercontent.com", "github-uploads"),
+            ("camo-origin.githubusercontent.com", "github-uploads"),
+            ("alive.github.com", "github-alive"),
+            ("live.github.com", "github-alive"),
+            ("central.github.com", "github-central"),
+            ("collector.github.com", "github-central"),
+            ("objects-origin.githubusercontent.com", "github-central"),
+            ("api.githubcopilot.com", "github-central"),
+            ("gist.github.com", "github"),
+            ("github.com", "github"),
+            ("www.github.com", "github"),
+            // Other curated edges.
+            ("raw.githubusercontent.com", "fastly"),
+            ("xtls.github.io", "fastly"),
+            ("reddit.com", "fastly"),
+            ("pypi.org", "fastly"),
+            ("nextjs.org", "vercel"),
+            ("vercel.com", "vercel"),
+            ("netlify.app", "amazon-cloudfront"),
+            ("pmc.ncbi.nlm.nih.gov", "pubmed"),
+        ];
+        for (host, expected) in cases {
+            let got = match_fronting_group(host, &resolved).unwrap_or_else(|| {
+                panic!("host `{}` matched no group, expected `{}`", host, expected)
+            });
+            assert_eq!(
+                &got.name, expected,
+                "host `{}` should route to `{}`, got `{}`",
+                host, expected, got.name
             );
         }
     }

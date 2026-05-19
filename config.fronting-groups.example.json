@@ -5,12 +5,14 @@
     {
       "name": "github-central",
       "ip": "140.82.113.21",
-      "sni": "central.github.com",
+      "sni": "collector.github.com",
       "domains": [
         "objects-origin.githubusercontent.com",
         "api.individual.githubcopilot.com",
         "glb-db52c2cf8be544.github.com",
-        "api.githubcopilot.com"
+        "api.githubcopilot.com",
+        "collector.github.com",
+        "central.github.com"
       ]
     },
     {
@@ -23,11 +25,23 @@
       ]
     },
     {
+      "name": "github-uploads",
+      "ip": "140.82.121.13",
+      "sni": "uploads.github.com",
+      "domains": [
+        "uploads.github.com",
+        "alambic-origin.githubusercontent.com",
+        "camo-origin.githubusercontent.com"
+      ]
+    },
+    {
       "name": "github",
       "ip": "140.82.121.3",
-      "sni": "github.com",
+      "sni": "www.github.com",
       "domains": [
-        "gist.github.com"
+        "gist.github.com",
+        "github.com",
+        "www.github.com"
       ]
     },
     {

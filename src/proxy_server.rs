@@ -807,7 +807,7 @@ pub struct FrontingGroupResolved {
 }
 
 impl FrontingGroupResolved {
-    fn from_config(g: &FrontingGroup) -> Result<Self, String> {
+    pub(crate) fn from_config(g: &FrontingGroup) -> Result<Self, String> {
         let server_name = ServerName::try_from(g.sni.clone())
             .map_err(|e| format!("invalid sni '{}': {}", g.sni, e))?;
         let domains_normalized = g

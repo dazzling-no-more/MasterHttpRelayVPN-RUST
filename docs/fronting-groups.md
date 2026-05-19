@@ -47,22 +47,40 @@ mirrors the same coverage as the curated bundle below.
 ## Curated bundle (no-typing path)
 
 The binary ships [`assets/fronting-groups/curated.json`](../assets/fronting-groups/curated.json)
-with five groups derived from the
+with eight groups derived from the
 [`patterniha/MITM-DomainFronting`](https://github.com/patterniha/MITM-DomainFronting)
 Xray config — the same set of (sni, edge IP, member-domain) tuples that
 project's author has tested in the field:
 
 | Group | SNI | Covers |
 | --- | --- | --- |
-| `github-direct` | `github.com` | `gist.github.com` |
-| `github-content-direct` | `central.github.com` | `objects-origin.githubusercontent.com` |
-| `vercel` | `react.dev` | `vercel.com`, `vercel.app`, `nextjs.org`, `cursor.com`, `zeit.co`, … (29 domains) |
+| `github-central` | `collector.github.com` | `objects-origin.githubusercontent.com`, `api.githubcopilot.com`, `central.github.com`, `collector.github.com`, … |
+| `github-alive` | `alive.github.com` | `alive.github.com`, `live.github.com` |
+| `github-uploads` | `uploads.github.com` | `uploads.github.com`, `alambic-origin.githubusercontent.com`, `camo-origin.githubusercontent.com` |
+| `github` | `www.github.com` | bare `github.com` — under the suffix matcher this is the **entire `*.github.com` zone** minus what the earlier `github-*` groups peel off (gist, www, and any unknown subdomain like `api.github.com`) |
+| `vercel` | `nextjs.org` | `vercel.com`, `vercel.app`, `nextjs.org`, `cursor.com`, `zeit.co`, … (29 domains) |
 | `fastly` | `pypi.org` | `reddit.com`, `cnn.com`, `pinterest.com`, `buzzfeed.com`, `githubusercontent.com`, `pypi.org`, … (40 domains) |
-| `cloudfront` | `kubernetes.io` | `netlify.app`, `netlify.com` |
+| `amazon-cloudfront` | `kubernetes.io` | `netlify.app`, `netlify.com` |
+| `pubmed` | `pubmed.ncbi.nlm.nih.gov` | `pmc.ncbi.nlm.nih.gov` |
 
-The two GitHub-direct groups appear before `fastly` in the list so that
-first-match-wins routes `objects-origin.githubusercontent.com` away from
-the broader `githubusercontent.com` suffix in `fastly`.
+Ordering is load-bearing. `match_fronting_group` is single-shot
+first-match-wins with **dot-anchored suffix** matching — an entry
+`github.com` catches every `*.github.com` host too. So the bundle
+threads the needle by ordering the github-* groups from most-specific
+to least-specific:
+
+1. `github-central`, `github-alive`, `github-uploads` claim their
+   explicit subdomains first.
+2. `github` (with bare `github.com` in its `domains`) catches
+   everything else under the zone.
+3. `fastly` runs last, so its broader `githubusercontent.com` suffix
+   can't eat `*-origin.githubusercontent.com` from earlier
+   github-content routes.
+
+Pinned by [`curated_groups::tests::curated_first_match_winners`](../src/curated_groups.rs) — a routing-winner test
+that exercises the real matcher (rather than just checking domains
+appear somewhere in the JSON) so future edits can't silently shadow
+a group by reordering or expanding suffixes.
 
 **Desktop UI** — open the *Advanced* section and click **Load curated
 fronting groups**. The button appends groups whose `name` isn't already
