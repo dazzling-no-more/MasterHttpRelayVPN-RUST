@@ -27,18 +27,12 @@ use tokio::net::UdpSocket;
 /// range for hostname lookups. If the magic IP collided with one of those
 /// synthetic IPs, every request to whichever hostname got that allocation
 /// would be silently mis-routed into the udpgw path. See issue #251.
-pub const UDPGW_MAGIC_IP: [u8; 4] = [192, 0, 2, 1];
-/// Pre-formatted dotted-quad form of `UDPGW_MAGIC_IP`. Compared against
-/// incoming hostnames in [`is_udpgw_dest`]; kept in sync with the octets
-/// above by the `magic_host_matches_octets` test.
+///
+/// The matching octet array lives in the test module — it exists only to
+/// pin the dotted form against drift via `magic_host_matches_octets`.
 pub const UDPGW_MAGIC_HOST: &str = "192.0.2.1";
 pub const UDPGW_MAGIC_PORT: u16 = 7300;
 
-/// Pre-#251 magic IP — still recognised by `is_udpgw_dest` for one
-/// deprecation cycle so users who upgrade the `mhrv-tunnel` Docker
-/// container ahead of the Android APK don't lose Full-mode UDP relay
-/// during the version-skew window. Slated for removal in v1.10.0.
-const LEGACY_UDPGW_MAGIC_IP: [u8; 4] = [198, 18, 0, 1];
 const LEGACY_UDPGW_MAGIC_HOST: &str = "198.18.0.1";
 
 const FLAG_KEEPALIVE: u8 = 0x01;
@@ -461,6 +455,12 @@ fn serialise_err(conn_id: u16) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Octet form of [`UDPGW_MAGIC_HOST`], pinned here so the
+    /// `magic_host_matches_octets` test catches drift between the two.
+    const UDPGW_MAGIC_IP: [u8; 4] = [192, 0, 2, 1];
+    /// Octet form of [`LEGACY_UDPGW_MAGIC_HOST`]. Same drift-pin purpose.
+    const LEGACY_UDPGW_MAGIC_IP: [u8; 4] = [198, 18, 0, 1];
 
     #[test]
     fn keepalive_round_trip() {
