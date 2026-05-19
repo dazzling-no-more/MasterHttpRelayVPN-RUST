@@ -1,10 +1,194 @@
-# rahgozar — bypass censorship for free, with your own Google account
-
 [![Latest release](https://img.shields.io/github/v/release/dazzling-no-more/rahgozar?display_name=tag&logo=github&label=release&color=blue&cacheSeconds=300)](https://github.com/dazzling-no-more/rahgozar/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/dazzling-no-more/rahgozar/total.svg?label=downloads&logo=github&cacheSeconds=300)](https://github.com/dazzling-no-more/rahgozar/releases)
 [![CI](https://github.com/dazzling-no-more/rahgozar/actions/workflows/release.yml/badge.svg)](https://github.com/dazzling-no-more/rahgozar/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/github/license/dazzling-no-more/rahgozar?color=blue)](LICENSE)
 [![Stars](https://img.shields.io/github/stars/dazzling-no-more/rahgozar?style=flat&logo=github)](https://github.com/dazzling-no-more/rahgozar/stargazers)
+
+<div dir="rtl">
+
+# رهگذر — دور زدن سانسور به‌رایگان، با حساب گوگل خودت
+
+**یک برنامهٔ کوچک که روی کامپیوترت اجرا می‌شود و کمک می‌کند سایت‌های مسدودشده را با یک اسکریپت رایگان که توی حساب گوگل خودت می‌سازی، باز کنی. ISP فقط می‌بیند که داری به `www.google.com` وصل می‌شوی — نمی‌فهمد در واقع چه سایتی را باز کرده‌ای.**
+
+🇬🇧 [English Quick Start](#quick-start) · [Full Guide (advanced)](docs/guide.md)
+🇮🇷 [راه‌اندازی سریع](#راه‌اندازی-سریع) · [راهنمای کامل (پیشرفته)](docs/guide.fa.md)
+
+## چی به دست می‌آوری
+
+- 🌐 **عبور از DPI / مسدودسازی SNI** با لبهٔ گوگل به‌عنوان رله
+- 💯 **کاملاً رایگان** — روی سهمیهٔ رایگان حساب گوگل خودت
+- ⚡ **یک فایل کوچک** (~۳ مگابایت)، بدون پایتون، بدون Node.js، بدون وابستگی
+- 🖥️ **روی** مک، ویندوز، لینوکس، اندروید، روتر OpenWRT کار می‌کند
+- 🦊 **هر مرورگر یا برنامه‌ای** که از HTTP proxy یا SOCKS5 پشتیبانی کند
+
+## چطور کار می‌کند (تصویر ساده)
+
+```
+        تو  ←  مرورگر  ←  rahgozar 
+                                │ ISP فقط می‌بیند:  www.google.com
+                                ▼
+                         شبکهٔ گوگل
+                                │
+                                ▼
+            اسکریپت رایگان گوگل تو  سایت اصلی را  باز می‌کند
+                                │
+                                ▼
+              توییتر / ChatGPT / هر سایت مسدودی
+```
+
+محتوای HTTPS رمزشده برای ISP قابل خواندن نیست. فقط آدرس را می‌بیند — `www.google.com`. جست‌وجوی واقعی صفحه داخل شبکهٔ گوگل، در تونل رمزشده اتفاق می‌افتد.
+
+## راه‌اندازی سریع
+
+**حدود ۵ دقیقه.** نیاز داری به:
+
+- یک حساب گوگل رایگان (هر Gmail‌ای کار می‌کند)
+- یک کامپیوتر (مک، ویندوز یا لینوکس)
+- فایرفاکس یا کروم
+
+### مرحلهٔ ۱ — ساخت اسکریپت گوگل (یک‌بار)
+
+۱. به **[script.google.com](https://script.google.com)** برو، با حساب گوگل خودت وارد شو
+۲. روی **New project** بالا سمت چپ کلیک کن
+۳. کد پیش‌فرض ویرایشگر را پاک کن
+۴. فایل [`assets/apps_script/Code.gs`](assets/apps_script/Code.gs) را در همین ریپو باز کن، همه‌اش را کپی کن، در ویرایشگر Apps Script پیست کن (جایگزین متن قبلی)
+۵. این خط را نزدیک بالای کد پیدا کن:
+   ```js
+   const AUTH_KEY = "CHANGE_ME_TO_A_STRONG_SECRET";
+   ```
+   مقدار `CHANGE_ME_TO_A_STRONG_SECRET` را با یک رشتهٔ تصادفی طولانیِ خودت عوض کن. **این رشته را نگه دار** — در مرحلهٔ ۳ داخل برنامه پیست می‌کنی. مثل پسورد محرمانه نگه‌اش دار.
+۶. روی 💾 **Save** کلیک کن (یا `Ctrl/Cmd+S`)
+۷. روی **Deploy** (بالا سمت راست) → **New deployment**
+۸. روی آیکون چرخ‌دندهٔ ⚙ کنار "Select type" کلیک کن → **Web app** را انتخاب کن
+۹. تنظیم کن:
+   - فیلد **Execute as:** را روی *Me* (حساب گوگل خودت) بگذار
+   - فیلد **Who has access:** را روی *Anyone* بگذار
+۱۰. روی **Deploy** بزن. ممکن است گوگل برای دادن دسترسی سؤال کند — روی **Authorize access** بزن و تأیید کن
+۱۱. گوگل یک **Deployment ID** نشانت می‌دهد (یک رشتهٔ تصادفی طولانی). **کپی‌اش کن** — در مرحلهٔ ۳ لازم داری.
+
+> **نکته:** اگر بعداً `Code.gs` را به‌روزرسانی کنی، Deployment جدید نساز. کد را ویرایش کن، بعد **Deploy → Manage deployments → ✏️ → Version: New version → Deploy**. Deployment ID همان قبلی می‌ماند.
+
+### مرحلهٔ ۲ — دانلود رهگذر
+
+به [صفحهٔ آخرین release](https://github.com/dazzling-no-more/rahgozar/releases/latest) برو و فایل مناسب کامپیوترت را دانلود کن:
+
+| سیستم تو | فایل دانلود |
+|---|---|
+| مک با تراشهٔ Apple Silicon (M1 / M2 / M3 / M4) | `rahgozar-macos-arm64-app.zip` |
+| مک با تراشهٔ Intel | `rahgozar-macos-amd64-app.zip` |
+| ویندوز | `rahgozar-windows-amd64.zip` |
+| لینوکس (Ubuntu / Mint / Fedora / Debian / Arch) | `rahgozar-linux-amd64.tar.gz` |
+| گوشی یا تبلت اندروید | `rahgozar-android-universal-v*.apk` |
+| روتر OpenWRT یا Alpine | `rahgozar-linux-musl-amd64.tar.gz` |
+
+> **مک: مطمئن نیستی Apple Silicon است یا Intel؟** کلیک کن  → **About This Mac**. اگر "Chip" نوشت **Apple**، arm64 بگیر. اگر **Intel** بود، amd64.
+
+> **لینوکس: خطای `GLIBC` می‌گیری؟** به‌جای آن از `linux-musl-amd64` استفاده کن — روی هر لینوکسی بدون وابستگی کار می‌کند.
+
+از حالت فشرده دربیار.
+
+### مرحلهٔ ۳ — اجرای اول
+
+روی فایل اجرا دو بار کلیک کن:
+
+| سیستم | فایل اجرا |
+|---|---|
+| مک | `run.command` |
+| ویندوز | `run.bat` |
+| لینوکس | `./run.sh` (در ترمینال) |
+
+اولین بار رمز کامپیوترت را می‌خواهد. این برای نصب یک گواهی کوچک است تا مرورگرت به رهگذر اعتماد کند. **گواهی روی کامپیوتر خودت ساخته می‌شود و هیچ‌وقت جایی ارسال نمی‌شود** — نه روی ابر، نه به گوگل، هیچ منبع راه‌دوری نمی‌تواند ازش استفاده کند.
+
+پنجرهٔ رهگذر باز می‌شود. این فیلدها را پر کن:
+
+- در فیلد **Apps Script ID(s)** مقدار **Deployment ID** از مرحلهٔ ۱ را پیست کن
+- در فیلد **Auth key** همان رشتهٔ تصادفی که در `Code.gs` گذاشتی را وارد کن
+- بقیه فیلدها را روی مقدار پیش‌فرض رها کن
+
+روی **Save config** و بعد **Start** بزن. اگر کار کند، دایرهٔ وضعیت سبز می‌شود.
+
+> **تستش کن:** دکمهٔ **Test** را بزن. یک درخواست از طریق رله می‌فرستد و می‌گوید کار کرد یا نه.
+
+### مرحلهٔ ۴ — مرورگر را روی رهگذر تنظیم کن
+
+#### فایرفاکس (پیشنهادی — ساده‌ترین)
+
+۱. فایرفاکس → منوی ☰ → **Settings**
+۲. در کادر جست‌وجو "proxy" تایپ کن
+۳. زیر Network Settings روی **Settings…** کلیک کن
+۴. گزینهٔ **Manual proxy configuration** را انتخاب کن
+۵. در فیلد **HTTP Proxy** آدرس `127.0.0.1` و پورت `8085` را بگذار
+۶. تیک گزینهٔ **"Also use this proxy for HTTPS"** ☑ را بزن
+۷. روی **OK** بزن
+
+#### کروم / Edge
+
+افزونهٔ [Proxy SwitchyOmega](https://chromewebstore.google.com/detail/proxy-switchyomega/padekgcemlokbadohgkifijomclgjgif) را نصب کن و پروکسی را روی `127.0.0.1:8085` تنظیم کن.
+
+#### مک (سراسری)
+
+از مسیر System Settings → Network → Wi-Fi → Details → **Proxies** برو و هر دو گزینهٔ **Web Proxy (HTTP)** و **Secure Web Proxy (HTTPS)** را روشن کن، هر دو روی `127.0.0.1:8085`.
+
+### مرحلهٔ ۵ — امتحان کن
+
+در مرورگرت یک سایت مسدود را باز کن. باید لود شود.
+
+اگر چیزی کار نکرد:
+
+- در پنجرهٔ رهگذر دکمهٔ **Test** را بزن — می‌گوید کجا گیر کرده
+- پنل **Recent log** پایین پنجره را نگاه کن
+- بخش [سؤالات رایج](#سؤالات-رایج) پایین را ببین
+
+---
+
+## سؤالات رایج
+
+**واقعاً رایگانه؟** بله. گوگل به هر حساب روزانه ۲۰٬۰۰۰ درخواست خروجی URL در سهمیهٔ رایگان می‌دهد. برای مرور عادی یک نفر کاملاً کافی است. برای خانوادهٔ ۳-۴ نفره که از یک سرویس استفاده می‌کنند، در ۲-۳ حساب گوگل مختلف Deployment بساز و همهٔ ID‌ها را اضافه کن.
+
+**امنه؟** گواهی روی کامپیوتر خودت می‌ماند — کسی کلید خصوصی را ندارد. `auth_key` رمز محرمانهٔ توست. گوگل سایت‌هایی که از طریق رله باز می‌کنی را می‌بیند (چون Apps Script برای تو fetch می‌کند) — مثل هر پروکسی میزبانی‌شدهٔ دیگری. اگر این برایت قابل قبول نیست، از Full Tunnel با VPS شخصی استفاده کن — در [راهنمای کامل](docs/guide.fa.md#حالت-تونل-کامل).
+
+**ویدیوی یوتیوب پخش نمی‌شود.** chunkهای ویدیوی یوتیوب از `googlevideo.com` می‌آیند و Apps Script نمی‌تواند به آن برسد (گوگل اجازهٔ دسترسی Apps Script به CDN ویدیوی خودش را نمی‌دهد). صفحهٔ خود یوتیوب لود می‌شود، فقط پخش ویدیو تحت تأثیر است. راه‌حل: Full Tunnel + VPS، یا `.googlevideo.com` را به `passthrough_hosts` در کانفیگت اضافه کن (مرورگر مستقیم می‌رود اما روی ISP ایران throttle می‌خورد).
+
+**در ChatGPT / Claude / Grok کپچای Cloudflare ظاهر می‌شود.** Cloudflare آی‌پی‌های دیتاسنتر گوگل را به‌عنوان bot شناسایی می‌کند. راه‌حل: یک **exit node** راه‌اندازی کن — یک handler کوچک TypeScript که روی یک host serverless (Deno Deploy، fly.io، VPS شخصی) deploy می‌کنی و پل می‌سازه از Apps Script به سایت Cloudflare. [`assets/exit_node/README.fa.md`](assets/exit_node/README.fa.md).
+
+**تلگرام پایدار نیست.** تلگرام از MTProto استفاده می‌کند که Apps Script نمی‌فهمد. روی کامپیوترت با [xray](https://github.com/XTLS/Xray-core) جفتش کن — [بخش تلگرام در راهنمای کامل](docs/guide.fa.md#تلگرام-با-xray).
+
+**وقتی ISP خود `script.google.com` را مسدود کرده.** رهگذر یک حالت `direct` دارد که فقط از تونل بازنویسی SNI استفاده می‌کند (بدون Apps Script). یک‌بار از این حالت استفاده کن تا به `script.google.com` برسی و اسکریپت را دیپلوی کنی، بعد به حالت apps_script سوئیچ کن. [حالت direct](docs/guide.fa.md#حالت-direct).
+
+**می‌خواهم از رهگذر به‌عنوان پروکسی upstream برای Psiphon (یا xray) استفاده کنم.** رهگذر را در حالت `direct` اجرا کن و در تنظیمات Psiphon قسمت *upstream proxy* را روی host:port که زیر دکمهٔ Connect نمایش داده می‌شود تنظیم کن. هاست‌هایی که در لیست fronting قرار ندارند به‌صورت raw TCP عبور می‌کنند، پس ترافیک bootstrap سایفون به سرورهای سایفون دست‌نخورده می‌رسد. [docs/use-as-upstream.fa.md](docs/use-as-upstream.fa.md).
+
+**جست‌وجوی گوگلم بدون JavaScript ظاهر می‌شود.** `User-Agent` Apps Script ثابت روی `Google-Apps-Script` است (گوگل نمی‌گذارد اسکریپت‌ها عوضش کنند)، پس بعضی سایت‌ها نسخهٔ بدون JS برمی‌گردانند. راه‌حل: دامنهٔ مورد نظر را به `hosts` اضافه کن تا از تونل بازنویسی SNI با User-Agent واقعی مرورگرت برود. `google.com`، `youtube.com`، `fonts.googleapis.com` به‌طور پیش‌فرض در این لیست‌اند.
+
+**سؤالات بیشتر:** [FAQ کامل در راهنمای بلند](docs/guide.fa.md#سؤالات-رایج).
+
+## کمک می‌خواهی؟
+
+- در [issueهای rahgozar](https://github.com/dazzling-no-more/rahgozar/issues?q=is%3Aissue) جست‌وجو کن — و در [بایگانی بزرگ‌تر بالادست therealaleph/MasterHttpRelayVPN-RUST](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues?q=is%3Aissue) که بیشتر تاریخ پروژه آن‌جاست — احتمالاً مشکلت قبلاً جواب داده شده
+- یک [issue جدید در rahgozar](https://github.com/dazzling-no-more/rahgozar/issues/new) باز کن با: کانفیگت (حتماً `auth_key` را پنهان کن!)، دقیقاً چه کاری کردی، دقیقاً چه دیدی در log
+
+## اعتبار
+
+این فورک روی سه پروژهٔ بالادست ایستاده — قبل از این که به این فورک فکر کنی، باید این سه را بشناسی و حمایتشان کنی:
+
+- پروژهٔ اصلی پایتون **[@masterking32/MasterHttpRelayVPN](https://github.com/masterking32/MasterHttpRelayVPN)** — همه‌چیز از این‌جا شروع شد. پروتکل Apps Script، معماری پروکسی، ایدهٔ استفاده از حساب گوگل خودت به‌عنوان رلهٔ رایگان — همه از اوست. بدون این، هیچ‌کدام از باقی وجود نداشت.
+- پورت Rust به نام **[@therealaleph/MasterHttpRelayVPN-RUST](https://github.com/therealaleph/MasterHttpRelayVPN-RUST)** (`mhrv-rs`) — این فورک ادامهٔ همان است. therealaleph پروژهٔ پایتون را به Rust بازنویسی کرد تا کلاینت‌های تک‌فایلی منتشر کند، رابط دسکتاپ و اندروید را ساخت، و پروژه را از v1.x تا v1.9.25 پیش برد. تقریباً هر خط کد این فورک کار اوست؛ ما فقط چراغ را روشن نگه داشتیم.
+- ایدهٔ گروه‌های fronting در **[@patterniha/MITM-DomainFronting](https://github.com/patterniha/MITM-DomainFronting)** — مسیریابی دامنه‌های خاص از طریق edge های Vercel / Fastly / CloudFront با SNI، که به بستهٔ آمادهٔ fronting این پروژه تبدیل شد. پروژه‌ای مستقل؛ کانفیگ Xray آن الهام‌بخش ادغام ما بود. جزئیات در [`docs/fronting-groups.md`](docs/fronting-groups.md).
+
+بیشتر کد Rust این پورت (شامل کار ادغام و rebrand این فورک) با کمک [Claude شرکت Anthropic](https://claude.com) نوشته شده و روی هر commit انسانی بازبینی شده است.
+
+## حمایت از این پروژه‌ها
+
+اگر از این نرم‌افزار سود برده‌ای، **حمایتت را به بالادست بفرست، نه به این فورک.** رهگذر هیچ کمک مالی‌ای نمی‌گیرد و فقط برای پوشش کاربران در دورانی که بالادست غیرفعال است وجود دارد. مهندسی اصلی در سه پروژهٔ بالا انجام شده؛ لطفاً مستقیماً از آن‌ها حمایت کن:
+
+- در GitHub Sponsors از **[@masterking32](https://github.com/masterking32)** — نویسندهٔ پروژهٔ اصلی پایتون. یا از طریق روش‌های ذکر شده در پروفایل و ریپوی او.
+- در **[sh1n.org/donate](https://sh1n.org/donate)** برای **[@therealaleph](https://github.com/therealaleph)** — نویسندهٔ پورت Rust. پوشش هزینهٔ هاستینگ / CI / سال‌ها نگه‌داری.
+- در GitHub Sponsors از **[@patterniha](https://github.com/patterniha)** — نویسندهٔ MITM-DomainFronting. یا از طریق روش‌های ذکر شده در ریپوی او.
+
+</div>
+
+---
+
+# rahgozar — bypass censorship for free, with your own Google account
 
 > ## About this fork
 >
@@ -203,187 +387,3 @@ Most of the Rust code in this port (including this fork's merge and rebrand work
 - **[@patterniha](https://github.com/patterniha)** — MITM-DomainFronting author. Sponsor on GitHub or via methods listed in his repo.
 
 Starring those three upstream repos also signals their work is worth keeping alive. If upstream `mhrv-rs` resumes, this fork will fold work back and wind down — the goal here is continuity of access for users behind heavy censorship, nothing more.
-
----
-
-<div dir="rtl">
-
-# رهگذر — دور زدن سانسور به‌رایگان، با حساب گوگل خودت
-
-**یک برنامهٔ کوچک که روی کامپیوترت اجرا می‌شود و کمک می‌کند سایت‌های مسدودشده را با یک اسکریپت رایگان که توی حساب گوگل خودت می‌سازی، باز کنی. ISP فقط می‌بیند که داری به `www.google.com` وصل می‌شوی — نمی‌فهمد در واقع چه سایتی را باز کرده‌ای.**
-
-🇬🇧 [English Quick Start](#quick-start) · [Full Guide (advanced)](docs/guide.md)
-🇮🇷 [راه‌اندازی سریع](#راه‌اندازی-سریع) · [راهنمای کامل (پیشرفته)](docs/guide.fa.md)
-
-## چی به دست می‌آوری
-
-- 🌐 **عبور از DPI / مسدودسازی SNI** با لبهٔ گوگل به‌عنوان رله
-- 💯 **کاملاً رایگان** — روی سهمیهٔ رایگان حساب گوگل خودت
-- ⚡ **یک فایل کوچک** (~۳ مگابایت)، بدون پایتون، بدون Node.js، بدون وابستگی
-- 🖥️ **روی** مک، ویندوز، لینوکس، اندروید، روتر OpenWRT کار می‌کند
-- 🦊 **هر مرورگر یا برنامه‌ای** که از HTTP proxy یا SOCKS5 پشتیبانی کند
-
-## چطور کار می‌کند (تصویر ساده)
-
-```
-        تو  ←  مرورگر  ←  rahgozar 
-                                │ ISP فقط می‌بیند:  www.google.com
-                                ▼
-                         شبکهٔ گوگل
-                                │
-                                ▼
-            اسکریپت رایگان گوگل تو  سایت اصلی را  باز می‌کند
-                                │
-                                ▼
-              توییتر / ChatGPT / هر سایت مسدودی
-```
-
-محتوای HTTPS رمزشده برای ISP قابل خواندن نیست. فقط آدرس را می‌بیند — `www.google.com`. جست‌وجوی واقعی صفحه داخل شبکهٔ گوگل، در تونل رمزشده اتفاق می‌افتد.
-
-## راه‌اندازی سریع
-
-**حدود ۵ دقیقه.** نیاز داری به:
-
-- یک حساب گوگل رایگان (هر Gmail‌ای کار می‌کند)
-- یک کامپیوتر (مک، ویندوز یا لینوکس)
-- فایرفاکس یا کروم
-
-### مرحلهٔ ۱ — ساخت اسکریپت گوگل (یک‌بار)
-
-۱. به **[script.google.com](https://script.google.com)** برو، با حساب گوگل خودت وارد شو
-۲. روی **New project** بالا سمت چپ کلیک کن
-۳. کد پیش‌فرض ویرایشگر را پاک کن
-۴. فایل [`assets/apps_script/Code.gs`](assets/apps_script/Code.gs) را در همین ریپو باز کن، همه‌اش را کپی کن، در ویرایشگر Apps Script پیست کن (جایگزین متن قبلی)
-۵. این خط را نزدیک بالای کد پیدا کن:
-   ```js
-   const AUTH_KEY = "CHANGE_ME_TO_A_STRONG_SECRET";
-   ```
-   مقدار `CHANGE_ME_TO_A_STRONG_SECRET` را با یک رشتهٔ تصادفی طولانیِ خودت عوض کن. **این رشته را نگه دار** — در مرحلهٔ ۳ داخل برنامه پیست می‌کنی. مثل پسورد محرمانه نگه‌اش دار.
-۶. روی 💾 **Save** کلیک کن (یا `Ctrl/Cmd+S`)
-۷. روی **Deploy** (بالا سمت راست) → **New deployment**
-۸. روی آیکون چرخ‌دندهٔ ⚙ کنار "Select type" کلیک کن → **Web app** را انتخاب کن
-۹. تنظیم کن:
-   - فیلد **Execute as:** را روی *Me* (حساب گوگل خودت) بگذار
-   - فیلد **Who has access:** را روی *Anyone* بگذار
-۱۰. روی **Deploy** بزن. ممکن است گوگل برای دادن دسترسی سؤال کند — روی **Authorize access** بزن و تأیید کن
-۱۱. گوگل یک **Deployment ID** نشانت می‌دهد (یک رشتهٔ تصادفی طولانی). **کپی‌اش کن** — در مرحلهٔ ۳ لازم داری.
-
-> **نکته:** اگر بعداً `Code.gs` را به‌روزرسانی کنی، Deployment جدید نساز. کد را ویرایش کن، بعد **Deploy → Manage deployments → ✏️ → Version: New version → Deploy**. Deployment ID همان قبلی می‌ماند.
-
-### مرحلهٔ ۲ — دانلود رهگذر
-
-به [صفحهٔ آخرین release](https://github.com/dazzling-no-more/rahgozar/releases/latest) برو و فایل مناسب کامپیوترت را دانلود کن:
-
-| سیستم تو | فایل دانلود |
-|---|---|
-| مک با تراشهٔ Apple Silicon (M1 / M2 / M3 / M4) | `rahgozar-macos-arm64-app.zip` |
-| مک با تراشهٔ Intel | `rahgozar-macos-amd64-app.zip` |
-| ویندوز | `rahgozar-windows-amd64.zip` |
-| لینوکس (Ubuntu / Mint / Fedora / Debian / Arch) | `rahgozar-linux-amd64.tar.gz` |
-| گوشی یا تبلت اندروید | `rahgozar-android-universal-v*.apk` |
-| روتر OpenWRT یا Alpine | `rahgozar-linux-musl-amd64.tar.gz` |
-
-> **مک: مطمئن نیستی Apple Silicon است یا Intel؟** کلیک کن  → **About This Mac**. اگر "Chip" نوشت **Apple**، arm64 بگیر. اگر **Intel** بود، amd64.
-
-> **لینوکس: خطای `GLIBC` می‌گیری؟** به‌جای آن از `linux-musl-amd64` استفاده کن — روی هر لینوکسی بدون وابستگی کار می‌کند.
-
-از حالت فشرده دربیار.
-
-### مرحلهٔ ۳ — اجرای اول
-
-روی فایل اجرا دو بار کلیک کن:
-
-| سیستم | فایل اجرا |
-|---|---|
-| مک | `run.command` |
-| ویندوز | `run.bat` |
-| لینوکس | `./run.sh` (در ترمینال) |
-
-اولین بار رمز کامپیوترت را می‌خواهد. این برای نصب یک گواهی کوچک است تا مرورگرت به رهگذر اعتماد کند. **گواهی روی کامپیوتر خودت ساخته می‌شود و هیچ‌وقت جایی ارسال نمی‌شود** — نه روی ابر، نه به گوگل، هیچ منبع راه‌دوری نمی‌تواند ازش استفاده کند.
-
-پنجرهٔ رهگذر باز می‌شود. این فیلدها را پر کن:
-
-- در فیلد **Apps Script ID(s)** مقدار **Deployment ID** از مرحلهٔ ۱ را پیست کن
-- در فیلد **Auth key** همان رشتهٔ تصادفی که در `Code.gs` گذاشتی را وارد کن
-- بقیه فیلدها را روی مقدار پیش‌فرض رها کن
-
-روی **Save config** و بعد **Start** بزن. اگر کار کند، دایرهٔ وضعیت سبز می‌شود.
-
-> **تستش کن:** دکمهٔ **Test** را بزن. یک درخواست از طریق رله می‌فرستد و می‌گوید کار کرد یا نه.
-
-### مرحلهٔ ۴ — مرورگر را روی رهگذر تنظیم کن
-
-#### فایرفاکس (پیشنهادی — ساده‌ترین)
-
-۱. فایرفاکس → منوی ☰ → **Settings**
-۲. در کادر جست‌وجو "proxy" تایپ کن
-۳. زیر Network Settings روی **Settings…** کلیک کن
-۴. گزینهٔ **Manual proxy configuration** را انتخاب کن
-۵. در فیلد **HTTP Proxy** آدرس `127.0.0.1` و پورت `8085` را بگذار
-۶. تیک گزینهٔ **"Also use this proxy for HTTPS"** ☑ را بزن
-۷. روی **OK** بزن
-
-#### کروم / Edge
-
-افزونهٔ [Proxy SwitchyOmega](https://chromewebstore.google.com/detail/proxy-switchyomega/padekgcemlokbadohgkifijomclgjgif) را نصب کن و پروکسی را روی `127.0.0.1:8085` تنظیم کن.
-
-#### مک (سراسری)
-
-از مسیر System Settings → Network → Wi-Fi → Details → **Proxies** برو و هر دو گزینهٔ **Web Proxy (HTTP)** و **Secure Web Proxy (HTTPS)** را روشن کن، هر دو روی `127.0.0.1:8085`.
-
-### مرحلهٔ ۵ — امتحان کن
-
-در مرورگرت یک سایت مسدود را باز کن. باید لود شود.
-
-اگر چیزی کار نکرد:
-
-- در پنجرهٔ رهگذر دکمهٔ **Test** را بزن — می‌گوید کجا گیر کرده
-- پنل **Recent log** پایین پنجره را نگاه کن
-- بخش [سؤالات رایج](#سؤالات-رایج) پایین را ببین
-
----
-
-## سؤالات رایج
-
-**واقعاً رایگانه؟** بله. گوگل به هر حساب روزانه ۲۰٬۰۰۰ درخواست خروجی URL در سهمیهٔ رایگان می‌دهد. برای مرور عادی یک نفر کاملاً کافی است. برای خانوادهٔ ۳-۴ نفره که از یک سرویس استفاده می‌کنند، در ۲-۳ حساب گوگل مختلف Deployment بساز و همهٔ ID‌ها را اضافه کن.
-
-**امنه؟** گواهی روی کامپیوتر خودت می‌ماند — کسی کلید خصوصی را ندارد. `auth_key` رمز محرمانهٔ توست. گوگل سایت‌هایی که از طریق رله باز می‌کنی را می‌بیند (چون Apps Script برای تو fetch می‌کند) — مثل هر پروکسی میزبانی‌شدهٔ دیگری. اگر این برایت قابل قبول نیست، از Full Tunnel با VPS شخصی استفاده کن — در [راهنمای کامل](docs/guide.fa.md#حالت-تونل-کامل).
-
-**ویدیوی یوتیوب پخش نمی‌شود.** chunkهای ویدیوی یوتیوب از `googlevideo.com` می‌آیند و Apps Script نمی‌تواند به آن برسد (گوگل اجازهٔ دسترسی Apps Script به CDN ویدیوی خودش را نمی‌دهد). صفحهٔ خود یوتیوب لود می‌شود، فقط پخش ویدیو تحت تأثیر است. راه‌حل: Full Tunnel + VPS، یا `.googlevideo.com` را به `passthrough_hosts` در کانفیگت اضافه کن (مرورگر مستقیم می‌رود اما روی ISP ایران throttle می‌خورد).
-
-**در ChatGPT / Claude / Grok کپچای Cloudflare ظاهر می‌شود.** Cloudflare آی‌پی‌های دیتاسنتر گوگل را به‌عنوان bot شناسایی می‌کند. راه‌حل: یک **exit node** راه‌اندازی کن — یک handler کوچک TypeScript که روی یک host serverless (Deno Deploy، fly.io، VPS شخصی) deploy می‌کنی و پل می‌سازه از Apps Script به سایت Cloudflare. [`assets/exit_node/README.fa.md`](assets/exit_node/README.fa.md).
-
-**تلگرام پایدار نیست.** تلگرام از MTProto استفاده می‌کند که Apps Script نمی‌فهمد. روی کامپیوترت با [xray](https://github.com/XTLS/Xray-core) جفتش کن — [بخش تلگرام در راهنمای کامل](docs/guide.fa.md#تلگرام-با-xray).
-
-**وقتی ISP خود `script.google.com` را مسدود کرده.** رهگذر یک حالت `direct` دارد که فقط از تونل بازنویسی SNI استفاده می‌کند (بدون Apps Script). یک‌بار از این حالت استفاده کن تا به `script.google.com` برسی و اسکریپت را دیپلوی کنی، بعد به حالت apps_script سوئیچ کن. [حالت direct](docs/guide.fa.md#حالت-direct).
-
-**می‌خواهم از رهگذر به‌عنوان پروکسی upstream برای Psiphon (یا xray) استفاده کنم.** رهگذر را در حالت `direct` اجرا کن و در تنظیمات Psiphon قسمت *upstream proxy* را روی host:port که زیر دکمهٔ Connect نمایش داده می‌شود تنظیم کن. هاست‌هایی که در لیست fronting قرار ندارند به‌صورت raw TCP عبور می‌کنند، پس ترافیک bootstrap سایفون به سرورهای سایفون دست‌نخورده می‌رسد. [docs/use-as-upstream.fa.md](docs/use-as-upstream.fa.md).
-
-**جست‌وجوی گوگلم بدون JavaScript ظاهر می‌شود.** `User-Agent` Apps Script ثابت روی `Google-Apps-Script` است (گوگل نمی‌گذارد اسکریپت‌ها عوضش کنند)، پس بعضی سایت‌ها نسخهٔ بدون JS برمی‌گردانند. راه‌حل: دامنهٔ مورد نظر را به `hosts` اضافه کن تا از تونل بازنویسی SNI با User-Agent واقعی مرورگرت برود. `google.com`، `youtube.com`، `fonts.googleapis.com` به‌طور پیش‌فرض در این لیست‌اند.
-
-**سؤالات بیشتر:** [FAQ کامل در راهنمای بلند](docs/guide.fa.md#سؤالات-رایج).
-
-## کمک می‌خواهی؟
-
-- در [issueهای rahgozar](https://github.com/dazzling-no-more/rahgozar/issues?q=is%3Aissue) جست‌وجو کن — و در [بایگانی بزرگ‌تر بالادست therealaleph/MasterHttpRelayVPN-RUST](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/issues?q=is%3Aissue) که بیشتر تاریخ پروژه آن‌جاست — احتمالاً مشکلت قبلاً جواب داده شده
-- یک [issue جدید در rahgozar](https://github.com/dazzling-no-more/rahgozar/issues/new) باز کن با: کانفیگت (حتماً `auth_key` را پنهان کن!)، دقیقاً چه کاری کردی، دقیقاً چه دیدی در log
-
-## اعتبار
-
-این فورک روی سه پروژهٔ بالادست ایستاده — قبل از این که به این فورک فکر کنی، باید این سه را بشناسی و حمایتشان کنی:
-
-- پروژهٔ اصلی پایتون **[@masterking32/MasterHttpRelayVPN](https://github.com/masterking32/MasterHttpRelayVPN)** — همه‌چیز از این‌جا شروع شد. پروتکل Apps Script، معماری پروکسی، ایدهٔ استفاده از حساب گوگل خودت به‌عنوان رلهٔ رایگان — همه از اوست. بدون این، هیچ‌کدام از باقی وجود نداشت.
-- پورت Rust به نام **[@therealaleph/MasterHttpRelayVPN-RUST](https://github.com/therealaleph/MasterHttpRelayVPN-RUST)** (`mhrv-rs`) — این فورک ادامهٔ همان است. therealaleph پروژهٔ پایتون را به Rust بازنویسی کرد تا کلاینت‌های تک‌فایلی منتشر کند، رابط دسکتاپ و اندروید را ساخت، و پروژه را از v1.x تا v1.9.25 پیش برد. تقریباً هر خط کد این فورک کار اوست؛ ما فقط چراغ را روشن نگه داشتیم.
-- ایدهٔ گروه‌های fronting در **[@patterniha/MITM-DomainFronting](https://github.com/patterniha/MITM-DomainFronting)** — مسیریابی دامنه‌های خاص از طریق edge های Vercel / Fastly / CloudFront با SNI، که به بستهٔ آمادهٔ fronting این پروژه تبدیل شد. پروژه‌ای مستقل؛ کانفیگ Xray آن الهام‌بخش ادغام ما بود. جزئیات در [`docs/fronting-groups.md`](docs/fronting-groups.md).
-
-بیشتر کد Rust این پورت (شامل کار ادغام و rebrand این فورک) با کمک [Claude شرکت Anthropic](https://claude.com) نوشته شده و روی هر commit انسانی بازبینی شده است.
-
-## حمایت از این پروژه‌ها
-
-اگر از این نرم‌افزار سود برده‌ای، **حمایتت را به بالادست بفرست، نه به این فورک.** رهگذر هیچ کمک مالی‌ای نمی‌گیرد و فقط برای پوشش کاربران در دورانی که بالادست غیرفعال است وجود دارد. مهندسی اصلی در سه پروژهٔ بالا انجام شده؛ لطفاً مستقیماً از آن‌ها حمایت کن:
-
-- در GitHub Sponsors از **[@masterking32](https://github.com/masterking32)** — نویسندهٔ پروژهٔ اصلی پایتون. یا از طریق روش‌های ذکر شده در پروفایل و ریپوی او.
-- در **[sh1n.org/donate](https://sh1n.org/donate)** برای **[@therealaleph](https://github.com/therealaleph)** — نویسندهٔ پورت Rust. پوشش هزینهٔ هاستینگ / CI / سال‌ها نگه‌داری.
-- در GitHub Sponsors از **[@patterniha](https://github.com/patterniha)** — نویسندهٔ MITM-DomainFronting. یا از طریق روش‌های ذکر شده در ریپوی او.
-
-</div>
