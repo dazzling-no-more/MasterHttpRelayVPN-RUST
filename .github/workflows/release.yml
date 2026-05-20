@@ -20,7 +20,8 @@ on:
 
 permissions:
   contents: write
-  # `tunnel-docker` job pushes to ghcr.io/${{ github.repository_owner }}/rahgozar-tunnel-node.
+  # `tunnel-docker-build` and `tunnel-docker-manifest` jobs push to
+  # ghcr.io/${{ github.repository_owner }}/rahgozar-tunnel-node.
   # `packages: write` is required by docker/login-action when authenticating
   # to GHCR with the workflow's auto-provisioned GITHUB_TOKEN. Granted at
   # the workflow level so the matrix-build job (which doesn't need it) and
@@ -760,7 +761,23 @@ jobs:
   # Build platforms: linux/amd64 and linux/arm64. Most VPS providers
   # (DigitalOcean, Hetzner, Oracle Free Tier) offer arm64 instances at
   # half price, and the binary works on both.
-  tunnel-docker:
+  #
+  # Layout: `tunnel-docker-build` runs a 2-entry matrix, one per platform,
+  # each on its own *native* runner — no QEMU. The amd64 leg uses the
+  # standard `ubuntu-latest`; the arm64 leg uses `ubuntu-24.04-arm` (free
+  # GitHub-hosted arm64 runner for public repos). Each leg pushes a
+  # digest-only image to GHCR. `tunnel-docker-manifest` then stitches the
+  # per-platform digests into a single multi-arch manifest under the
+  # release tags. Result: arm64 build drops from ~20 min under QEMU
+  # emulation to ~3–5 min native, cutting the tunnel-docker critical
+  # path of the release roughly in half.
+  #
+  # The Dockerfile is unchanged — any developer running
+  # `docker build ./tunnel-node` (single-arch native) or
+  # `docker buildx build --platform=linux/amd64,linux/arm64 ./tunnel-node`
+  # (multi-arch via local QEMU) locally still works identically. We just
+  # don't emulate in CI anymore.
+  tunnel-docker-build:
     # No `needs:` on purpose. tunnel-node is a separate crate; the docker
     # image is built from ./tunnel-node source via its own Dockerfile and
     # consumes zero artifacts from the desktop build matrix. Previously
@@ -778,10 +795,27 @@ jobs:
     # are a different audience from desktop users, and the recovery path
     # (workflow_dispatch on the existing tag to retry the failed pieces)
     # republishes the docker tag atomically with the rest.
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runs-on: ubuntu-latest
+            arch_suffix: amd64
+          - platform: linux/arm64
+            # GitHub-hosted free arm64 runner for public repos (GA early
+            # 2025). Native arm64 means no QEMU and no 5–10x emulation
+            # tax on Rust compilation. If GitHub retires this label,
+            # swap for the latest `ubuntu-XX.YY-arm` they publish.
+            runs-on: ubuntu-24.04-arm
+            arch_suffix: arm64
+    runs-on: ${{ matrix.runs-on }}
     permissions:
       contents: read
       packages: write
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      minor: ${{ steps.ver.outputs.minor }}
     steps:
       - uses: actions/checkout@v4
 
@@ -790,6 +824,11 @@ jobs:
       # workflow_dispatch from the explicit `inputs.version` (e.g.
       # "1.5.0"). Strip a possible leading "v" so the docker tag namespace
       # is consistent: `:1.5.0`, not `:v1.5.0`.
+      #
+      # Both matrix legs compute the same value; the manifest job reads
+      # it via `needs.tunnel-docker-build.outputs.version` — matrix
+      # outputs collapse to a single value when every leg writes the same
+      # thing, which is exactly the case here.
       - name: Compute version
         id: ver
         run: |
@@ -798,9 +837,10 @@ jobs:
           MINOR="${VER%.*}"
           echo "version=${VER}" >> "$GITHUB_OUTPUT"
           echo "minor=${MINOR}" >> "$GITHUB_OUTPUT"
-          echo "Building docker for v${VER} (minor: ${MINOR})"
+          echo "Building docker for v${VER} (minor: ${MINOR}) on ${{ matrix.platform }}"
 
-      - uses: docker/setup-qemu-action@v3
+      # No `docker/setup-qemu-action@v3` — we're building each platform
+      # on its own native runner, so emulation is dead weight.
       - uses: docker/setup-buildx-action@v3
 
       - name: Log in to GHCR
@@ -810,23 +850,165 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build for both amd64 and arm64. `:latest` is only updated on
-      # actual tag pushes — workflow_dispatch re-runs on an existing
-      # version (e.g. for the v1.4.0 mipsel republish) shouldn't move
-      # the latest pointer.
-      - name: Build and push image
+      # Build for a single platform and push by digest only — no tag is
+      # applied here. The manifest job below combines the per-platform
+      # digests under the actual release tags. This is the standard
+      # docker/build-push-action multi-platform pattern for split runners.
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@v6
         with:
           context: ./tunnel-node
           file: ./tunnel-node/Dockerfile
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ghcr.io/${{ github.repository_owner }}/rahgozar-tunnel-node:${{ steps.ver.outputs.version }}
-            ghcr.io/${{ github.repository_owner }}/rahgozar-tunnel-node:${{ steps.ver.outputs.minor }}
-            ${{ github.event_name == 'push' && format('ghcr.io/{0}/rahgozar-tunnel-node:latest', github.repository_owner) || '' }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          platforms: ${{ matrix.platform }}
+          # Per-platform cache scope so the two matrix legs don't fight
+          # over a shared GHA cache key (cache mode=max would otherwise
+          # invalidate cross-platform layers on every push).
+          cache-from: type=gha,scope=tunnel-${{ matrix.arch_suffix }}
+          cache-to: type=gha,scope=tunnel-${{ matrix.arch_suffix }},mode=max
+          outputs: type=image,name=ghcr.io/${{ github.repository_owner }}/rahgozar-tunnel-node,push-by-digest=true,name-canonical=true,push=true
+
+      # Write the digest to a file whose basename IS the digest (sans
+      # `sha256:` prefix). The manifest job globs `/tmp/digests/*` and
+      # reconstructs the `<image>@sha256:<digest>` reference list from
+      # the filenames.
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          DIGEST="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tunnel-docker-digest-${{ matrix.arch_suffix }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # Combine the per-platform digests into a single multi-arch manifest
+  # under the release tags. End-user `docker pull ...:<version>` (no
+  # leading `v` — the workflow strips it, so the tag is e.g. `:2.2.0`,
+  # not `:v2.2.0`) on either amd64 or arm64 keeps working unchanged —
+  # the manifest list resolves to the right platform automatically.
+  # `:latest` only moves on actual tag pushes; workflow_dispatch re-runs
+  # on an existing version skip it.
+  tunnel-docker-manifest:
+    needs: tunnel-docker-build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      # Download each expected platform digest by *exact artifact name*,
+      # not by glob. If a build leg silently produced no artifact (e.g.
+      # `Export digest` regression, future maintainer renames the upload
+      # without updating this list), the named download fails with
+      # "Unable to find any artifacts for the associated workflow" and
+      # this job aborts before `imagetools create` can publish a
+      # single-platform manifest under the release tag. Adding a third
+      # platform to `tunnel-docker-build` requires adding another
+      # download here AND another expected entry in the assertion
+      # script below — both must agree.
+      - name: Download amd64 digest
+        uses: actions/download-artifact@v4
+        with:
+          name: tunnel-docker-digest-amd64
+          path: /tmp/digests
+      - name: Download arm64 digest
+        uses: actions/download-artifact@v4
+        with:
+          name: tunnel-docker-digest-arm64
+          path: /tmp/digests
+
+      # Belt-and-suspenders count check. Catches the case where someone
+      # adds a new platform to `tunnel-docker-build` (and a matching
+      # `Download <arch> digest` step above) without updating this
+      # constant — the inspect-time platform assertion below covers the
+      # opposite direction, but the count check makes the "extra
+      # platform built but ignored" case fail loudly here too.
+      - name: Verify expected digest count
+        env:
+          EXPECTED_COUNT: "2"
+        run: |
+          set -euo pipefail
+          GOT=$(find /tmp/digests -maxdepth 1 -type f | wc -l)
+          if [ "${GOT}" -ne "${EXPECTED_COUNT}" ]; then
+            echo "::error::expected ${EXPECTED_COUNT} platform digests, got ${GOT}"
+            ls -la /tmp/digests/
+            exit 1
+          fi
+          echo "verified ${GOT} platform digest(s) present"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create multi-arch manifest
+        env:
+          VERSION: ${{ needs.tunnel-docker-build.outputs.version }}
+          MINOR: ${{ needs.tunnel-docker-build.outputs.minor }}
+          EVENT: ${{ github.event_name }}
+          IMG: ghcr.io/${{ github.repository_owner }}/rahgozar-tunnel-node
+        run: |
+          set -euo pipefail
+          TAGS=( "-t" "${IMG}:${VERSION}" "-t" "${IMG}:${MINOR}" )
+          # `:latest` only on tag-push events. workflow_dispatch reruns
+          # on an already-released version (e.g. mipsel republish) must
+          # not move the latest pointer — matches the previous behavior.
+          if [ "${EVENT}" = "push" ]; then
+            TAGS+=( "-t" "${IMG}:latest" )
+          fi
+          SOURCES=()
+          for f in /tmp/digests/*; do
+            DIGEST="$(basename "$f")"
+            SOURCES+=( "${IMG}@sha256:${DIGEST}" )
+          done
+          docker buildx imagetools create "${TAGS[@]}" "${SOURCES[@]}"
+
+      # Assert the *published* manifest actually contains every expected
+      # platform. Catches:
+      #  - registry write that succeeded but landed a partial manifest
+      #    for any reason (extremely unlikely with `imagetools create`,
+      #    but cheap to verify)
+      #  - silent regressions where a future Dockerfile change makes one
+      #    platform's build push a manifest list that imagetools then
+      #    flattens in unexpected ways
+      # `--raw` returns the manifest JSON; jq diffs against the expected
+      # platform set and exits non-zero (via `error`) if anything's
+      # missing. Update EXPECTED_PLATFORMS when the build matrix grows.
+      - name: Inspect manifest and assert platforms
+        env:
+          VERSION: ${{ needs.tunnel-docker-build.outputs.version }}
+          IMG: ghcr.io/${{ github.repository_owner }}/rahgozar-tunnel-node
+          EXPECTED_PLATFORMS: '["linux/amd64","linux/arm64"]'
+        run: |
+          set -euo pipefail
+          docker buildx imagetools inspect "${IMG}:${VERSION}"
+          docker buildx imagetools inspect --raw "${IMG}:${VERSION}" \
+            | jq --argjson expected "${EXPECTED_PLATFORMS}" -er '
+                ([.manifests[]
+                  | select((.platform.os != "unknown") and
+                           (.platform.architecture != "unknown"))
+                  | "\(.platform.os)/\(.platform.architecture)"] | unique) as $got
+                | ($expected | unique) as $want
+                | ($want - $got) as $missing
+                | ($got - $want) as $unexpected
+                | if ($missing | length) > 0 then
+                    error("manifest missing platforms: " + ($missing | tostring) +
+                          "; got: " + ($got | tostring))
+                  elif ($unexpected | length) > 0 then
+                    error("manifest has unexpected platforms: " +
+                          ($unexpected | tostring) + "; got: " + ($got | tostring))
+                  else
+                    "manifest contains exactly the expected platforms: " +
+                    ($got | tostring)
+                  end
+              '
 
   # release: lightweight aggregation job kept on GH-hosted ubuntu-latest.
   # It only downloads artifacts and calls APIs — no build tooling needed,
