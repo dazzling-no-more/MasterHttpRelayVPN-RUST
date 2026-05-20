@@ -21,13 +21,13 @@ Current version: **v2.1.0**
 ## Download via git clone
 
 ```
-git clone https://github.com/therealaleph/MasterHttpRelayVPN-RUST.git
-cd MasterHttpRelayVPN-RUST/releases
+git clone https://github.com/dazzling-no-more/rahgozar.git
+cd rahgozar/releases
 ```
 
 ## Download via ZIP
 
-Go to [github.com/therealaleph/MasterHttpRelayVPN-RUST](https://github.com/therealaleph/MasterHttpRelayVPN-RUST), click the green **Code** button, then **Download ZIP**. Extract it — the archives are in the `releases/` folder.
+Go to [github.com/dazzling-no-more/rahgozar](https://github.com/dazzling-no-more/rahgozar), click the green **Code** button, then **Download ZIP**. Extract it — the archives are in the `releases/` folder.
 
 ## After download
 
@@ -59,7 +59,7 @@ See the [main README](../README.md) for desktop setup (Apps Script deployment, c
 
 ### دانلود از طریق ZIP
 
-به [github.com/therealaleph/MasterHttpRelayVPN-RUST](https://github.com/therealaleph/MasterHttpRelayVPN-RUST) بروید، روی دکمهٔ سبز **Code** کلیک و **Download ZIP** را بزنید. پس از extract، آرشیوها در پوشهٔ `releases/` هستند.
+به [github.com/dazzling-no-more/rahgozar](https://github.com/dazzling-no-more/rahgozar) بروید، روی دکمهٔ سبز **Code** کلیک و **Download ZIP** را بزنید. پس از extract، آرشیوها در پوشهٔ `releases/` هستند.
 
 ### بعد از دانلود
 

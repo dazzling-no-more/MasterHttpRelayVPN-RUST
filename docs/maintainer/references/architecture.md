@@ -36,7 +36,7 @@ client app → rahgozar SOCKS5 →
 ```
 
 - **CodeFull.gs** (in `assets/apps_script/CodeFull.gs`) is a different Apps Script — replaces Code.gs's local-fetch with calls to a tunnel-node container.
-- **tunnel-node** is a small axum-based Rust HTTP server (in `tunnel-node/`) that the user runs on their own VPS via Docker. Image: `ghcr.io/therealaleph/mhrv-tunnel-node:latest`.
+- **tunnel-node** is a small axum-based Rust HTTP server (in `tunnel-node/`) that the user runs on their own VPS via Docker. Image: `ghcr.io/dazzling-no-more/rahgozar-tunnel-node:latest`.
 - The bytes flow through the actual TCP tunnel between tunnel-node and the upstream server — Apps Script only handles the **signaling** for tunnel session lifecycle. This means Apps Script's 30s response cap doesn't apply to long-running connections (no SABR cliff). Bigger uploads/downloads work.
 - Trade-off: requires a VPS ($3-5/month from Hetzner/Contabo/OVH/Parspack), more setup steps, three places to keep AUTH_KEYs in sync.
 - The VPS does NOT need to be reachable from Iran directly. Apps Script (running in Google's data center) is the one that talks to the VPS, so the user's ISP only sees the user-to-Apps-Script leg, which is Google IPs.

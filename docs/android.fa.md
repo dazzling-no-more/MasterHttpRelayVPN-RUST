@@ -63,7 +63,7 @@ VpnService TUN  ──► tun2proxy (داخل فرایند)
 
 ## ۱. نصب APK
 
-۱. در مرورگر گوشی به <https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases/latest> بروید.
+۱. در مرورگر گوشی به <https://github.com/dazzling-no-more/rahgozar/releases/latest> بروید.
 ۲. فایل `rahgozar-android-universal-v*.apk` را دانلود کنید.
 ۳. روی نوتیفیکیشن دانلود ضربه بزنید تا `installer` باز شود.
 ۴. وقتی اندروید پرسید **«Allow this source to install apps?»**:
@@ -95,13 +95,13 @@ VpnService TUN  ──► tun2proxy (داخل فرایند)
    </div>
 
    مقدار `placeholder` را با یک رشتهٔ تصادفی قوی (حداقل ۲۰ کاراکتر حروف + رقم) جایگزین کنید. این مقدار را جایی ذخیره کنید — در برنامه هم همین را می‌خواهید.
-۵. ذخیره کنید (⌘S / Ctrl+S). نام پروژه را چیزی مثل `mhrv-relay` بگذارید.
+۵. ذخیره کنید (⌘S / Ctrl+S). نام پروژه را چیزی مثل `rahgozar-relay` بگذارید.
 ۶. **Deploy → New deployment**.
 ۷. روی آیکون چرخ‌دنده بزنید → **Web app**. این فیلدها را پر کنید:
 
    | فیلد | مقدار |
    |---|---|
-   | Description | `mhrv-relay v1` (یا هر چیزی) |
+   | Description | `rahgozar-relay v1` (یا هر چیزی) |
    | Execute as | **Me** |
    | Who has access | **Anyone** |
 

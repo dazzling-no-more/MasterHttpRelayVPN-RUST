@@ -91,7 +91,7 @@ docker run -d --name mhrv-tunnel \
   --restart unless-stopped \
   -p 8443:8443 \
   -e TUNNEL_AUTH_KEY="your-secret-here" \
-  ghcr.io/therealaleph/mhrv-tunnel-node:latest
+  ghcr.io/dazzling-no-more/rahgozar-tunnel-node:latest
 ```
 
 به‌جای `your-secret-here` همون مقداری که در CodeFull.gs گذاشتید بنویسید.
@@ -220,7 +220,7 @@ docker run -d --name mhrv-tunnel \
   --restart unless-stopped \
   -p 8443:8443 \
   -e TUNNEL_AUTH_KEY="your-secret-here" \
-  ghcr.io/therealaleph/mhrv-tunnel-node:latest
+  ghcr.io/dazzling-no-more/rahgozar-tunnel-node:latest
 ```
 
 **اسم env var دقیقاً `TUNNEL_AUTH_KEY` ست** — uppercase، با underscore. هر deviation در default `changeme` می‌افته + بعداً mismatch می‌سازه.

@@ -66,7 +66,7 @@ If both ngrok and cloudflared paths are blocked on your network, run
 
 - **HuggingFace Spaces (Docker SDK)**: free, permanent `*.hf.space` URL,
   no tunnel layer needed. Create a Space → pick Docker SDK → small
-  Dockerfile that runs `ghcr.io/therealaleph/mhrv-tunnel-node:latest`.
+  Dockerfile that runs `ghcr.io/dazzling-no-more/rahgozar-tunnel-node:latest`.
   16 GB storage, 2 vCPU. Most Iran-friendly option in 2026.
 - **Replit (Deno repl)**: signup with email, free tier. Run
   `mhrv-tunnel-node` and the Repl exposes a public URL.

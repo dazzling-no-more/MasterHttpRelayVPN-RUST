@@ -177,6 +177,6 @@ After all PRs are merged, **then** bump version, write changelog (covering all m
 - Changing the env var contract
 - Bumping the Docker image label
 
-For pure internal refactors of tunnel-node that don't change the surface, leave it alone — the Docker image at `ghcr.io/therealaleph/mhrv-tunnel-node:latest` continues to be the latest tag and users don't need to know an internal version bumped.
+For pure internal refactors of tunnel-node that don't change the surface, leave it alone — the Docker image at `ghcr.io/dazzling-no-more/rahgozar-tunnel-node:latest` continues to be the latest tag and users don't need to know an internal version bumped.
 
-When tunnel-node version bumps, the Docker image gets re-tagged in the registry by the CI. Users running `docker pull ghcr.io/therealaleph/mhrv-tunnel-node:latest` get the new version automatically; users pinned to a specific version stay pinned.
+When tunnel-node version bumps, the Docker image gets re-tagged in the registry by the CI. Users running `docker pull ghcr.io/dazzling-no-more/rahgozar-tunnel-node:latest` get the new version automatically; users pinned to a specific version stay pinned.

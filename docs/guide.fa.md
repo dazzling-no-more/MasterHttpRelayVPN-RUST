@@ -19,7 +19,7 @@
 - [تلگرام با xray](#تلگرام-با-xray)
 - [حالت تونل کامل](#حالت-تونل-کامل)
   - [تأثیر تعداد Deployment](#تأثیر-تعداد-deployment)
-  - [راه‌اندازی سریع](#راه‌اندازی-سریع-حالت-full)
+  - [راهنمای راه‌اندازی](#راه‌اندازی)
 - [Exit node — برای ChatGPT / Claude / Grok](#exit-node)
 - [اشتراک‌گذاری از طریق هات‌اسپات](#اشتراک‌گذاری-هات‌اسپات)
 - [اجرا روی OpenWRT](#اجرا-روی-openwrt)
@@ -59,7 +59,7 @@ DPI سانسورگر فقط SNI داخل TLS را می‌بیند و اجازه 
 
 ## پلتفرم‌ها و فایل‌های اجرایی
 
-لینوکس (x86_64، aarch64)، مک (x86_64، aarch64)، ویندوز (x86_64)، **اندروید ۷.۰ به بالا** (APK جهانی شامل arm64، armv7، x86_64، x86). فایل‌های آماده در [صفحهٔ releases](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases).
+لینوکس (x86_64، aarch64)، مک (x86_64، aarch64)، ویندوز (x86_64)، **اندروید ۷.۰ به بالا** (APK جهانی شامل arm64، armv7، x86_64، x86). فایل‌های آماده در [صفحهٔ releases](https://github.com/dazzling-no-more/rahgozar/releases).
 
 **اندروید:** فایل `rahgozar-android-universal-v*.apk` را دانلود کن. راهنمای کامل در [docs/android.fa.md](android.fa.md) (فارسی) یا [docs/android.md](android.md) (انگلیسی). نسخهٔ اندروید همان `rahgozar` Rust دسکتاپ را اجرا می‌کند (از طریق JNI) به‌علاوهٔ پل TUN با `tun2proxy` تا تمام برنامه‌های دستگاه بدون نیاز به تنظیم per-app از پروکسی رد شوند.
 
@@ -231,29 +231,11 @@ HTTP / HTTPS مثل قبل از Apps Script می‌رود (تغییری نمی�
 - **سقف payload ۴ مگابایت** در هر بَچ — خیلی کمتر از ۵۰ مگابایت Apps Script
 - **timeout ۳۰ ثانیه** هر بَچ — مقصد کند / مرده نمی‌تواند سایر سشن‌ها را گیر بیاندازد
 
-### راه‌اندازی سریع حالت full
+### راه‌اندازی
 
-۱. [`CodeFull.gs`](../assets/apps_script/CodeFull.gs) را به‌عنوان Web App روی **هر حساب گوگل** دیپلوی کن (همان مراحل `Code.gs`، اما با اسکریپت full-mode که به tunnel-node تو forward می‌کند). یک Deployment per account — سقف ۳۰ همزمان per account است، چند Deployment روی یک حساب سهمیه را زیاد نمی‌کند. برای مقیاس، حساب‌های بیشتر:
-   - **استفادهٔ تنها** → ۱-۲ حساب
-   - **اشتراک با ~۳ نفر** → ۳ حساب
-   - **اشتراک با گروه** → یک حساب per کاربر سنگین
+**← [تونل کامل — راهنمای کامل راه‌اندازی](full-tunnel-setup.fa.md)**
 
-۲. [tunnel-node](../tunnel-node/) را روی VPS دیپلوی کن. سریع‌ترین راه ایمیج Docker آماده:
-   ```bash
-   docker run -d --name mhrv-tunnel --restart unless-stopped \
-     -p 8080:8080 -e TUNNEL_AUTH_KEY=رمز_قوی_تو \
-     ghcr.io/therealaleph/mhrv-tunnel-node:latest
-   ```
-   Multi-arch (linux/amd64 + linux/arm64)، اجرا با کاربر غیر root، حدود ۳۲ مگابایت فشرده. برای production نسخهٔ مشخص (`:1.5.0`) را pin کن. راهنمای کامل (شامل Cloud Run، docker-compose، بیلد از سورس) در [tunnel-node/README.fa.md](../tunnel-node/README.fa.md).
-
-۳. در کانفیگت `"mode": "full"` با همهٔ Deployment IDها بگذار:
-   ```json
-   {
-     "mode": "full",
-     "script_id": ["id1", "id2", "id3", "id4", "id5", "id6"],
-     "auth_key": "secret-تو"
-   }
-   ```
+قابل copy-paste از صفر: کرایهٔ VPS، نصب Docker، اجرای tunnel-node، paste کردن CodeFull.gs داخل Apps Script با مراحل کلیک-به-کلیک UI، اتصال هر سه constant، نوشتن `config.json`، تست end-to-end. حدود ۱۵ دقیقه (با تهیهٔ VPS حدود ۲۵).
 
 ## Exit node
 

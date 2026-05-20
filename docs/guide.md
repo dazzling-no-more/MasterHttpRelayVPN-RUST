@@ -17,7 +17,7 @@ This is the long version — every config option, every advanced mode, every tro
 - [Telegram via xray](#telegram-via-xray)
 - [Full Tunnel mode](#full-tunnel-mode)
   - [How deployment IDs affect performance](#how-deployment-ids-affect-performance)
-  - [Quick start](#full-mode-quick-start)
+  - [Setup walkthrough](#setup)
 - [Exit node — for ChatGPT / Claude / Grok](#exit-node)
 - [Sharing via hotspot](#sharing-via-hotspot)
 - [Running on OpenWRT or any musl distro](#running-on-openwrt)
@@ -57,7 +57,7 @@ For Google-owned domains (`google.com`, `youtube.com`, `fonts.googleapis.com`, �
 
 ## Platforms and binaries
 
-Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64), **Android 7.0+** (universal APK covering arm64, armv7, x86_64, x86). Prebuilt binaries on the [releases page](https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases).
+Linux (x86_64, aarch64), macOS (x86_64, aarch64), Windows (x86_64), **Android 7.0+** (universal APK covering arm64, armv7, x86_64, x86). Prebuilt binaries on the [releases page](https://github.com/dazzling-no-more/rahgozar/releases).
 
 **Android:** download `rahgozar-android-universal-v*.apk`. Full walk-through in [docs/android.md](android.md) (English) or [docs/android.fa.md](android.fa.md) (Persian). The Android build runs the same `rahgozar` Rust crate as desktop (via JNI) plus a TUN bridge via `tun2proxy` so every app on the device routes its IP traffic through the proxy without per-app config.
 
@@ -234,32 +234,11 @@ More deployments = more total concurrency = lower per-session latency. Each batc
 - **4 MB payload cap** per batch — well under Apps Script's 50 MB limit
 - **30 s timeout** per batch — slow / dead targets can't block other sessions forever
 
-### Full mode quick start
+### Setup
 
-1. Deploy [`CodeFull.gs`](../assets/apps_script/CodeFull.gs) as a Web App on **each Google account** (same steps as `Code.gs`, but use the full-mode script that forwards to your tunnel-node). One deployment per account — the 30-concurrent limit is per account, so multiple deployments on one account share the pool. To scale, use more accounts:
-   - **Solo use** → 1–2 accounts
-   - **Shared with ~3 people** → 3 accounts
-   - **Shared with a group** → one account per heavy user
+**→ [Full Tunnel — complete setup walkthrough](full-tunnel-setup.md)**
 
-2. Deploy [tunnel-node](../tunnel-node/) on a VPS. Fastest is the prebuilt Docker image:
-
-   ```bash
-   docker run -d --name mhrv-tunnel --restart unless-stopped \
-     -p 8080:8080 -e TUNNEL_AUTH_KEY=your-strong-secret \
-     ghcr.io/therealaleph/mhrv-tunnel-node:latest
-   ```
-
-   Multi-arch (linux/amd64 + linux/arm64), runs as non-root, ~32 MB compressed. Pin a version tag (`:1.5.0`) for production. See [tunnel-node/README.md](../tunnel-node/README.md) for Cloud Run, docker-compose, and source-build alternatives.
-
-3. Set `"mode": "full"` in your config with all deployment IDs:
-
-   ```json
-   {
-     "mode": "full",
-     "script_id": ["id1", "id2", "id3", "id4", "id5", "id6"],
-     "auth_key": "your-secret"
-   }
-   ```
+Copy-paste from zero: rent a VPS, install Docker, run tunnel-node, paste CodeFull.gs into Apps Script with click-by-click UI steps, wire all three constants, write `config.json`, test end-to-end. ~15 minutes (~25 with VPS provisioning).
 
 ## Exit node
 

@@ -57,7 +57,7 @@ Setup time: **~10 minutes** if your Apps Script deployment already exists, ~15 m
 
 ## 1. Install the APK
 
-1. On your phone, open the browser and go to <https://github.com/therealaleph/MasterHttpRelayVPN-RUST/releases/latest>.
+1. On your phone, open the browser and go to <https://github.com/dazzling-no-more/rahgozar/releases/latest>.
 2. Download `rahgozar-android-universal-v*.apk`.
 3. Tap the download to open the installer.
 4. When Android asks **"Allow this source to install apps?"**:
@@ -84,13 +84,13 @@ Do this on a laptop — it's a browser-heavy flow that's painful on a phone.
    const AUTH_KEY = "CHANGE_ME_TO_A_STRONG_SECRET";
    ```
    Replace the placeholder with a strong random secret (20+ chars, letters + digits). Save this value — you'll paste it into the app too.
-5. **File → Save** (⌘S / Ctrl+S). Name the project something like `mhrv-relay`.
+5. **File → Save** (⌘S / Ctrl+S). Name the project something like `rahgozar-relay`.
 6. **Deploy → New deployment**.
 7. Click the gear icon → **Web app**. Fill in:
 
    | Field | Value |
    |---|---|
-   | Description | `mhrv-relay v1` (or whatever) |
+   | Description | `rahgozar-relay v1` (or whatever) |
    | Execute as | **Me** |
    | Who has access | **Anyone** |
 

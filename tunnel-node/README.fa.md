@@ -4,6 +4,8 @@
 
 سرور پل HTTP-tunnel برای حالت `full` در MasterHttpRelayVPN. درخواست‌های HTTP-tunnel رو که از Apps Script می‌رسن، به اتصال‌های واقعی TCP/UDP تبدیل می‌کنه.
 
+> فقط می‌خوای Full Tunnel راه بیفته؟ راهنمای [`docs/full-tunnel-setup.fa.md`](../docs/full-tunnel-setup.fa.md) را ببین — راهنمای copy-paste که VPS، Apps Script، و config کلاینت را پوشش می‌دهد. این README مرجع همهٔ گزینه‌های دیپلوی و جزئیات پروتکل است.
+
 این `tunnel-node` همون قطعه‌ای از مسیر Full mode هست که روی **VPS شما** اجرا می‌شه. جواب کوتاه به سؤال «آیا VPS لازمه؟» = **بله، برای حالت Full بدون VPS کار نمی‌کنه**.
 
 ## معماری
@@ -54,17 +56,17 @@ docker run -d \
   --restart unless-stopped \
   -p 8080:8080 \
   -e TUNNEL_AUTH_KEY="$SECRET" \
-  ghcr.io/therealaleph/mhrv-tunnel-node:latest
+  ghcr.io/dazzling-no-more/rahgozar-tunnel-node:latest
 ```
 
-تگ `:latest` آخرین release رو دنبال می‌کنه. برای production توصیه می‌شه روی version مشخص pin بزنی: `ghcr.io/therealaleph/mhrv-tunnel-node:v1.8.0` (یا هر نسخه‌ای که داری). image روی `linux/amd64` و `linux/arm64` موجوده.
+تگ `:latest` آخرین release رو دنبال می‌کنه. برای production توصیه می‌شه روی version مشخص pin بزنی: `ghcr.io/dazzling-no-more/rahgozar-tunnel-node:1.8.0` (یا هر نسخه‌ای که داری). image روی `linux/amd64` و `linux/arm64` موجوده. تگ‌ها از releaseهای rahgozar پیروی می‌کنن بدون پیشوند `v` — ببین <https://github.com/dazzling-no-more/rahgozar/releases>.
 
 **docker-compose.yml** اگه این رو ترجیح می‌دی:
 
 ```yaml
 services:
   tunnel:
-    image: ghcr.io/therealaleph/mhrv-tunnel-node:latest
+    image: ghcr.io/dazzling-no-more/rahgozar-tunnel-node:latest
     restart: unless-stopped
     ports:
       - "8080:8080"

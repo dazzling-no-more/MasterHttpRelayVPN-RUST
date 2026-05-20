@@ -4,9 +4,11 @@
 
 HTTP tunnel bridge server for MasterHttpRelayVPN "full" mode. Bridges HTTP tunnel requests (from Apps Script) to real TCP connections.
 
+> **Just want Full Tunnel set up?** Use [`docs/full-tunnel-setup.md`](../docs/full-tunnel-setup.md) — copy-paste walkthrough covering VPS, Apps Script, and client config. This README is the reference for all deployment options and protocol details.
+
 ## Architecture
 
-```
+```text
 Phone → rahgozar → [domain-fronted TLS] → Apps Script → [HTTP] → Tunnel Node → [real TCP] → Internet
 ```
 
@@ -50,17 +52,17 @@ docker run -d \
   --restart unless-stopped \
   -p 8080:8080 \
   -e TUNNEL_AUTH_KEY="$SECRET" \
-  ghcr.io/therealaleph/mhrv-tunnel-node:latest
+  ghcr.io/dazzling-no-more/rahgozar-tunnel-node:latest
 ```
 
-The `:latest` tag tracks the most recent release. To pin a specific version (recommended for production), use `ghcr.io/therealaleph/mhrv-tunnel-node:v1.5.0` (or whatever release you're on). Image is available for `linux/amd64` and `linux/arm64`.
+The `:latest` tag tracks the most recent release. To pin a specific version (recommended for production), use `ghcr.io/dazzling-no-more/rahgozar-tunnel-node:1.5.0` (or whatever release you're on). Image is available for `linux/amd64` and `linux/arm64`. Tags follow rahgozar releases without the `v` prefix — see <https://github.com/dazzling-no-more/rahgozar/releases>.
 
 **docker-compose.yml** if you prefer:
 
 ```yaml
 services:
   tunnel:
-    image: ghcr.io/therealaleph/mhrv-tunnel-node:latest
+    image: ghcr.io/dazzling-no-more/rahgozar-tunnel-node:latest
     restart: unless-stopped
     ports:
       - "8080:8080"
