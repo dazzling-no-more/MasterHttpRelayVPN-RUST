@@ -80,23 +80,35 @@ function _isConfiguredAuthKey() {
 // client → GAS → tunnel-node → public resolver path, and the
 // trans-Atlantic round-trip dominates first-hop latency. When
 // ENABLE_EDGE_DNS_CACHE is true, _doTunnelBatch intercepts udp_open
-// ops with port=53, serves the reply from CacheService on a hit, or
-// does its own DoH lookup on a miss from inside Google's network.
-// Cache hits never reach the tunnel-node.
+// ops with port=53 and serves CacheService hits locally. Cache misses
+// may spend a small, bounded number of DoH fetches from inside Google's
+// network; once that budget is exhausted, misses fall back to the normal
+// tunnel-node batch path and their replies are cached opportunistically.
+// Cache hits never reach the tunnel-node and cost zero UrlFetchApp quota.
 //
 // Safety property: parse errors, refused qtypes, and "every DoH resolver
 // failed" return null from _edgeDnsResolve and the op falls through to
 // the existing tunnel-node forward path. CacheService failures (transient
 // quota, getAll exceptions, oversize keys) are softer: the per-batch
-// cache lookup is skipped and no put happens, but DoH still runs from
-// inside Google's network. The per-op outcome degrades to "uncached
-// forward via DoH" rather than "forwarded all the way to the tunnel-node".
+// cache lookup is skipped and no persistent put happens, but the bounded
+// DoH miss budget may still run from inside Google's network. The per-op
+// outcome degrades to "uncached forward via DoH" or "forwarded all the
+// way to the tunnel-node" rather than failing the batch.
 // Set ENABLE_EDGE_DNS_CACHE=false to disable the whole feature and route
 // all DNS through the tunnel as before.
 const ENABLE_EDGE_DNS_CACHE = true;
 
-// DoH endpoints tried in order on cache miss. All speak RFC 8484
-// over GET. Apps Script's outbound network peers well to all three.
+// Maximum extra UrlFetchApp calls a single tunnel batch may spend on DoH
+// cache misses. This is deliberately low: warm cache hits are the real
+// quota win, while cold bursts of many distinct names should not explode
+// from one tunnel-node fetch into N DoH fetches. Set to 0 for pure
+// quota-saving (learn only from forwarded tunnel-node replies), or raise
+// if first-hit DNS latency matters more than daily UrlFetchApp count.
+const EDGE_DNS_MAX_DOH_FETCHES_PER_BATCH = 1;
+
+// DoH endpoints tried in order on cache miss, subject to the per-batch
+// fetch budget above. All speak RFC 8484 over GET. Apps Script's
+// outbound network peers well to all three.
 const EDGE_DNS_RESOLVERS = [
   "https://1.1.1.1/dns-query",
   "https://dns.google/dns-query",
@@ -238,8 +250,8 @@ function _doTunnel(req) {
 // is hit exactly once for the whole batch:
 //   pass 1: parse each candidate's question and collect cache keys
 //   one cache.getAll(keys) call serves every hit
-//   pass 2: resolve each candidate (cache hit → synth; miss → DoH; null
-//           → tunnel-node forward)
+//   pass 2: resolve each candidate (cache hit → synth; miss → bounded DoH;
+//           null → tunnel-node forward)
 // On a 5-DNS-query batch, this collapses 5 serial cache.get round trips
 // into one cache.getAll round trip.
 function _doTunnelBatch(req) {
@@ -253,6 +265,7 @@ function _doTunnelBatch(req) {
   var results = new Array(ops.length);   // sparse: filled by edge-DNS hits
   var forwardOps = [];
   var forwardIdx = [];
+  var forwardPrep = [];  // same shape as forwardOps; DNS prep or null
 
   // Pass 1: route non-DNS ops to forward, parse DNS candidates.
   var candidates = [];   // [{ i, prep }, ...]
@@ -267,21 +280,27 @@ function _doTunnelBatch(req) {
     }
     forwardOps.push(op);
     forwardIdx.push(i);
+    forwardPrep.push(null);
   }
 
   // One batched cache lookup for every DNS candidate. CacheService.getAll
   // returns a {key: value} map populated only for hits; missing keys are
   // simply absent. Any failure (transient quota, backend hiccup) returns
-  // an empty map so each candidate falls through to its own DoH attempt
-  // with no cached put either — the safe degradation path.
+  // an empty map so candidates fall through to the bounded DoH/tunnel
+  // path with no persistent cache put — the safe degradation path.
   var cacheMap = {};
   var cache = null;
   if (candidates.length > 0) {
     try {
       cache = CacheService.getScriptCache();
-      var keys = new Array(candidates.length);
+      var keys = [];
+      var seenKeys = {};
       for (var c = 0; c < candidates.length; c++) {
-        keys[c] = candidates[c].prep.key;
+        var key = candidates[c].prep.key;
+        if (!Object.prototype.hasOwnProperty.call(seenKeys, key)) {
+          seenKeys[key] = 1;
+          keys.push(key);
+        }
       }
       cacheMap = cache.getAll(keys) || {};
     } catch (_) {
@@ -293,17 +312,19 @@ function _doTunnelBatch(req) {
   // Pass 2: resolve each candidate. cacheMap doubles as the in-batch dedup
   // table — a successful DoH writes its encoded reply back into cacheMap
   // so a later candidate with the same qname/qtype hits without re-DoH.
-  // On null (cache miss + DoH all failed), append to the forward path so
-  // the tunnel-node still gets a chance.
+  // On null (cache miss + DoH failed or budget exhausted), append to the
+  // forward path so the tunnel-node still gets a chance.
+  var dohBudget = { remaining: EDGE_DNS_MAX_DOH_FETCHES_PER_BATCH };
   for (var c = 0; c < candidates.length; c++) {
     var cand = candidates[c];
     var synth = _edgeDnsResolve(
-      cand.prep, cacheMap[cand.prep.key] || null, cache, cacheMap);
+      cand.prep, cacheMap[cand.prep.key] || null, cache, cacheMap, dohBudget);
     if (synth) {
       results[cand.i] = synth;
     } else {
       forwardOps.push(ops[cand.i]);
       forwardIdx.push(cand.i);
+      forwardPrep.push(cand.prep);
     }
   }
 
@@ -312,18 +333,26 @@ function _doTunnelBatch(req) {
     return _json({ r: results });
   }
 
-  // Nothing was served locally — forward verbatim, no splice needed.
-  if (forwardOps.length === ops.length) {
+  // Nothing was served locally and there were no DNS candidates to learn
+  // from — forward verbatim, no parse/splice overhead.
+  if (forwardOps.length === ops.length && candidates.length === 0) {
     return _doTunnelBatchForward(ops);
   }
 
-  // Partial: forward the un-served ops and splice results back in place.
+  // Forward the un-served ops. DNS replies that came back from the
+  // tunnel-node are cached here, so the next batch can hit locally without
+  // spending an extra DoH fetch first.
   var resp = _doTunnelBatchFetch(forwardOps);
   if (resp.error) return _json({ e: resp.error });
   if (resp.r.length !== forwardOps.length) {
     // Tunnel-node version skew — bail explicitly rather than silently
     // route TCP responses to UDP sids.
     return _json({ e: "tunnel batch length mismatch" });
+  }
+  _edgeDnsCacheForwardedReplies(forwardPrep, resp.r, cache);
+  if (forwardOps.length === ops.length) {
+    return ContentService.createTextOutput(resp.text)
+      .setMimeType(ContentService.MimeType.JSON);
   }
   return _json({ r: _spliceTunnelResults(forwardIdx, resp.r, results) });
 }
@@ -358,8 +387,9 @@ function _doTunnelBatchFetch(ops) {
     return { error: "tunnel batch HTTP " + resp.getResponseCode() };
   }
   try {
-    var parsed = JSON.parse(resp.getContentText());
-    return { r: (parsed && parsed.r) || [] };
+    var text = resp.getContentText();
+    var parsed = JSON.parse(text);
+    return { r: (parsed && parsed.r) || [], text: text };
   } catch (err) {
     return { error: "tunnel batch parse error" };
   }
@@ -381,23 +411,27 @@ function _doSingle(req) {
   if (!req.u || typeof req.u !== "string" || !URL_RE.test(req.u)) {
     return _json({ e: "bad url" });
   }
-  var opts = _buildOpts(req);
-  var resp = UrlFetchApp.fetch(req.u, opts);
+  try {
+    var opts = _buildOpts(req);
+    var resp = UrlFetchApp.fetch(req.u, opts);
 
-  // Raw-return mode for the exit-node outer hop — see Code.gs _doSingle
-  // for the rationale. CodeFull.gs's HTTP relay path mirrors Code.gs's
-  // wire contract, so the same flag needs the same handling here.
-  if (req.raw === true) {
-    return ContentService
-      .createTextOutput(resp.getContentText())
-      .setMimeType(ContentService.MimeType.JSON);
+    // Raw-return mode for the exit-node outer hop — see Code.gs _doSingle
+    // for the rationale. CodeFull.gs's HTTP relay path mirrors Code.gs's
+    // wire contract, so the same flag needs the same handling here.
+    if (req.raw === true) {
+      return ContentService
+        .createTextOutput(resp.getContentText())
+        .setMimeType(ContentService.MimeType.JSON);
+    }
+
+    return _json({
+      s: resp.getResponseCode(),
+      h: _respHeaders(resp),
+      b: Utilities.base64Encode(resp.getContent()),
+    });
+  } catch (err) {
+    return _json({ e: "fetch failed: " + String(err) });
   }
-
-  return _json({
-    s: resp.getResponseCode(),
-    h: _respHeaders(resp),
-    b: Utilities.base64Encode(resp.getContent()),
-  });
 }
 
 function _doBatch(items) {
@@ -426,40 +460,45 @@ function _doBatch(items) {
     }
   }
 
-  // fetchAll() runs all requests in parallel inside Google. If it
-  // throws as a whole (e.g. one URL violates UrlFetchApp limits and
-  // poisons the whole batch), degrade to per-item fetch so a single
-  // bad request does not zero out the entire batch's responses.
-  // Mirrors upstream `masterking32/MasterHttpRelayVPN@3094288`.
+  // Single-item batches use fetch() directly to avoid fetchAll overhead.
+  // Multi-item batches use fetchAll(), which runs requests in parallel
+  // inside Google. If fetchAll() throws as a whole (e.g. one URL violates
+  // UrlFetchApp limits and poisons the whole batch), degrade to per-item
+  // fetch so a single bad request does not zero out the entire batch's
+  // responses. Mirrors upstream `masterking32/MasterHttpRelayVPN@3094288`.
+  //
+  // Single-item failures bypass the SAFE_REPLAY_METHODS dance: fetch()
+  // is the first attempt, not a replay, so there is nothing safe to
+  // re-run. We surface the underlying error string verbatim instead.
   var responses = [];
   if (fetchArgs.length > 0) {
     try {
-      responses = UrlFetchApp.fetchAll(fetchArgs);
-    } catch (fetchAllErr) {
+      if (fetchArgs.length === 1) {
+        var single = _unpackFetchArg(fetchArgs[0]);
+        responses = [UrlFetchApp.fetch(single.url, single.opts)];
+      } else {
+        responses = UrlFetchApp.fetchAll(fetchArgs);
+      }
+    } catch (fetchErr) {
       responses = [];
-      for (var j = 0; j < fetchArgs.length; j++) {
-        try {
-          if (!SAFE_REPLAY_METHODS[fetchMethods[j]]) {
-            errorMap[fetchIndex[j]] =
-              "batch fetchAll failed; unsafe method not replayed";
-            responses[j] = null;
-            continue;
-          }
-          var fallbackReq = fetchArgs[j];
-          var fallbackUrl = fallbackReq.url;
-          var fallbackOpts = {};
-          for (var key in fallbackReq) {
-            if (
-              Object.prototype.hasOwnProperty.call(fallbackReq, key) &&
-              key !== "url"
-            ) {
-              fallbackOpts[key] = fallbackReq[key];
+      if (fetchArgs.length === 1) {
+        errorMap[fetchIndex[0]] = "fetch failed: " + String(fetchErr);
+        responses[0] = null;
+      } else {
+        for (var j = 0; j < fetchArgs.length; j++) {
+          try {
+            if (!SAFE_REPLAY_METHODS[fetchMethods[j]]) {
+              errorMap[fetchIndex[j]] =
+                "batch fetchAll failed; unsafe method not replayed";
+              responses[j] = null;
+              continue;
             }
+            var fallback = _unpackFetchArg(fetchArgs[j]);
+            responses[j] = UrlFetchApp.fetch(fallback.url, fallback.opts);
+          } catch (singleErr) {
+            errorMap[fetchIndex[j]] = String(singleErr);
+            responses[j] = null;
           }
-          responses[j] = UrlFetchApp.fetch(fallbackUrl, fallbackOpts);
-        } catch (singleErr) {
-          errorMap[fetchIndex[j]] = String(singleErr);
-          responses[j] = null;
         }
       }
     }
@@ -510,6 +549,23 @@ function _buildOpts(req) {
     if (req.ct) opts.contentType = req.ct;
   }
   return opts;
+}
+
+// Splits a fetchAll-shaped request object (opts + `url` key) into the
+// `(url, opts)` pair that UrlFetchApp.fetch() expects. Used by both the
+// single-item fast path and the per-item replay loop in _doBatch.
+function _unpackFetchArg(arg) {
+  var url = arg.url;
+  var opts = {};
+  for (var key in arg) {
+    if (
+      Object.prototype.hasOwnProperty.call(arg, key) &&
+      key !== "url"
+    ) {
+      opts[key] = arg[key];
+    }
+  }
+  return { url: url, opts: opts };
 }
 
 // Lazy module-level cache of the runtime feature check; reset between GAS
@@ -607,12 +663,15 @@ function _edgeDnsPrepare(op) {
 // `cache`    is the CacheService handle reused across the batch (or null
 //            if CacheService is unavailable, in which case DoH still runs
 //            but no put).
-// `localMap` is an optional in-batch lookup table (typically the same
-//            object returned by cache.getAll). When DoH succeeds, the
-//            encoded reply is written back to localMap[prep.key] so that
-//            a later candidate in the same batch with the same qname/qtype
-//            hits without a second DoH round-trip.
-function _edgeDnsResolve(prep, cachedReplyB64, cache, localMap) {
+// `localMap`  is an optional in-batch lookup table (typically the same
+//             object returned by cache.getAll). When DoH succeeds, the
+//             encoded reply is written back to localMap[prep.key] so that
+//             a later candidate in the same batch with the same qname/qtype
+//             hits without a second DoH round-trip.
+// `dohBudget` is an optional mutable `{remaining:N}` guard. When present,
+//             each DoH UrlFetchApp call decrements it; once it reaches
+//             zero, misses return null and ride the tunnel-node batch.
+function _edgeDnsResolve(prep, cachedReplyB64, cache, localMap, dohBudget) {
   try {
     if (cachedReplyB64) {
       try {
@@ -631,19 +690,13 @@ function _edgeDnsResolve(prep, cachedReplyB64, cache, localMap) {
     }
 
     for (var i = 0; i < EDGE_DNS_RESOLVERS.length; i++) {
+      if (dohBudget && dohBudget.remaining <= 0) return null;
+      if (dohBudget) dohBudget.remaining--;
       var reply = _edgeDnsDoh(EDGE_DNS_RESOLVERS[i], prep.bytes);
       if (!reply) continue;
+      if (!_edgeDnsReplyMatchesPrep(prep, reply)) continue;
 
-      var rcode = reply[3] & 0x0F;
-      var ttl;
-      if (rcode === 2 || rcode === 3) {
-        ttl = EDGE_DNS_NEG_TTL_S;
-      } else {
-        var minTtl = _dnsMinTtl(reply);
-        ttl = (minTtl === null) ? EDGE_DNS_NEG_TTL_S : minTtl;
-        if (ttl < EDGE_DNS_MIN_TTL_S) ttl = EDGE_DNS_MIN_TTL_S;
-        if (ttl > EDGE_DNS_MAX_TTL_S) ttl = EDGE_DNS_MAX_TTL_S;
-      }
+      var ttl = _edgeDnsReplyTtl(reply);
 
       // Encode once and reuse for both the persistent cache and the
       // in-batch dedup map. The reply bytes carry the resolver-echoed
@@ -673,6 +726,64 @@ function _edgeDnsResolve(prep, cachedReplyB64, cache, localMap) {
   } catch (err) {
     return null;
   }
+}
+
+// Computes the CacheService TTL for a DNS reply. Kept separate so DoH
+// replies and tunnel-node-forwarded replies use identical cache semantics.
+function _edgeDnsReplyTtl(reply) {
+  var rcode = reply[3] & 0x0F;
+  if (rcode === 2 || rcode === 3) {
+    return EDGE_DNS_NEG_TTL_S;
+  }
+
+  var minTtl = _dnsMinTtl(reply);
+  var ttl = (minTtl === null) ? EDGE_DNS_NEG_TTL_S : minTtl;
+  if (ttl < EDGE_DNS_MIN_TTL_S) ttl = EDGE_DNS_MIN_TTL_S;
+  if (ttl > EDGE_DNS_MAX_TTL_S) ttl = EDGE_DNS_MAX_TTL_S;
+  return ttl;
+}
+
+// Caches DNS replies that came back from the tunnel-node forward path.
+// This converts the unavoidable cold-miss tunnel fetch into a future
+// zero-UrlFetchApp cache hit, without spending a separate DoH fetch.
+// Pass-2 is already complete by the time this runs, so the in-batch
+// dedup map is not threaded through — only the persistent CacheService
+// put matters here.
+function _edgeDnsCacheForwardedReplies(forwardPrep, forwardedResults, cache) {
+  if (!cache) return;
+  for (var i = 0; i < forwardPrep.length; i++) {
+    if (!forwardPrep[i]) continue;
+    var res = forwardedResults[i];
+    if (!res || !res.pkts || !res.pkts.length) continue;
+    _edgeDnsStoreReply(forwardPrep[i], res.pkts[0], cache);
+  }
+}
+
+function _edgeDnsStoreReply(prep, replyB64, cache) {
+  if (!cache) return false;
+  try {
+    var reply = Utilities.base64Decode(replyB64);
+    if (!_edgeDnsReplyMatchesPrep(prep, reply)) return false;
+
+    var ttl = _edgeDnsReplyTtl(reply);
+    try {
+      cache.put(prep.key, Utilities.base64Encode(reply), ttl);
+    } catch (_) {
+      // >100KB value or transient quota — the live reply already went out.
+    }
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
+function _edgeDnsReplyMatchesPrep(prep, reply) {
+  if (!reply || reply.length < 12) return false;
+  // Only cache actual DNS responses, and skip truncated UDP answers.
+  if ((reply[2] & 0x80) === 0 || (reply[2] & 0x02) !== 0) return false;
+
+  var q = _dnsParseQuestion(reply);
+  return !!q && q.qname === prep.q.qname && q.qtype === prep.q.qtype;
 }
 
 // Hex-encodes the SHA-256 of a UTF-8 string. Used to keep long-qname cache

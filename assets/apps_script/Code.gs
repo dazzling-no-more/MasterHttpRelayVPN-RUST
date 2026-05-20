@@ -338,40 +338,45 @@ function _doBatch(items) {
     }
   }
 
-  // fetchAll() processes all requests in parallel inside Google. If it
-  // throws as a whole (e.g. one URL violates UrlFetchApp limits and
-  // poisons the whole batch), degrade to per-item fetch on safe methods
-  // so a single bad request does not zero out every response in the
-  // batch. Mirrors upstream `masterking32/MasterHttpRelayVPN@3094288`.
+  // Single-item batches use fetch() directly to avoid fetchAll overhead.
+  // Multi-item batches use fetchAll(), which processes requests in
+  // parallel inside Google. If fetchAll() throws as a whole (e.g. one URL
+  // violates UrlFetchApp limits and poisons the whole batch), degrade to
+  // per-item fetch on safe methods so a single bad request does not zero
+  // out every response in the batch.
+  //
+  // Single-item failures bypass the SAFE_REPLAY_METHODS dance: fetch()
+  // is the first attempt, not a replay, so there is nothing safe to
+  // re-run. We surface the underlying error string verbatim instead.
   var responses = [];
   if (fetchArgs.length > 0) {
     try {
-      responses = UrlFetchApp.fetchAll(fetchArgs);
-    } catch (fetchAllErr) {
+      if (fetchArgs.length === 1) {
+        var single = _unpackFetchArg(fetchArgs[0]);
+        responses = [UrlFetchApp.fetch(single.url, single.opts)];
+      } else {
+        responses = UrlFetchApp.fetchAll(fetchArgs);
+      }
+    } catch (fetchErr) {
       responses = [];
-      for (var j = 0; j < fetchArgs.length; j++) {
-        try {
-          if (!SAFE_REPLAY_METHODS[fetchMethods[j]]) {
-            errorMap[fetchIndex[j]] =
-              "batch fetchAll failed; unsafe method not replayed";
-            responses[j] = null;
-            continue;
-          }
-          var fallbackReq = fetchArgs[j];
-          var fallbackUrl = fallbackReq.url;
-          var fallbackOpts = {};
-          for (var key in fallbackReq) {
-            if (
-              Object.prototype.hasOwnProperty.call(fallbackReq, key) &&
-              key !== "url"
-            ) {
-              fallbackOpts[key] = fallbackReq[key];
+      if (fetchArgs.length === 1) {
+        errorMap[fetchIndex[0]] = "fetch failed: " + String(fetchErr);
+        responses[0] = null;
+      } else {
+        for (var j = 0; j < fetchArgs.length; j++) {
+          try {
+            if (!SAFE_REPLAY_METHODS[fetchMethods[j]]) {
+              errorMap[fetchIndex[j]] =
+                "batch fetchAll failed; unsafe method not replayed";
+              responses[j] = null;
+              continue;
             }
+            var fallback = _unpackFetchArg(fetchArgs[j]);
+            responses[j] = UrlFetchApp.fetch(fallback.url, fallback.opts);
+          } catch (singleErr) {
+            errorMap[fetchIndex[j]] = String(singleErr);
+            responses[j] = null;
           }
-          responses[j] = UrlFetchApp.fetch(fallbackUrl, fallbackOpts);
-        } catch (singleErr) {
-          errorMap[fetchIndex[j]] = String(singleErr);
-          responses[j] = null;
         }
       }
     }
@@ -431,6 +436,23 @@ function _respHeaders(resp) {
     }
   } catch (err) {}
   return resp.getHeaders();
+}
+
+// Splits a fetchAll-shaped request object (opts + `url` key) into the
+// `(url, opts)` pair that UrlFetchApp.fetch() expects. Used by both the
+// single-item fast path and the per-item replay loop in _doBatch.
+function _unpackFetchArg(arg) {
+  var url = arg.url;
+  var opts = {};
+  for (var key in arg) {
+    if (
+      Object.prototype.hasOwnProperty.call(arg, key) &&
+      key !== "url"
+    ) {
+      opts[key] = arg[key];
+    }
+  }
+  return { url: url, opts: opts };
 }
 
 function _json(obj) {

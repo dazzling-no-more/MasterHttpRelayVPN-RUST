@@ -22,11 +22,14 @@ const src = fs.readFileSync(SRC, 'utf8');
 const FUNC_NAMES = [
   '_dnsSkipName', '_dnsParseQuestion', '_dnsMinTtl', '_dnsRewriteTxid',
   '_sha256Hex', '_edgeDnsPrepare', '_edgeDnsResolve', '_edgeDnsDoh',
-  '_doTunnelBatch', '_doTunnelBatchForward', '_doTunnelBatchFetch',
+  '_edgeDnsReplyTtl', '_edgeDnsCacheForwardedReplies', '_edgeDnsStoreReply',
+  '_edgeDnsReplyMatchesPrep', '_doTunnelBatch', '_doTunnelBatchForward',
+  '_doTunnelBatchFetch',
   '_spliceTunnelResults', '_json',
 ];
 const CONST_NAMES = [
-  'ENABLE_EDGE_DNS_CACHE', 'EDGE_DNS_RESOLVERS', 'EDGE_DNS_MIN_TTL_S',
+  'ENABLE_EDGE_DNS_CACHE', 'EDGE_DNS_MAX_DOH_FETCHES_PER_BATCH',
+  'EDGE_DNS_RESOLVERS', 'EDGE_DNS_MIN_TTL_S',
   'EDGE_DNS_MAX_TTL_S', 'EDGE_DNS_NEG_TTL_S', 'EDGE_DNS_CACHE_PREFIX',
   'EDGE_DNS_MAX_KEY_LEN', 'EDGE_DNS_REFUSE_QTYPES',
   'TUNNEL_SERVER_URL', 'TUNNEL_AUTH_KEY',
@@ -87,11 +90,13 @@ function makeCache(opts) {
   opts = opts || {};
   const store = Object.assign({}, opts.seed || {});
   let getAllCalls = 0;
+  const getAllHistory = [];
   const putHistory = [];
   return {
     handle: {
       getAll: function (keys) {
         getAllCalls++;
+        getAllHistory.push(keys.slice());
         if (opts.throwOnGetAll) throw new Error('cache backend hiccup');
         const out = {};
         for (let i = 0; i < keys.length; i++) {
@@ -105,6 +110,7 @@ function makeCache(opts) {
       },
     },
     getAllCalls: () => getAllCalls,
+    getAllHistory: () => getAllHistory,
     putHistory: () => putHistory,
   };
 }
@@ -430,6 +436,9 @@ console.log('TEST B9 _doTunnelBatch intra-batch dedup: one DoH for two same-key 
     ],
   });
   const parsed = JSON.parse(out._text);
+  check('getAll key list deduped',
+        cache.getAllHistory()[0].length === 1,
+        'got ' + cache.getAllHistory()[0].length);
   check('only one DoH call', dohCalls === 1, 'got ' + dohCalls);
   check('two results', parsed.r.length === 2);
   check('first is doh', parsed.r[0].sid === 'edns-doh');
@@ -444,7 +453,119 @@ console.log('TEST B9 _doTunnelBatch intra-batch dedup: one DoH for two same-key 
   ok();
 }
 
-console.log('TEST B10 _edgeDnsResolve: corrupt cache value falls through to DoH');
+console.log('TEST B10 _doTunnelBatch DoH budget forwards extra misses and caches replies');
+{
+  const cache = makeCache();
+  const replyA = buildAReply(0x1111, 'a.example', 300, [1, 1, 1, 1]);
+  const replyB = buildAReply(0x2222, 'b.example', 120, [2, 2, 2, 2]);
+  const replyC = buildAReply(0x3333, 'c.example', 90, [3, 3, 3, 3]);
+  let dohCalls = 0;
+  let tunnelCalls = 0;
+  const utf = makeUrlFetchApp((url, opts) => {
+    if (url.indexOf('dns-query') >= 0) {
+      dohCalls++;
+      return {
+        getResponseCode: () => 200,
+        getContent: () => bytesArr(replyA),
+      };
+    }
+    if (url.indexOf('/tunnel/batch') >= 0) {
+      tunnelCalls++;
+      const body = JSON.parse(opts.payload);
+      check('budget forwards two DNS misses', body.ops.length === 2);
+      return {
+        getResponseCode: () => 200,
+        getContent: () => Buffer.alloc(0),
+        getContentText: () => JSON.stringify({
+          r: [
+            { sid: 'node-b', pkts: [replyB.toString('base64')], eof: true },
+            { sid: 'node-c', pkts: [replyC.toString('base64')], eof: true },
+          ],
+        }),
+      };
+    }
+    throw new Error('unexpected fetch ' + url);
+  });
+  const ctx = buildContext({
+    Utilities: makeUtilities(),
+    CacheService: makeCacheService(cache),
+    UrlFetchApp: utf.handle,
+    ContentService: makeContentService(),
+  });
+  const out = ctx._doTunnelBatch({
+    ops: [
+      { op: 'udp_open', port: 53,
+        d: buildQuery(0x1111, 'a.example', 1).toString('base64') },
+      { op: 'udp_open', port: 53,
+        d: buildQuery(0x2222, 'b.example', 1).toString('base64') },
+      { op: 'udp_open', port: 53,
+        d: buildQuery(0x3333, 'c.example', 1).toString('base64') },
+    ],
+  });
+  const parsed = JSON.parse(out._text);
+  check('one DoH fetch budget spent',
+        dohCalls === ctx.EDGE_DNS_MAX_DOH_FETCHES_PER_BATCH,
+        'got ' + dohCalls);
+  check('one tunnel batch for remaining misses', tunnelCalls === 1);
+  check('three results', parsed.r.length === 3);
+  check('idx 0 = DoH synth', parsed.r[0].sid === 'edns-doh');
+  check('idx 1 = tunnel node', parsed.r[1].sid === 'node-b');
+  check('idx 2 = tunnel node', parsed.r[2].sid === 'node-c');
+
+  const putKeys = cache.putHistory().map((p) => p.k).sort();
+  check('DoH answer cached', putKeys.indexOf('edns:1:a.example') >= 0);
+  check('forwarded answer b cached', putKeys.indexOf('edns:1:b.example') >= 0);
+  check('forwarded answer c cached', putKeys.indexOf('edns:1:c.example') >= 0);
+  ok();
+}
+
+console.log('TEST B11 _doTunnelBatch forwarded reply with mismatched qname is not cached');
+{
+  const cache = makeCache();
+  // Tunnel-node hands back a reply whose question section is for the WRONG
+  // qname. The forwarded result still flows back to the client (we don't
+  // second-guess what the node sends), but it must NOT poison the cache.
+  const wrongReply = buildAReply(0x4444, 'attacker.example', 300, [9, 9, 9, 9]);
+  let tunnelCalls = 0;
+  const utf = makeUrlFetchApp((url) => {
+    if (url.indexOf('/tunnel/batch') >= 0) {
+      tunnelCalls++;
+      return {
+        getResponseCode: () => 200,
+        getContent: () => Buffer.alloc(0),
+        getContentText: () => JSON.stringify({
+          r: [{ sid: 'node', pkts: [wrongReply.toString('base64')], eof: true }],
+        }),
+      };
+    }
+    throw new Error('unexpected fetch ' + url);
+  });
+  const ctx = buildContext({
+    Utilities: makeUtilities(),
+    CacheService: makeCacheService(cache),
+    UrlFetchApp: utf.handle,
+    ContentService: makeContentService(),
+  });
+  // Single DNS op so the DoH budget (1) is irrelevant — we force the
+  // forward path by making DoH unreachable: the only fetch handler above
+  // routes /tunnel/batch only, and a DoH attempt would throw, returning
+  // null from _edgeDnsDoh, which falls through to the tunnel forward.
+  const out = ctx._doTunnelBatch({
+    ops: [{
+      op: 'udp_open', port: 53,
+      d: buildQuery(0x4444, 'victim.example', 1).toString('base64'),
+    }],
+  });
+  const parsed = JSON.parse(out._text);
+  check('one tunnel batch', tunnelCalls === 1);
+  check('reply still forwarded to client', parsed.r[0].sid === 'node');
+  check('cache untouched by mismatch',
+        cache.putHistory().length === 0,
+        'got ' + cache.putHistory().length + ' puts');
+  ok();
+}
+
+console.log('TEST B12 _edgeDnsResolve: corrupt cache value falls through to DoH');
 {
   const replyBytes = buildAReply(0xAAAA, 'example.com', 300, [1, 2, 3, 4]);
   let dohCalls = 0;
