@@ -26,6 +26,12 @@ const FUNC_NAMES = [
   '_edgeDnsReplyMatchesPrep', '_doTunnelBatch', '_doTunnelBatchForward',
   '_doTunnelBatchFetch',
   '_spliceTunnelResults', '_json',
+  // Perf instrumentation helpers referenced by `_doTunnelBatch*` and
+  // `_edgeDnsDoh`. Inert when `ENABLE_PERF_LOGGING` is false (the
+  // shipped default and the test default), but the symbols still
+  // need to be in the extracted bundle so the tested functions can
+  // call them without ReferenceError.
+  '_perfRecordFetch', '_timedFetch', '_timedFetchAll',
 ];
 const CONST_NAMES = [
   'ENABLE_EDGE_DNS_CACHE', 'EDGE_DNS_MAX_DOH_FETCHES_PER_BATCH',
@@ -33,6 +39,8 @@ const CONST_NAMES = [
   'EDGE_DNS_MAX_TTL_S', 'EDGE_DNS_NEG_TTL_S', 'EDGE_DNS_CACHE_PREFIX',
   'EDGE_DNS_MAX_KEY_LEN', 'EDGE_DNS_REFUSE_QTYPES',
   'TUNNEL_SERVER_URL', 'TUNNEL_AUTH_KEY',
+  // Perf state object + toggle — `_perfRecordFetch` reads both.
+  'ENABLE_PERF_LOGGING', '_PERF',
 ];
 
 let bundle = '';

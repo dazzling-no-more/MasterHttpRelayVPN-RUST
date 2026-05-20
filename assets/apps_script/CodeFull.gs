@@ -133,6 +133,52 @@ const EDGE_DNS_MAX_KEY_LEN = 240;
 //   255 = ANY (resolvers handle it more correctly than we would)
 const EDGE_DNS_REFUSE_QTYPES = { 255: 1 };
 
+// Per-request latency instrumentation. Off by default — turn on to
+// capture timing data and tell whether the per-RTT cost is in our
+// JS (parse / dispatch / serialize) or in fixed Apps Script /
+// UrlFetchApp overhead we can't fix from this file.
+//
+// When true, `doPost` records the total handler wall-clock and the
+// sum of all `UrlFetchApp.fetch` / `fetchAll` durations, then emits
+// a single grep-friendly line to Stackdriver via `console.log`:
+//
+//   perf: kind=tunnel_batch total=712 fetch=620 fetches=1 js=92 ops=5
+//
+// `js = total - fetch` is the cost we own; high `js` numbers point at
+// things this file can optimise (parse cost, edge-DNS bookkeeping,
+// splice/serialize). High `fetch` numbers with low `js` are the
+// Apps-Script / Google-network floor and are not fixable here.
+//
+// Reading the logs: View → Executions in the Apps Script editor (or
+// the Cloud Logging console for the script's GCP project). Each
+// invocation emits at most one `perf:` line. Filter the log query
+// for `"perf:"` to get a clean stream.
+//
+// Disable in production once you've captured enough samples —
+// `console.log` round-trips add a tiny but non-zero overhead even
+// at no-op-log levels under heavy load.
+const ENABLE_PERF_LOGGING = false;
+
+// Per-invocation timing scratchpad. Reset at the top of every
+// `doPost` so totals never carry across requests, even on the rare
+// long-lived V8 context that retains module globals between
+// invocations. `const` with mutable fields satisfies the test
+// extractor (which only matches `const NAME = ...`) while allowing
+// the counters to update in place.
+const _PERF = { t0: 0, fetch_ms: 0, fetch_count: 0 };
+
+// Allowlist of tunnel op names whose verbatim form is safe to put in
+// the `perf:` log line. Anything not in this map buckets to
+// `tunnel_unknown` so a malformed / hostile `req.t` can't smuggle
+// control characters or oversize strings into Cloud Logging.
+const _PERF_TUNNEL_KIND = {
+  batch: "tunnel_batch",
+  connect: "tunnel_connect",
+  connect_data: "tunnel_connect_data",
+  data: "tunnel_data",
+  close: "tunnel_close",
+};
+
 // ═══════════════════════════════════════════════════════════════════
 //  ▸▸▸  SENTINELS — DO NOT EDIT  ◂◂◂
 //
@@ -153,38 +199,146 @@ const EDGE_DNS_REFUSE_QTYPES = { 255: 1 };
 // ═══════════════════════════════════════════════════════════════════
 const DEFAULT_AUTH_KEY = "CHANGE_ME_" + "TO_A_STRONG_SECRET";
 
+// ========================== Perf instrumentation ==========================
+
+function _perfStart() {
+  if (!ENABLE_PERF_LOGGING) return;
+  _PERF.t0 = Date.now();
+  _PERF.fetch_ms = 0;
+  _PERF.fetch_count = 0;
+}
+
+// Called by `_timedFetch` / `_timedFetchAll` to fold a measured
+// duration into the per-invocation totals. No-op when
+// instrumentation is off.
+function _perfRecordFetch(ms) {
+  if (!ENABLE_PERF_LOGGING) return;
+  _PERF.fetch_ms += ms;
+  _PERF.fetch_count += 1;
+}
+
+// Drop-in replacements for `UrlFetchApp.fetch` / `fetchAll` that
+// record the call's wall-clock duration into the perf totals. Two
+// invariants over the prior inline pattern:
+//
+//   1. **Failures are counted.** The try/finally ensures
+//      `_perfRecordFetch` runs even when UrlFetchApp throws (slow
+//      timeout, network error, quota throttle). The earlier "record
+//      after success" pattern billed those exact-when-diagnostic
+//      durations as `js=` time, hiding the real source.
+//   2. **Zero overhead when disabled.** When `ENABLE_PERF_LOGGING`
+//      is false the helper is one tail call to UrlFetchApp — no
+//      Date.now, no try/finally bookkeeping, no helper-call frame.
+//
+// All call sites in this file go through these two functions so the
+// invariants stay centralised. Don't call `UrlFetchApp.fetch`
+// directly from new code in this file — use `_timedFetch`.
+function _timedFetch(url, opts) {
+  if (!ENABLE_PERF_LOGGING) return UrlFetchApp.fetch(url, opts);
+  var t = Date.now();
+  try {
+    return UrlFetchApp.fetch(url, opts);
+  } finally {
+    _perfRecordFetch(Date.now() - t);
+  }
+}
+
+function _timedFetchAll(args) {
+  if (!ENABLE_PERF_LOGGING) return UrlFetchApp.fetchAll(args);
+  var t = Date.now();
+  try {
+    return UrlFetchApp.fetchAll(args);
+  } finally {
+    // `fetchAll` is one HTTP execution slot from Apps Script's POV
+    // regardless of per-item count, so we record one sample for the
+    // whole call. Per-item breakdown isn't available from the sync
+    // `fetchAll` API.
+    _perfRecordFetch(Date.now() - t);
+  }
+}
+
+// Single perf line emitted at the end of every `doPost` invocation.
+// `kind` is the dispatch branch (tunnel_batch / single_relay / etc.)
+// so logs from a mixed-mode deployment can be filtered. `opsCount` is
+// included only when meaningful (batch sizes); single-shot kinds pass
+// null and the field is omitted.
+function _perfReport(kind, opsCount) {
+  if (!ENABLE_PERF_LOGGING) return;
+  var total = Date.now() - _PERF.t0;
+  var fetch = _PERF.fetch_ms;
+  var js = total - fetch;
+  if (js < 0) js = 0; // clock drift defensive — never report negative
+  var line =
+    "perf: kind=" + kind +
+    " total=" + total +
+    " fetch=" + fetch +
+    " fetches=" + _PERF.fetch_count +
+    " js=" + js;
+  if (opsCount != null) line += " ops=" + opsCount;
+  console.log(line);
+}
+
 // ========================== Entry point ==========================
 
 function doPost(e) {
+  _perfStart();
+  // Classification captured outside the try so the finally clause
+  // can report it even on parse failure / unauthorized / decoy.
+  // Defaults to "error" so anything that exits via the catch is
+  // visibly bucketed.
+  var perfKind = "error";
+  var perfOps = null;
   try {
     // Fail-closed BEFORE parsing if AUTH_KEY is still the template
     // placeholder or blank — see Code.gs::doPost for the rationale.
     if (!_isConfiguredAuthKey()) {
+      perfKind = "no_auth_config";
       return _json({ e: "configure AUTH_KEY in CodeFull.gs" });
     }
 
     var req = JSON.parse(e.postData.contents);
-    if (req.k !== AUTH_KEY) return _decoyOrError({ e: "unauthorized" });
+    if (req.k !== AUTH_KEY) {
+      perfKind = "bad_auth";
+      return _decoyOrError({ e: "unauthorized" });
+    }
 
     // Quota probe: `{ k, op: "quota" }` → `{ remaining: N }`. The
     // preferred quota path — auth key in the body rather than the URL
     // (which `GET /exec/quota?k=…` leaks into history / logs).
     if (req.op === "quota") {
+      perfKind = "quota";
       return _json({ remaining: UrlFetchApp.getRemainingDailyQuota() });
     }
 
     // Tunnel mode
-    if (req.t) return _doTunnel(req);
+    if (req.t) {
+      // Allowlist the known tunnel ops so adversarial `req.t` values
+      // (control characters, oversize strings, log-injection
+      // attempts) bucket cleanly to `tunnel_unknown` instead of
+      // landing verbatim in Cloud Logging.
+      perfKind = _PERF_TUNNEL_KIND[req.t] || "tunnel_unknown";
+      if (req.t === "batch" && req.ops && req.ops.length != null) {
+        perfOps = req.ops.length;
+      }
+      return _doTunnel(req);
+    }
 
     // Batch relay mode
-    if (Array.isArray(req.q)) return _doBatch(req.q);
+    if (Array.isArray(req.q)) {
+      perfKind = "batch_relay";
+      perfOps = req.q.length;
+      return _doBatch(req.q);
+    }
 
     // Single relay mode
+    perfKind = "single_relay";
     return _doSingle(req);
   } catch (err) {
     // Parse failures of the request body are also probe-shaped — a real
     // rahgozar client never sends invalid JSON. Decoy for the same reason.
     return _decoyOrError({ e: String(err) });
+  } finally {
+    _perfReport(perfKind, perfOps);
   }
 }
 
@@ -226,7 +380,7 @@ function _doTunnel(req) {
       return _json({ e: "unknown tunnel op: " + req.t, code: "UNSUPPORTED_OP" });
   }
 
-  var resp = UrlFetchApp.fetch(TUNNEL_SERVER_URL + "/tunnel", {
+  var resp = _timedFetch(TUNNEL_SERVER_URL + "/tunnel", {
     method: "post",
     contentType: "application/json",
     payload: JSON.stringify(payload),
@@ -359,7 +513,7 @@ function _doTunnelBatch(req) {
 
 // Verbatim forward: no splice, response passed through unchanged.
 function _doTunnelBatchForward(ops) {
-  var resp = UrlFetchApp.fetch(TUNNEL_SERVER_URL + "/tunnel/batch", {
+  var resp = _timedFetch(TUNNEL_SERVER_URL + "/tunnel/batch", {
     method: "post",
     contentType: "application/json",
     payload: JSON.stringify({ k: TUNNEL_AUTH_KEY, ops: ops }),
@@ -376,7 +530,7 @@ function _doTunnelBatchForward(ops) {
 // Forward + parse for the splice path. Returns { r:[...] } on success or
 // { error: "..." } on any failure.
 function _doTunnelBatchFetch(ops) {
-  var resp = UrlFetchApp.fetch(TUNNEL_SERVER_URL + "/tunnel/batch", {
+  var resp = _timedFetch(TUNNEL_SERVER_URL + "/tunnel/batch", {
     method: "post",
     contentType: "application/json",
     payload: JSON.stringify({ k: TUNNEL_AUTH_KEY, ops: ops }),
@@ -413,7 +567,7 @@ function _doSingle(req) {
   }
   try {
     var opts = _buildOpts(req);
-    var resp = UrlFetchApp.fetch(req.u, opts);
+    var resp = _timedFetch(req.u, opts);
 
     // Raw-return mode for the exit-node outer hop — see Code.gs _doSingle
     // for the rationale. CodeFull.gs's HTTP relay path mirrors Code.gs's
@@ -475,9 +629,9 @@ function _doBatch(items) {
     try {
       if (fetchArgs.length === 1) {
         var single = _unpackFetchArg(fetchArgs[0]);
-        responses = [UrlFetchApp.fetch(single.url, single.opts)];
+        responses = [_timedFetch(single.url, single.opts)];
       } else {
-        responses = UrlFetchApp.fetchAll(fetchArgs);
+        responses = _timedFetchAll(fetchArgs);
       }
     } catch (fetchErr) {
       responses = [];
@@ -494,7 +648,7 @@ function _doBatch(items) {
               continue;
             }
             var fallback = _unpackFetchArg(fetchArgs[j]);
-            responses[j] = UrlFetchApp.fetch(fallback.url, fallback.opts);
+            responses[j] = _timedFetch(fallback.url, fallback.opts);
           } catch (singleErr) {
             errorMap[fetchIndex[j]] = String(singleErr);
             responses[j] = null;
@@ -807,7 +961,7 @@ function _sha256Hex(s) {
 function _edgeDnsDoh(url, queryBytes) {
   try {
     var dns = Utilities.base64EncodeWebSafe(queryBytes).replace(/=+$/, "");
-    var resp = UrlFetchApp.fetch(url + "?dns=" + dns, {
+    var resp = _timedFetch(url + "?dns=" + dns, {
       method: "get",
       muteHttpExceptions: true,
       followRedirects: true,

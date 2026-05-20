@@ -198,12 +198,24 @@ function buildSandbox(file, opts) {
     'DECOY_HTML', 'ContentService', 'UrlFetchApp',
     '_isConfiguredAuthKey', '_decoyOrError', '_json',
     '_doSingle', '_doBatch', '_doTunnel',
+    // CodeFull.gs's doPost calls these around the dispatch. Inert
+    // when `ENABLE_PERF_LOGGING` is false (the shipped default), but
+    // we still need to define the symbols so the extracted function
+    // body doesn't ReferenceError. No-op stubs are sufficient — this
+    // test exercises the auth-fail / dispatch branches, not the
+    // timing instrumentation itself.
+    '_perfStart', '_perfReport',
+    // Tunnel-op allowlist used to normalise `perfKind`. Empty object
+    // forces the `tunnel_unknown` fallback, which is fine for the
+    // auth-guard tests — they never assert on the perf log line.
+    '_PERF_TUNNEL_KIND',
   ];
   function _unexpectedRelay(name) {
     return function () {
       throw new Error('unexpected ' + name + ' call: auth-rejected path leaked into relay');
     };
   }
+  function _perfNoop() { /* intentionally inert */ }
   function callFn(body, e) {
     return new Function(...closureArgs, body)(
       e,
@@ -220,6 +232,9 @@ function buildSandbox(file, opts) {
       _unexpectedRelay('_doSingle'),
       _unexpectedRelay('_doBatch'),
       _unexpectedRelay('_doTunnel'),
+      _perfNoop,
+      _perfNoop,
+      {},
     );
   }
   return {
