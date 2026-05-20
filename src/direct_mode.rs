@@ -2018,7 +2018,6 @@ mod tests {
         let (host, port) = addr.split_once(':').unwrap();
         let port: u16 = port.parse().unwrap();
         let ctx = ctx_with_front(host, 50);
-        let port = port; // capture
         for _ in 0..CIRCUIT_BREAKER_THRESHOLD {
             let res =
                 dial_with_validation("host.example.test", port, &ctx, &minimal_client_hello())

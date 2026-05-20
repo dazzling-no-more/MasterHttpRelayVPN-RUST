@@ -206,8 +206,8 @@ pub async fn run(config: &Config) -> bool {
     }
     results.sort_by_key(|r| r.latency_ms.unwrap_or(u128::MAX));
 
-    println!("{:<20} {:>12}   {}", "IP", "LATENCY", "STATUS");
-    println!("{:-<20} {:->12}   {}", "", "", "-------");
+    println!("{:<20} {:>12}   STATUS", "IP", "LATENCY");
+    println!("{:-<20} {:->12}   -------", "", "");
     let mut ok_count = 0usize;
     for r in &results {
         match r.latency_ms {
@@ -390,7 +390,7 @@ async fn fetch_and_validate_google_ips(
     google_ip_validation: bool,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
     let candidate_ips = build_candidate_ip_pool(max_ips).await?;
-    let total_batches = (candidate_ips.len() + batch_size - 1) / batch_size;
+    let total_batches = candidate_ips.len().div_ceil(batch_size);
     tracing::info!(
         "Selected {} IPs to test, testing in {} batches...",
         candidate_ips.len(),

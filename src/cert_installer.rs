@@ -153,7 +153,7 @@ mod unix {
 /// load-bearing `euid == 0 && SUDO_USER unset` path that must leave
 /// HOME as root's own /root — can be asserted with unit tests.
 /// Always compiled so the tests run on every host.
-fn should_reconcile_for<'a>(euid: u32, sudo_user: Option<&'a str>) -> Option<&'a str> {
+fn should_reconcile_for(euid: u32, sudo_user: Option<&str>) -> Option<&str> {
     // EUID gate: if we're not actually root, `SUDO_USER` could be
     // anything (inherited from a shell init, explicitly exported,
     // set via `sudo -E`) and rewriting HOME based on it would let a
@@ -610,7 +610,7 @@ fn classify_os_release(content: &str) -> String {
         .chain(id_like.split(|c: char| c.is_whitespace() || c == ','))
         .filter(|t| !t.is_empty())
         .collect();
-    let has = |needle: &str| tokens.iter().any(|t| *t == needle);
+    let has = |needle: &str| tokens.contains(&needle);
     if has("openwrt") {
         return "openwrt".into();
     }
@@ -848,6 +848,7 @@ fn remove_windows() {
 ///      this is the one update-ca-certificates does NOT populate, and
 ///      missing it was the real blocker for Chrome users who'd installed
 ///      the OS-level CA and still got cert errors (part of issue #11).
+///
 /// Silently no-ops if `certutil` (from libnss3-tools) isn't on PATH.
 /// Browsers must be closed during install for changes to take effect.
 fn install_nss_stores(cert_path: &str) {
@@ -1025,7 +1026,7 @@ fn strip_enterprise_roots_block(existing: &str) -> Option<String> {
     let mut i = 0;
     while i < lines.len() {
         let is_marker = lines[i].trim() == FX_MARKER;
-        let next_is_our_pref = lines.get(i + 1).map_or(false, |l| l.trim() == FX_PREF);
+        let next_is_our_pref = lines.get(i + 1).is_some_and(|l| l.trim() == FX_PREF);
         if is_marker && next_is_our_pref {
             i += 2;
             continue;
@@ -1392,6 +1393,7 @@ fn disable_mozilla_enterprise_roots() {
 ///     `security.enterprise_roots.enabled` semantics as Firefox; only
 ///     the binary's branded profile dir differs. Windows/macOS builds
 ///     are not officially distributed, so we don't list paths there.
+///
 /// Non-existent roots silently no-op via `read_dir` failure, so listing
 /// all of them costs nothing on installs that only have one.
 fn mozilla_family_profile_roots(

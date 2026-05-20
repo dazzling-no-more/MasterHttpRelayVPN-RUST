@@ -249,8 +249,8 @@ pub async fn run(config: &Config) -> bool {
     let mut results = probe_all(&config.google_ip, pool).await;
     results.sort_by_key(|(_, r)| r.latency_ms.unwrap_or(u32::MAX));
 
-    println!("{:<36} {:>10}  {}", "SNI", "LATENCY", "STATUS");
-    println!("{:-<36} {:->10}  {}", "", "", "------");
+    println!("{:<36} {:>10}  STATUS", "SNI", "LATENCY");
+    println!("{:-<36} {:->10}  ------", "", "");
     let mut ok_count = 0usize;
     for (sni, r) in &results {
         match r.latency_ms {
@@ -544,15 +544,14 @@ async fn validate_sni_against_dpi(sni: &str, test_ip: &str) -> bool {
         Err(_) => return false,
     };
 
-    match timeout(
-        Duration::from_secs(5),
-        connector.connect(domain, tcp_stream),
+    matches!(
+        timeout(
+            Duration::from_secs(5),
+            connector.connect(domain, tcp_stream),
+        )
+        .await,
+        Ok(Ok(_))
     )
-    .await
-    {
-        Ok(Ok(_)) => true,
-        _ => false,
-    }
 }
 
 pub async fn fetch_dns_info(url_addr: &str) -> Result<String, Box<dyn std::error::Error>> {

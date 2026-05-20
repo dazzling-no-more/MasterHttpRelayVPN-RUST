@@ -442,7 +442,9 @@ fn normalize_cache_host(host: &str) -> String {
 /// other way. `connect_plain` ignores the script_id (`_script_id` in
 /// the destructure at `connect_plain`) since legacy detection happens
 /// only after the first data reply.
-type BatchedReply = oneshot::Sender<Result<(TunnelResponse, String), String>>;
+type BatchedReplyResult = Result<(TunnelResponse, String), String>;
+type BatchedReply = oneshot::Sender<BatchedReplyResult>;
+type BatchedReplyRx = oneshot::Receiver<BatchedReplyResult>;
 
 enum MuxMsg {
     Connect {
@@ -553,6 +555,7 @@ pub struct TunnelMux {
     ///     also recover or the process to restart;
     ///   * the warn log fires once per (deployment, recovery cycle), so
     ///     re-detection after recovery is a real signal in the logs.
+    ///
     /// The cost: legacy deployments still receive fast empty polls in
     /// mixed mode (round-robin doesn't know to avoid them). Worth it to
     /// keep pushed bytes flowing through the long-poll-capable peers.
@@ -582,6 +585,7 @@ pub struct TunnelMux {
     ///   * `preread_loss` — timed out empty; paid 50 ms for nothing
     ///   * `preread_skip_port` — port was server-speaks-first; skipped wait
     ///   * `preread_skip_unsupported` — tunnel-node said no; skipped wait
+    ///
     /// A rolling sum of win-time (µs) drives a `mean_win_time` readout so
     /// you can tune `CLIENT_FIRST_DATA_WAIT` against real client flush
     /// timing. A summary line is logged every 100 preread events.
@@ -962,7 +966,7 @@ impl TunnelMux {
     /// multiple of 100 — here, exactly one thread gets the boundary.
     fn maybe_log_preread_summary(&self) {
         let new_count = self.preread_total_events.fetch_add(1, Ordering::Relaxed) + 1;
-        if new_count % 100 != 0 {
+        if !new_count.is_multiple_of(100) {
             return;
         }
         let win = self.preread_win.load(Ordering::Relaxed);
@@ -970,7 +974,7 @@ impl TunnelMux {
         let skip_port = self.preread_skip_port.load(Ordering::Relaxed);
         let skip_unsup = self.preread_skip_unsupported.load(Ordering::Relaxed);
         let total_us = self.preread_win_total_us.load(Ordering::Relaxed);
-        let mean_us = if win > 0 { total_us / win } else { 0 };
+        let mean_us = total_us.checked_div(win).unwrap_or(0);
         tracing::info!(
             "connect_data preread: {} win / {} loss / {} skip(port) / {} skip(unsup), mean win time {}µs (ceiling {}µs)",
             win,
@@ -1703,9 +1707,8 @@ async fn connect_plain(host: &str, port: u16, mux: &Arc<TunnelMux>) -> std::io::
                     e.clone(),
                 ));
             }
-            resp.sid.ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::Other, "tunnel connect: no session id")
-            })
+            resp.sid
+                .ok_or_else(|| std::io::Error::other("tunnel connect: no session id"))
         }
         Ok(Err(e)) => {
             tracing::error!("tunnel connect error for {}:{}: {}", host, port, e);
@@ -1714,10 +1717,7 @@ async fn connect_plain(host: &str, port: u16, mux: &Arc<TunnelMux>) -> std::io::
                 e,
             ))
         }
-        Err(_) => Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "mux channel closed",
-        )),
+        Err(_) => Err(std::io::Error::other("mux channel closed")),
     }
 }
 
@@ -1753,10 +1753,7 @@ async fn connect_with_initial_data(
             ));
         }
         Err(_) => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                "mux channel closed",
-            ));
+            return Err(std::io::Error::other("mux channel closed"));
         }
     };
 
@@ -1781,10 +1778,7 @@ async fn connect_with_initial_data(
     }
 
     let Some(sid) = resp.sid.clone() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "tunnel connect_data: no session id",
-        ));
+        return Err(std::io::Error::other("tunnel connect_data: no session id"));
     };
 
     Ok(ConnectDataOutcome::Opened {
@@ -1907,7 +1901,7 @@ async fn tunnel_loop(
     // Helper: wrap a reply_rx into a ReplyFut with timeout.
     fn wrap_reply(
         meta: InflightMeta,
-        reply_rx: oneshot::Receiver<Result<(TunnelResponse, String), String>>,
+        reply_rx: BatchedReplyRx,
         reply_timeout: Duration,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (InflightMeta, ReplyOutcome)> + Send>>
     {
@@ -1927,10 +1921,7 @@ async fn tunnel_loop(
         sid: &str,
         next_send_seq: &mut u64,
         mux: &Arc<TunnelMux>,
-    ) -> (
-        InflightMeta,
-        oneshot::Receiver<Result<(TunnelResponse, String), String>>,
-    ) {
+    ) -> (InflightMeta, BatchedReplyRx) {
         let seq = *next_send_seq;
         *next_send_seq += 1;
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1968,10 +1959,7 @@ async fn tunnel_loop(
         next_send_seq: &mut u64,
         next_data_write_seq: &mut u64,
         mux: &Arc<TunnelMux>,
-    ) -> (
-        InflightMeta,
-        oneshot::Receiver<Result<(TunnelResponse, String), String>>,
-    ) {
+    ) -> (InflightMeta, BatchedReplyRx) {
         let seq = *next_send_seq;
         *next_send_seq += 1;
         let wseq = *next_data_write_seq;
@@ -2398,8 +2386,7 @@ async fn tunnel_loop(
                         if !eof_seen
                             && inflight.len() < max_inflight
                             && refill_at.is_none()
-                        {
-                            if !should_suppress_empty_refill(
+                            && !should_suppress_empty_refill(
                                 buffered_upload.is_some(),
                                 client_closed,
                                 max_inflight,
@@ -2411,7 +2398,6 @@ async fn tunnel_loop(
                                     consecutive_empty,
                                 ))));
                             }
-                        }
                     }
                     ReplyOutcome::BatchErr(e) => {
                         tracing::debug!("tunnel data error: {}", e);

@@ -168,7 +168,7 @@ impl ProfilesFile {
         // `config` — otherwise applying it would clobber config.json
         // with non-config bytes (e.g. `null`).
         for (i, p) in pf.profiles.iter().enumerate() {
-            validate_profile(i, p).map_err(|msg| ProfileError::CorruptOnDisk(msg))?;
+            validate_profile(i, p).map_err(ProfileError::CorruptOnDisk)?;
         }
         // Names must be unique. With duplicates, `active` and every
         // by-name operation (apply / rename / delete) become

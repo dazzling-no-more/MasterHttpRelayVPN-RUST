@@ -899,26 +899,6 @@ fn default_verify_ssl() -> bool {
     true
 }
 
-/// Validate a single `relay_url_patterns` entry. The expected shape is
-/// `host/path-prefix` (or bare `host`, equivalent to `host/`), with an
-/// optional `http://` / `https://` scheme that gets stripped at runtime.
-///
-/// Checks:
-/// * non-empty after trim
-/// * scheme strip leaves a non-empty host
-/// * host part is a syntactically valid DNS hostname per RFC 1123:
-///   labels of [a-zA-Z0-9-], ≤ 63 chars each, no leading/trailing
-///   hyphen, no empty labels (which would mean consecutive dots),
-///   total host ≤ 253 chars
-///
-/// What's intentionally NOT checked here:
-/// * whether the host is in `SNI_REWRITE_SUFFIXES` — that's a runtime
-///   `tracing::warn!` (see `ResolvedRouting::skipped_force_mitm_hosts`)
-///   because users may want a pattern to be no-op-pulled-out-of-MITM
-///   path filter while the matching half still routes via relay.
-/// * path syntax — any byte sequence after the first `/` is treated
-///   as a literal prefix to `starts_with` against URL paths, by design.
-
 /// Validate a `direct_mode` hostname / suffix list entry.
 ///
 /// Accepts: ASCII LDH-shaped (RFC 952 §2 + RFC 1123 §2.1) DNS labels
@@ -1023,6 +1003,25 @@ fn validate_direct_mode_hostname(field: &str, i: usize, raw: &str) -> Result<(),
     Ok(())
 }
 
+/// Validate a single `relay_url_patterns` entry. The expected shape is
+/// `host/path-prefix` (or bare `host`, equivalent to `host/`), with an
+/// optional `http://` / `https://` scheme that gets stripped at runtime.
+///
+/// Checks:
+/// * non-empty after trim
+/// * scheme strip leaves a non-empty host
+/// * host part is a syntactically valid DNS hostname per RFC 1123:
+///   labels of [a-zA-Z0-9-], ≤ 63 chars each, no leading/trailing
+///   hyphen, no empty labels (which would mean consecutive dots),
+///   total host ≤ 253 chars
+///
+/// What's intentionally NOT checked here:
+/// * whether the host is in `SNI_REWRITE_SUFFIXES` — that's a runtime
+///   `tracing::warn!` (see `ResolvedRouting::skipped_force_mitm_hosts`)
+///   because users may want a pattern to be no-op-pulled-out-of-MITM
+///   path filter while the matching half still routes via relay.
+/// * path syntax — any byte sequence after the first `/` is treated
+///   as a literal prefix to `starts_with` against URL paths, by design.
 fn validate_relay_url_pattern(p: &str) -> Result<(), String> {
     let trimmed = p.trim();
     if trimmed.is_empty() {
@@ -1854,14 +1853,14 @@ mod rt_tests {
             cfg.sni_hosts.as_ref().unwrap(),
             &vec!["www.google.com".to_string(), "drive.google.com".to_string()]
         );
-        assert_eq!(cfg.fetch_ips_from_api, true);
+        assert!(cfg.fetch_ips_from_api);
         // Heartbeat / brotli-zstd round-trip: a hand-edited config
         // must preserve user-set values, not silently snap back to
         // defaults.
-        assert_eq!(cfg.heartbeat_enabled, false);
+        assert!(!cfg.heartbeat_enabled);
         assert_eq!(cfg.heartbeat_interval_secs, 17);
         assert_eq!(cfg.heartbeat_failure_threshold, 5);
-        assert_eq!(cfg.allow_brotli_zstd, true);
+        assert!(cfg.allow_brotli_zstd);
         let _ = std::fs::remove_file(&tmp);
     }
 

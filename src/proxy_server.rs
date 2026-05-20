@@ -561,6 +561,10 @@ pub struct RewriteCtx {
     pub direct_mode: Option<Arc<crate::direct_mode::DirectModeCtx>>,
 }
 
+type ModeState = (Option<Arc<DomainFronter>>, Arc<RewriteCtx>, Mode);
+type HeaderList = Vec<(String, String)>;
+type ParsedRequestHead = (String, String, String, HeaderList);
+
 /// One-shot resolution of the YouTube routing knobs (`youtube_via_relay`,
 /// `relay_url_patterns`, `exit_node.mode == "full"`) for a given
 /// `Config` + `Mode`. Pulled out of `ProxyServer::new` so it can be
@@ -937,9 +941,7 @@ pub fn matches_passthrough(host: &str, list: &[String]) -> bool {
 /// and `RuntimeState::switch_mode` for live mode toggling — the two paths
 /// must produce identical state so the second-pass switch behaves the same
 /// as a fresh Start.
-fn build_mode_state(
-    config: &Config,
-) -> Result<(Option<Arc<DomainFronter>>, Arc<RewriteCtx>, Mode), ProxyError> {
+fn build_mode_state(config: &Config) -> Result<ModeState, ProxyError> {
     let mode = config
         .mode_kind()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
@@ -949,8 +951,8 @@ fn build_mode_state(
     // `script_id`, which is exactly the state a direct-mode user is in.
     let fronter = match mode {
         Mode::AppsScript | Mode::Full => {
-            let f = DomainFronter::new(config)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("{e}")))?;
+            let f =
+                DomainFronter::new(config).map_err(|e| std::io::Error::other(format!("{e}")))?;
             Some(Arc::new(f))
         }
         Mode::Direct => None,
@@ -1784,7 +1786,7 @@ async fn accept_backoff(kind: &str, err: &std::io::Error, count: &mut u64) {
                 kind,
                 err
             );
-        } else if *count % 100 == 0 {
+        } else if (*count).is_multiple_of(100) {
             tracing::warn!(
                 "accept ({}) still fd-limited after {} retries. Current connections \
                  need to finish before we can accept new ones.",
@@ -3113,10 +3115,10 @@ async fn socks5_connect_via(proxy: &str, host: &str, port: u16) -> std::io::Resu
     let mut reply = [0u8; 2];
     s.read_exact(&mut reply).await?;
     if reply[0] != 0x05 || reply[1] != 0x00 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("socks5 greet rejected: {:?}", reply),
-        ));
+        return Err(std::io::Error::other(format!(
+            "socks5 greet rejected: {:?}",
+            reply
+        )));
     }
 
     // CONNECT request: VER=5, CMD=1, RSV=0, ATYP=3 (domain) | 1 (IPv4) | 4 (IPv6)
@@ -3147,10 +3149,10 @@ async fn socks5_connect_via(proxy: &str, host: &str, port: u16) -> std::io::Resu
     let mut head = [0u8; 4];
     s.read_exact(&mut head).await?;
     if head[0] != 0x05 || head[1] != 0x00 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("socks5 connect rejected rep=0x{:02x}", head[1]),
-        ));
+        return Err(std::io::Error::other(format!(
+            "socks5 connect rejected rep=0x{:02x}",
+            head[1]
+        )));
     }
     // Skip BND.ADDR + BND.PORT.
     match head[3] {
@@ -3203,6 +3205,15 @@ fn looks_like_http(first_bytes: &[u8]) -> bool {
 /// of memory before failing.
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 
+/// Maximum request body we buffer in the HTTP/MITM relay paths.
+///
+/// These paths have to materialize the full body before passing it to
+/// Apps Script, and Apps Script's request payload limit is well below
+/// "unbounded" once base64/JSON overhead is included. Refusing above
+/// 32 MiB keeps a malicious local/LAN client from forcing a huge
+/// allocation while still leaving room for ordinary form/API uploads.
+const MAX_REQUEST_BODY_BYTES: usize = 32 * 1024 * 1024;
+
 /// Result of `read_http_head` / `read_http_head_io`.
 /// `Oversized` is distinct from other I/O errors so the caller can
 /// reply with `431 Request Header Fields Too Large` instead of just
@@ -3245,7 +3256,7 @@ fn find_headers_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n").map(|p| p + 4)
 }
 
-fn parse_request_head(head: &[u8]) -> Option<(String, String, String, Vec<(String, String)>)> {
+fn parse_request_head(head: &[u8]) -> Option<ParsedRequestHead> {
     let s = std::str::from_utf8(head).ok()?;
     let mut lines = s.split("\r\n");
     let first = lines.next()?;
@@ -3640,7 +3651,7 @@ async fn forward_via_sni_rewrite_http(
         .tls_connector
         .connect(server_name, upstream_tcp)
         .await
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, format!("tls: {}", e)))?;
+        .map_err(|e| std::io::Error::other(format!("tls: {}", e)))?;
 
     let req = build_sni_forward_request_bytes(method, host, port, path, headers, body);
     tls.write_all(&req).await?;
@@ -3806,7 +3817,20 @@ where
         None => return Ok(false),
     };
 
-    let body = read_body(stream, &leftover, &headers).await?;
+    let body = match read_body(stream, &leftover, &headers).await {
+        Ok(body) => body,
+        Err(e) if is_body_too_large(&e) => {
+            tracing::warn!(
+                "MITM request body exceeds {} bytes — returning 413 ({}:{})",
+                MAX_REQUEST_BODY_BYTES,
+                host,
+                port
+            );
+            let _ = write_payload_too_large(stream).await;
+            return Ok(false);
+        }
+        Err(e) => return Err(e),
+    };
 
     // ── Per-host URL fix-ups ──────────────────────────────────────────
     // x.com's GraphQL endpoints concatenate three huge JSON blobs into
@@ -4198,6 +4222,36 @@ fn invalid_body(msg: impl Into<String>) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, msg.into())
 }
 
+fn body_too_large() -> std::io::Error {
+    // FileTooLarge (stable since 1.83) is the canonical kind for this
+    // condition. Using a distinct ErrorKind — rather than InvalidData
+    // with a magic message substring — keeps the 413 path tied to a
+    // compiler-checked tag, so renaming the message can't silently
+    // demote responses to 500.
+    std::io::Error::new(
+        std::io::ErrorKind::FileTooLarge,
+        format!("request body exceeds {} byte cap", MAX_REQUEST_BODY_BYTES),
+    )
+}
+
+fn is_body_too_large(e: &std::io::Error) -> bool {
+    e.kind() == std::io::ErrorKind::FileTooLarge
+}
+
+async fn write_payload_too_large<S>(stream: &mut S) -> std::io::Result<()>
+where
+    S: tokio::io::AsyncWrite + Unpin,
+{
+    stream
+        .write_all(
+            b"HTTP/1.1 413 Payload Too Large\r\n\
+              Connection: close\r\n\
+              Content-Length: 0\r\n\r\n",
+        )
+        .await?;
+    stream.flush().await
+}
+
 async fn read_body<S>(
     stream: &mut S,
     leftover: &[u8],
@@ -4248,6 +4302,10 @@ where
         return Ok(Vec::new());
     };
 
+    if content_length > MAX_REQUEST_BODY_BYTES {
+        return Err(body_too_large());
+    }
+
     let mut body = Vec::with_capacity(content_length);
     body.extend_from_slice(&leftover[..leftover.len().min(content_length)]);
     let mut tmp = [0u8; 8192];
@@ -4294,7 +4352,16 @@ where
             }
         }
 
-        fill_buffer(stream, &mut buf, &mut tmp, size + 2).await?;
+        let Some(total_len) = out.len().checked_add(size) else {
+            return Err(body_too_large());
+        };
+        if total_len > MAX_REQUEST_BODY_BYTES {
+            return Err(body_too_large());
+        }
+        let want = size
+            .checked_add(2)
+            .ok_or_else(|| invalid_body(format!("chunk too large '{}'", line_str)))?;
+        fill_buffer(stream, &mut buf, &mut tmp, want).await?;
         if &buf[size..size + 2] != b"\r\n" {
             return Err(invalid_body("chunk missing trailing CRLF"));
         }
@@ -4361,7 +4428,18 @@ async fn do_plain_http(
     let (method, target, _version, headers) = parse_request_head(head)
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidData, "bad request"))?;
 
-    let body = read_body(&mut sock, leftover, &headers).await?;
+    let body = match read_body(&mut sock, leftover, &headers).await {
+        Ok(body) => body,
+        Err(e) if is_body_too_large(&e) => {
+            tracing::warn!(
+                "plain HTTP request body exceeds {} bytes — returning 413",
+                MAX_REQUEST_BODY_BYTES
+            );
+            let _ = write_payload_too_large(&mut sock).await;
+            return Ok(());
+        }
+        Err(e) => return Err(e),
+    };
 
     // Browser sends `GET http://example.com/path HTTP/1.1` on plain proxy.
     let url = if target.starts_with("http://") || target.starts_with("https://") {
@@ -4852,6 +4930,73 @@ mod tests {
 
         client_task.await.unwrap();
         assert_eq!(body, b"hello");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_body_rejects_oversized_content_length_before_allocating() {
+        let (_client, mut server) = duplex(64);
+        let err = read_body(
+            &mut server,
+            &[],
+            &headers(&[("Content-Length", &(MAX_REQUEST_BODY_BYTES + 1).to_string())]),
+        )
+        .await
+        .expect_err("oversized body must be rejected before allocation");
+
+        assert!(is_body_too_large(&err));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_body_rejects_oversized_chunked_body_before_fill() {
+        let (_client, mut server) = duplex(64);
+        let first_chunk = format!("{:x}\r\n", MAX_REQUEST_BODY_BYTES + 1);
+        let err = read_body(
+            &mut server,
+            first_chunk.as_bytes(),
+            &headers(&[("Transfer-Encoding", "chunked")]),
+        )
+        .await
+        .expect_err("oversized chunked body must be rejected before buffering");
+
+        assert!(is_body_too_large(&err));
+    }
+
+    #[test]
+    fn body_too_large_detector_round_trips_through_constructor() {
+        // Guard against future drift between `body_too_large` and
+        // `is_body_too_large` — if anyone retypes the error
+        // construction, this test must keep failing until both ends
+        // agree on the same signal.
+        assert!(is_body_too_large(&body_too_large()));
+        assert!(!is_body_too_large(&invalid_body("something else")));
+        assert!(!is_body_too_large(&std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "eof",
+        )));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn write_payload_too_large_emits_413_status_line() {
+        let (mut client, mut server) = duplex(256);
+        write_payload_too_large(&mut server)
+            .await
+            .expect("413 must write cleanly to an open stream");
+        drop(server);
+
+        let mut buf = Vec::new();
+        client
+            .read_to_end(&mut buf)
+            .await
+            .expect("client side must drain the 413");
+        let text = std::str::from_utf8(&buf).expect("413 response is ASCII");
+        assert!(
+            text.starts_with("HTTP/1.1 413 Payload Too Large\r\n"),
+            "413 status line missing or malformed: {:?}",
+            text
+        );
+        assert!(text.contains("Content-Length: 0\r\n"));
+        assert!(text.contains("Connection: close\r\n"));
+        assert!(text.ends_with("\r\n\r\n"));
     }
 
     #[test]
@@ -6367,7 +6512,7 @@ mod tests {
         for entry in crate::direct_mode::DEFAULT_GOOGLE_DOMAINS {
             let bare = entry.trim_start_matches('.');
             assert!(
-                SNI_REWRITE_SUFFIXES.iter().any(|s| *s == bare),
+                SNI_REWRITE_SUFFIXES.contains(&bare),
                 "{} is in DEFAULT_GOOGLE_DOMAINS but not in SNI_REWRITE_SUFFIXES — \
                  the SkipPrefaced fallback to SNI-rewrite would be unsafe for this host",
                 bare

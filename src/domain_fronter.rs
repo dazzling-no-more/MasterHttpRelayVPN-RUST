@@ -619,11 +619,11 @@ const SCRIPT_PROBE_TIMEOUT_SECS: u64 = 15;
 /// (`_EXIT_NODE_BYPASS_SUFFIXES`).
 const EXIT_NODE_BYPASS_SUFFIXES: &[&str] = &["googlevideo.com"];
 
-/// Auto-blacklist defaults are now per-instance fields on `DomainFronter`,
-/// driven by `Config::auto_blacklist_strikes` / `_window_secs` /
-/// `_cooldown_secs` (#391, #444). The constants below are gone — see the
-/// `Config` doc comments for tuning guidance and `default_auto_blacklist_*`
-/// for the historical defaults (3 strikes / 30s window / 120s cooldown).
+// Auto-blacklist defaults are now per-instance fields on `DomainFronter`,
+// driven by `Config::auto_blacklist_strikes` / `_window_secs` /
+// `_cooldown_secs` (#391, #444). The constants below are gone — see the
+// `Config` doc comments for tuning guidance and `default_auto_blacklist_*`
+// for the historical defaults (3 strikes / 30s window / 120s cooldown).
 
 /// Request payload sent to Apps Script (single, non-batch).
 #[derive(Serialize)]
@@ -998,7 +998,7 @@ impl DomainFronter {
         let m = self.per_site.lock().unwrap();
         let mut v: Vec<(String, HostStat)> =
             m.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-        v.sort_by(|a, b| b.1.requests.cmp(&a.1.requests));
+        v.sort_by_key(|(_, stat)| std::cmp::Reverse(stat.requests));
         v
     }
 
@@ -1977,6 +1977,7 @@ impl DomainFronter {
 
     /// Post-TLS portion of the h2 open path: ALPN check + h2 handshake
     /// + connection-driver task spawn. Split out from `open_h2` so
+    ///
     /// tests can drive it with a TLS stream from any local server,
     /// bypassing the hard-coded `connect_host:443` target.
     async fn h2_handshake_post_tls(
@@ -2030,6 +2031,7 @@ impl DomainFronter {
     ///     completed round-trip; for a 421 we want it counted as
     ///     `h2_fallbacks` instead since the request will take the
     ///     h1 path.)
+    ///
     /// Logs at info because this is a meaningful state transition for
     /// the deployment, not a per-request hiccup.
     async fn sticky_disable_h2_for_fronting_refusal(&self, status: u16, context: &str) {
@@ -2067,6 +2069,7 @@ impl DomainFronter {
     ///      holds generation N+1 (healthy)
     ///   3. Task A's stale stream errors → unconditionally clearing
     ///      the cell would kill the healthy N+1
+    ///
     /// With generation matching, A's poison is a no-op against N+1.
     async fn poison_h2_if_gen(&self, generation: u64) {
         let mut cell = self.h2_cell.lock().await;
@@ -2105,6 +2108,7 @@ impl DomainFronter {
     ///     the deadline so legitimate slow Apps Script calls and
     ///     Full-mode batches with custom `request_timeout_secs` aren't
     ///     cut off at an arbitrary fixed cap.
+    #[allow(clippy::too_many_arguments)]
     async fn h2_round_trip(
         &self,
         send: h2::client::SendRequest<Bytes>,
@@ -3107,7 +3111,7 @@ impl DomainFronter {
     }
 
     async fn do_relay_parallel(
-        self: &Self,
+        &self,
         method: &str,
         url: &str,
         headers: &[(String, String)],
@@ -4008,35 +4012,14 @@ impl DomainFronter {
     }
 }
 
-/// Strip connection-specific headers (matches Code.gs SKIP_HEADERS) and,
-/// by default, strip `br` / `zstd` from Accept-Encoding (Apps Script's
-/// `UrlFetchApp` auto-decompresses gzip but neither of those). Opt-in
-/// via `Config::allow_brotli_zstd` to let br/zstd flow through;
-/// `parse_relay_json` / `parse_exit_node_response` then decode the
-/// resulting bodies on the way back.
-/// Extract the host (no scheme, no port, no path) from a URL string.
-/// Returns None for malformed / scheme-less inputs.
-/// Trim X/Twitter GraphQL URLs down to just the `variables=` query param,
-/// stripping everything from the first `&` in the query onward. See the
-/// `normalize_x_graphql` config field for the why.
-///
-/// Exact pattern mirrored from the Python community patch (issue #16):
-///
-///   host == "x.com"
-///   && path starts with "/i/api/graphql/"
-///   && query starts with "variables="
-///   → truncate at first `&` past the `?`.
-///
-/// Returns the possibly-rewritten URL. If the URL doesn't match the
-/// pattern the input is returned unchanged (as an owned String — the
-/// allocation is cheap on the slow path and keeps the caller's
-/// type-signature-juggling simple).
 // ─── HTTP response helpers used by relay_parallel_range ──────────────────
+
+type SplitResponse<'a> = (u16, Vec<(String, String)>, &'a [u8]);
 
 /// Split an HTTP/1.x response blob into `(status, headers, body)`.
 /// Returns `None` if the buffer doesn't even have a status line + CRLFCRLF
 /// separator — the caller should then pass the bytes through unchanged.
-fn split_response(raw: &[u8]) -> Option<(u16, Vec<(String, String)>, &[u8])> {
+fn split_response(raw: &[u8]) -> Option<SplitResponse<'_>> {
     // Locate end-of-headers.
     let sep = b"\r\n\r\n";
     let sep_pos = raw.windows(sep.len()).position(|w| w == sep)?;
@@ -4529,6 +4512,21 @@ impl tokio::io::AsyncWrite for VecAsyncWriter<'_> {
     }
 }
 
+/// Trim X/Twitter GraphQL URLs down to just the `variables=` query param,
+/// stripping everything from the first `&` in the query onward. See the
+/// `normalize_x_graphql` config field for the why.
+///
+/// Exact pattern mirrored from the Python community patch (issue #16):
+///
+///   host == "x.com"
+///   && path starts with "/i/api/graphql/"
+///   && query starts with "variables="
+///   → truncate at first `&` past the `?`.
+///
+/// Returns the possibly-rewritten URL. If the URL doesn't match the
+/// pattern the input is returned unchanged (as an owned String — the
+/// allocation is cheap on the slow path and keeps the caller's
+/// type-signature-juggling simple).
 fn normalize_x_graphql_url(url: &str) -> String {
     // Split host from the rest. We accept both "x.com" and common legacy
     // forms; the Python patch only checks x.com so we do the same to be
@@ -4677,7 +4675,7 @@ fn unix_to_pt_seconds(utc_secs: u64) -> u64 {
 /// hour itself (02:00 local) is approximated to whole-day boundaries —
 /// good enough for a daily-quota countdown.
 fn pacific_is_dst(year: i64, month: u32, day: u32) -> bool {
-    if month < 3 || month > 11 {
+    if !(3..=11).contains(&month) {
         return false;
     }
     if month > 3 && month < 11 {
@@ -5209,6 +5207,9 @@ pub(crate) fn strip_sabr_quality_tracks(body: &[u8]) -> Vec<u8> {
     out
 }
 
+/// Extract the host (no scheme, no port, no path) from a URL string.
+/// Falls back to the input verbatim if no `://` is present, so callers
+/// get a best-effort authority rather than `None` on bare hostnames.
 fn extract_host(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
     let authority = after_scheme.split('/').next().unwrap_or("");
@@ -7564,7 +7565,7 @@ Content-Type: text/javascript\r\n\
 Vary: Accept-Encoding\r\n\
 Content-Length: 45812\r\n\r\n"
             .to_vec();
-        raw.extend(std::iter::repeat(b'x').take(45_812));
+        raw.extend(std::iter::repeat_n(b'x', 45_812));
 
         let (status, headers, body) = split_response(&raw).unwrap();
         assert_eq!(
@@ -8062,7 +8063,7 @@ hello";
         // Flush must have been called after the committed prefix
         // was in place — i.e., at the same byte count as `buf.len()`.
         assert!(
-            writer.flushed_at.iter().any(|&at| at == expected_committed),
+            writer.flushed_at.contains(&expected_committed),
             "flush() must run after committed prefix is written; flushed_at={:?}, expected at byte {}",
             writer.flushed_at,
             expected_committed,
@@ -8120,7 +8121,8 @@ hello";
         let chunk_size: u64 = 256 * 1024;
         let total: u64 = 40 * 1024 * 1024;
         let probe_body = vec![0u8; chunk_size as usize];
-        let mut chunks_data: Vec<(u64, u64, Result<Vec<u8>, &'static str>)> = Vec::new();
+        type TestChunk = (u64, u64, Result<Vec<u8>, &'static str>);
+        let mut chunks_data: Vec<TestChunk> = Vec::new();
         let mut start = chunk_size;
         while start < total {
             let end = (start + chunk_size - 1).min(total - 1);
@@ -8207,7 +8209,7 @@ hello";
         // (BEFORE any chunk bytes), proving the early flush ran.
         let head_plus_probe = head.len() + probe.len();
         assert!(
-            writer.flushed_at.iter().any(|&at| at == head_plus_probe),
+            writer.flushed_at.contains(&head_plus_probe),
             "early flush must run after head+probe but before chunks; flushed_at={:?}, expected at byte {}",
             writer.flushed_at,
             head_plus_probe,

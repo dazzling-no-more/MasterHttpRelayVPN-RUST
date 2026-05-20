@@ -491,8 +491,8 @@ fn pick_asset_for_target(
 }
 
 fn is_newer(a: &str, b: &str) -> bool {
-    let parts_a: Vec<&str> = a.split(|c: char| c == '.' || c == '-').collect();
-    let parts_b: Vec<&str> = b.split(|c: char| c == '.' || c == '-').collect();
+    let parts_a: Vec<&str> = a.split(['.', '-']).collect();
+    let parts_b: Vec<&str> = b.split(['.', '-']).collect();
     let n = parts_a.len().max(parts_b.len());
     for i in 0..n {
         let pa = parts_a.get(i).unwrap_or(&"0");

@@ -426,7 +426,7 @@ mod tests {
         // copy-paste regression where the new function emits the old
         // hint text.
         assert!(
-            !log.matches(apps_script_marker).nth(1).is_some(),
+            log.matches(apps_script_marker).count() < 2,
             "Apps-Script hint appeared twice — exit-node function may \
              be emitting the wrong message: {}",
             log
