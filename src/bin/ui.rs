@@ -3675,31 +3675,66 @@ impl eframe::App for App {
                 {
                     self.form.log_color_editor_open = !self.form.log_color_editor_open;
                 }
-                if ui.small_button("save…")
+                if ui.small_button("copy")
                     .on_hover_text(
-                        "Write every line in the log panel to a timestamped file in the \
-                         user-data dir. Useful for filing bug reports."
+                        "Copy every line in the log panel to the system clipboard. \
+                         The text inside the panel is rendered as styled labels and \
+                         is not directly selectable, so this is the easiest way to \
+                         grab logs for bug reports."
                     )
                     .clicked()
                 {
-                    let log = self.shared.state.lock().unwrap().log.clone();
+                    let (n, body) = snapshot_log_body(&self.shared);
+                    ui.output_mut(|o| o.copied_text = body);
+                    self.toast = Some((
+                        format!("Copied {} log lines to clipboard", n),
+                        Instant::now(),
+                    ));
+                }
+                if ui.small_button("save")
+                    .on_hover_text(
+                        "Write every line in the log panel to a timestamped file in \
+                         the OS Downloads folder, then reveal it in the file manager. \
+                         Useful for filing bug reports."
+                    )
+                    .clicked()
+                {
+                    // Drop into the OS Downloads dir rather than the user-data dir
+                    // (~%APPDATA%\rahgozar on Windows / ~/Library/Application Support
+                    // on macOS). Downloads is somewhere users can actually find
+                    // without spelunking through hidden config paths, and the
+                    // `reveal_in_file_manager` call below opens it for them anyway.
+                    //
+                    // Filename has millisecond precision so two saves issued in the
+                    // same second don't silently overwrite each other — easy to do
+                    // when grabbing successive snapshots while reproducing a bug.
                     let fname = format!(
-                        "log-{}.txt",
+                        "rahgozar-log-{}.txt",
                         time::OffsetDateTime::now_utc()
                             .format(&time::macros::format_description!(
-                                "[year][month][day]-[hour][minute][second]"
+                                "[year][month][day]-[hour][minute][second]-[subsecond digits:3]"
                             ))
                             .unwrap_or_default(),
                     );
-                    let path = data_dir::data_dir().join(&fname);
-                    let body: String = log.iter().cloned().collect::<Vec<_>>().join("\n");
+                    let dir = downloads_dir();
+                    let path = dir.join(&fname);
+                    let (_, body) = snapshot_log_body(&self.shared);
+                    // Some OSes don't materialise ~/Downloads until the user opens
+                    // their browser — `directories` happily returns the path but
+                    // the dir itself may not exist yet, which would turn the write
+                    // below into a misleading NotFound. Best-effort create; if it
+                    // fails the std::fs::write error path still surfaces a toast.
+                    let _ = std::fs::create_dir_all(&dir);
                     match std::fs::write(&path, body) {
-                        Ok(_) => self.toast = Some((
-                            format!("Log saved to {}", path.display()),
-                            Instant::now(),
-                        )),
+                        Ok(_) => {
+                            reveal_in_file_manager(&path);
+                            self.toast = Some((
+                                format!("Log saved to {}", path.display()),
+                                Instant::now(),
+                            ));
+                        }
                         Err(e) => self.toast = Some((
-                            format!("Log save failed: {}", e),
+                            format!("Log save failed ({}): {}", path.display(), e),
                             Instant::now(),
                         )),
                     }
@@ -5419,6 +5454,15 @@ fn reveal_in_file_manager(p: &std::path::Path) {
             let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
         }
     }
+}
+
+/// Snapshot the in-memory log ring buffer as `(line_count, body)` where `body`
+/// is the lines joined by `\n`. Holds the state mutex only for the clone so
+/// the formatting work can't block the tracing writer pushing new lines in.
+fn snapshot_log_body(shared: &Shared) -> (usize, String) {
+    let lines: Vec<String> = shared.state.lock().unwrap().log.iter().cloned().collect();
+    let n = lines.len();
+    (n, lines.join("\n"))
 }
 
 fn push_log(shared: &Shared, msg: &str) {
