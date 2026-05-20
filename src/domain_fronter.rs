@@ -408,6 +408,16 @@ pub struct DomainFronter {
     /// strike state is per-deployment health bookkeeping, not the
     /// permanent ban list.
     script_timeouts: Arc<std::sync::Mutex<HashMap<String, (Instant, u32)>>>,
+    /// Per-deployment EWMA of recent successful batch RTT, in
+    /// milliseconds, alongside the time of the last fold. Updated by
+    /// [`record_batch_latency`] after each successful batch (failed
+    /// batches are excluded — their elapsed time is whatever timeout
+    /// fired, not the deployment's actual throughput). Read by
+    /// [`next_script_id`] to deprioritize deployments running
+    /// materially slower than peers. The timestamp lets the slow-set
+    /// snapshot expire stale entries so a deployment marked slow
+    /// gets a fresh probe pick after `LATENCY_FRESH_FOR_SECS`.
+    script_latency_ewma: Arc<std::sync::Mutex<HashMap<String, (f64, Instant)>>>,
     relay_calls: AtomicU64,
     relay_failures: AtomicU64,
     bytes_relayed: AtomicU64,
@@ -543,6 +553,82 @@ impl HostStat {
 }
 
 const BLACKLIST_COOLDOWN_SECS: u64 = 600;
+
+/// EWMA weight for the most recent batch RTT. 0.3 makes the score
+/// responsive to a deployment that just sped up or slowed down without
+/// being dominated by a single outlier sample.
+const LATENCY_EWMA_ALPHA: f64 = 0.3;
+/// Skip a deployment from `next_script_id` when its EWMA exceeds the
+/// group median by this multiple. Tuned so a deployment running 2-3×
+/// slower than peers (the typical "Apps Script is having a bad minute"
+/// pattern) drops out of selection without ejecting one that is merely
+/// 20-30% slower from quota or h2-warmup effects.
+const LATENCY_SLOW_THRESHOLD: f64 = 2.0;
+/// Skip-logic stays inert below this many configured deployments. With
+/// only one or two, the "skip the slow one" rule would either be a
+/// no-op (1 deployment) or oscillate (2 deployments — median equals
+/// whichever sample arrived last). Three is the smallest size where a
+/// stable median exists.
+const LATENCY_MIN_DEPLOYMENTS: usize = 3;
+/// Skip-logic stays inert below this median. When everyone is already
+/// fast (median < 500 ms), a 2× outlier is still a fine batch and
+/// kicking it out of round-robin just churns the selector for no win.
+const LATENCY_SKIP_MIN_MEDIAN_MS: f64 = 500.0;
+/// How long an EWMA sample stays "fresh" for the slow-set decision.
+/// Past this age, the entry is ignored by both the median calculation
+/// and the slow-set filter — effectively letting the deployment back
+/// into rotation. Without an expiry, a deployment marked slow would
+/// never be picked again (no new sample → EWMA frozen high → still
+/// slow forever), so a transient bad minute could permanently
+/// blacklist it. With 30 s, a long-skipped deployment gets a probe
+/// pick the next time its turn comes around, and either recovers
+/// (new sample folds in lower, exits slow-set) or stays out for
+/// another 30 s.
+const LATENCY_FRESH_FOR_SECS: u64 = 30;
+
+/// Filter `map` down to entries whose timestamp is within `fresh` of
+/// `now`, projecting away the timestamp. Pure helper so the staleness
+/// filter has direct unit coverage without standing up a live fronter
+/// or fighting `std::time::Instant`'s wall-clock-only semantics.
+fn fresh_latency_snapshot(
+    map: &HashMap<String, (f64, Instant)>,
+    now: Instant,
+    fresh: Duration,
+) -> HashMap<String, f64> {
+    map.iter()
+        .filter(|(_, (_, ts))| now.duration_since(*ts) < fresh)
+        .map(|(k, (score, _))| (k.clone(), *score))
+        .collect()
+}
+
+/// Set of script IDs whose recent EWMA latency is materially worse
+/// than the group median. The selector skips these in round-robin so
+/// a deployment having a slow minute (Apps Script quota throttle, h2
+/// stream contention, etc.) doesn't repeatedly stall handshake-stage
+/// traffic. Pure function over the EWMA snapshot — easy to unit-test
+/// without standing up a live fronter. See `LATENCY_SLOW_THRESHOLD`
+/// and the two `LATENCY_*_MIN_*` guards for the inertness conditions.
+fn compute_slow_set(ewma_snapshot: &HashMap<String, f64>) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    if ewma_snapshot.len() < LATENCY_MIN_DEPLOYMENTS {
+        return HashSet::new();
+    }
+    let mut values: Vec<f64> = ewma_snapshot.values().copied().collect();
+    // f64 has no total ordering due to NaN, but our values come from
+    // `Duration::as_secs_f64() * 1000.0` so NaN is unreachable here;
+    // `partial_cmp().unwrap_or(Equal)` is the safe-by-fallback form.
+    values.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = values[values.len() / 2];
+    if median < LATENCY_SKIP_MIN_MEDIAN_MS {
+        return HashSet::new();
+    }
+    let threshold = median * LATENCY_SLOW_THRESHOLD;
+    ewma_snapshot
+        .iter()
+        .filter(|(_, &v)| v > threshold)
+        .map(|(k, _)| k.clone())
+        .collect()
+}
 
 /// Outcome of [`DomainFronter::apply_probe_recovery`] — the
 /// compare-and-swap step the probe loop runs after a recovery-
@@ -788,6 +874,7 @@ impl DomainFronter {
             coalesced: AtomicU64::new(0),
             blacklist: Arc::new(std::sync::Mutex::new(HashMap::new())),
             script_timeouts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            script_latency_ewma: Arc::new(std::sync::Mutex::new(HashMap::new())),
             relay_calls: AtomicU64::new(0),
             relay_failures: AtomicU64::new(0),
             bytes_relayed: AtomicU64::new(0),
@@ -1059,10 +1146,27 @@ impl DomainFronter {
 
     pub fn next_script_id(&self) -> String {
         let n = self.script_ids.len();
+        // Compute the slow-set BEFORE taking the blacklist mutex — both
+        // are short-lived locks but nesting them widens the critical
+        // section and creates a lock-order dependency between two
+        // otherwise-independent maps. The snapshot is a self-contained
+        // value, so it's safe to compute outside any other lock.
+        let slow_set = compute_slow_set(&self.script_latency_snapshot());
         let mut bl = self.blacklist.lock().unwrap();
         let now = Instant::now();
         bl.retain(|_, e| e.until > now);
 
+        for _ in 0..n {
+            let idx = self.script_idx.fetch_add(1, Ordering::Relaxed);
+            let sid = &self.script_ids[idx % n];
+            if !bl.contains_key(sid) && !slow_set.contains(sid) {
+                return sid.clone();
+            }
+        }
+        // Nothing healthy *and* fast — relax the slow-set guard and
+        // pick the first non-blacklisted deployment we encounter.
+        // Better to use a known-slow deployment than to fall through
+        // to the all-blacklisted fallback below.
         for _ in 0..n {
             let idx = self.script_idx.fetch_add(1, Ordering::Relaxed);
             let sid = &self.script_ids[idx % n];
@@ -1088,19 +1192,37 @@ impl DomainFronter {
         if n == 0 {
             return vec![];
         }
+        // Snapshot before the blacklist lock — see next_script_id.
+        let slow_set = compute_slow_set(&self.script_latency_snapshot());
         let mut bl = self.blacklist.lock().unwrap();
         let now = Instant::now();
         bl.retain(|_, e| e.until > now);
 
         let mut picked: Vec<String> = Vec::with_capacity(want);
+        // Pass 1: blacklist-free AND slow-set-free.
         for _ in 0..n {
             if picked.len() >= want {
                 break;
             }
             let idx = self.script_idx.fetch_add(1, Ordering::Relaxed);
             let sid = &self.script_ids[idx % n];
-            if !bl.contains_key(sid) && !picked.iter().any(|p| p == sid) {
+            if !bl.contains_key(sid) && !slow_set.contains(sid) && !picked.iter().any(|p| p == sid)
+            {
                 picked.push(sid.clone());
+            }
+        }
+        // Pass 2: relax the slow-set guard if we didn't get enough on
+        // pass 1 — same fallback rationale as `next_script_id`.
+        if picked.len() < want {
+            for _ in 0..n {
+                if picked.len() >= want {
+                    break;
+                }
+                let idx = self.script_idx.fetch_add(1, Ordering::Relaxed);
+                let sid = &self.script_ids[idx % n];
+                if !bl.contains_key(sid) && !picked.iter().any(|p| p == sid) {
+                    picked.push(sid.clone());
+                }
             }
         }
         if picked.is_empty() {
@@ -1191,6 +1313,37 @@ impl DomainFronter {
     pub(crate) fn record_batch_success(&self, script_id: &str) {
         let mut counts = self.script_timeouts.lock().unwrap();
         counts.remove(script_id);
+    }
+
+    /// Fold a successful batch RTT into the deployment's EWMA score.
+    /// Only successful batches are recorded — a failed batch's elapsed
+    /// time is the timeout, not the deployment's actual speed, and
+    /// would poison the EWMA upward.
+    pub(crate) fn record_batch_latency(&self, script_id: &str, latency: Duration) {
+        let ms = latency.as_secs_f64() * 1000.0;
+        let now = Instant::now();
+        let mut map = self.script_latency_ewma.lock().unwrap();
+        map.entry(script_id.to_string())
+            .and_modify(|(score, ts)| {
+                *score = LATENCY_EWMA_ALPHA * ms + (1.0 - LATENCY_EWMA_ALPHA) * *score;
+                *ts = now;
+            })
+            .or_insert((ms, now));
+    }
+
+    /// Snapshot of `script_latency_ewma` for read-only consumers
+    /// (tests, the selector), restricted to samples taken within the
+    /// last `LATENCY_FRESH_FOR_SECS`. Stale entries are filtered out
+    /// so a deployment that's been skipped long enough for its sample
+    /// to expire becomes eligible again — the recovery path that
+    /// keeps a single bad minute from being a permanent ban.
+    fn script_latency_snapshot(&self) -> HashMap<String, f64> {
+        let map = self.script_latency_ewma.lock().unwrap();
+        fresh_latency_snapshot(
+            &map,
+            Instant::now(),
+            Duration::from_secs(LATENCY_FRESH_FOR_SECS),
+        )
     }
 
     /// Log a relay failure with extra guidance on cert-validation cases.
@@ -3846,6 +3999,12 @@ impl DomainFronter {
         script_id: &str,
         ops: &[BatchOp],
     ) -> Result<BatchTunnelResponse, FronterError> {
+        // Time the whole batch round-trip — including request build,
+        // socket acquire, redirect chain, and response parse. Recorded
+        // on the success return below so the EWMA reflects what the
+        // deployment actually delivered (failed batches' elapsed time
+        // would be dominated by the timeout, not throughput).
+        let t0 = std::time::Instant::now();
         let mut map = serde_json::Map::new();
         map.insert("k".into(), Value::String(self.auth_key.clone()));
         map.insert("t".into(), Value::String("batch".into()));
@@ -3925,6 +4084,7 @@ impl DomainFronter {
         // raw body gated behind RUST_LOG=trace.
         let resp = self.finalize_batch_response(script_id, status, resp_body)?;
         self.release(entry).await;
+        self.record_batch_latency(script_id, t0.elapsed());
         Ok(resp)
     }
 
@@ -6839,6 +6999,274 @@ mod tests {
         let msg = format!("{}", err);
         assert!(msg.contains("unauthorized"), "got: {}", msg);
         assert!(msg.contains("exit node"), "got: {}", msg);
+    }
+
+    fn multi_deployment_fronter(ids: &[&str]) -> DomainFronter {
+        let ids_json = serde_json::to_string(ids).unwrap();
+        let json = format!(
+            r#"{{
+                "mode": "apps_script",
+                "google_ip": "127.0.0.1",
+                "front_domain": "www.google.com",
+                "script_id": {ids_json},
+                "auth_key": "test_auth_key",
+                "listen_host": "127.0.0.1",
+                "listen_port": 8085,
+                "log_level": "info",
+                "verify_ssl": true
+            }}"#
+        );
+        let cfg: Config = serde_json::from_str(&json).unwrap();
+        DomainFronter::new(&cfg).expect("test fronter must construct")
+    }
+
+    #[test]
+    fn compute_slow_set_empty_when_below_min_deployments() {
+        // 1-2 deployments → no stable median → always inert.
+        let mut m = HashMap::new();
+        m.insert("a".into(), 200.0);
+        assert!(compute_slow_set(&m).is_empty());
+        m.insert("b".into(), 10_000.0);
+        assert!(
+            compute_slow_set(&m).is_empty(),
+            "2 deployments: even a 50× outlier must not trigger skip"
+        );
+    }
+
+    #[test]
+    fn compute_slow_set_empty_when_median_below_floor() {
+        // 3 deployments, all under LATENCY_SKIP_MIN_MEDIAN_MS (500ms).
+        // Even a 5× outlier within "everyone is fast" stays in rotation.
+        let mut m = HashMap::new();
+        m.insert("a".into(), 100.0);
+        m.insert("b".into(), 150.0);
+        m.insert("c".into(), 800.0);
+        assert!(
+            compute_slow_set(&m).is_empty(),
+            "median 150ms < 500ms floor: skip must be inert"
+        );
+    }
+
+    #[test]
+    fn compute_slow_set_skips_outlier_above_threshold() {
+        // 3 deployments, median 1000ms, one outlier at 3000ms (3× median).
+        let mut m = HashMap::new();
+        m.insert("fast".into(), 800.0);
+        m.insert("median".into(), 1000.0);
+        m.insert("slow".into(), 3000.0);
+        let slow = compute_slow_set(&m);
+        assert_eq!(slow.len(), 1);
+        assert!(slow.contains("slow"));
+    }
+
+    #[test]
+    fn compute_slow_set_keeps_outlier_within_threshold() {
+        // Same shape but the "slow" one is only 1.8× median — under the
+        // 2× threshold, so it stays in rotation.
+        let mut m = HashMap::new();
+        m.insert("a".into(), 800.0);
+        m.insert("b".into(), 1000.0);
+        m.insert("c".into(), 1800.0);
+        assert!(
+            compute_slow_set(&m).is_empty(),
+            "1.8× median is below the 2× cutoff and must stay in rotation"
+        );
+    }
+
+    #[test]
+    fn compute_slow_set_skips_multiple_outliers() {
+        // 5 deployments, two of them well above 2× median.
+        let mut m = HashMap::new();
+        m.insert("a".into(), 700.0);
+        m.insert("b".into(), 900.0);
+        m.insert("c".into(), 1000.0); // median
+        m.insert("d".into(), 2500.0);
+        m.insert("e".into(), 4000.0);
+        let slow = compute_slow_set(&m);
+        assert_eq!(slow.len(), 2);
+        assert!(slow.contains("d"));
+        assert!(slow.contains("e"));
+    }
+
+    #[test]
+    fn record_batch_latency_folds_with_ewma_weight() {
+        let fronter = multi_deployment_fronter(&["A", "B", "C"]);
+        // First observation seeds the EWMA at exactly the sample.
+        fronter.record_batch_latency("A", Duration::from_millis(1000));
+        let snap = fronter.script_latency_snapshot();
+        assert!(
+            (snap["A"] - 1000.0).abs() < 0.001,
+            "first sample seeds EWMA; got {}",
+            snap["A"]
+        );
+        // Second observation folds with α = LATENCY_EWMA_ALPHA.
+        // expected = α*2000 + (1-α)*1000 = 0.3*2000 + 0.7*1000 = 1300
+        fronter.record_batch_latency("A", Duration::from_millis(2000));
+        let snap = fronter.script_latency_snapshot();
+        let expected = LATENCY_EWMA_ALPHA * 2000.0 + (1.0 - LATENCY_EWMA_ALPHA) * 1000.0;
+        assert!(
+            (snap["A"] - expected).abs() < 0.001,
+            "EWMA fold mismatched: got {}, expected {}",
+            snap["A"],
+            expected
+        );
+        // Different deployments tracked independently.
+        fronter.record_batch_latency("B", Duration::from_millis(500));
+        let snap = fronter.script_latency_snapshot();
+        assert!((snap["B"] - 500.0).abs() < 0.001);
+        assert!((snap["A"] - expected).abs() < 0.001, "A unaffected by B");
+    }
+
+    #[test]
+    fn next_script_id_skips_slow_deployment_when_others_healthy() {
+        let fronter = multi_deployment_fronter(&["FAST1", "FAST2", "SLOW"]);
+        // FAST* steady-state must clear `LATENCY_SKIP_MIN_MEDIAN_MS`
+        // (500ms) for the skip logic to engage at all — below that
+        // floor the rule is intentionally inert. SLOW at 5× the
+        // median sits well over the 2× threshold.
+        for _ in 0..5 {
+            fronter.record_batch_latency("FAST1", Duration::from_millis(800));
+            fronter.record_batch_latency("FAST2", Duration::from_millis(800));
+            fronter.record_batch_latency("SLOW", Duration::from_millis(4000));
+        }
+        // Drive the round-robin for several picks; SLOW must never come up.
+        let mut picks: Vec<String> = (0..30).map(|_| fronter.next_script_id()).collect();
+        picks.sort();
+        picks.dedup();
+        assert_eq!(
+            picks,
+            vec!["FAST1".to_string(), "FAST2".to_string()],
+            "SLOW should be excluded from round-robin while FAST* are available"
+        );
+    }
+
+    #[test]
+    fn next_script_id_does_not_skip_when_median_below_floor() {
+        // Companion test pinning the floor behavior: when all
+        // deployments are sub-500ms, even a 10× outlier stays in
+        // rotation. Prevents the skip from kicking in on a fast
+        // network where the "slow" deployment is still plenty fast
+        // in absolute terms.
+        let fronter = multi_deployment_fronter(&["A", "B", "FAST_BUT_OUTLIER"]);
+        for _ in 0..5 {
+            fronter.record_batch_latency("A", Duration::from_millis(30));
+            fronter.record_batch_latency("B", Duration::from_millis(30));
+            fronter.record_batch_latency("FAST_BUT_OUTLIER", Duration::from_millis(300));
+        }
+        let mut picks: Vec<String> = (0..30).map(|_| fronter.next_script_id()).collect();
+        picks.sort();
+        picks.dedup();
+        assert_eq!(
+            picks,
+            vec![
+                "A".to_string(),
+                "B".to_string(),
+                "FAST_BUT_OUTLIER".to_string()
+            ],
+            "median 30ms is below 500ms floor — all three must stay in rotation"
+        );
+    }
+
+    #[test]
+    fn fresh_latency_snapshot_filters_stale_entries() {
+        let now = Instant::now();
+        let fresh = Duration::from_secs(30);
+        let mut map = HashMap::new();
+        map.insert("FRESH".into(), (1000.0, now - Duration::from_secs(5)));
+        map.insert("STALE".into(), (5000.0, now - Duration::from_secs(60)));
+        map.insert("EDGE_KEEP".into(), (1500.0, now - Duration::from_secs(29)));
+        // Strictly-less-than guards the boundary: a 30s-old entry is
+        // already stale, only entries newer than 30s survive.
+        map.insert("EDGE_DROP".into(), (2000.0, now - Duration::from_secs(30)));
+
+        let snap = fresh_latency_snapshot(&map, now, fresh);
+
+        assert!(snap.contains_key("FRESH"));
+        assert!(snap.contains_key("EDGE_KEEP"));
+        assert!(!snap.contains_key("STALE"));
+        assert!(!snap.contains_key("EDGE_DROP"));
+        assert_eq!(snap.len(), 2);
+    }
+
+    #[test]
+    fn slow_deployment_recovers_when_sample_expires() {
+        // Integration: deployment scored as slow with FRESH samples is
+        // skipped; once those samples age past LATENCY_FRESH_FOR_SECS,
+        // the slow_set snapshot drops them and the selector lets the
+        // deployment back into rotation. This is the recovery path
+        // that prevents a transient slow minute from being a permanent
+        // ban. We poke the private map directly to inject samples with
+        // controlled timestamps — `std::time::Instant` doesn't compose
+        // with tokio's paused time and we don't want to actually sleep
+        // 30 s in a unit test.
+        let fronter = multi_deployment_fronter(&["A", "B", "SLOW"]);
+        let now = Instant::now();
+        let fresh_age = Duration::from_secs(5);
+        let stale_age = Duration::from_secs(LATENCY_FRESH_FOR_SECS + 5);
+        // Step 1: fresh slow sample — SLOW must be skipped.
+        {
+            let mut map = fronter.script_latency_ewma.lock().unwrap();
+            map.insert("A".into(), (800.0, now - fresh_age));
+            map.insert("B".into(), (800.0, now - fresh_age));
+            map.insert("SLOW".into(), (4000.0, now - fresh_age));
+        }
+        assert!(
+            compute_slow_set(&fronter.script_latency_snapshot()).contains("SLOW"),
+            "step 1: fresh SLOW sample must put it in the slow_set"
+        );
+        // Step 2: replace SLOW's timestamp with a stale one.
+        // A's and B's stay fresh.
+        {
+            let mut map = fronter.script_latency_ewma.lock().unwrap();
+            map.insert("SLOW".into(), (4000.0, now - stale_age));
+        }
+        let snap = fronter.script_latency_snapshot();
+        assert!(
+            !snap.contains_key("SLOW"),
+            "step 2: stale SLOW sample must not appear in the snapshot — got {snap:?}"
+        );
+        // With SLOW absent from the snapshot, only A and B count for
+        // the median, and there's no entry above 2× median → slow_set
+        // is empty.
+        assert!(compute_slow_set(&snap).is_empty());
+        // The selector should now reach SLOW too on pass 1 (no longer
+        // in slow_set), so over a sufficient number of picks all
+        // three must appear.
+        let mut picks: Vec<String> = (0..30).map(|_| fronter.next_script_id()).collect();
+        picks.sort();
+        picks.dedup();
+        assert_eq!(
+            picks,
+            vec!["A".to_string(), "B".to_string(), "SLOW".to_string()],
+            "step 2: SLOW should be back in rotation after sample expiry"
+        );
+    }
+
+    #[test]
+    fn next_script_id_falls_back_when_only_slow_deployment_is_left() {
+        // 3 deployments, two blacklisted, the only remaining one is
+        // the slow one. The selector must still return it (the
+        // relaxed-guard pass 2) rather than fall through to the
+        // all-blacklisted fallback. Latencies must clear
+        // `LATENCY_SKIP_MIN_MEDIAN_MS` (500 ms) — otherwise
+        // compute_slow_set returns empty and this test would pass for
+        // the wrong reason (pass 1 picks SLOW directly, never
+        // exercising the relaxed pass).
+        let fronter = multi_deployment_fronter(&["A", "B", "SLOW"]);
+        for _ in 0..5 {
+            fronter.record_batch_latency("A", Duration::from_millis(800));
+            fronter.record_batch_latency("B", Duration::from_millis(800));
+            fronter.record_batch_latency("SLOW", Duration::from_millis(4000));
+        }
+        // Pre-condition: SLOW must actually be in the slow_set so we
+        // know this test exercises the relaxed-pass code path.
+        assert!(
+            compute_slow_set(&fronter.script_latency_snapshot()).contains("SLOW"),
+            "test pre-condition: SLOW must be in slow_set"
+        );
+        fronter.blacklist_script("A", "test");
+        fronter.blacklist_script("B", "test");
+        assert_eq!(fronter.next_script_id(), "SLOW");
     }
 
     #[test]
