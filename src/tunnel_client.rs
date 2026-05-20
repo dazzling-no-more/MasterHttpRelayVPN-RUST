@@ -146,6 +146,11 @@ const MUX_CHANNEL_DEPTH: usize = 2048;
 const DEFAULT_COALESCE_STEP_MS: u64 = 200;
 const DEFAULT_COALESCE_MAX_MS: u64 = 1000;
 
+/// Per-batch coalesce cap when a handshake-stage op is in flight.
+/// Effective cap is `min(coalesce_max, HANDSHAKE_COALESCE_MAX_MS)` so
+/// a tighter operator setting wins. See `is_handshake_priority`.
+const HANDSHAKE_COALESCE_MAX_MS: u64 = 50;
+
 /// Structured error code the tunnel-node returns when it doesn't know the
 /// op (version mismatch). Must match `tunnel-node/src/main.rs`.
 const CODE_UNSUPPORTED_OP: &str = "UNSUPPORTED_OP";
@@ -995,6 +1000,10 @@ async fn mux_loop(
 ) {
     let coalesce_step = Duration::from_millis(coalesce_step_ms);
     let coalesce_max = Duration::from_millis(coalesce_max_ms);
+    // Honor an operator-configured `coalesce_max` tighter than the
+    // handshake floor — `min` keeps that intent. See
+    // `HANDSHAKE_COALESCE_MAX_MS` for the reasoning behind the cap.
+    let coalesce_max_handshake = Duration::from_millis(HANDSHAKE_COALESCE_MAX_MS).min(coalesce_max);
     // One total semaphore per deployment ID (30 concurrent requests), plus
     // one smaller idle-poll semaphore so pure empty long-polls cannot occupy
     // every Apps Script execution slot for that account.
@@ -1024,11 +1033,29 @@ async fn mux_loop(
             Some(msg) => msgs.push(msg),
             None => break,
         }
-        let hard_deadline = tokio::time::Instant::now() + coalesce_max;
-        let mut soft_deadline = tokio::time::Instant::now() + coalesce_step;
+        // Anchor deadlines to the first-op instant so a late priority op
+        // can only shrink `hard_deadline`, never extend it. Initial
+        // priority is taken from msgs[0]; `upgrade_handshake_deadline`
+        // applies the sticky flip + clamp on every new arrival.
+        let batch_start = tokio::time::Instant::now();
+        let mut priority = is_handshake_priority(&msgs[0]);
+        let mut hard_deadline = batch_start
+            + if priority {
+                coalesce_max_handshake
+            } else {
+                coalesce_max
+            };
+        let mut soft_deadline = batch_start + coalesce_step;
         loop {
             // Drain anything that's already queued without waiting.
             while let Ok(msg) = rx.try_recv() {
+                (priority, hard_deadline) = upgrade_handshake_deadline(
+                    priority,
+                    is_handshake_priority(&msg),
+                    hard_deadline,
+                    batch_start,
+                    coalesce_max_handshake,
+                );
                 msgs.push(msg);
                 // Reset the soft deadline — more ops are arriving.
                 soft_deadline = tokio::time::Instant::now() + coalesce_step;
@@ -1040,6 +1067,13 @@ async fn mux_loop(
             }
             match tokio::time::timeout(wait_until - now, rx.recv()).await {
                 Ok(Some(msg)) => {
+                    (priority, hard_deadline) = upgrade_handshake_deadline(
+                        priority,
+                        is_handshake_priority(&msg),
+                        hard_deadline,
+                        batch_start,
+                        coalesce_max_handshake,
+                    );
                     msgs.push(msg);
                     // New op arrived — extend the soft deadline.
                     soft_deadline = tokio::time::Instant::now() + coalesce_step;
@@ -1258,6 +1292,46 @@ fn should_fire(pending_len: usize, payload_bytes: usize, op_bytes: usize) -> boo
     pending_len > 0
         && (pending_len >= MAX_BATCH_OPS
             || payload_bytes.saturating_add(op_bytes) > MAX_BATCH_PAYLOAD_BYTES)
+}
+
+/// Heuristic — true if `msg` is plausibly a TLS handshake op.
+///
+/// `Connect`/`ConnectData` are always priority. `Data` is matched on
+/// the leading TLS record header `[0x16, 0x03, ..]` (Handshake content
+/// type + TLS major version 3, used by every TLS 1.0–1.3 record). The
+/// version check makes a false positive on an unaligned mid-stream
+/// ApplicationData chunk vanishingly unlikely (1/65536 vs 1/256).
+/// Still: this is a heuristic that fires on legitimate post-handshake
+/// renegotiations and session-ticket refreshes too, which is the
+/// intended behavior — those compound the same per-RTT cost.
+fn is_handshake_priority(msg: &MuxMsg) -> bool {
+    match msg {
+        MuxMsg::Connect { .. } | MuxMsg::ConnectData { .. } => true,
+        MuxMsg::Data { data, .. } => matches!(data.as_ref(), [0x16, 0x03, ..]),
+        MuxMsg::UdpOpen { .. } | MuxMsg::UdpData { .. } | MuxMsg::Close { .. } => false,
+    }
+}
+
+/// Sticky deadline upgrade: if `new_is_priority` and the batch wasn't
+/// already priority, flip the flag and clamp the hard deadline to the
+/// handshake floor anchored at `batch_start`. Pure function so the
+/// shrink-only / can't-extend invariant lives in one place and is
+/// directly unit-testable without standing up the async mux loop.
+fn upgrade_handshake_deadline(
+    priority: bool,
+    new_is_priority: bool,
+    hard_deadline: tokio::time::Instant,
+    batch_start: tokio::time::Instant,
+    coalesce_max_handshake: Duration,
+) -> (bool, tokio::time::Instant) {
+    if !priority && new_is_priority {
+        (
+            true,
+            hard_deadline.min(batch_start + coalesce_max_handshake),
+        )
+    } else {
+        (priority, hard_deadline)
+    }
 }
 
 fn is_idle_poll_batch(ops: &[PendingOp]) -> bool {
@@ -3235,6 +3309,157 @@ mod tests {
         assert!(should_fire(MAX_BATCH_OPS, 0, 100));
         // Well past the cap: must fire.
         assert!(should_fire(MAX_BATCH_OPS + 5, 0, 100));
+    }
+
+    #[test]
+    fn is_handshake_priority_classifies_connect_and_tls_record_type() {
+        let (tx, _rx) = oneshot::channel();
+        // Connect / ConnectData are unconditionally priority — the
+        // CONNECT response is a prerequisite for any later data, and
+        // ConnectData typically bundles the client's first ClientHello.
+        assert!(is_handshake_priority(&MuxMsg::Connect {
+            host: "h".into(),
+            port: 443,
+            reply: tx,
+        }));
+        let (tx, _rx) = oneshot::channel();
+        assert!(is_handshake_priority(&MuxMsg::ConnectData {
+            host: "h".into(),
+            port: 443,
+            data: Bytes::from_static(b""),
+            reply: tx,
+        }));
+        // Data carrying TLS record-layer Handshake (0x16) is priority.
+        let (tx, _rx) = oneshot::channel();
+        assert!(is_handshake_priority(&MuxMsg::Data {
+            sid: "s".into(),
+            data: Bytes::from_static(&[0x16, 0x03, 0x03]),
+            seq: None,
+            wseq: None,
+            reply: tx,
+        }));
+        // ApplicationData (0x17) / Alert (0x15) / ChangeCipherSpec
+        // (0x14) are post-handshake bulk traffic — NOT priority.
+        for first in [0x17u8, 0x15, 0x14, 0x00] {
+            let (tx, _rx) = oneshot::channel();
+            assert!(
+                !is_handshake_priority(&MuxMsg::Data {
+                    sid: "s".into(),
+                    data: Bytes::copy_from_slice(&[first, 0x03, 0x03]),
+                    seq: None,
+                    wseq: None,
+                    reply: tx,
+                }),
+                "data starting with 0x{first:02x} should NOT be priority",
+            );
+        }
+        // Empty data op (idle poll) is not priority — `[0x16, 0x03, ..]`
+        // pattern match requires at least two bytes.
+        let (tx, _rx) = oneshot::channel();
+        assert!(!is_handshake_priority(&MuxMsg::Data {
+            sid: "s".into(),
+            data: Bytes::new(),
+            seq: None,
+            wseq: None,
+            reply: tx,
+        }));
+        // Single 0x16 byte without a TLS version byte after it must NOT
+        // be priority — the two-byte check is what makes the heuristic
+        // false-positive-resistant on mid-stream ApplicationData chunks
+        // that happen to start with 0x16.
+        let (tx, _rx) = oneshot::channel();
+        assert!(!is_handshake_priority(&MuxMsg::Data {
+            sid: "s".into(),
+            data: Bytes::from_static(&[0x16]),
+            seq: None,
+            wseq: None,
+            reply: tx,
+        }));
+        // 0x16 followed by a non-TLS-major version byte: still NOT
+        // priority. TLS records are always major version 3.
+        for v in [0x00u8, 0x01, 0x02, 0x04, 0x16, 0xff] {
+            let (tx, _rx) = oneshot::channel();
+            assert!(
+                !is_handshake_priority(&MuxMsg::Data {
+                    sid: "s".into(),
+                    data: Bytes::copy_from_slice(&[0x16, v, 0x00]),
+                    seq: None,
+                    wseq: None,
+                    reply: tx,
+                }),
+                "[0x16, 0x{v:02x}] should NOT be priority — only major version 3 is TLS",
+            );
+        }
+        // UDP and Close ops never carry TCP handshake bytes.
+        let (tx, _rx) = oneshot::channel();
+        assert!(!is_handshake_priority(&MuxMsg::UdpOpen {
+            host: "h".into(),
+            port: 53,
+            data: Bytes::from_static(&[0x16]),
+            reply: tx,
+        }));
+        let (tx, _rx) = oneshot::channel();
+        assert!(!is_handshake_priority(&MuxMsg::UdpData {
+            sid: "s".into(),
+            data: Bytes::from_static(&[0x16]),
+            reply: tx,
+        }));
+        assert!(!is_handshake_priority(&MuxMsg::Close { sid: "s".into() }));
+    }
+
+    #[test]
+    fn upgrade_handshake_deadline_is_sticky_and_shrink_only() {
+        let batch_start = tokio::time::Instant::now();
+        let handshake = Duration::from_millis(50);
+        let non_priority_deadline = batch_start + Duration::from_millis(1000);
+        let already_priority_deadline = batch_start + handshake;
+        let pre_clamped_deadline = batch_start + Duration::from_millis(30);
+
+        // Case 1: batch was not priority and a non-priority op arrives —
+        // no change.
+        assert_eq!(
+            upgrade_handshake_deadline(false, false, non_priority_deadline, batch_start, handshake),
+            (false, non_priority_deadline),
+        );
+        // Case 2: batch was not priority and a priority op arrives —
+        // flag flips, deadline clamps to batch_start + handshake.
+        assert_eq!(
+            upgrade_handshake_deadline(false, true, non_priority_deadline, batch_start, handshake),
+            (true, batch_start + handshake),
+        );
+        // Case 3: batch already priority and another priority op arrives
+        // — flag stays true, deadline does not move (already at the
+        // floor, .min() doesn't extend it).
+        assert_eq!(
+            upgrade_handshake_deadline(
+                true,
+                true,
+                already_priority_deadline,
+                batch_start,
+                handshake
+            ),
+            (true, already_priority_deadline),
+        );
+        // Case 4: batch already priority and a non-priority op arrives —
+        // critical sticky case. Flag must stay true and deadline must
+        // not be pushed back out to coalesce_max.
+        assert_eq!(
+            upgrade_handshake_deadline(
+                true,
+                false,
+                already_priority_deadline,
+                batch_start,
+                handshake
+            ),
+            (true, already_priority_deadline),
+        );
+        // Case 5: operator pre-clamped the deadline tighter than the
+        // handshake floor (e.g., via `coalesce_max_ms = 30`); shrink-only
+        // means we keep their tighter value, not widen back to 50.
+        assert_eq!(
+            upgrade_handshake_deadline(false, true, pre_clamped_deadline, batch_start, handshake),
+            (true, pre_clamped_deadline),
+        );
     }
 
     #[test]
