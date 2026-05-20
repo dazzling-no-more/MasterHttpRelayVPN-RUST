@@ -10,6 +10,7 @@
 //!   PORT           — listen port (default 8080, Cloud Run sets this)
 
 use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -236,12 +237,608 @@ struct ManagedUdpSession {
     reader_handle: tokio::task::JoinHandle<()>,
 }
 
-async fn create_session(host: &str, port: u16) -> std::io::Result<ManagedSession> {
-    let addr = format!("{}:{}", host, port);
-    let stream = tokio::time::timeout(Duration::from_secs(10), TcpStream::connect(&addr))
-        .await
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "connect timeout"))??;
+// ---------------------------------------------------------------------------
+// Connect-path acceleration: DNS cache + idle TCP pool + hot-host tracker.
+//
+// Profiling on a typical session-open showed two real costs that compound
+// across a multi-RTT TLS handshake against PSN/Akamai:
+//   1) `TcpStream::connect(host:port)` does DNS resolution inline, which
+//      adds 5-30 ms per uncached resolve from a non-local resolver.
+//   2) The TCP three-way handshake to a far CDN edge adds 30-100 ms.
+//
+// `PrewarmState` caches both. The DNS cache is a straightforward
+// host:port -> Vec<SocketAddr> map with a short TTL. The TCP pool keeps
+// a small number of idle connections per hot host. "Hot" is defined
+// as ≥ HOT_HOST_MIN_COUNT connects within HOT_HOST_WINDOW; this keeps
+// the pool from filling up with one-off destinations and bounds the
+// FD overhead on the tunnel-node.
+//
+// Pool entries are deliberately short-TTL (`TCP_POOL_TTL`) so we don't
+// hand out connections an intermediary might have ghosted while idle,
+// and `open_tcp` does a non-blocking `try_read` liveness check (see
+// `is_likely_alive`) on every pool entry before handing it to a session;
+// entries that fail the check are discarded and `connect_fresh` runs
+// instead. Race-window stragglers (peer closed but the FIN hasn't
+// propagated yet) can still slip through; the cost is one wasted
+// round-trip before the session EOFs.
+
+/// DNS resolution cache TTL. Conservative vs typical DNS record TTLs
+/// (hours), short enough that we don't keep serving stale records past
+/// a real backend rotation.
+const DNS_CACHE_TTL: Duration = Duration::from_secs(60);
+/// Maximum entries kept in the DNS cache. Bounded so a misbehaving
+/// client can't OOM us by opening sessions to many distinct hosts.
+const DNS_CACHE_MAX_ENTRIES: usize = 1024;
+/// Idle TCP pool entries past this age are treated as stale and
+/// discarded. Short enough to avoid handing out connections ghosted by
+/// NAT/CDN intermediaries; long enough to cover a typical multi-RTT
+/// handshake's gap between session-close and the next session-open
+/// to the same host.
+const TCP_POOL_TTL: Duration = Duration::from_secs(30);
+/// Maximum idle TCP connections kept per (host, port). Two is enough
+/// to absorb a small burst (e.g. a PSN sign-in opening two parallel
+/// sessions to the same auth endpoint) without keeping a long tail of
+/// idle file descriptors.
+const TCP_POOL_PER_HOST_MAX: usize = 2;
+/// Global cap on the total number of pooled TCP connections across
+/// every host. A safety net against unbounded growth if many hosts
+/// each accumulate per-host max — bounded FD budget on shared
+/// tunnel-nodes.
+const TCP_POOL_TOTAL_MAX: usize = 64;
+/// Sliding window over which a host's connect-count is considered for
+/// the "hot" decision. Long enough that a sign-in flow's multiple
+/// connects to the same auth endpoint count together; short enough
+/// that traffic patterns drift naturally.
+const HOT_HOST_WINDOW: Duration = Duration::from_secs(300);
+/// Minimum connects to (host, port) within `HOT_HOST_WINDOW` for the
+/// host to qualify for prewarming. The first connect can't pre-warm
+/// itself (we don't know yet that it's hot), but the second one
+/// triggers a background prewarm so the third sees a pool hit.
+const HOT_HOST_MIN_COUNT: usize = 2;
+/// How long to wait for a TCP handshake before giving up. Mirrors the
+/// pre-Phase-7 `create_session` hard timeout — we don't want a hung
+/// outbound DNS or SYN to wedge a session-open. **Covers both DNS
+/// resolution AND every per-address connect attempt under a single
+/// budget**, so a stuck resolver can't add to the connect deadline.
+const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// Maximum distinct (host, port) entries the hot-host tracker retains.
+/// Bounded so adversarial / scanner-shaped input from authenticated
+/// clients cannot grow the map without limit. Stale entries are
+/// pruned opportunistically when this cap would otherwise be hit.
+const HOT_HOSTS_MAX_KEYS: usize = 256;
+/// Env-var kill switch for speculative TCP prewarming. Set to `1`,
+/// `true`, or `TRUE` to disable: `maybe_prewarm` becomes a no-op,
+/// the pool never gets populated, and every session-open takes the
+/// `connect_fresh` path. Provided so an operator can fall back to
+/// purely-reactive behaviour if a connection-limited or server-
+/// speaks-first protocol turns out to misbehave under speculative
+/// upstream sockets. The env var is read once at `PrewarmState::new`;
+/// changing it requires a tunnel-node restart.
+const PREWARM_DISABLED_ENV: &str = "MHRV_DISABLE_PREWARM";
+
+/// One-shot read of `PREWARM_DISABLED_ENV` at startup. Recognises
+/// the conventional truthy spellings; anything else (unset, empty,
+/// "0", "false", arbitrary text) leaves prewarm enabled.
+fn prewarm_enabled_from_env() -> bool {
+    match std::env::var(PREWARM_DISABLED_ENV).as_deref() {
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES") => {
+            tracing::info!(
+                "{} set; speculative TCP prewarm disabled",
+                PREWARM_DISABLED_ENV
+            );
+            false
+        }
+        _ => true,
+    }
+}
+
+struct DnsEntry {
+    addrs: Vec<SocketAddr>,
+    expires_at: Instant,
+}
+
+struct DnsCache {
+    entries: Mutex<HashMap<(String, u16), DnsEntry>>,
+}
+
+impl DnsCache {
+    fn new() -> Self {
+        Self {
+            entries: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Return the cached addresses if fresh, otherwise resolve and
+    /// cache. Errors bubble straight from `lookup_host` so the caller
+    /// sees the same shape as the un-cached path.
+    async fn resolve(&self, host: &str, port: u16) -> std::io::Result<Vec<SocketAddr>> {
+        let key = (host.to_string(), port);
+        let now = Instant::now();
+        {
+            let entries = self.entries.lock().await;
+            if let Some(entry) = entries.get(&key) {
+                if entry.expires_at > now {
+                    return Ok(entry.addrs.clone());
+                }
+            }
+        }
+        let addrs: Vec<SocketAddr> = lookup_host((host, port)).await?.collect();
+        if addrs.is_empty() {
+            // Don't cache the empty resolution: a brief
+            // resolver hiccup shouldn't latch in as 60 s of empty
+            // results for this host.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "no addresses resolved",
+            ));
+        }
+        let mut entries = self.entries.lock().await;
+        // Bounded-cache eviction: when we'd cross the cap, drop one
+        // arbitrary entry. HashMap iteration order is randomized so
+        // this is effectively random eviction — fine for a small cache
+        // dominated by recent re-resolves, and avoids the LRU
+        // bookkeeping cost on the hot path.
+        if entries.len() >= DNS_CACHE_MAX_ENTRIES {
+            if let Some(victim) = entries.keys().next().cloned() {
+                entries.remove(&victim);
+            }
+        }
+        entries.insert(
+            key,
+            DnsEntry {
+                addrs: addrs.clone(),
+                expires_at: now + DNS_CACHE_TTL,
+            },
+        );
+        Ok(addrs)
+    }
+
+    /// Drop the cached resolution for `(host, port)`. Called by
+    /// `PrewarmState::connect_fresh` when every resolved address
+    /// failed to connect — the cached entry may be a stale CDN /
+    /// failover answer, and keeping it around for the full TTL would
+    /// poison every subsequent session-open against the same host
+    /// for up to `DNS_CACHE_TTL`. Eviction lets the next call
+    /// re-resolve and pick whatever the current DNS answer is.
+    async fn evict(&self, host: &str, port: u16) {
+        let key = (host.to_string(), port);
+        self.entries.lock().await.remove(&key);
+    }
+}
+
+struct PooledConn {
+    stream: TcpStream,
+    opened_at: Instant,
+}
+
+/// Per-host pool state. `pending` is the count of in-flight prewarms
+/// that have reserved a slot but haven't completed yet — gating
+/// `try_reserve` on `queue.len() + pending` is what bounds parallel
+/// prewarms to the per-host cap.
+#[derive(Default)]
+struct HostState {
+    queue: VecDeque<PooledConn>,
+    pending: usize,
+}
+
+impl HostState {
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty() && self.pending == 0
+    }
+}
+
+struct PoolInner {
+    hosts: HashMap<(String, u16), HostState>,
+    /// Sum of `queue.len()` across all hosts. Kept consistent with
+    /// the hosts map under the same lock — no separate atomic, no
+    /// lock-order pair to deadlock against.
+    total_actual: usize,
+    /// Sum of `pending` across all hosts. Counts reserved-but-not-
+    /// committed prewarms against the global cap so a burst of hot
+    /// connects can't spawn N parallel TCP connects when there's
+    /// only room for K.
+    total_pending: usize,
+}
+
+impl PoolInner {
+    /// Drop entries past TTL from every queue and update `total_actual`.
+    /// Called from `try_reserve` when the global cap would otherwise
+    /// be hit — this is the periodic-cleanup mechanism the reviewer
+    /// asked for, amortized to the prewarm path so a quiescent pool
+    /// pays no maintenance cost.
+    fn prune_stale(&mut self) {
+        let now = Instant::now();
+        let mut dropped = 0;
+        for state in self.hosts.values_mut() {
+            let before = state.queue.len();
+            state
+                .queue
+                .retain(|c| now.duration_since(c.opened_at) < TCP_POOL_TTL);
+            dropped += before - state.queue.len();
+        }
+        self.hosts.retain(|_, s| !s.is_empty());
+        self.total_actual = self.total_actual.saturating_sub(dropped);
+    }
+}
+
+/// Single-mutex pool. All mutations and reads go through `inner` so
+/// there's no second lock to pair with — eliminates the lock-order
+/// hazard a two-mutex design would have under concurrent take/insert.
+struct TcpPool {
+    inner: Mutex<PoolInner>,
+}
+
+impl TcpPool {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(PoolInner {
+                hosts: HashMap::new(),
+                total_actual: 0,
+                total_pending: 0,
+            }),
+        }
+    }
+
+    /// Take a pooled connection for (host, port) if a fresh one
+    /// exists. Stale entries (older than `TCP_POOL_TTL`) are dropped
+    /// off the front of the queue until a fresh one is found or the
+    /// queue is empty.
+    async fn try_take(&self, host: &str, port: u16) -> Option<TcpStream> {
+        let key = (host.to_string(), port);
+        let now = Instant::now();
+        let mut inner = self.inner.lock().await;
+        let mut taken: Option<TcpStream> = None;
+        let mut dropped: usize = 0;
+        if let Some(state) = inner.hosts.get_mut(&key) {
+            while let Some(conn) = state.queue.pop_front() {
+                if now.duration_since(conn.opened_at) < TCP_POOL_TTL {
+                    taken = Some(conn.stream);
+                    break;
+                }
+                dropped += 1;
+            }
+        }
+        let consumed = dropped + if taken.is_some() { 1 } else { 0 };
+        inner.total_actual = inner.total_actual.saturating_sub(consumed);
+        // Drop now-empty host entries so the hosts map doesn't
+        // accumulate keys with empty queues and no pending work.
+        if inner.hosts.get(&key).map(|s| s.is_empty()).unwrap_or(false) {
+            inner.hosts.remove(&key);
+        }
+        taken
+    }
+
+    /// Reserve a pool slot for an in-flight prewarm. Returns true if
+    /// both the per-host cap (`queue.len() + pending < per-host max`)
+    /// and the global cap (`total_actual + total_pending < global max`)
+    /// have room after pruning stale entries. Caller MUST follow up
+    /// with exactly one of `commit_reserve` (on connect success) or
+    /// `cancel_reserve` (on connect failure) so the counter stays
+    /// consistent. Combined with `commit_reserve`'s rare ability to
+    /// skip the cap (see its doc), the reservation pair is what makes
+    /// prewarm-in-flight bounded.
+    async fn try_reserve(&self, host: &str, port: u16) -> bool {
+        let key = (host.to_string(), port);
+        let mut inner = self.inner.lock().await;
+        if inner.total_actual + inner.total_pending >= TCP_POOL_TOTAL_MAX {
+            inner.prune_stale();
+            if inner.total_actual + inner.total_pending >= TCP_POOL_TOTAL_MAX {
+                return false;
+            }
+        }
+        let state = inner.hosts.entry(key).or_default();
+        if state.queue.len() + state.pending >= TCP_POOL_PER_HOST_MAX {
+            return false;
+        }
+        state.pending += 1;
+        inner.total_pending += 1;
+        true
+    }
+
+    /// Convert a previously-reserved slot into an actual pooled
+    /// stream. Always honors the reservation: even if other actors
+    /// added entries since `try_reserve` returned, we already counted
+    /// against the cap when we incremented `total_pending`, so the
+    /// invariant holds.
+    async fn commit_reserve(&self, host: &str, port: u16, stream: TcpStream) {
+        let key = (host.to_string(), port);
+        let mut inner = self.inner.lock().await;
+        let state = inner.hosts.entry(key).or_default();
+        state.pending = state.pending.saturating_sub(1);
+        state.queue.push_back(PooledConn {
+            stream,
+            opened_at: Instant::now(),
+        });
+        inner.total_pending = inner.total_pending.saturating_sub(1);
+        inner.total_actual += 1;
+    }
+
+    /// Release a previously-reserved slot without filling it. Used
+    /// when a prewarm's connect fails.
+    async fn cancel_reserve(&self, host: &str, port: u16) {
+        let key = (host.to_string(), port);
+        let mut inner = self.inner.lock().await;
+        if let Some(state) = inner.hosts.get_mut(&key) {
+            state.pending = state.pending.saturating_sub(1);
+        }
+        inner.total_pending = inner.total_pending.saturating_sub(1);
+        if inner.hosts.get(&key).map(|s| s.is_empty()).unwrap_or(false) {
+            inner.hosts.remove(&key);
+        }
+    }
+}
+
+struct HotHostsInner {
+    seen: HashMap<(String, u16), VecDeque<Instant>>,
+}
+
+impl HotHostsInner {
+    /// Drop stale timestamps from every queue and remove any queue
+    /// that's now empty. Bounded by `HOT_HOSTS_MAX_KEYS` per call.
+    fn prune(&mut self, cutoff: Instant) {
+        self.seen.retain(|_, q| {
+            while q.front().map(|t| *t < cutoff).unwrap_or(false) {
+                q.pop_front();
+            }
+            !q.is_empty()
+        });
+    }
+}
+
+struct HotHosts {
+    /// Bounded by `HOT_HOSTS_MAX_KEYS` keys. Stale timestamps are
+    /// pruned on the hot path's same-key path; full-map prune runs
+    /// opportunistically when the cap would otherwise be hit.
+    inner: Mutex<HotHostsInner>,
+}
+
+impl HotHosts {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(HotHostsInner {
+                seen: HashMap::new(),
+            }),
+        }
+    }
+
+    /// Record a connect to (host, port) and return whether the host
+    /// is now "hot" (≥ `HOT_HOST_MIN_COUNT` connects within
+    /// `HOT_HOST_WINDOW`). Map-size is bounded by `HOT_HOSTS_MAX_KEYS`
+    /// — a new key over the cap triggers a full-map prune; if still
+    /// over after that, one arbitrary existing key is evicted.
+    async fn record_and_check(&self, host: &str, port: u16) -> bool {
+        let key = (host.to_string(), port);
+        let now = Instant::now();
+        let cutoff = now.checked_sub(HOT_HOST_WINDOW).unwrap_or(now);
+        let mut inner = self.inner.lock().await;
+        if !inner.seen.contains_key(&key) && inner.seen.len() >= HOT_HOSTS_MAX_KEYS {
+            inner.prune(cutoff);
+            if !inner.seen.contains_key(&key) && inner.seen.len() >= HOT_HOSTS_MAX_KEYS {
+                if let Some(victim) = inner.seen.keys().next().cloned() {
+                    inner.seen.remove(&victim);
+                }
+            }
+        }
+        let q = inner.seen.entry(key).or_insert_with(VecDeque::new);
+        while q.front().map(|t| *t < cutoff).unwrap_or(false) {
+            q.pop_front();
+        }
+        // Bound the queue per key. The hot decision only needs
+        // `HOT_HOST_MIN_COUNT` in-window samples — anything beyond
+        // that adds no information but lets a single very-popular
+        // host (or a quiet host whose record path doesn't get hit
+        // again) accumulate unboundedly within the window. Trim
+        // before push so the final queue length is exactly
+        // `HOT_HOST_MIN_COUNT` whenever the host is hot.
+        while q.len() >= HOT_HOST_MIN_COUNT {
+            q.pop_front();
+        }
+        q.push_back(now);
+        q.len() >= HOT_HOST_MIN_COUNT
+    }
+}
+
+struct PrewarmState {
+    dns: DnsCache,
+    pool: TcpPool,
+    hot: HotHosts,
+    /// One-shot snapshot of `PREWARM_DISABLED_ENV` taken at
+    /// `PrewarmState::new`. False → `maybe_prewarm` is a no-op and
+    /// the pool stays empty, which naturally degrades `open_tcp` to
+    /// the legacy `connect_fresh` path. The DNS cache stays active
+    /// either way — it's a pure resolver-call savings with no
+    /// semantic change.
+    prewarm_enabled: bool,
+}
+
+impl PrewarmState {
+    fn new() -> Arc<Self> {
+        Self::with_prewarm_enabled(prewarm_enabled_from_env())
+    }
+
+    /// Test-only constructor that bypasses the env-var check. Keeps
+    /// `PrewarmState::new` env-driven for production callers while
+    /// letting the unit tests pin the disabled / enabled branch
+    /// deterministically — env vars are process-wide so test-time
+    /// `set_var` would race across the test runner.
+    fn with_prewarm_enabled(prewarm_enabled: bool) -> Arc<Self> {
+        Arc::new(Self {
+            dns: DnsCache::new(),
+            pool: TcpPool::new(),
+            hot: HotHosts::new(),
+            prewarm_enabled,
+        })
+    }
+
+    /// Open a TCP connection to (host, port). Pool hit → instant
+    /// return of the cached stream; pool miss → DNS-cached resolve
+    /// followed by a fresh `TcpStream::connect`. Either path applies
+    /// `TCP_CONNECT_TIMEOUT` so a wedged outbound can't stall the
+    /// session-open path.
+    async fn open_tcp(&self, host: &str, port: u16) -> std::io::Result<TcpStream> {
+        // Pooled TCP sockets can be up to TCP_POOL_TTL old. In that
+        // window NAT/CDN intermediaries (or the destination itself)
+        // may have closed the connection out from under us. The
+        // tunnel-client side makes one attempt per session and has no
+        // retry budget, so handing out a dead pool entry would brick
+        // the session — drain the queue until either a likely-alive
+        // entry surfaces or the queue is empty, then fall back to a
+        // fresh connect.
+        while let Some(stream) = self.pool.try_take(host, port).await {
+            if is_likely_alive(&stream) {
+                return Ok(stream);
+            }
+            tracing::debug!(
+                "pool entry for {}:{} failed liveness check; discarding",
+                host,
+                port
+            );
+        }
+        self.connect_fresh(host, port).await
+    }
+
+    /// Open a fresh TCP connection without consulting the pool — used
+    /// by the prewarm path itself, which is the producer side of the
+    /// pool. Kept distinct from `open_tcp` so it's syntactically
+    /// impossible for the prewarm task to recurse into `try_take`.
+    ///
+    /// The `TCP_CONNECT_TIMEOUT` budget wraps **both** DNS resolution
+    /// and every per-address connect attempt, so a stuck resolver
+    /// can't add to the connect deadline (matches the pre-Phase-7
+    /// `TcpStream::connect(host:port)` semantics where DNS was inline
+    /// under the same outer timeout). On multi-A or dual-stack
+    /// targets we iterate the resolved addresses in order — same as
+    /// the pre-Phase-7 behavior — so a single dead IPv6 doesn't
+    /// shadow a healthy IPv4.
+    async fn connect_fresh(&self, host: &str, port: u16) -> std::io::Result<TcpStream> {
+        self.connect_fresh_with_timeout(host, port, TCP_CONNECT_TIMEOUT)
+            .await
+    }
+
+    /// Same as `connect_fresh` but with a caller-supplied budget.
+    /// Extracted so unit tests can exercise the timeout-eviction path
+    /// without waiting `TCP_CONNECT_TIMEOUT` of wall-clock seconds.
+    /// Production callers always go through `connect_fresh`.
+    async fn connect_fresh_with_timeout(
+        &self,
+        host: &str,
+        port: u16,
+        budget: Duration,
+    ) -> std::io::Result<TcpStream> {
+        let dns = &self.dns;
+        let host_owned = host;
+        let attempt = async move {
+            let addrs = dns.resolve(host_owned, port).await?;
+            let mut last_err: Option<std::io::Error> = None;
+            for addr in addrs {
+                match TcpStream::connect(addr).await {
+                    Ok(s) => return Ok::<TcpStream, std::io::Error>(s),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            Err(last_err.unwrap_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::AddrNotAvailable,
+                    "no addresses resolved",
+                )
+            }))
+        };
+        // Match the timeout outcome explicitly so the timeout-Err arm
+        // flows through the same eviction check as a resolved-Err.
+        // The earlier `?` over the timeout's `map_err` short-circuited
+        // before eviction, leaving stale/blackholed cached addresses
+        // to keep poisoning sessions for the rest of DNS_CACHE_TTL.
+        let result: std::io::Result<TcpStream> = match tokio::time::timeout(budget, attempt).await {
+            Ok(r) => r,
+            Err(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "connect timeout (includes dns)",
+            )),
+        };
+        if result.is_err() {
+            // Every resolved address either refused, errored, or
+            // exhausted the budget. The cached entry may be stale
+            // (CDN failover, blocked region, etc.); drop it so the
+            // next call re-resolves rather than rolling the same bad
+            // address for `DNS_CACHE_TTL`.
+            self.dns.evict(host, port).await;
+        }
+        result
+    }
+
+    /// Record a connect and, if the destination is now hot, spawn a
+    /// background task to pre-open another connection for the next
+    /// session-open to land on. The spawn is fire-and-forget: failure
+    /// modes are handled by the reservation pair — a failed connect
+    /// releases its slot via `cancel_reserve` so subsequent prewarms
+    /// can take its place. `try_reserve` is what bounds parallel
+    /// prewarm work: if the per-host cap or global cap (counting both
+    /// pooled streams AND in-flight reservations) is exhausted, we
+    /// don't even start the connect.
+    fn maybe_prewarm(self: &Arc<Self>, host: String, port: u16) {
+        // Kill switch: `MHRV_DISABLE_PREWARM=1` makes this a no-op so
+        // the tunnel-node never opens a speculative upstream socket.
+        // Pool entries are only ever produced here, so disabling
+        // prewarm naturally drains the pool to zero and reverts
+        // `open_tcp` to pure `connect_fresh` behaviour.
+        if !self.prewarm_enabled {
+            return;
+        }
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            if !me.hot.record_and_check(&host, port).await {
+                return;
+            }
+            if !me.pool.try_reserve(&host, port).await {
+                return;
+            }
+            match me.connect_fresh(&host, port).await {
+                Ok(stream) => {
+                    let _ = stream.set_nodelay(true);
+                    me.pool.commit_reserve(&host, port, stream).await;
+                }
+                Err(e) => {
+                    me.pool.cancel_reserve(&host, port).await;
+                    tracing::debug!("prewarm {}:{} failed: {}", host, port, e);
+                }
+            }
+        });
+    }
+}
+
+/// Non-blocking liveness check on a pooled TCP stream. Returns
+/// `false` if the peer has sent FIN, sent any unexpected bytes (a
+/// pre-warmed outbound socket to a destination we haven't started
+/// the protocol on yet must be quiet), or any other read error
+/// surfaced through `try_read`. Returns `true` only on the
+/// `WouldBlock` "no data available right now" case, which is what an
+/// idle-but-alive socket reports.
+///
+/// The check is best-effort: an alive peer that hasn't yet noticed
+/// the route is dead will still look alive here (the standard race
+/// for any out-of-band liveness probe). That's acceptable because
+/// the alternative is handing out a definitively-dead socket every
+/// time — `try_read` catches the common case where an intermediary
+/// (NAT, CDN edge) has already closed an idle connection out from
+/// under us.
+fn is_likely_alive(stream: &TcpStream) -> bool {
+    let mut buf = [0u8; 1];
+    match stream.try_read(&mut buf) {
+        Ok(0) => false,
+        Ok(_) => false,
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => true,
+        Err(_) => false,
+    }
+}
+
+async fn create_session(
+    host: &str,
+    port: u16,
+    prewarm: &Arc<PrewarmState>,
+) -> std::io::Result<ManagedSession> {
+    let stream = prewarm.open_tcp(host, port).await?;
     let _ = stream.set_nodelay(true);
+    prewarm.maybe_prewarm(host.to_string(), port);
     let (reader, writer) = stream.into_split();
 
     let inner = Arc::new(SessionInner {
@@ -328,9 +925,13 @@ async fn reader_task(mut reader: impl AsyncRead + Unpin, session: Arc<SessionInn
     }
 }
 
-async fn create_udp_session(host: &str, port: u16) -> std::io::Result<ManagedUdpSession> {
-    let mut addrs = lookup_host((host, port)).await?;
-    let remote = addrs.next().ok_or_else(|| {
+async fn create_udp_session(
+    host: &str,
+    port: u16,
+    dns: &DnsCache,
+) -> std::io::Result<ManagedUdpSession> {
+    let addrs = dns.resolve(host, port).await?;
+    let remote = *addrs.first().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::AddrNotAvailable,
             "no UDP address resolved",
@@ -679,6 +1280,12 @@ struct AppState {
     /// of "wrong key", "wrong URL path", or "wrong tunnel-node" you've
     /// hit. (Inspired by #365 Section 3.)
     diagnostic_mode: bool,
+    /// Connect-path accelerator: DNS cache + idle TCP pool + hot-host
+    /// tracker. Cloned (Arc bump) by every handler that opens a
+    /// session; the per-cache state is shared across all sessions on
+    /// this tunnel-node so a hot endpoint discovered by one client
+    /// benefits the next.
+    prewarm: Arc<PrewarmState>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1504,7 +2111,7 @@ async fn handle_connect(
     let session = if udpgw::is_udpgw_dest(&host, port) {
         create_udpgw_session()
     } else {
-        match create_session(&host, port).await {
+        match create_session(&host, port, &state.prewarm).await {
             Ok(s) => s,
             Err(e) => return TunnelResponse::error(format!("connect failed: {}", e)),
         }
@@ -1541,7 +2148,7 @@ async fn handle_connect_data_phase1(
     let session = if udpgw::is_udpgw_dest(&host, port) {
         create_udpgw_session()
     } else {
-        create_session(&host, port)
+        create_session(&host, port, &state.prewarm)
             .await
             .map_err(|e| TunnelResponse::error(format!("connect failed: {}", e)))?
     };
@@ -1589,7 +2196,7 @@ async fn handle_udp_open_phase1(
 ) -> Result<(String, Arc<UdpSessionInner>), TunnelResponse> {
     let (host, port) = validate_host_port(host, port)?;
 
-    let session = create_udp_session(&host, port)
+    let session = create_udp_session(&host, port, &state.prewarm.dns)
         .await
         .map_err(|e| TunnelResponse::error(format!("udp connect failed: {}", e)))?;
 
@@ -1856,6 +2463,7 @@ async fn main() {
         udp_sessions,
         auth_key: Arc::from(auth_key),
         diagnostic_mode,
+        prewarm: PrewarmState::new(),
     };
 
     let app = Router::new()
@@ -1895,7 +2503,695 @@ mod tests {
             // (see e.g. `bad_auth_returns_unauthorized`), so they need
             // diagnostic_mode enabled. Production default is false.
             diagnostic_mode: true,
+            prewarm: PrewarmState::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn dns_cache_returns_same_addrs_on_repeated_resolve() {
+        // Two back-to-back resolves of the same key must return the
+        // same Vec, sourced from the cache on the second call.
+        // Localhost resolves reliably without external DNS so we
+        // can do the round-trip in-test.
+        let cache = DnsCache::new();
+        let first = cache.resolve("localhost", 7777).await.unwrap();
+        assert!(
+            !first.is_empty(),
+            "localhost must resolve to at least one address"
+        );
+        let second = cache.resolve("localhost", 7777).await.unwrap();
+        assert_eq!(
+            first, second,
+            "second resolve must return the cached addrs unchanged"
+        );
+        let entries = cache.entries.lock().await;
+        let entry = entries
+            .get(&("localhost".to_string(), 7777))
+            .expect("entry must be cached");
+        assert_eq!(entry.addrs, first, "cached addrs must match returned addrs");
+        assert!(
+            entry.expires_at > Instant::now(),
+            "fresh entry must have expires_at in the future"
+        );
+    }
+
+    #[tokio::test]
+    async fn dns_cache_evict_drops_entry() {
+        // Eviction is the recovery hook `connect_fresh` calls when
+        // every resolved address fails — proves the operation in
+        // isolation so the wired integration below isn't testing
+        // two things at once.
+        let cache = DnsCache::new();
+        cache.resolve("localhost", 7778).await.unwrap();
+        assert!(cache
+            .entries
+            .lock()
+            .await
+            .contains_key(&("localhost".to_string(), 7778)));
+        cache.evict("localhost", 7778).await;
+        assert!(!cache
+            .entries
+            .lock()
+            .await
+            .contains_key(&("localhost".to_string(), 7778)));
+    }
+
+    #[tokio::test]
+    async fn connect_fresh_evicts_dns_on_timeout() {
+        // The timeout-Err arm of `connect_fresh` must flow through the
+        // same eviction path as a resolved-Err — otherwise a stale
+        // cached address that blackholes (silent drop, not refused)
+        // would keep poisoning sessions for the full DNS_CACHE_TTL.
+        // We drive this deterministically by going through
+        // `connect_fresh_with_timeout` with a tiny budget and a DNS
+        // entry pointing at TEST-NET-1 (RFC 5737, never routes), so
+        // the inner connect never returns and the budget always
+        // fires.
+        let state = PrewarmState::new();
+        let blackhole = SocketAddr::from(([192, 0, 2, 1], 81));
+        {
+            let mut entries = state.dns.entries.lock().await;
+            entries.insert(
+                ("blackhole.example".into(), 443),
+                DnsEntry {
+                    addrs: vec![blackhole],
+                    expires_at: Instant::now() + Duration::from_secs(60),
+                },
+            );
+        }
+        let err = state
+            .connect_fresh_with_timeout("blackhole.example", 443, Duration::from_millis(100))
+            .await
+            .expect_err("tight budget against TEST-NET-1 must time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            !state
+                .dns
+                .entries
+                .lock()
+                .await
+                .contains_key(&("blackhole.example".to_string(), 443)),
+            "timeout must evict the cached DNS entry, not skip the eviction path",
+        );
+    }
+
+    #[tokio::test]
+    async fn hot_hosts_caps_samples_per_key() {
+        // Same hot key recorded many times within the window must
+        // not let its sample queue grow without bound. Cap is
+        // `HOT_HOST_MIN_COUNT` — the hot decision needs no more
+        // information than that, and a quiet host that never gets
+        // re-recorded would otherwise carry whatever it accumulated
+        // until the full-map prune fires.
+        let hot = HotHosts::new();
+        for _ in 0..100 {
+            hot.record_and_check("very-hot", 443).await;
+        }
+        let inner = hot.inner.lock().await;
+        let q = inner.seen.get(&("very-hot".into(), 443)).unwrap();
+        assert_eq!(
+            q.len(),
+            HOT_HOST_MIN_COUNT,
+            "per-key queue must be capped at HOT_HOST_MIN_COUNT regardless of record count",
+        );
+    }
+
+    #[tokio::test]
+    async fn maybe_prewarm_is_noop_when_kill_switch_set() {
+        // With prewarm disabled, `maybe_prewarm` must not record to
+        // HotHosts and must not enqueue a reservation. We assert the
+        // observable side effects are absent after the call returns:
+        //   1. HotHosts saw no record (seen map empty for the key).
+        //   2. Pool has zero pending reservations and zero actual
+        //      entries for the key.
+        // The spawn would be async, so we sleep briefly to give any
+        // hypothetical spawned task time to land before checking —
+        // if it did anything, the check would fail.
+        let state = PrewarmState::with_prewarm_enabled(false);
+        state.maybe_prewarm("blocked.example".to_string(), 443);
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let hot_inner = state.hot.inner.lock().await;
+        assert!(
+            !hot_inner
+                .seen
+                .contains_key(&("blocked.example".to_string(), 443)),
+            "disabled prewarm must not write to HotHosts"
+        );
+        drop(hot_inner);
+        let pool_inner = state.pool.inner.lock().await;
+        assert_eq!(pool_inner.total_pending, 0);
+        assert_eq!(pool_inner.total_actual, 0);
+        assert!(pool_inner.hosts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn connect_fresh_evicts_dns_when_all_addresses_unreachable() {
+        // Stale CDN/failover DNS answers would otherwise keep
+        // returning unreachable addresses for the full TTL. Inject
+        // an entry pointing at a guaranteed-refused port, let
+        // connect_fresh exhaust the
+        // address list, and assert the cached entry is gone so the
+        // next call re-resolves.
+        let state = PrewarmState::new();
+        let unreachable = SocketAddr::from(([127, 0, 0, 1], 1));
+        {
+            let mut entries = state.dns.entries.lock().await;
+            entries.insert(
+                ("unreachable.example".into(), 443),
+                DnsEntry {
+                    addrs: vec![unreachable],
+                    expires_at: Instant::now() + Duration::from_secs(60),
+                },
+            );
+        }
+        let result = state.connect_fresh("unreachable.example", 443).await;
+        assert!(
+            result.is_err(),
+            "connect to refused port must error: {result:?}"
+        );
+        assert!(
+            !state
+                .dns
+                .entries
+                .lock()
+                .await
+                .contains_key(&("unreachable.example".to_string(), 443)),
+            "failed connect must evict the cached DNS entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn pooled_stream_is_actually_usable_after_take() {
+        // The basic pool tests above use `loopback_stream`, which
+        // drops the server side immediately — they prove counts and
+        // structural moves but never that a pooled stream can carry
+        // bytes. Spin up a real echo server, put the client stream
+        // into the pool, take it back out, and assert it can carry a
+        // request/response round trip.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt as _};
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let echo = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 32];
+            let n = sock.read(&mut buf).await.unwrap();
+            sock.write_all(&buf[..n]).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let pool = TcpPool::new();
+        assert!(pool.try_reserve("echo", 9100).await);
+        pool.commit_reserve("echo", 9100, stream).await;
+        let mut taken = pool
+            .try_take("echo", 9100)
+            .await
+            .expect("freshly pooled stream must come back via try_take");
+        // The stream must be alive — pool was populated < 1ms ago.
+        assert!(
+            is_likely_alive(&taken),
+            "freshly pooled, never-closed stream must pass the liveness check"
+        );
+        taken.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        taken.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping", "echo server must see the bytes we sent");
+        echo.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn open_tcp_skips_dead_pool_entry_and_falls_back_to_fresh() {
+        // Pooled streams up to 30 s old can be closed by
+        // NAT/CDN/intermediary while idle. Without the liveness
+        // check, `open_tcp` would hand the dead stream to the caller
+        // and the session would EOF immediately — bricking it,
+        // because tunnel_client has no retry budget.
+        // This test seeds the pool with a stream whose peer has
+        // explicitly closed, then injects a DNS entry pointing at a
+        // separate live listener so `connect_fresh` has somewhere to
+        // succeed. open_tcp must:
+        //   1. take the dead entry off the pool,
+        //   2. recognise it via `is_likely_alive`,
+        //   3. drop it and fall back to `connect_fresh`,
+        //   4. return a live stream.
+        // Final pool state must be empty for the key (dead entry
+        // consumed, no new entry inserted by the fallback path).
+        let live_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let live_addr = live_listener.local_addr().unwrap();
+        let live_accept = tokio::spawn(async move {
+            let _ = live_listener.accept().await;
+            // Hold the accept side briefly so the client connect succeeds
+            // and the resulting stream stays open while the test
+            // inspects it.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+
+        // Open a TCP connection to a listener that immediately drops
+        // the server side. The local end of the stream survives in
+        // a half-closed state; `try_read` returns Ok(0).
+        let dead_listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let dead_addr = dead_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (sock, _) = dead_listener.accept().await.unwrap();
+            drop(sock);
+        });
+        let dead_stream = TcpStream::connect(dead_addr).await.unwrap();
+        // Let the FIN propagate so `try_read` reliably returns Ok(0).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !is_likely_alive(&dead_stream),
+            "test pre-condition: peer-closed stream must fail the liveness check"
+        );
+
+        let state = PrewarmState::new();
+        // Inject the dead stream into the pool under the test key.
+        {
+            let mut inner = state.pool.inner.lock().await;
+            inner
+                .hosts
+                .entry(("synthetic.example".into(), 443))
+                .or_default()
+                .queue
+                .push_back(PooledConn {
+                    stream: dead_stream,
+                    opened_at: Instant::now(),
+                });
+            inner.total_actual += 1;
+        }
+        // Resolve the same test key to the *live* listener so
+        // connect_fresh can succeed.
+        {
+            let mut entries = state.dns.entries.lock().await;
+            entries.insert(
+                ("synthetic.example".into(), 443),
+                DnsEntry {
+                    addrs: vec![live_addr],
+                    expires_at: Instant::now() + Duration::from_secs(60),
+                },
+            );
+        }
+
+        let stream = state
+            .open_tcp("synthetic.example", 443)
+            .await
+            .expect("must fall back to connect_fresh when the pool entry is dead");
+        assert!(
+            is_likely_alive(&stream),
+            "open_tcp must return a live stream after discarding a dead pool entry"
+        );
+
+        // Pool now empty for the key — dead entry was consumed and no
+        // new entry was inserted by the fallback path. (The host's
+        // empty queue is removed by `try_take`'s post-take cleanup.)
+        let inner = state.pool.inner.lock().await;
+        assert!(
+            inner
+                .hosts
+                .get(&("synthetic.example".to_string(), 443))
+                .is_none(),
+            "pool entry must be cleaned up after the dead-stream fallback"
+        );
+        live_accept.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn dns_cache_evicts_when_over_capacity() {
+        // Direct-poke a near-full cache to verify the bounded-size
+        // eviction kicks in without hammering the resolver in a loop.
+        let cache = DnsCache::new();
+        let now = Instant::now();
+        let future = now + Duration::from_secs(60);
+        {
+            let mut entries = cache.entries.lock().await;
+            for i in 0..DNS_CACHE_MAX_ENTRIES {
+                entries.insert(
+                    (format!("host{i}.example"), 80),
+                    DnsEntry {
+                        addrs: vec![SocketAddr::from(([127, 0, 0, 1], 80))],
+                        expires_at: future,
+                    },
+                );
+            }
+            assert_eq!(entries.len(), DNS_CACHE_MAX_ENTRIES);
+        }
+        // A real resolve through localhost forces an insert under cap.
+        let _ = cache.resolve("localhost", 7778).await.unwrap();
+        let entries = cache.entries.lock().await;
+        assert!(
+            entries.len() <= DNS_CACHE_MAX_ENTRIES,
+            "cache must not exceed cap; got {}",
+            entries.len()
+        );
+    }
+
+    /// Helper: open a loopback TCP stream against a one-shot acceptor
+    /// listening on `:0`. The accepted side is dropped immediately;
+    /// the client side comes back to the caller for pool tests.
+    async fn loopback_stream() -> TcpStream {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        TcpStream::connect(addr).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_returns_none_when_empty() {
+        let pool = TcpPool::new();
+        assert!(pool.try_take("nowhere", 80).await.is_none());
+        // Counters start at zero.
+        let inner = pool.inner.lock().await;
+        assert_eq!(inner.total_actual, 0);
+        assert_eq!(inner.total_pending, 0);
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_reserve_commit_then_take() {
+        let pool = TcpPool::new();
+        assert!(
+            pool.try_reserve("127.0.0.1", 9001).await,
+            "reserve on empty pool must succeed"
+        );
+        {
+            let inner = pool.inner.lock().await;
+            assert_eq!(inner.total_pending, 1, "pending count tracks the reserve");
+            assert_eq!(inner.total_actual, 0);
+        }
+        let stream = loopback_stream().await;
+        pool.commit_reserve("127.0.0.1", 9001, stream).await;
+        {
+            let inner = pool.inner.lock().await;
+            assert_eq!(inner.total_pending, 0, "commit clears the pending slot");
+            assert_eq!(inner.total_actual, 1);
+        }
+        assert!(pool.try_take("127.0.0.1", 9001).await.is_some());
+        let inner = pool.inner.lock().await;
+        assert_eq!(inner.total_actual, 0, "take decrements actual");
+        assert!(
+            !inner.hosts.contains_key(&("127.0.0.1".to_string(), 9001)),
+            "empty host entry must be removed"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_cancel_reserve_releases_slot() {
+        // Reservation that the caller cancels (e.g. connect failed)
+        // must restore both per-host and global counters so the next
+        // reserve can take its place.
+        let pool = TcpPool::new();
+        for _ in 0..TCP_POOL_PER_HOST_MAX {
+            assert!(pool.try_reserve("x", 1).await);
+        }
+        assert!(
+            !pool.try_reserve("x", 1).await,
+            "per-host cap must reject the over-cap reserve"
+        );
+        pool.cancel_reserve("x", 1).await;
+        assert!(
+            pool.try_reserve("x", 1).await,
+            "after cancel, the freed slot must be reservable again"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_per_host_cap_counts_pending_and_pooled() {
+        // Mix of pending + pooled must respect the per-host cap.
+        let pool = TcpPool::new();
+        let stream = loopback_stream().await;
+        assert!(pool.try_reserve("h", 2).await);
+        pool.commit_reserve("h", 2, stream).await;
+        // 1 actual + 0 pending. Reserve once more (== 1 actual + 1
+        // pending). Then reserve again — must fail (would be 1 + 2).
+        assert!(pool.try_reserve("h", 2).await, "second reserve under cap");
+        assert!(
+            !pool.try_reserve("h", 2).await,
+            "reserve over cap (pooled + pending) must fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_global_cap_counts_pending() {
+        // Fill the global cap with reservations alone — no commits.
+        let pool = TcpPool::new();
+        // Spread across many hosts so the per-host cap isn't the
+        // gating factor; we want to prove the global cap counts
+        // pending entries.
+        let mut reserved = 0;
+        for i in 0..(TCP_POOL_TOTAL_MAX + 1) {
+            let host = format!("h{i}");
+            if pool.try_reserve(&host, 80).await {
+                reserved += 1;
+            }
+        }
+        assert_eq!(
+            reserved, TCP_POOL_TOTAL_MAX,
+            "global cap must cap reservations across distinct hosts"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_try_reserve_prunes_stale_when_global_cap_hit() {
+        // Stale-pool cleanup: a pool sitting at global cap with
+        // stale entries for hosts that are never re-requested must
+        // self-clean when the next reserve would otherwise be
+        // rejected. Poke stale entries directly into the map under
+        // TCP_POOL_TOTAL_MAX, then assert that the next try_reserve
+        // succeeds for a fresh host (it can only succeed if
+        // prune_stale ran).
+        let pool = TcpPool::new();
+        let stale_age = TCP_POOL_TTL + Duration::from_secs(5);
+        {
+            let mut inner = pool.inner.lock().await;
+            for i in 0..TCP_POOL_TOTAL_MAX {
+                let host = format!("stale{i}");
+                let stream = loopback_stream().await;
+                inner
+                    .hosts
+                    .entry((host, 80))
+                    .or_default()
+                    .queue
+                    .push_back(PooledConn {
+                        stream,
+                        opened_at: Instant::now() - stale_age,
+                    });
+                inner.total_actual += 1;
+            }
+            assert_eq!(inner.total_actual, TCP_POOL_TOTAL_MAX);
+        }
+        assert!(
+            pool.try_reserve("fresh", 80).await,
+            "stale entries must be pruned so the fresh reservation fits"
+        );
+        let inner = pool.inner.lock().await;
+        // After prune, all the stale entries are gone and the host
+        // map only contains the fresh reservation's empty queue.
+        assert_eq!(inner.total_actual, 0);
+        assert_eq!(inner.total_pending, 1);
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_try_take_discards_stale_entries() {
+        let pool = TcpPool::new();
+        let stale_age = TCP_POOL_TTL + Duration::from_secs(5);
+        let stale = loopback_stream().await;
+        let fresh = loopback_stream().await;
+        {
+            let mut inner = pool.inner.lock().await;
+            let state = inner.hosts.entry(("h".into(), 9000)).or_default();
+            state.queue.push_back(PooledConn {
+                stream: stale,
+                opened_at: Instant::now() - stale_age,
+            });
+            state.queue.push_back(PooledConn {
+                stream: fresh,
+                opened_at: Instant::now(),
+            });
+            inner.total_actual += 2;
+        }
+        assert!(
+            pool.try_take("h", 9000).await.is_some(),
+            "stale entry must be skipped; fresh returned"
+        );
+        let inner = pool.inner.lock().await;
+        assert_eq!(
+            inner.total_actual, 0,
+            "both the stale (dropped) and fresh (taken) must be accounted for"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_pool_concurrent_take_and_reserve_do_not_deadlock() {
+        // With the single-mutex design there is no lock-order pair to
+        // deadlock against. This is a behavioral smoke test that
+        // confirms many concurrent ops complete within a bounded
+        // wall-clock budget.
+        let pool = Arc::new(TcpPool::new());
+        let mut set = JoinSet::new();
+        for i in 0..32 {
+            let p = Arc::clone(&pool);
+            set.spawn(async move {
+                let host = format!("h{}", i % 4);
+                if p.try_reserve(&host, 443).await {
+                    p.cancel_reserve(&host, 443).await;
+                }
+                let _ = p.try_take(&host, 443).await;
+            });
+        }
+        let drain = async {
+            while let Some(res) = set.join_next().await {
+                res.expect("join must succeed");
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(2), drain)
+            .await
+            .expect("concurrent take/reserve must not deadlock");
+    }
+
+    #[tokio::test]
+    async fn hot_hosts_flags_after_min_count_within_window() {
+        let hot = HotHosts::new();
+        assert!(
+            !hot.record_and_check("psn", 443).await,
+            "1 connect must not be hot (HOT_HOST_MIN_COUNT is {HOT_HOST_MIN_COUNT})"
+        );
+        assert!(
+            hot.record_and_check("psn", 443).await,
+            "{HOT_HOST_MIN_COUNT} connects in-window must be hot"
+        );
+        assert!(!hot.record_and_check("other", 443).await);
+    }
+
+    #[tokio::test]
+    async fn hot_hosts_prunes_stale_timestamps_per_host() {
+        let hot = HotHosts::new();
+        {
+            let mut inner = hot.inner.lock().await;
+            let q = inner
+                .seen
+                .entry(("flaky".into(), 443))
+                .or_insert_with(VecDeque::new);
+            q.push_back(Instant::now() - HOT_HOST_WINDOW - Duration::from_secs(10));
+        }
+        assert!(
+            !hot.record_and_check("flaky", 443).await,
+            "stale timestamp must be pruned; fresh count=1 is below threshold"
+        );
+        let inner = hot.inner.lock().await;
+        let q = inner.seen.get(&("flaky".into(), 443)).unwrap();
+        assert_eq!(q.len(), 1, "pruned queue plus one fresh sample = 1");
+    }
+
+    #[tokio::test]
+    async fn hot_hosts_caps_distinct_keys() {
+        // Map size must stay bounded even under adversarial input.
+        // Pre-fill with HOT_HOSTS_MAX_KEYS distinct stale-only
+        // entries (so the prune-on-cap path can clean them up), then
+        // record one new key. The map must not exceed the cap.
+        let hot = HotHosts::new();
+        let stale = Instant::now() - HOT_HOST_WINDOW - Duration::from_secs(10);
+        {
+            let mut inner = hot.inner.lock().await;
+            for i in 0..HOT_HOSTS_MAX_KEYS {
+                let mut q = VecDeque::new();
+                q.push_back(stale);
+                inner.seen.insert((format!("stale{i}"), 80), q);
+            }
+            assert_eq!(inner.seen.len(), HOT_HOSTS_MAX_KEYS);
+        }
+        // New key — must trigger the prune-on-cap path, drop all
+        // the stale entries, and end up with just the new one.
+        hot.record_and_check("new", 443).await;
+        let inner = hot.inner.lock().await;
+        assert!(
+            inner.seen.len() <= HOT_HOSTS_MAX_KEYS,
+            "map must respect cap; got {}",
+            inner.seen.len()
+        );
+        assert!(inner.seen.contains_key(&("new".into(), 443)));
+    }
+
+    #[tokio::test]
+    async fn hot_hosts_evicts_arbitrary_key_when_no_stale_to_prune() {
+        // Edge case: all entries fresh and at cap — pruning yields
+        // no space, so an arbitrary key is evicted to make room.
+        let hot = HotHosts::new();
+        let fresh = Instant::now();
+        {
+            let mut inner = hot.inner.lock().await;
+            for i in 0..HOT_HOSTS_MAX_KEYS {
+                let mut q = VecDeque::new();
+                q.push_back(fresh);
+                inner.seen.insert((format!("live{i}"), 80), q);
+            }
+        }
+        hot.record_and_check("new", 443).await;
+        let inner = hot.inner.lock().await;
+        assert!(
+            inner.seen.len() <= HOT_HOSTS_MAX_KEYS,
+            "map must respect cap even when prune frees nothing; got {}",
+            inner.seen.len()
+        );
+        assert!(inner.seen.contains_key(&("new".into(), 443)));
+    }
+
+    #[tokio::test]
+    async fn connect_fresh_iterates_resolved_addresses() {
+        // The previous TcpStream::connect("host:port") tried every
+        // resolved address. The refactored connect_fresh must
+        // preserve that: a list with one unreachable address followed
+        // by a reachable one must succeed.
+        //
+        // We construct the failure case directly via DnsCache::entries
+        // (no need to spin up a fake resolver). The reachable address
+        // is a real loopback listener.
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let live = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+        });
+        // 127.0.0.1:1 is essentially guaranteed to refuse / be closed.
+        let dead = SocketAddr::from(([127, 0, 0, 1], 1));
+        let state = PrewarmState::new();
+        {
+            let mut entries = state.dns.entries.lock().await;
+            entries.insert(
+                ("multi.example".into(), live.port()),
+                DnsEntry {
+                    addrs: vec![dead, live],
+                    expires_at: Instant::now() + Duration::from_secs(60),
+                },
+            );
+        }
+        let stream = state
+            .connect_fresh("multi.example", live.port())
+            .await
+            .expect("must fall through to the reachable address");
+        assert_eq!(stream.peer_addr().unwrap(), live);
+    }
+
+    #[tokio::test]
+    async fn connect_fresh_errors_when_no_addresses_available() {
+        // Inject a cached DNS entry with zero addresses. The cache
+        // hit returns the empty vec without re-resolving; connect_fresh
+        // iterates zero addresses and the loop's `last_err` stays
+        // None, so we return `AddrNotAvailable`. Exercises the
+        // empty-iterate branch of the wrapped DNS+connect budget.
+        let state = PrewarmState::new();
+        {
+            let mut entries = state.dns.entries.lock().await;
+            entries.insert(
+                ("nothing.example".into(), 443),
+                DnsEntry {
+                    addrs: vec![],
+                    expires_at: Instant::now() + Duration::from_secs(60),
+                },
+            );
+        }
+        let err = state
+            .connect_fresh("nothing.example", 443)
+            .await
+            .expect_err("must fail when no addresses are available");
+        assert_eq!(err.kind(), std::io::ErrorKind::AddrNotAvailable);
     }
 
     async fn start_udp_echo_server() -> u16 {
