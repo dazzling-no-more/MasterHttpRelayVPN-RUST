@@ -89,7 +89,7 @@ const INFLIGHT_OPTIMIST: usize = 2;
 
 /// Maximum pipeline depth when data is actively flowing. Ramps up on
 /// data-bearing replies, drops back to IDLE after consecutive empties.
-const INFLIGHT_ACTIVE: usize = 4;
+const INFLIGHT_ACTIVE: usize = 6;
 
 /// Max sessions that can run at elevated pipeline depth per deployment.
 const MAX_ELEVATED_PER_DEPLOYMENT: u64 = 30;

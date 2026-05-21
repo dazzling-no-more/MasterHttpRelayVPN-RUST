@@ -488,6 +488,7 @@ pub struct DomainFronter {
     /// payloads. Mirrors `Config::disable_padding` (#391). Default false
     /// (padding active = stronger DPI defense at +25% bandwidth cost).
     disable_padding: bool,
+    zstd_enabled: Arc<AtomicBool>,
     /// Per-instance auto-blacklist tuning. Mirrors `Config::auto_blacklist_*`
     /// (#391, #444). Cached here so the hot path in `record_timeout_strike`
     /// doesn't have to reach back through the Config (which we don't keep
@@ -795,6 +796,10 @@ pub struct BatchTunnelResponse {
     pub r: Vec<TunnelResponse>,
     #[serde(default)]
     pub e: Option<String>,
+    #[serde(default)]
+    pub zr: Option<String>,
+    #[serde(default)]
+    pub zc: Option<u8>,
 }
 
 impl DomainFronter {
@@ -888,6 +893,7 @@ impl DomainFronter {
             today_bytes: AtomicU64::new(0),
             today_key: std::sync::Mutex::new(current_pt_day_key()),
             disable_padding: config.disable_padding,
+            zstd_enabled: Arc::new(AtomicBool::new(false)),
             auto_blacklist_strikes: config.auto_blacklist_strikes.max(1),
             auto_blacklist_window: Duration::from_secs(
                 config.auto_blacklist_window_secs.clamp(1, 3600),
@@ -4008,7 +4014,20 @@ impl DomainFronter {
         let mut map = serde_json::Map::new();
         map.insert("k".into(), Value::String(self.auth_key.clone()));
         map.insert("t".into(), Value::String("batch".into()));
-        map.insert("ops".into(), serde_json::to_value(ops)?);
+        if self.zstd_enabled.load(Ordering::Relaxed) {
+            let ops_json = serde_json::to_vec(ops)?;
+            match zstd::encode_all(ops_json.as_slice(), 3) {
+                Ok(compressed) => {
+                    map.insert("zops".into(), Value::String(B64.encode(&compressed)));
+                }
+                Err(_) => {
+                    map.insert("ops".into(), serde_json::to_value(ops)?);
+                }
+            }
+        } else {
+            map.insert("ops".into(), serde_json::to_value(ops)?);
+        }
+        map.insert("zc".into(), Value::Number(1.into()));
         if !self.disable_padding {
             add_random_pad(&mut map);
         }
@@ -4150,8 +4169,28 @@ impl DomainFronter {
             "batch response body (trace only): {}",
             &json_str[..json_str.len().min(500)]
         );
-        match serde_json::from_str(json_str) {
-            Ok(v) => Ok(v),
+        match serde_json::from_str::<BatchTunnelResponse>(json_str) {
+            Ok(mut resp) => {
+                if let Some(zr_b64) = resp.zr.take() {
+                    match B64.decode(&zr_b64) {
+                        Ok(compressed) => match zstd::decode_all(compressed.as_slice()) {
+                            Ok(decompressed) => match serde_json::from_slice(&decompressed) {
+                                Ok(r) => {
+                                    resp.r = r;
+                                }
+                                Err(e) => tracing::error!("zr json parse failed: {}", e),
+                            },
+                            Err(e) => tracing::error!("zr zstd decompress failed: {}", e),
+                        },
+                        Err(e) => tracing::error!("zr base64 decode failed: {}", e),
+                    }
+                }
+                if resp.zc.is_some() && !self.zstd_enabled.load(Ordering::Relaxed) {
+                    tracing::info!("tunnel-node supports zstd, enabling compressed batches");
+                    self.zstd_enabled.store(true, Ordering::Relaxed);
+                }
+                Ok(resp)
+            }
             Err(e) => {
                 // Same redaction policy on the error path. Length and
                 // the serde error message are enough to locate the
