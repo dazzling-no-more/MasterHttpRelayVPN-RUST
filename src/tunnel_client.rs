@@ -1972,6 +1972,7 @@ async fn tunnel_loop(
     type ReplyFut =
         std::pin::Pin<Box<dyn std::future::Future<Output = (InflightMeta, ReplyOutcome)> + Send>>;
     let mut inflight: FuturesUnordered<ReplyFut> = FuturesUnordered::new();
+    let mut inflight_uploads: usize = 0;
 
     // Reply timeout: use the mux's config-derived value (request_timeout_secs
     // + REPLY_TIMEOUT_SLACK) rather than the hardcoded REPLY_TIMEOUT constant
@@ -2081,6 +2082,7 @@ async fn tunnel_loop(
                 &sid[..sid.len().min(8)],
                 meta.seq,
             );
+            inflight_uploads += 1;
             inflight.push(wrap_reply(meta, reply_rx, reply_timeout));
         }
     }
@@ -2146,6 +2148,9 @@ async fn tunnel_loop(
         if eof_seen && !inflight.is_empty() {
             match tokio::time::timeout(Duration::from_millis(500), inflight.next()).await {
                 Ok(Some((meta, ReplyOutcome::Ok(resp, script_id)))) => {
+                    if !meta.was_empty_poll {
+                        inflight_uploads = inflight_uploads.saturating_sub(1);
+                    }
                     if meta.seq == next_write_seq {
                         let _ = write_tunnel_response(&mut writer, &resp).await;
                         next_write_seq += 1;
@@ -2189,6 +2194,7 @@ async fn tunnel_loop(
                             &mut next_data_write_seq,
                             mux,
                         );
+                        inflight_uploads += 1;
                         inflight.push(wrap_reply(meta, reply_rx, reply_timeout));
                         continue;
                     }
@@ -2237,7 +2243,17 @@ async fn tunnel_loop(
                     // instead of sending an empty poll.
                     if let Some(data) = buffered_upload.take() {
                         let (meta, reply_rx) = send_data_op(sid, data, &mut next_send_seq, &mut next_data_write_seq, mux);
+                        inflight_uploads += 1;
                         inflight.push(wrap_reply(meta, reply_rx, reply_timeout));
+                    } else if inflight_uploads > 0 {
+                        // A data op is already able to drain the upstream
+                        // response. Sending an older empty poll here creates
+                        // an in-order barrier for a later data-bearing reply.
+                        tracing::debug!(
+                            "sess {}: defer empty refill; {} upload op(s) in flight",
+                            &sid[..sid.len().min(8)],
+                            inflight_uploads,
+                        );
                     } else {
                         let (meta, reply_rx) = send_empty_poll(sid, &mut next_send_seq, mux);
                         inflight.push(wrap_reply(meta, reply_rx, reply_timeout));
@@ -2251,6 +2267,9 @@ async fn tunnel_loop(
 
             // Process completed replies.
             Some((meta, outcome)) = inflight.next() => {
+                if !meta.was_empty_poll {
+                    inflight_uploads = inflight_uploads.saturating_sub(1);
+                }
                 match outcome {
                     ReplyOutcome::Ok(resp, script_id) => {
                         let has_data = resp.d.as_ref().map(|d| !d.is_empty()).unwrap_or(false);
@@ -2384,6 +2403,8 @@ async fn tunnel_loop(
                             if inflight.len() < max_inflight {
                                 let (meta, reply_rx) = send_data_op(sid, data, &mut next_send_seq, &mut next_data_write_seq, mux);
                                 consecutive_empty = 0;
+                                inflight_uploads += 1;
+                                refill_at = None;
                                 inflight.push(wrap_reply(meta, reply_rx, reply_timeout));
                             } else {
                                 buffered_upload = Some(data);
@@ -2467,6 +2488,7 @@ async fn tunnel_loop(
                         // Schedule refill if pipeline needs more polls.
                         if !eof_seen
                             && inflight.len() < max_inflight
+                            && inflight_uploads == 0
                             && refill_at.is_none()
                             && !should_suppress_empty_refill(
                                 buffered_upload.is_some(),
@@ -2527,11 +2549,15 @@ async fn tunnel_loop(
                             // Normal path: send immediately as data op.
                             let (meta, reply_rx) = send_data_op(sid, data, &mut next_send_seq, &mut next_data_write_seq, mux);
                             consecutive_empty = 0;
+                            inflight_uploads += 1;
+                            refill_at = None;
                             inflight.push(wrap_reply(meta, reply_rx, reply_timeout));
                         } else if inflight.len() < max_inflight + 4 {
                             // Fast-path: pipeline full but under +4 extra.
                             let (meta, reply_rx) = send_data_op(sid, data, &mut next_send_seq, &mut next_data_write_seq, mux);
                             consecutive_empty = 0;
+                            inflight_uploads += 1;
+                            refill_at = None;
                             inflight.push(wrap_reply(meta, reply_rx, reply_timeout));
                         } else {
                             // Buffer upload data until a slot frees up.
