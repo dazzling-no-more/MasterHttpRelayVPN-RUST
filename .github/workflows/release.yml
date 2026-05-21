@@ -1346,7 +1346,13 @@ jobs:
           # `inputs.version`. The leading `v` is preserved (release
           # tags are `v1.4.0`, not `1.4.0`).
           tag_name: ${{ inputs.version && format('v{0}', inputs.version) || github.ref_name }}
-          files: dist/*
+          # Recursive glob: Tauri desktop artifacts arrive nested under
+          # `dist/deb/`, `dist/msi/`, `dist/dmg/`, `dist/macos/`,
+          # `dist/appimage/`, etc. — the upload-artifact step preserves
+          # the bundle/ subdir layout. A flat `dist/*` would only catch
+          # the CLI / APK files at the top level and silently skip the
+          # installers.
+          files: dist/**/*
           # Append auto-generated comparison link AFTER our changelog
           # body — `append_body: true` puts our body first, then the
           # auto notes. If no changelog file existed, body is empty and
