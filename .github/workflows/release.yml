@@ -412,24 +412,28 @@ jobs:
   desktop:
     strategy:
       fail-fast: false
+      # Bundle paths anchor at the workspace-root `target/`, NOT
+      # `desktop/src-tauri/target/`. The Cargo workspace at the repo root
+      # declares `desktop/src-tauri` as a member, so cargo (and `tauri
+      # build` underneath) emits into the SHARED workspace target dir.
       matrix:
         include:
           - os: ubuntu-latest
             name: rahgozar-desktop-linux-amd64
             artifact_paths: |
-              desktop/src-tauri/target/release/bundle/deb/*.deb
-              desktop/src-tauri/target/release/bundle/rpm/*.rpm
-              desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+              target/release/bundle/deb/*.deb
+              target/release/bundle/rpm/*.rpm
+              target/release/bundle/appimage/*.AppImage
           - os: macos-latest
             name: rahgozar-desktop-macos
             artifact_paths: |
-              desktop/src-tauri/target/release/bundle/dmg/*.dmg
-              desktop/src-tauri/target/release/bundle/macos/*.app.tar.gz
+              target/release/bundle/dmg/*.dmg
+              target/release/bundle/macos/*.app.tar.gz
           - os: windows-latest
             name: rahgozar-desktop-windows-amd64
             artifact_paths: |
-              desktop/src-tauri/target/release/bundle/msi/*.msi
-              desktop/src-tauri/target/release/bundle/nsis/*.exe
+              target/release/bundle/msi/*.msi
+              target/release/bundle/nsis/*.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -457,10 +461,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          # The Tauri target dir is nested under `desktop/`, so we
-          # point rust-cache there. Separate cache key from the CLI
-          # matrix so the two don't share / clobber.
-          workspaces: desktop/src-tauri -> target
+          # The Cargo workspace at the repo root owns the target dir
+          # (see Cargo.toml `members = ["desktop/src-tauri"]`). Cache
+          # the workspace-root `target/`. Separate cache key from the
+          # CLI matrix so the two don't share / clobber.
+          workspaces: . -> target
           key: tauri-${{ runner.os }}
 
       - name: Install frontend deps
@@ -525,7 +530,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          find desktop/src-tauri/target/release/bundle -maxdepth 3 -type f \
+          find target/release/bundle -maxdepth 3 -type f \
             \( -name '*.msi' -o -name '*.dmg' -o -name '*.AppImage' \
                -o -name '*.deb' -o -name '*.rpm' -o -name '*.exe' \
                -o -name '*.tar.gz' -o -name '*.sig' \) \
@@ -536,7 +541,7 @@ jobs:
           name: ${{ matrix.name }}
           path: |
             ${{ matrix.artifact_paths }}
-            desktop/src-tauri/target/release/bundle/**/*.sig
+            target/release/bundle/**/*.sig
           if-no-files-found: error
 
   # Generate `latest.json` — the manifest that `tauri-plugin-updater`
