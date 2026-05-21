@@ -2,7 +2,7 @@
 
 This folder contains the prebuilt binaries from the latest release, committed directly to the repository for users who cannot reach the GitHub Releases page.
 
-Current version: **v2.4.0**
+Current version: **v2.5.0**
 
 **Note (v2.4):** the legacy egui desktop UI (`rahgozar-ui` /
 `rahgozar-ui.exe`) and the launcher scripts (`run.sh`, `run.bat`,
@@ -14,7 +14,7 @@ from another process.
 
 | File | Platform | Contents |
 |---|---|---|
-| `rahgozar-android-universal-v2.4.0.apk` | Android 7.0+ (all ABIs) | Universal APK — arm64-v8a, armeabi-v7a, x86_64, x86 in one file |
+| `rahgozar-android-universal-v2.5.0.apk` | Android 7.0+ (all ABIs) | Universal APK — arm64-v8a, armeabi-v7a, x86_64, x86 in one file |
 | `rahgozar-desktop-windows-amd64.msi` | Windows 10 / 11 x86_64 | Tauri-bundled desktop UI installer (MSI) |
 | `rahgozar-desktop-macos.dmg` | macOS 11+ (Intel + Apple Silicon) | Tauri-bundled desktop UI disk image |
 | `rahgozar-desktop-linux-amd64.AppImage` | Linux x86_64 | Portable Tauri-bundled desktop UI |
@@ -55,7 +55,7 @@ Extract `rahgozar-windows-amd64.zip`, then double-click `run.bat` inside the ext
 
 ### Android
 
-Copy `rahgozar-android-universal-v2.4.0.apk` to your phone, tap it from the Files app, and allow "Install unknown apps" for whichever app is opening the APK (Files, Chrome, etc.). See [the Android guide](../docs/android.md) for the full walk-through of the first-run steps (Apps Script deployment, MITM CA install, VPN permission, SNI tester).
+Copy `rahgozar-android-universal-v2.5.0.apk` to your phone, tap it from the Files app, and allow "Install unknown apps" for whichever app is opening the APK (Files, Chrome, etc.). See [the Android guide](../docs/android.md) for the full walk-through of the first-run steps (Apps Script deployment, MITM CA install, VPN permission, SNI tester).
 
 See the [main README](../README.md) for desktop setup (Apps Script deployment, config, browser proxy settings).
 
@@ -65,7 +65,7 @@ See the [main README](../README.md) for desktop setup (Apps Script deployment, c
 
 این پوشه شامل فایل‌های آخرین نسخه است و مستقیماً در ریپو قرار گرفته برای کاربرانی که به صفحهٔ GitHub Releases دسترسی ندارند.
 
-نسخهٔ فعلی: **v2.4.0**
+نسخهٔ فعلی: **v2.5.0**
 
 ### دانلود از طریق ZIP
 
@@ -83,6 +83,6 @@ cd rahgozar-macos-arm64
 
 **ویندوز:** فایل `rahgozar-windows-amd64.zip` را extract کنید و داخل پوشه روی `run.bat` دو بار کلیک کنید (UAC را قبول کنید تا گواهی MITM نصب شود).
 
-**اندروید:** فایل `rahgozar-android-universal-v2.4.0.apk` را روی گوشی کپی کنید، از Files app روی آن tap کنید و اجازهٔ "نصب برنامه‌های ناشناس" را بدهید. راهنمای کامل شروع به کار (دیپلوی Apps Script، نصب CA، اجازهٔ VPN، تستر SNI) در [راهنمای اندروید](../docs/android.md) هست.
+**اندروید:** فایل `rahgozar-android-universal-v2.5.0.apk` را روی گوشی کپی کنید، از Files app روی آن tap کنید و اجازهٔ "نصب برنامه‌های ناشناس" را بدهید. راهنمای کامل شروع به کار (دیپلوی Apps Script، نصب CA، اجازهٔ VPN، تستر SNI) در [راهنمای اندروید](../docs/android.md) هست.
 
 برای راه‌اندازی کامل دسکتاپ (دیپلوی Apps Script، config، تنظیم proxy مرورگر) به [README اصلی](../README.md) مراجعه کنید.
