@@ -178,14 +178,14 @@ jobs:
       # installed and the standard target triples are pre-added. It
       # still verifies the target is present and is cheap enough to keep
       # as a safety net.
-      # Per-matrix-entry toolchain selection. Default is `stable` (latest)
-      # for every target except where `rust_toolchain` is explicitly pinned
-      # — currently just i686-pc-windows-msvc, which needs 1.77.2 to keep
-      # the Win7 binary loadable (Rust 1.78+ raised Windows MSRV to Win10).
+      # All matrix entries use latest stable. If a future target ever
+      # needs an older MSRV (e.g. the retired Win7 i686-pc-windows-msvc
+      # entry that required 1.77.2), reintroduce a `matrix.rust_toolchain`
+      # override and substitute it for the literal `stable` below.
       - uses: dtolnay/rust-toolchain@master
         if: matrix.mipsel_softfloat != true
         with:
-          toolchain: ${{ matrix.rust_toolchain || 'stable' }}
+          toolchain: stable
           targets: ${{ matrix.target }}
 
       # Cache target/ + cargo registry across runs — this is the big
@@ -204,11 +204,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         if: matrix.mipsel_softfloat != true
         with:
-          # Include toolchain in the cache key so a pinned-Rust target
-          # (i686-pc-windows-msvc on 1.77.2) doesn't collide with
-          # stable-Rust caches for other targets, and a future toolchain
-          # bump invalidates only the affected slot.
-          key: ${{ matrix.target }}-${{ matrix.rust_toolchain || 'stable' }}
+          key: ${{ matrix.target }}-stable
           cache-bin: "false"
 
       # Cross-compile toolchains. Same story as above — gated to hosted
