@@ -575,6 +575,16 @@ const LATENCY_MIN_DEPLOYMENTS: usize = 3;
 /// fast (median < 500 ms), a 2× outlier is still a fine batch and
 /// kicking it out of round-robin just churns the selector for no win.
 const LATENCY_SKIP_MIN_MEDIAN_MS: f64 = 500.0;
+/// Successful tunnel batches above this wall-clock RTT are user-visible
+/// tail-latency outliers, even if the deployment's EWMA has not drifted
+/// above the relative median threshold yet. Cool the deployment down
+/// immediately so bursts don't keep landing on a currently-slow Apps
+/// Script container/account.
+const LATENCY_HARD_SLOW_BATCH_MS: f64 = 6000.0;
+/// Short cooldown for a hard-slow successful batch. Kept equal to the
+/// latency freshness window so the deployment naturally re-enters for a
+/// probe pick after the same period EWMA slow entries age out.
+const LATENCY_HARD_SLOW_COOLDOWN_SECS: u64 = LATENCY_FRESH_FOR_SECS;
 /// How long an EWMA sample stays "fresh" for the slow-set decision.
 /// Past this age, the entry is ignored by both the median calculation
 /// and the slow-set filter — effectively letting the deployment back
@@ -1328,13 +1338,23 @@ impl DomainFronter {
     pub(crate) fn record_batch_latency(&self, script_id: &str, latency: Duration) {
         let ms = latency.as_secs_f64() * 1000.0;
         let now = Instant::now();
-        let mut map = self.script_latency_ewma.lock().unwrap();
-        map.entry(script_id.to_string())
-            .and_modify(|(score, ts)| {
-                *score = LATENCY_EWMA_ALPHA * ms + (1.0 - LATENCY_EWMA_ALPHA) * *score;
-                *ts = now;
-            })
-            .or_insert((ms, now));
+        {
+            let mut map = self.script_latency_ewma.lock().unwrap();
+            map.entry(script_id.to_string())
+                .and_modify(|(score, ts)| {
+                    *score = LATENCY_EWMA_ALPHA * ms + (1.0 - LATENCY_EWMA_ALPHA) * *score;
+                    *ts = now;
+                })
+                .or_insert((ms, now));
+        }
+
+        if self.script_ids.len() >= LATENCY_MIN_DEPLOYMENTS && ms >= LATENCY_HARD_SLOW_BATCH_MS {
+            self.blacklist_script_for(
+                script_id,
+                Duration::from_secs(LATENCY_HARD_SLOW_COOLDOWN_SECS),
+                "successful tunnel batch exceeded hard latency threshold",
+            );
+        }
     }
 
     /// Snapshot of `script_latency_ewma` for read-only consumers
@@ -7154,6 +7174,35 @@ mod tests {
         let snap = fronter.script_latency_snapshot();
         assert!((snap["B"] - 500.0).abs() < 0.001);
         assert!((snap["A"] - expected).abs() < 0.001, "A unaffected by B");
+    }
+
+    #[test]
+    fn hard_slow_successful_batch_cools_down_deployment_immediately() {
+        let fronter = multi_deployment_fronter(&["FAST1", "FAST2", "SLOW"]);
+
+        // Establish a normal baseline. A single 7s success would only
+        // fold SLOW's EWMA to 3500ms (0.3*7000 + 0.7*2000), which is
+        // below the relative 2x threshold when FAST* sit around 2s.
+        // The hard-slow path should still remove SLOW immediately.
+        fronter.record_batch_latency("FAST1", Duration::from_millis(2000));
+        fronter.record_batch_latency("FAST2", Duration::from_millis(2000));
+        fronter.record_batch_latency("SLOW", Duration::from_millis(2000));
+        fronter.record_batch_latency("SLOW", Duration::from_millis(7000));
+
+        let snap = fronter.script_latency_snapshot();
+        assert!(
+            !compute_slow_set(&snap).contains("SLOW"),
+            "EWMA alone should still be too gentle here; snap={snap:?}"
+        );
+
+        let mut picks: Vec<String> = (0..30).map(|_| fronter.next_script_id()).collect();
+        picks.sort();
+        picks.dedup();
+        assert_eq!(
+            picks,
+            vec!["FAST1".to_string(), "FAST2".to_string()],
+            "hard-slow successful batch should temporarily skip SLOW"
+        );
     }
 
     #[test]
