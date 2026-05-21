@@ -32,8 +32,7 @@ const DIAGNOSTIC_MODE = false;
 // to the destination. UrlFetchApp rejects most of the connection-level
 // names anyway, but we also drop the `X-Forwarded-*` / `Forwarded` /
 // `Via` family so that a misconfigured upstream proxy on the user side
-// can't leak the user's real IP through the relay path. Mirrors
-// upstream `masterking32/MasterHttpRelayVPN@3094288`.
+// can't leak the user's real IP through the relay path.
 const SKIP_HEADERS = {
   host: 1, connection: 1, "content-length": 1,
   "transfer-encoding": 1, "proxy-connection": 1, "proxy-authorization": 1,
@@ -307,7 +306,7 @@ function doPost(e) {
     // (which `GET /exec/quota?k=…` leaks into history / logs).
     if (req.op === "quota") {
       perfKind = "quota";
-      return _json({ remaining: UrlFetchApp.getRemainingDailyQuota() });
+      return _json({ remaining: _remainingUrlFetchQuota() });
     }
 
     // Tunnel mode
@@ -796,11 +795,20 @@ function doGet(e) {
     e.parameter && e.parameter.k === AUTH_KEY &&
     _isConfiguredAuthKey()
   ) {
-    return _json({ remaining: UrlFetchApp.getRemainingDailyQuota() });
+    return _json({ remaining: _remainingUrlFetchQuota() });
   }
   return ContentService
     .createTextOutput(DECOY_HTML)
     .setMimeType(ContentService.MimeType.HTML);
+}
+
+function _remainingUrlFetchQuota() {
+  try {
+    if (typeof UrlFetchApp.getRemainingDailyQuota === "function") {
+      return UrlFetchApp.getRemainingDailyQuota();
+    }
+  } catch (_) {}
+  return null;
 }
 
 function _json(obj) {

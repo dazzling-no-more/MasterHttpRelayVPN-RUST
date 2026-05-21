@@ -130,9 +130,9 @@ TUNNEL_AUTH_KEY=your-secret PORT=8080 ./target/release/tunnel-node
 
 ## Performance: تعداد deployment و عمق pipeline
 
-کلاینت rahgozar در حالت Full یک batch-multiplexer pipelined اجرا می‌کنه. هر روند-تریپ Apps Script حدود ۲ ثانیه طول می‌کشه، پس کلاینت چندین request batch همزمان شلیک می‌کنه — عمق pipeline برابر تعداد deployment ID‌های Apps Script هست (حداقل ۲، بدون سقف بالا).
+کلاینت rahgozar در حالت Full یک batch-multiplexer pipelined اجرا می‌کنه. هر روند-تریپ Apps Script حدود ۲ ثانیه طول می‌کشه، پس کلاینت چندین request batch را همزمان در پرواز نگه می‌داره. عمق pipeline برای هر session بین حالت idle، startup خوش‌بینانه، و انتقال فعال adaptive است؛ هر deployment ID هم یک pool همزمانی جدا از Apps Script اضافه می‌کند.
 
-تعداد deployment بیشتر = batchهای همزمان بیشتر روی tunnel-node = latency پایین‌تر برای session. با ۶ deployment، هر ۰.۳ ثانیه یه batch جدید می‌رسه (به‌جای هر ۲ ثانیه).
+تعداد deployment بیشتر = batchهای همزمان بیشتر روی tunnel-node و احتمال کمتر برای bottleneck شدن یک account Apps Script. این throughput کل را بالا می‌برد و queue شدن زیر load را کم می‌کند، اما یک درخواست HTTPS تازه معمولاً هنوز برای اولین byte پاسخ به دو cycle Apps Script نیاز دارد.
 
 خود tunnel-node per-request stateless هست (session‌ها بر اساس UUID key می‌شن)، پس batchهای همزمان رو طبیعی handle می‌کنه. برای بهترین نتیجه، ۳–۱۲ Apps Script روی account‌های Google جداگانه deploy کن و همهٔ deployment ID‌ها رو در config کلاینت لیست کن.
 

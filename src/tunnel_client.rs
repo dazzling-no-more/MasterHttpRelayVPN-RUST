@@ -93,8 +93,11 @@ const INFLIGHT_IDLE: usize = 1;
 /// after `connect_data` returns (TLS Finished + encrypted request). With
 /// only two slots, that second upload waits a full Apps Script batch RTT;
 /// three slots let it ride the first post-connect batch without needing
-/// an elevated-session permit. A fourth optimistic slot mostly becomes
-/// an extra empty poll on short HTTPS flows and can delay in-order
+/// an elevated-session permit. This does not make fresh HTTPS one-cycle:
+/// `connect_data` still has to return the server handshake bytes before
+/// the client can send Finished/request bytes, so first response data is
+/// normally the second Apps Script cycle. A fourth optimistic slot mostly
+/// becomes an extra empty poll on short HTTPS flows and can delay in-order
 /// delivery if it grabs data before older empty replies return. Drops to
 /// IDLE after consecutive empties.
 const INFLIGHT_OPTIMIST: usize = 3;

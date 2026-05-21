@@ -164,8 +164,8 @@ TUNNEL_AUTH_KEY=your-secret PORT=8080 ./target/release/tunnel-node
 
 ## Performance: deployment count and pipeline depth
 
-The rahgozar client runs a pipelined batch multiplexer in full mode. Each Apps Script round-trip takes ~2s, so the client fires multiple batch requests concurrently — the pipeline depth equals the number of configured script deployment IDs (minimum 2, no upper cap).
+The rahgozar client runs a pipelined batch multiplexer in full mode. Each Apps Script round-trip takes ~2s, so the client keeps multiple batch requests in flight concurrently. Per-session pipeline depth adapts between idle, optimistic startup, and active-transfer levels; each configured script deployment ID adds another Apps Script concurrency pool.
 
-More deployments = more concurrent batches hitting the tunnel-node = lower per-session latency. With 6 deployments, a new batch arrives every ~0.3s instead of every 2s.
+More deployments = more concurrent batches hitting the tunnel-node and less chance that one Apps Script account becomes the bottleneck. They increase total throughput and reduce queueing under load, but a fresh HTTPS request still normally needs two Apps Script cycles to first response data.
 
 The tunnel-node itself is stateless per-request (sessions are keyed by UUID), so it handles concurrent batches naturally. For best results, deploy 3–12 Apps Script instances across separate Google accounts and list all their deployment IDs in the client config.
