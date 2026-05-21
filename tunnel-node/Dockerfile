@@ -1,4 +1,4 @@
-# Multi-stage build for the mhrv-tunnel-node service.
+# Multi-stage build for the rahgozar-tunnel-node service.
 #
 # Build stage compiles a release binary on a recent stable Rust.
 # Dependency caching is done via `cargo-chef`: a separate layer cooks

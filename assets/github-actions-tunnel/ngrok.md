@@ -85,7 +85,7 @@ GitHub Actions or ngrok IP address.
 
 ## How It Works
 
-1. GitHub Actions starts a Docker container running `mhrv-tunnel-node` on port
+1. GitHub Actions starts a Docker container running `rahgozar-tunnel-node` on port
    `8080`
 2. `ngrok` creates a secure tunnel using your authtoken, assigning a temporary
    `*.ngrok-free.app` URL that routes to `localhost:8080` on the runner

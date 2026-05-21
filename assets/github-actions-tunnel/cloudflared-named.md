@@ -139,7 +139,7 @@ You should see a Cloudflare IP address.
 
 ## How It Works
 
-1. GitHub Actions starts a Docker container running `mhrv-tunnel-node` on port
+1. GitHub Actions starts a Docker container running `rahgozar-tunnel-node` on port
    `8080`
 2. `cloudflared` connects to Cloudflare using the named tunnel credentials
 3. Cloudflare routes traffic from your custom domain to the runner through a

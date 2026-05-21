@@ -61,7 +61,7 @@ echo "TUNNEL_SECRET = $(openssl rand -hex 24)"
 # C. اجرای tunnel-node. مقدار TUNNEL_SECRET از قسمت B را
 #    به‌جای <TUNNEL_SECRET> در زیر paste کن.
 docker run -d \
-  --name mhrv-tunnel \
+  --name rahgozar-tunnel \
   --restart unless-stopped \
   -p 8080:8080 \
   -e TUNNEL_AUTH_KEY="<TUNNEL_SECRET>" \
@@ -242,8 +242,8 @@ curl -x http://127.0.0.1:8085 https://api.ipify.org
 
 ```bash
 docker pull ghcr.io/dazzling-no-more/rahgozar-tunnel-node:latest
-docker rm -f mhrv-tunnel
-docker run -d --name mhrv-tunnel --restart unless-stopped \
+docker rm -f rahgozar-tunnel
+docker run -d --name rahgozar-tunnel --restart unless-stopped \
   -p 8080:8080 -e TUNNEL_AUTH_KEY="<TUNNEL_SECRET>" \
   ghcr.io/dazzling-no-more/rahgozar-tunnel-node:latest
 ```
@@ -255,7 +255,7 @@ docker run -d --name mhrv-tunnel --restart unless-stopped \
 | علامت | علت / رفع |
 |---|---|
 | دستور `curl http://<VPS_IP>:8080/health` معلق می‌ماند | firewall سمت provider پورت ۸۰۸۰ را بلاک کرده — در کنسول وب provider بازش کن (فقط `ufw` کافی نیست) |
-| پاسخ `curl /health` → `Connection refused` | کانتینر بالا نیست. روی VPS: `docker ps` (باید `mhrv-tunnel` را نشان دهد)؛ برای خطاها `docker logs mhrv-tunnel` |
+| پاسخ `curl /health` → `Connection refused` | کانتینر بالا نیست. روی VPS: `docker ps` (باید `rahgozar-tunnel` را نشان دهد)؛ برای خطاها `docker logs rahgozar-tunnel` |
 | کلاینت وصل می‌شود اما همهٔ requestها با `unauthorized` / `502` خطا می‌دهند | یکی از دو secret match نمی‌کند. چک کن: `CLIENT_SECRET` بین `auth_key` در config.json و `AUTH_KEY` در CodeFull.gs یکسان است؛ `TUNNEL_SECRET` بین `docker run -e TUNNEL_AUTH_KEY=` و `TUNNEL_AUTH_KEY` در CodeFull.gs یکسان است |
 | کلاینت گزارش می‌دهد `script_id ... not deployed` | بعد از ویرایش CodeFull.gs publish را فراموش کردی. **Deploy → Manage deployments → ✏️ edit → New version → Deploy** |
 | تونل کار می‌کند اما ChatGPT / Claude / Grok / x.com چالش CAPTCHA می‌دهند | طبیعی است — این سایت‌ها IPهای دیتاسنتر گوگل را block می‌کنند. یک [exit node](../assets/exit_node/README.fa.md) دیپلوی کن (۵ دقیقه، free tier) |

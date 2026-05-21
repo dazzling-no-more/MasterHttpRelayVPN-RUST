@@ -2,7 +2,7 @@
 
 A temporary, repeatable Full tunnel mode for users who cannot or prefer not to
 purchase a VPS. Uses GitHub Actions free hosted runners to run the official
-`mhrv-tunnel-node` container for 6-hour sessions at no cost.
+`rahgozar-tunnel-node` container for 6-hour sessions at no cost.
 
 ## Who This Is For
 
@@ -15,7 +15,7 @@ purchase a VPS. Uses GitHub Actions free hosted runners to run the official
 
 ## How It Works
 
-1. A GitHub Actions workflow starts the official `mhrv-tunnel-node` Docker
+1. A GitHub Actions workflow starts the official `rahgozar-tunnel-node` Docker
    container on a free hosted runner
 2. A tunneling service (cloudflared or ngrok) exposes the container to the
    internet on a public URL
@@ -62,14 +62,14 @@ a one-time Cloudflare CLI setup with your own domain.
 ## Alternative hosts (when GitHub Actions tunnels don't work)
 
 If both ngrok and cloudflared paths are blocked on your network, run
-`mhrv-tunnel-node` somewhere that doesn't rely on a third-party tunnel:
+`rahgozar-tunnel-node` somewhere that doesn't rely on a third-party tunnel:
 
 - **HuggingFace Spaces (Docker SDK)**: free, permanent `*.hf.space` URL,
   no tunnel layer needed. Create a Space → pick Docker SDK → small
   Dockerfile that runs `ghcr.io/dazzling-no-more/rahgozar-tunnel-node:latest`.
   16 GB storage, 2 vCPU. Most Iran-friendly option in 2026.
 - **Replit (Deno repl)**: signup with email, free tier. Run
-  `mhrv-tunnel-node` and the Repl exposes a public URL.
+  `rahgozar-tunnel-node` and the Repl exposes a public URL.
 - **Your own VPS**: Hetzner / Vultr / DigitalOcean / ArvanCloud. ~$3-5/mo.
   See [tunnel-node README](../../tunnel-node/README.md) for Docker setup.
 

@@ -54,7 +54,7 @@ echo "TUNNEL_SECRET = $(openssl rand -hex 24)"
 # C. Run tunnel-node. Paste the TUNNEL_SECRET value from step B
 #    in place of <TUNNEL_SECRET> below.
 docker run -d \
-  --name mhrv-tunnel \
+  --name rahgozar-tunnel \
   --restart unless-stopped \
   -p 8080:8080 \
   -e TUNNEL_AUTH_KEY="<TUNNEL_SECRET>" \
@@ -221,8 +221,8 @@ On the VPS:
 
 ```bash
 docker pull ghcr.io/dazzling-no-more/rahgozar-tunnel-node:latest
-docker rm -f mhrv-tunnel
-docker run -d --name mhrv-tunnel --restart unless-stopped \
+docker rm -f rahgozar-tunnel
+docker run -d --name rahgozar-tunnel --restart unless-stopped \
   -p 8080:8080 -e TUNNEL_AUTH_KEY="<TUNNEL_SECRET>" \
   ghcr.io/dazzling-no-more/rahgozar-tunnel-node:latest
 ```
@@ -234,7 +234,7 @@ Pin a specific tag (e.g. `:1.8.0`) instead of `:latest` if you want stable upgra
 | Symptom | Cause / fix |
 |---|---|
 | `curl http://<VPS_IP>:8080/health` hangs | Cloud-provider firewall blocks 8080 — open it in the provider's web console (not just `ufw`) |
-| `curl /health` → `Connection refused` | Container isn't running. On VPS: `docker ps` (should list `mhrv-tunnel`); `docker logs mhrv-tunnel` for errors |
+| `curl /health` → `Connection refused` | Container isn't running. On VPS: `docker ps` (should list `rahgozar-tunnel`); `docker logs rahgozar-tunnel` for errors |
 | Client connects but every request fails with `unauthorized` / `502` | One of the two secrets doesn't match. Check: `CLIENT_SECRET` is identical in `config.json` `auth_key` and `CodeFull.gs` `AUTH_KEY`; `TUNNEL_SECRET` is identical in `docker run -e TUNNEL_AUTH_KEY=` and `CodeFull.gs` `TUNNEL_AUTH_KEY` |
 | Client reports `script_id ... not deployed` | You forgot to publish after editing CodeFull.gs. **Deploy → Manage deployments → ✏️ edit → New version → Deploy** |
 | Tunnel works but ChatGPT / Claude / Grok / x.com show CAPTCHA | Expected — those sites block Google datacenter IPs. Deploy an [exit node](../assets/exit_node/README.md) (5 min, free tier) |

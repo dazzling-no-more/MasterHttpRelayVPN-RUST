@@ -1,8 +1,17 @@
+# Standalone crate (not a member of the root rahgozar workspace). The root
+# Cargo.toml gained `[workspace]` when the Tauri desktop crate was added,
+# which would otherwise force this directory into the workspace and break
+# `cargo` invocations from inside `tunnel-node/`. Cargo's documented opt-out
+# is an empty `[workspace]` table here. The canonical build path is still
+# the Dockerfile (./tunnel-node/Dockerfile) — this only matters for local
+# `cargo check` / `cargo test` from inside the directory.
+[workspace]
+
 [package]
-name = "mhrv-tunnel-node"
+name = "rahgozar-tunnel-node"
 version = "0.1.0"
 edition = "2021"
-description = "HTTP tunnel bridge for MasterHttpRelayVPN full mode — bridges HTTP tunnel requests to real TCP connections"
+description = "HTTP tunnel bridge for rahgozar (mhrv-rs) full mode — bridges HTTP tunnel requests from Apps Script to real TCP/UDP connections"
 
 [[bin]]
 name = "tunnel-node"

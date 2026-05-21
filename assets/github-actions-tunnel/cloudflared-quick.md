@@ -74,7 +74,7 @@ Use `rahgozar test` or visit `https://ipleak.net` through your proxy.
 
 ## How It Works
 
-1. GitHub Actions starts a Docker container running `mhrv-tunnel-node` on port
+1. GitHub Actions starts a Docker container running `rahgozar-tunnel-node` on port
    `8080`
 2. `cloudflared` creates a free Quick Tunnel — a temporary `*.trycloudflare.com`
    subdomain that routes to `localhost:8080` on the runner

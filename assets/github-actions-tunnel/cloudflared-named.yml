@@ -11,9 +11,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 360
     steps:
-      - name: Start mhrv-tunnel-node
+      - name: Start rahgozar-tunnel-node
         run: |
-          docker run -d --name mhrv-tunnel \
+          docker run -d --name rahgozar-tunnel \
             -p 8080:8080 \
             -e TUNNEL_AUTH_KEY="${{ secrets.TUNNEL_AUTH_KEY }}" \
             ghcr.io/dazzling-no-more/rahgozar-tunnel-node:latest
@@ -48,5 +48,5 @@ jobs:
       - name: Cleanup
         if: always()
         run: |
-          docker stop mhrv-tunnel || true
+          docker stop rahgozar-tunnel || true
           pkill cloudflared || true

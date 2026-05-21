@@ -56,7 +56,7 @@ URL deployment همون می‌مونه ولی الان Apps Script کد جدی�
 
 ## Template 2: TUNNEL_AUTH_KEY exact spelling
 
-For users showing `tunnel_auth_key not set, using defaults` in `docker logs mhrv-tunnel`:
+For users showing `tunnel_auth_key not set, using defaults` in `docker logs rahgozar-tunnel`:
 
 ```markdown
 مشکلت یادم نرفته! `tunnel_auth_key not set, using defaults` در log‌ها یعنی **اسم env variable هنوز اشتباه است**. می‌خوام دقیق‌تر توضیح بدم چون اسم env vars خیلی sensitive هست:
@@ -84,10 +84,10 @@ TUNNEL_AUTH_KEY
 
 ```bash
 ssh root@your-vps-ip
-docker stop mhrv-tunnel
-docker rm mhrv-tunnel
+docker stop rahgozar-tunnel
+docker rm rahgozar-tunnel
 
-docker run -d --name mhrv-tunnel \
+docker run -d --name rahgozar-tunnel \
   --restart unless-stopped \
   -p 8443:8443 \
   -e TUNNEL_AUTH_KEY="your-secret-here" \
@@ -99,7 +99,7 @@ docker run -d --name mhrv-tunnel \
 **verify بعد از start:**
 
 ```bash
-docker exec mhrv-tunnel env | grep TUNNEL_AUTH_KEY
+docker exec rahgozar-tunnel env | grep TUNNEL_AUTH_KEY
 ```
 
 اگر خروجی این باشه:
@@ -216,7 +216,7 @@ docker --version  # verify
 **۳. tunnel-node container run:**
 
 ```bash
-docker run -d --name mhrv-tunnel \
+docker run -d --name rahgozar-tunnel \
   --restart unless-stopped \
   -p 8443:8443 \
   -e TUNNEL_AUTH_KEY="your-secret-here" \

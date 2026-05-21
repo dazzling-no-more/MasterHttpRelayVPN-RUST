@@ -48,7 +48,7 @@ echo "Your TUNNEL_AUTH_KEY: $SECRET"
 
 # Pull + run.
 docker run -d \
-  --name mhrv-tunnel \
+  --name rahgozar-tunnel \
   --restart unless-stopped \
   -p 8080:8080 \
   -e TUNNEL_AUTH_KEY="$SECRET" \
