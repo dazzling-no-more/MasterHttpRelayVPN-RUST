@@ -47,8 +47,7 @@
       "endpoints": [
         "https://github.com/dazzling-no-more/rahgozar/releases/latest/download/latest.json"
       ],
-      "_comment": "REQUIRED before shipping: run `cd desktop && npx @tauri-apps/cli signer generate` and paste the printed PUBLIC key into the `pubkey` field below (committed). Save the PRIVATE key into `gh secret set TAURI_SIGNING_PRIVATE_KEY` (and optionally TAURI_SIGNING_PRIVATE_KEY_PASSWORD). Until both are done the updater plugin will reject every downloaded `.sig` and silently disable auto-update.",
-      "pubkey": "UNSET-RUN-TAURI-SIGNER-GENERATE"
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDQ2RkQ0NTAxQzMyRkFBMTUKUldRVnFpL0RBVVg5Umh5OWFFRkZKRDRWbnRkdGhDR1YzQUVLUDZtdzVkTlpHOEVYZlFzR041dzMK"
     }
   }
 }
