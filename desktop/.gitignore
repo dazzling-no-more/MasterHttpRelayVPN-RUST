@@ -1,0 +1,31 @@
+# JS toolchain artifacts
+node_modules/
+dist/
+.vite/
+
+# Tauri build artifacts
+src-tauri/target/
+src-tauri/gen/
+
+# Generated icon raster set — derived from `src-tauri/icons/icon.svg`
+# by `npx @tauri-apps/cli icon src-tauri/icons/icon.svg`. We commit
+# only the SVG source; the derived bundle (Tauri's standard PNG /
+# ICO / ICNS set plus the per-platform iOS / Android dirs) is rebuilt
+# on demand. See `desktop/scripts/regen-icons.sh`.
+src-tauri/icons/*.png
+src-tauri/icons/*.ico
+src-tauri/icons/*.icns
+src-tauri/icons/Square*
+src-tauri/icons/StoreLogo*
+src-tauri/icons/ios/
+src-tauri/icons/android/
+!src-tauri/icons/icon.svg
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Editor noise
+.vscode/
+.idea/
+*.swp

@@ -67,10 +67,13 @@ When the release is shipping multiple PRs from contributors, credit each by name
 ```bash
 cargo test --lib 2>&1 | tail -5
 cargo build --release 2>&1 | tail -3
-cargo build --bin rahgozar-ui --release --features ui 2>&1 | tail -3
+# Desktop UI moved to Tauri in v2.4 — build it through its own
+# manifest so the path-dep into the workspace resolves correctly.
+cargo check --manifest-path desktop/src-tauri/Cargo.toml 2>&1 | tail -3
+( cd desktop && npm run check && npm run build ) 2>&1 | tail -5
 ```
 
-All three must succeed. Test count varies by version. All passing is the gate.
+All four must succeed. Test count varies by version. All passing is the gate.
 
 If any contributor PRs were merged in this release, also verify by re-running tests after the merge — sometimes integration with main reveals issues that didn't show in the PR's CI.
 

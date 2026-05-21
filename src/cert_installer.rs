@@ -1,7 +1,17 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::mitm::{CA_DIR, CERT_NAME};
+use crate::mitm::{CA_DIR, CERT_NAME, LEGACY_CERT_NAMES};
+
+/// Iterator over every CA subject name this binary knows about —
+/// the current [`CERT_NAME`] plus every entry in [`LEGACY_CERT_NAMES`].
+/// Used by `remove_ca` and `is_ca_trusted_by_name` so a user
+/// upgrading from a pre-v2.4 install can clean up the old
+/// `MasterHttpRelayVPN` cert in the same Remove click that installs
+/// the new `rahgozar` cert.
+fn known_cert_names() -> impl Iterator<Item = &'static str> {
+    std::iter::once(CERT_NAME).chain(LEGACY_CERT_NAMES.iter().copied())
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum InstallError {
@@ -243,14 +253,29 @@ pub fn remove_ca(base: &Path) -> Result<RemovalOutcome, InstallError> {
     // still contain the CA even after the anchor file is gone. macOS
     // and Windows write directly to their stores, so there's nothing
     // separate to refresh; they rely entirely on the by-name probe.
+    // Sweep both the current and any legacy CA name. A first-time-on-v2.4
+    // user has a `MasterHttpRelayVPN` entry in their trust store from an
+    // older install; expecting them to know they need to click Remove,
+    // then manually find that legacy name in Keychain.app / certmgr.msc
+    // / certutil to clean up, would be hostile UX.
     let platform_ok = match os {
         "macos" => {
-            remove_macos();
+            for name in known_cert_names() {
+                remove_macos(name);
+            }
             true
         }
-        "linux" => remove_linux(),
+        "linux" => {
+            let mut any_ok = false;
+            for name in known_cert_names() {
+                any_ok |= remove_linux(name);
+            }
+            any_ok
+        }
         "windows" => {
-            remove_windows();
+            for name in known_cert_names() {
+                remove_windows(name);
+            }
             true
         }
         other => return Err(InstallError::Unsupported(other.to_string())),
@@ -318,14 +343,30 @@ pub fn is_ca_trusted(path: &Path) -> bool {
 }
 
 /// Path-independent variant of `is_ca_trusted`: queries the OS trust
-/// store by cert name (CERT_NAME) without requiring the on-disk cert
-/// file. Used by `remove_ca` to verify revocation completed even if the
-/// local `ca.crt` was already missing or deleted mid-flight.
+/// store for *any* CA whose subject CN matches the current
+/// [`CERT_NAME`] or any legacy alias. Used by `remove_ca`'s post-
+/// condition — after a remove sweep, neither the current name nor
+/// any legacy name should remain. Returning true on a legacy-only
+/// hit is the right behaviour for that caller: the remove didn't
+/// finish.
+///
+/// **Do not** use this for "is my current on-disk CA trusted?" UI
+/// flows — a stale legacy cert in the store can mask the actual state
+/// of the freshly minted one. Use [`is_ca_trusted_by_subject`] with
+/// the on-disk cert's actual Subject CN for that case.
 pub fn is_ca_trusted_by_name() -> bool {
+    known_cert_names().any(is_ca_trusted_by_subject)
+}
+
+/// Query the OS trust store for a CA with the supplied Subject CN.
+/// Single-name variant of [`is_ca_trusted_by_name`]; intended for UI
+/// status reporting where the question is "is *this specific* cert
+/// trusted?" rather than "is any of our known names trusted?".
+pub fn is_ca_trusted_by_subject(name: &str) -> bool {
     match std::env::consts::OS {
-        "macos" => is_trusted_macos(),
-        "linux" => is_trusted_linux(),
-        "windows" => is_trusted_windows(),
+        "macos" => is_trusted_macos_one(name),
+        "linux" => is_trusted_linux_one(name),
+        "windows" => is_trusted_windows_one(name),
         _ => false,
     }
 }
@@ -394,7 +435,7 @@ fn install_macos(cert_path: &str) -> bool {
 /// exits non-zero for "not found", which is indistinguishable from
 /// real failures, so the final trust state is verified by the caller
 /// via `is_ca_trusted_by_name`.
-fn remove_macos() {
+fn remove_macos(name: &str) {
     let home = std::env::var("HOME").unwrap_or_default();
     let login_kc_db = format!("{}/Library/Keychains/login.keychain-db", home);
     let login_kc = format!("{}/Library/Keychains/login.keychain", home);
@@ -405,28 +446,29 @@ fn remove_macos() {
     };
 
     let res = Command::new("security")
-        .args(["delete-certificate", "-c", CERT_NAME, &login_keychain])
+        .args(["delete-certificate", "-c", name, &login_keychain])
         .status();
     if matches!(res, Ok(s) if s.success()) {
-        tracing::info!("Removed CA from login keychain.");
+        tracing::info!("Removed CA '{}' from login keychain.", name);
     }
 
-    if macos_system_keychain_has() {
+    if macos_system_keychain_has(name) {
         let res = Command::new("sudo")
             .args([
                 "security",
                 "delete-certificate",
                 "-c",
-                CERT_NAME,
+                name,
                 "/Library/Keychains/System.keychain",
             ])
             .status();
         if matches!(res, Ok(s) if s.success()) {
-            tracing::info!("Removed CA from System keychain.");
+            tracing::info!("Removed CA '{}' from System keychain.", name);
         } else {
             tracing::warn!(
-                "System keychain still has the CA and the sudo delete did not \
-                 succeed — re-run with an admin password available."
+                "System keychain still has '{}' and the sudo delete did not \
+                 succeed — re-run with an admin password available.",
+                name,
             );
         }
     }
@@ -436,13 +478,13 @@ fn remove_macos() {
 /// cert? `security find-certificate` against the system keychain path
 /// does not require admin; only `delete-certificate` does. Used to
 /// decide whether to escalate at all.
-fn macos_system_keychain_has() -> bool {
+fn macos_system_keychain_has(name: &str) -> bool {
     let out = Command::new("security")
         .args([
             "find-certificate",
             "-a",
             "-c",
-            CERT_NAME,
+            name,
             "/Library/Keychains/System.keychain",
         ])
         .output();
@@ -452,14 +494,22 @@ fn macos_system_keychain_has() -> bool {
     }
 }
 
+/// True iff a CA with the supplied subject CN is reachable via
+/// `security find-certificate` (covers both login and System
+/// keychains via the global search path).
+fn is_trusted_macos_one(name: &str) -> bool {
+    Command::new("security")
+        .args(["find-certificate", "-a", "-c", name])
+        .output()
+        .map(|o| o.status.success() && !o.stdout.is_empty())
+        .unwrap_or(false)
+}
+
+/// True iff EITHER the current `CERT_NAME` or any legacy name shows
+/// up in the macOS keychains. Probes them in order; first hit
+/// short-circuits.
 fn is_trusted_macos() -> bool {
-    let out = Command::new("security")
-        .args(["find-certificate", "-a", "-c", CERT_NAME])
-        .output();
-    match out {
-        Ok(o) => !o.stdout.is_empty() && o.status.success(),
-        Err(_) => false,
-    }
+    known_cert_names().any(is_trusted_macos_one)
 }
 
 // ---------- Linux ----------
@@ -644,8 +694,8 @@ fn classify_os_release(content: &str) -> String {
 /// Returns `false` if any refresh command failed — callers must then
 /// abort file deletion so a regenerated CA with a fresh keypair can't
 /// mismatch the stale root.
-fn remove_linux() -> bool {
-    let safe_name = CERT_NAME.replace(' ', "_");
+fn remove_linux(name: &str) -> bool {
+    let safe_name = name.replace(' ', "_");
     let anchors: &[(&str, &[&str])] = &[
         (
             "/usr/local/share/ca-certificates",
@@ -704,30 +754,33 @@ fn remove_linux() -> bool {
     all_ok
 }
 
-fn is_trusted_linux() -> bool {
-    // Check both the anchor dirs (what we write into on install) and
-    // the post-extract dirs (where update-ca-certificates / `trust
-    // extract-compat` etc. copy or symlink our PEM after refresh).
-    // Checking the post-extract side catches the "anchor file already
-    // removed but bundle not regenerated" case on a retry — if we only
-    // looked at anchor dirs, a `remove_ca` retry after a prior refresh
-    // failure could declare success while the merged bundle still
-    // contains our stale root.
-    let dirs = [
-        "/usr/local/share/ca-certificates",
-        "/etc/pki/ca-trust/source/anchors",
-        "/etc/ca-certificates/trust-source/anchors",
-        // Post-extract locations:
-        "/etc/ssl/certs",
-        "/etc/pki/ca-trust/extracted/pem/directory-hash",
-        "/etc/ca-certificates/extracted/cadir",
-    ];
-    for d in dirs {
+/// Anchor + post-extract directories the Linux trust-store touches.
+/// Centralised so `is_trusted_linux_one` and `is_trusted_linux` (the
+/// all-known-names sweep) read from the same list.
+const LINUX_TRUST_DIRS: &[&str] = &[
+    "/usr/local/share/ca-certificates",
+    "/etc/pki/ca-trust/source/anchors",
+    "/etc/ca-certificates/trust-source/anchors",
+    // Post-extract locations — see is_trusted_linux's docstring for
+    // the "retry after failed refresh" rationale.
+    "/etc/ssl/certs",
+    "/etc/pki/ca-trust/extracted/pem/directory-hash",
+    "/etc/ca-certificates/extracted/cadir",
+];
+
+/// True iff any file in the Linux trust-store anchor + post-extract
+/// dirs has a name containing the supplied substring (lowercased).
+/// Substring match (not equality) is intentional: distros mangle the
+/// installed filename with prefixes (`ca-cert-rahgozar.pem`) and
+/// `safe_name` replacements that vary by tool, so an exact-match
+/// check would miss legitimate hits.
+fn is_trusted_linux_one(name: &str) -> bool {
+    let needle = name.to_lowercase();
+    for d in LINUX_TRUST_DIRS {
         if let Ok(entries) = std::fs::read_dir(d) {
             for e in entries.flatten() {
-                let name = e.file_name();
-                let s = name.to_string_lossy().to_lowercase();
-                if s.contains("masterhttprelayvpn") || s.contains("mhrv") {
+                let s = e.file_name().to_string_lossy().to_lowercase();
+                if s.contains(&needle) {
                     return true;
                 }
             }
@@ -736,31 +789,52 @@ fn is_trusted_linux() -> bool {
     false
 }
 
-// ---------- Windows ----------
-
-/// Check whether our CA is present in the Windows Trusted Root store.
-/// Looks in both the user store (no admin required to install) and the
-/// machine store. Returns true if `certutil -store ... MasterHttpRelayVPN`
-/// finds a match. Issue #13 follow-up: previously this always returned
-/// false on Windows, so the Check-CA button was misleading users into
-/// reinstalling a cert that was already trusted.
-fn is_trusted_windows() -> bool {
-    windows_store_has(true) || windows_store_has(false)
+/// Walks the Linux trust-store anchor + post-extract dirs looking
+/// for any of our known cert names (current + legacy) OR the
+/// historical `"mhrv"` short-form some users had hand-installed
+/// pre-fork. See `is_trusted_linux_one` for the per-name sub-check.
+fn is_trusted_linux() -> bool {
+    // Check current + legacy via the per-name helper, then the extra
+    // legacy short-form that doesn't correspond to a "real" cert
+    // subject (no `mhrv` cert was ever minted under that exact name
+    // — it's a filename heuristic).
+    if known_cert_names().any(is_trusted_linux_one) {
+        return true;
+    }
+    is_trusted_linux_one("mhrv")
 }
 
-/// Query a single Windows Trusted Root store for our CA.
-/// `user = true` hits the current-user store (no admin needed);
-/// `user = false` hits the machine store. `certutil -store Root <name>`
-/// prints the matching cert entries on success and exits non-zero with
-/// "Not found" if nothing matches — we also check stdout for the cert
-/// name because certutil in some locales returns 0 on no-match with
-/// empty output.
-fn windows_store_has(user: bool) -> bool {
+// ---------- Windows ----------
+
+/// Single-name variant of `is_trusted_windows`: probes both the
+/// per-user (no admin) and machine Trusted Root stores for the
+/// supplied subject CN.
+fn is_trusted_windows_one(name: &str) -> bool {
+    windows_store_has(true, name) || windows_store_has(false, name)
+}
+
+/// Check whether any of our known CAs (current + legacy) live in the
+/// Windows Trusted Root stores. See `is_trusted_windows_one` for the
+/// per-name probe. Issue #13 follow-up: previously this always
+/// returned false on Windows, so the Check-CA button was misleading
+/// users into reinstalling a cert that was already trusted.
+fn is_trusted_windows() -> bool {
+    known_cert_names().any(is_trusted_windows_one)
+}
+
+/// Query a single Windows Trusted Root store for the supplied CA
+/// name. `user = true` hits the current-user store (no admin needed);
+/// `user = false` hits the machine store. `certutil -store Root
+/// <name>` prints the matching cert entries on success and exits
+/// non-zero with "Not found" if nothing matches — we also check
+/// stdout for the cert name because certutil in some locales returns
+/// 0 on no-match with empty output.
+fn windows_store_has(user: bool, name: &str) -> bool {
     let mut args: Vec<&str> = Vec::new();
     if user {
         args.push("-user");
     }
-    args.extend(["-store", "Root", CERT_NAME]);
+    args.extend(["-store", "Root", name]);
     let out = Command::new("certutil").args(&args).output();
     match out {
         Ok(o) => {
@@ -768,7 +842,7 @@ fn windows_store_has(user: bool) -> bool {
             o.status.success()
                 && stdout
                     .to_ascii_lowercase()
-                    .contains(&CERT_NAME.to_ascii_lowercase())
+                    .contains(&name.to_ascii_lowercase())
         }
         Err(_) => false,
     }
@@ -805,38 +879,48 @@ fn install_windows(cert_path: &str) -> bool {
 /// error that `-delstore Root` would print when the cert was only ever
 /// installed in the per-user store (the default path for non-admin
 /// runs). Final state is verified by the caller via `is_ca_trusted`.
-fn remove_windows() {
+fn remove_windows(name: &str) {
     let mut any = false;
 
-    if windows_store_has(true) {
+    if windows_store_has(true, name) {
         let res = Command::new("certutil")
-            .args(["-delstore", "-user", "Root", CERT_NAME])
+            .args(["-delstore", "-user", "Root", name])
             .status();
         if matches!(res, Ok(s) if s.success()) {
-            tracing::info!("Removed CA from Windows user Trusted Root store.");
-            any = true;
-        } else {
-            tracing::warn!("failed to remove CA from Windows user Trusted Root store");
-        }
-    }
-
-    if windows_store_has(false) {
-        let res = Command::new("certutil")
-            .args(["-delstore", "Root", CERT_NAME])
-            .status();
-        if matches!(res, Ok(s) if s.success()) {
-            tracing::info!("Removed CA from Windows machine Trusted Root store.");
+            tracing::info!(
+                "Removed CA '{}' from Windows user Trusted Root store.",
+                name
+            );
             any = true;
         } else {
             tracing::warn!(
-                "failed to remove CA from Windows machine Trusted Root store \
-                 (run as administrator to complete)"
+                "failed to remove CA '{}' from Windows user Trusted Root store",
+                name,
+            );
+        }
+    }
+
+    if windows_store_has(false, name) {
+        let res = Command::new("certutil")
+            .args(["-delstore", "Root", name])
+            .status();
+        if matches!(res, Ok(s) if s.success()) {
+            tracing::info!(
+                "Removed CA '{}' from Windows machine Trusted Root store.",
+                name,
+            );
+            any = true;
+        } else {
+            tracing::warn!(
+                "failed to remove CA '{}' from Windows machine Trusted Root store \
+                 (run as administrator to complete)",
+                name,
             );
         }
     }
 
     if !any {
-        tracing::info!("No MITM CA found in Windows Trusted Root stores.");
+        tracing::debug!("No '{}' entry in Windows Trusted Root stores.", name);
     }
 }
 
@@ -1178,9 +1262,6 @@ fn remove_nss_stores() -> NssReport {
     disable_mozilla_enterprise_roots();
 
     if !has_nss_certutil() {
-        // Only warn if there's actually an NSS store we can see — if the
-        // user never ran Firefox/Chrome on this machine there's nothing
-        // to clean up either way.
         let profiles = mozilla_family_profile_dirs();
         let chrome_present: bool;
         #[cfg(target_os = "linux")]
@@ -1197,10 +1278,12 @@ fn remove_nss_stores() -> NssReport {
         if stores_present {
             tracing::warn!(
                 "NSS certutil not found — cannot automatically remove CA from \
-                 Firefox/LibreWolf/Chrome NSS stores. Remove `MasterHttpRelayVPN` \
-                 manually via each browser's certificate settings, or install NSS \
-                 tools (`libnss3-tools` on Debian/Ubuntu, `nss-tools` on Fedora/RHEL) \
-                 and re-run --remove-cert."
+                 Firefox/LibreWolf/Chrome NSS stores. Remove `{}` (and any legacy \
+                 entries: {:?}) manually via each browser's certificate settings, \
+                 or install NSS tools (`libnss3-tools` on Debian/Ubuntu, \
+                 `nss-tools` on Fedora/RHEL) and re-run --remove-cert.",
+                CERT_NAME,
+                LEGACY_CERT_NAMES,
             );
         }
         return NssReport {
@@ -1210,12 +1293,19 @@ fn remove_nss_stores() -> NssReport {
         };
     }
 
+    // Each (profile, name) pair counts as its own attempt. A profile
+    // that has neither the new name nor any legacy entry returns
+    // success on both probes (idempotent contract), so the report
+    // numbers stay accurate to "we tried every store × every known
+    // name and the union came out clean".
     let mut report = NssReport::default();
 
     for p in mozilla_family_profile_dirs() {
-        report.tried += 1;
-        if remove_nss_in_profile(&p) {
-            report.ok += 1;
+        for name in known_cert_names() {
+            report.tried += 1;
+            if remove_nss_in_profile(&p, name) {
+                report.ok += 1;
+            }
         }
     }
 
@@ -1223,30 +1313,34 @@ fn remove_nss_stores() -> NssReport {
     {
         if let Some(nssdb) = chrome_nssdb_path() {
             if nssdb.join("cert9.db").exists() || nssdb.join("cert8.db").exists() {
-                report.tried += 1;
                 let dir_arg = format!("sql:{}", nssdb.display());
-                if remove_nss_in_dir(&dir_arg) {
-                    report.ok += 1;
-                    tracing::info!(
-                        "Removed CA from Chrome/Chromium NSS DB: {}",
-                        nssdb.display()
-                    );
+                for name in known_cert_names() {
+                    report.tried += 1;
+                    if remove_nss_in_dir(&dir_arg, name) {
+                        report.ok += 1;
+                    }
                 }
+                tracing::info!(
+                    "Swept Chrome/Chromium NSS DB at {} for all known CA names.",
+                    nssdb.display()
+                );
             }
         }
     }
 
     if report.tried > 0 {
         if report.ok == report.tried {
-            tracing::info!("Removed CA from {} NSS store(s).", report.ok);
+            tracing::info!("Cleaned {} NSS-store entries.", report.ok);
         } else {
             tracing::warn!(
-                "NSS cleanup partial: {}/{} stores updated. If Firefox/LibreWolf/Chrome \
-                 was running, close it and re-run --remove-cert. Otherwise \
-                 remove `MasterHttpRelayVPN` manually via each browser's cert \
-                 settings.",
+                "NSS cleanup partial: {}/{} probes succeeded. If \
+                 Firefox/LibreWolf/Chrome was running, close it and re-run \
+                 --remove-cert. Otherwise remove `{}` (and any legacy entries: \
+                 {:?}) manually via each browser's cert settings.",
                 report.ok,
-                report.tried
+                report.tried,
+                CERT_NAME,
+                LEGACY_CERT_NAMES,
             );
         }
     }
@@ -1262,9 +1356,9 @@ fn remove_nss_stores() -> NssReport {
 /// an incomplete revocation the user can't see, and NSS would keep
 /// trusting the stale root. We parse stderr: only the specific
 /// "could not find cert" message means absent.
-fn remove_nss_in_dir(dir_arg: &str) -> bool {
+fn remove_nss_in_dir(dir_arg: &str, name: &str) -> bool {
     let list = Command::new("certutil")
-        .args(["-L", "-n", CERT_NAME, "-d", dir_arg])
+        .args(["-L", "-n", name, "-d", dir_arg])
         .output();
     match list {
         Ok(o) if o.status.success() => {
@@ -1273,7 +1367,7 @@ fn remove_nss_in_dir(dir_arg: &str) -> bool {
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
             if is_nss_not_found(&stderr) {
-                tracing::debug!("NSS {}: no `{}` entry — already clean", dir_arg, CERT_NAME);
+                tracing::debug!("NSS {}: no `{}` entry — already clean", dir_arg, name);
                 return true;
             }
             tracing::warn!(
@@ -1290,20 +1384,21 @@ fn remove_nss_in_dir(dir_arg: &str) -> bool {
     }
 
     let res = Command::new("certutil")
-        .args(["-D", "-n", CERT_NAME, "-d", dir_arg])
+        .args(["-D", "-n", name, "-d", dir_arg])
         .output();
     match res {
         Ok(o) if o.status.success() => true,
         Ok(o) => {
             tracing::warn!(
-                "NSS {}: delete failed: {}",
+                "NSS {}: delete '{}' failed: {}",
                 dir_arg,
+                name,
                 String::from_utf8_lossy(&o.stderr).trim()
             );
             false
         }
         Err(e) => {
-            tracing::warn!("NSS {}: delete exec failed: {}", dir_arg, e);
+            tracing::warn!("NSS {}: delete '{}' exec failed: {}", dir_arg, name, e);
             false
         }
     }
@@ -1319,7 +1414,7 @@ fn is_nss_not_found(stderr: &str) -> bool {
     s.contains("could not find cert") || s.contains("could not find a certificate")
 }
 
-fn remove_nss_in_profile(profile: &Path) -> bool {
+fn remove_nss_in_profile(profile: &Path, name: &str) -> bool {
     let prefix = if profile.join("cert9.db").exists() {
         "sql:"
     } else if profile.join("cert8.db").exists() {
@@ -1328,7 +1423,7 @@ fn remove_nss_in_profile(profile: &Path) -> bool {
         return false;
     };
     let dir_arg = format!("{}{}", prefix, profile.display());
-    remove_nss_in_dir(&dir_arg)
+    remove_nss_in_dir(&dir_arg, name)
 }
 
 /// Undo `enable_mozilla_enterprise_roots`: for each profile, strip the

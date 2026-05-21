@@ -1,0 +1,28 @@
+<!--
+  Source of truth for every rahgozar icon (Tauri, Android, Windows .ico,
+  macOS .icns). Translated 1:1 from the Android vector drawable at
+  `android/app/src/main/res/drawable/ic_launcher_foreground.xml` so the
+  three platforms ship the identical glyph. Hand-rolled rasterisers used
+  to approximate the arch top with half-ellipses; SVG keeps the original
+  cubic Bézier so the silhouette matches the Android source exactly.
+
+  Regenerate the platform raster bundles from this file with:
+    cd desktop && npx @tauri-apps/cli icon src-tauri/icons/icon.svg
+-->
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 108 108"
+     width="108" height="108">
+  <!-- Background rectangle (Android adaptive icon's launcher tile). Solid
+       black mirrors the `@android:color/black` background in
+       `mipmap-anydpi-v26/ic_launcher.xml`. Tauri's icon command extracts
+       just the foreground for some targets (e.g. macOS) so the bg only
+       shows up on platforms that paint the full square. -->
+  <rect width="108" height="108" fill="#000000"/>
+
+  <!-- Arch frame. Two subpaths with `fill-rule="evenodd"`:
+       outer arch silhouette + inner doorway opening = visible frame. -->
+  <path fill="#1ABC9C"
+        fill-rule="evenodd"
+        d="M27,80 L27,47 C27,28 81,28 81,47 L81,80 Z
+           M41,80 L41,57 C41,42 67,42 67,57 L67,80 Z"/>
+</svg>

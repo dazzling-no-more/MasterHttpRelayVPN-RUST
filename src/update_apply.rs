@@ -390,8 +390,10 @@ mod desktop {
                 std::os::unix::fs::symlink(&target, &to)?;
             } else {
                 std::fs::copy(&from, &to)?;
-                // Preserve mode (rcgen / build-app.sh chmod +x's the inner
-                // binary; we want that to survive the copy).
+                // Preserve mode — release archives ship the binary with
+                // the executable bit set (the CI packaging step does an
+                // explicit `chmod +x` after `cp`), and we want that to
+                // survive the copy here.
                 use std::os::unix::fs::PermissionsExt;
                 let mode = std::fs::metadata(&from)?.permissions().mode();
                 let _ = std::fs::set_permissions(&to, std::fs::Permissions::from_mode(mode));
@@ -496,10 +498,11 @@ mod desktop {
     /// Walk `root` for regular files whose name matches `target_name` or
     /// its stem (handles archives that ship the binary without a `.exe`
     /// extension, or with one when current_exe doesn't). Errors if more
-    /// than one match — defensive against future multi-binary archives
-    /// where multiple files could plausibly satisfy the same name (e.g.
-    /// `rahgozar-ui` shipped at root AND inside an `extras/` dir would
-    /// otherwise pick whichever `read_dir` returned first).
+    /// than one match — defensive against multi-binary archives where
+    /// several files could plausibly satisfy the same name (e.g. the
+    /// target shipped both at the archive root AND inside an `extras/`
+    /// subdir would otherwise pick whichever `read_dir` returned
+    /// first).
     fn find_binary(root: &Path, target_name: &str) -> Result<PathBuf, ApplyError> {
         let stem = Path::new(target_name)
             .file_stem()
@@ -789,14 +792,19 @@ mod desktop {
         use super::*;
         use std::io::Write;
 
+        // The auto-updater (this module) drives the CLI's `rahgozar`
+        // binary's update flow. Tests use that name as the fixture so
+        // the test text reads close to what the helper sees in
+        // production. The Tauri desktop UI uses its own update story
+        // via `tauri-plugin-updater`, not this code path.
         #[test]
         fn staged_path_appends_new() {
-            let p = Path::new("/tmp/foo/rahgozar-ui");
-            assert_eq!(staged_path(p), PathBuf::from("/tmp/foo/rahgozar-ui.new"));
-            let p = Path::new("C:/x/rahgozar-ui.exe");
+            let p = Path::new("/tmp/foo/rahgozar");
+            assert_eq!(staged_path(p), PathBuf::from("/tmp/foo/rahgozar.new"));
+            let p = Path::new("C:/x/rahgozar.exe");
             assert_eq!(
                 staged_path(p).file_name().unwrap().to_string_lossy(),
-                "rahgozar-ui.exe.new"
+                "rahgozar.exe.new"
             );
         }
 
@@ -805,27 +813,27 @@ mod desktop {
             let dir = tempfile::tempdir().unwrap();
             let nested = dir.path().join("rahgozar-1.0");
             std::fs::create_dir_all(&nested).unwrap();
-            let bin = nested.join("rahgozar-ui");
+            let bin = nested.join("rahgozar");
             std::fs::write(&bin, b"#!/bin/sh\n").unwrap();
             // current_exe has .exe, archive has bare name → still match by stem.
-            let found = find_binary(dir.path(), "rahgozar-ui.exe").unwrap();
+            let found = find_binary(dir.path(), "rahgozar.exe").unwrap();
             assert_eq!(found, bin);
             // current_exe has bare name, archive has bare name → match.
-            let found = find_binary(dir.path(), "rahgozar-ui").unwrap();
+            let found = find_binary(dir.path(), "rahgozar").unwrap();
             assert_eq!(found, bin);
         }
 
         #[test]
         fn find_binary_errors_on_ambiguous_match() {
             let dir = tempfile::tempdir().unwrap();
-            // Two files would both satisfy the stem `rahgozar-ui`: one at root
-            // and one inside a subdir. We want the function to refuse rather
-            // than silently pick by `read_dir` order.
-            std::fs::write(dir.path().join("rahgozar-ui"), b"a").unwrap();
+            // Two files would both satisfy the stem `rahgozar`: one at
+            // root and one inside a subdir. We want the function to
+            // refuse rather than silently pick by `read_dir` order.
+            std::fs::write(dir.path().join("rahgozar"), b"a").unwrap();
             let sub = dir.path().join("inner");
             std::fs::create_dir_all(&sub).unwrap();
-            std::fs::write(sub.join("rahgozar-ui"), b"b").unwrap();
-            let res = find_binary(dir.path(), "rahgozar-ui");
+            std::fs::write(sub.join("rahgozar"), b"b").unwrap();
+            let res = find_binary(dir.path(), "rahgozar");
             assert!(matches!(res, Err(ApplyError::AmbiguousBinary(_))));
         }
 

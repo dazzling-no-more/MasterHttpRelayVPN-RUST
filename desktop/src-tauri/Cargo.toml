@@ -1,0 +1,71 @@
+[package]
+name = "rahgozar-desktop"
+version = "2.4.0"
+description = "rahgozar — DPI bypass via Apps Script relay (Tauri desktop UI)"
+authors = ["dazzling-no-more"]
+license = "MIT"
+edition = "2021"
+rust-version = "1.77.2"
+
+[lib]
+# Tauri 2 wants the app exposed as a library so the same code can also
+# back mobile (iOS / Android) builds in a future cycle. The CLI's
+# `cargo tauri dev/build` calls into `run()` from this lib via the bin
+# below.
+name = "rahgozar_desktop_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "rahgozar-desktop"
+path = "src/main.rs"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+# tauri-plugin-updater: handles the "is there a newer release?" check,
+# download + ed25519-signature verification, and install-and-restart
+# flow. Configured in `tauri.conf.json::plugins.updater` (endpoint URL +
+# public key) — see `lib.rs::run` for the plugin init call.
+tauri-plugin-updater = "2"
+# tauri-plugin-process: exposes `relaunch()` to the frontend so the
+# updater flow can bounce the app after installing a new binary on
+# Windows / Linux (macOS auto-relaunches and the call is a no-op
+# there).
+tauri-plugin-process = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Cert-display helpers (used by the MITM CA card on the Status tab):
+#   sha2          — SHA-256 over the cert's DER bytes for the fingerprint
+#                   the user verifies before clicking "Install CA".
+#   x509-parser   — pull the Subject CN out of the same DER so the
+#                   confirm dialog reads e.g. "Subject: rahgozar MITM CA"
+#                   instead of just a hex blob.
+#   rustls-pemfile — decode the PEM the proxy writes to `ca/ca.crt`
+#                    into the DER both of the above need.
+# These are scoped to this crate (not the rahgozar core lib) because
+# they're UI-display-only — the lib's `MitmCertManager` already has
+# everything it needs to mint + load the CA for the proxy itself.
+sha2 = "0.10"
+x509-parser = "0.16"
+rustls-pemfile = "2"
+
+# Path-dep into the core rahgozar crate (config models, proxy server,
+# update check, profile store, etc.). Lives in the parent workspace so
+# this resolves without registry indirection.
+rahgozar = { path = "../.." }
+
+# Async runtime — rahgozar's proxy is tokio-based, and we need a
+# multi-thread runtime to spawn it alongside Tauri's event loop.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[features]
+# Default Tauri release feature — embeds the frontend assets into the
+# binary at build time so the shipped exe doesn't need `dist/` next to
+# it.
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]

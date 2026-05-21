@@ -23,7 +23,29 @@ pub enum MitmError {
     Invalid(String),
 }
 
-pub const CERT_NAME: &str = "MasterHttpRelayVPN";
+/// Subject Common Name stamped on the MITM CA when it's minted, and
+/// the name the install / remove / trust-check paths look for in the
+/// OS trust store.
+///
+/// Renamed from `"MasterHttpRelayVPN"` (the upstream `mhrv-rs` name)
+/// to `"rahgozar"` for the v2.4 release. Existing users may have a
+/// CA installed in their trust store under the old name — see
+/// [`LEGACY_CERT_NAMES`] for the compat shim that lets the
+/// `remove_ca` path clean up both the new and legacy entries in one
+/// click.
+pub const CERT_NAME: &str = "rahgozar";
+
+/// CA subject names this code base used in previous releases. Listed
+/// so `cert_installer::remove_ca` can sweep them out alongside the
+/// current `CERT_NAME`, and so `is_ca_trusted_by_name` reports an
+/// existing legacy CA as still-trusted (avoiding a confusing "not
+/// installed" badge on an install that's technically still working).
+///
+/// Don't add entries here speculatively — every name on this list
+/// gets a trust-store query on every install/remove probe, so the
+/// list directly bounds the worst-case latency of those paths.
+pub const LEGACY_CERT_NAMES: &[&str] = &["MasterHttpRelayVPN"];
+
 pub const CA_DIR: &str = "ca";
 pub const CA_KEY_FILE: &str = "ca/ca.key";
 pub const CA_CERT_FILE: &str = "ca/ca.crt";

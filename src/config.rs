@@ -57,13 +57,17 @@ impl ScriptId {
     }
 }
 
-/// Top-level config schema. The `rahgozar-ui` bin constructs this via
-/// struct literal in `src/bin/ui.rs::to_config()`, so every field must
-/// stay accessible to the same-package bin crate. (A `#[non_exhaustive]`
-/// marker was tried earlier to "future-proof for downstream consumers,"
-/// but bin-vs-lib are separate crates from rustc's view and that broke
-/// the UI build with E0639. No external crates depend on us as a
-/// library anyway — `rahgozar` isn't published to crates.io.)
+/// Top-level config schema. Every field is `pub` so the Tauri desktop
+/// crate (`desktop/src-tauri`) — a separate package that path-deps on
+/// this lib via the workspace — can read each one for its `get_config`
+/// command and reconcile updates from the Tunnel form. The earlier
+/// egui binary lived in this same package so accessibility wasn't a
+/// question; now we're across a crate boundary, and a `#[non_exhaustive]`
+/// marker (tried once for "future-proofing for downstream consumers")
+/// would re-introduce the same E0639 build error there. No external
+/// crates depend on us as a library — `rahgozar` isn't published to
+/// crates.io — so the `non_exhaustive` annotation buys us nothing
+/// real anyway.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Config {
     pub mode: String,
@@ -761,12 +765,11 @@ fn default_google_ip_validation() -> bool {
     true
 }
 
-/// Source of truth for `heartbeat_enabled`'s default. Public so the
-/// UI side (`src/bin/ui.rs`'s `FormState` defaults + `ConfigWire`
-/// skip-if-default predicate) can reference this value instead of
-/// re-encoding the literal — a config-only tweak here would
-/// otherwise silently drift the UI save behaviour away from the
-/// runtime default.
+/// Source of truth for `heartbeat_enabled`'s default. Public so any
+/// UI surface that needs to emit a "current default" hint can pull
+/// the value from here instead of re-encoding the literal — a
+/// config-only tweak here would otherwise silently drift caller
+/// behaviour away from the runtime default.
 pub fn default_heartbeat_enabled() -> bool {
     true
 }
@@ -1883,11 +1886,14 @@ mod rt_tests {
     }
 
     /// Unknown / future config.json keys captured into `extras` round-trip
-    /// through serde load. Sibling tests on the write side
-    /// (`config_wire_serializes_extras` /
-    /// `config_wire_serializes_previously_dropped_modeled_fields` /
-    /// `config_wire_omits_default_values`) live in `src/bin/ui.rs`
-    /// since `ConfigWire` is defined there.
+    /// through serde load. The write-side equivalents (preserving extras
+    /// across a save, omitting default values from the wire form) used
+    /// to live next to `ConfigWire` in the egui binary; since the
+    /// desktop UI moved to Tauri (which round-trips via raw
+    /// `serde_json::Value` overlay, see
+    /// `desktop/src-tauri/src/commands.rs::save_config`) those write
+    /// invariants are instead exercised by integration tests in the
+    /// Tauri crate.
     #[test]
     fn unknown_fields_captured_into_extras() {
         let json = r#"{

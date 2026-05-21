@@ -9,39 +9,45 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
 
 /*
- * Visual theme tuned to match the desktop `rahgozar-ui` eframe UI pixel-for-pixel
- * where Compose semantics allow. The canonical source lives in `src/bin/ui.rs`
- * — these constants are the same `egui::Color32` values, re-expressed as
- * `Color(0xAARRGGBB)`. If you change a value here and not there (or vice
- * versa) the two builds will drift visibly.
+ * Android-specific dark theme.
+ *
+ * History: until v2.3 these constants were kept in lockstep with the
+ * desktop egui binary's hand-rolled palette so a user moving between
+ * Android + desktop saw the same brand. The desktop UI moved to Tauri
+ * in v2.4 (see `desktop/src/app.css`), which uses a different palette
+ * driven by Tailwind design tokens — there is no longer a desktop
+ * source to mirror.
+ *
+ * Why not just adopt the Tauri palette: the legacy values below are
+ * tested visually across the Android tablet + small-phone form
+ * factors, and changing them risks contrast / readability regressions
+ * on devices we can't easily re-test. We can revisit if the brand
+ * drift between platforms becomes a real complaint.
  *
  * Deliberate choices:
- *   - ALWAYS dark. The desktop UI is always dark (`egui::Visuals::dark()`),
- *     so Android follows. Neither light mode nor Android 12+ dynamic color
- *     is respected — matching the desktop trumps blending with the user's
- *     wallpaper here.
- *   - Card corners 6.dp, button corners 4.dp, matching the eframe
- *     `.rounding(6.0)` / `.rounding(4.0)` pairs in the desktop code.
+ *   - ALWAYS dark. Neither light mode nor Android 12+ dynamic color
+ *     is respected — consistent appearance across the user base
+ *     trumps blending with the wallpaper here.
+ *   - Card corners 6.dp, button corners 4.dp — kept for visual
+ *     continuity with previous releases.
  */
 
-// Exact palette from src/bin/ui.rs (line 508+).
-// ACCENT / ACCENT_HOVER
+// ACCENT / ACCENT_HOVER — clickable accents.
 val AccentBlue = Color(0xFF4678B4)
 val AccentHover = Color(0xFF5A91CD)
 
-// OK_GREEN / ERR_RED
+// Status indicators.
 val OkGreen = Color(0xFF50B464)
 val ErrRed = Color(0xFFDC6E6E)
 
-// Card fill and stroke used by section containers in the desktop UI.
+// Card fill and stroke used by section containers.
 val CardFill = Color(0xFF1C1E22)
 val CardStroke = Color(0xFF32363C)
 
-// Backdrop slightly darker than cards so containers pop off the page —
-// egui's default dark background sits right around this value.
+// Backdrop slightly darker than cards so containers pop off the page.
 val BgDark = Color(0xFF111317)
 
-// Text shades — `egui::Color32::from_gray(200)` etc.
+// Text shades.
 val TextPrimary = Color(0xFFC8C8C8)
 val TextSecondary = Color(0xFF8C8C8C)
 val TextLabel = Color(0xFFB4B4B4)

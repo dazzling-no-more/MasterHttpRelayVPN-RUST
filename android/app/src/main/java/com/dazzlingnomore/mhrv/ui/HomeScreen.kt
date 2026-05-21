@@ -1336,8 +1336,11 @@ private fun ProbeBadge(state: ProbeState) {
 
         is ProbeState.Ok -> {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                // Same green the desktop UI uses for OK status (OK_GREEN
-                // in src/bin/ui.rs line 510) — kept in sync via Theme.kt.
+                // Status-OK green from the Android palette. Used to be
+                // kept in sync with the legacy desktop egui binary's
+                // OK_GREEN; the desktop moved to Tauri in v2.4 and
+                // Android now owns its palette independently
+                // (see ui/theme/Theme.kt).
                 Icon(
                     Icons.Default.CheckCircle,
                     null,

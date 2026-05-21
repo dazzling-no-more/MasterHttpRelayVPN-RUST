@@ -211,22 +211,6 @@ jobs:
           key: ${{ matrix.target }}-${{ matrix.rust_toolchain || 'stable' }}
           cache-bin: "false"
 
-      # eframe needs a few system libs on Linux for window management, keyboard,
-      # and OpenGL/X11/Wayland. Gated to GitHub-hosted runners only — the
-      # self-hosted runners pre-install all of these once at setup time, and
-      # letting multiple parallel matrix jobs race on `sudo apt-get install`
-      # fights over /var/lib/apt/lists/lock and fails them all.
-      - name: Install Linux eframe system deps
-        if: runner.os == 'Linux' && runner.environment == 'github-hosted'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libxkbcommon-dev \
-            libwayland-dev \
-            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libx11-dev \
-            libgl1-mesa-dev libglib2.0-dev libgtk-3-dev
-
       # Cross-compile toolchains. Same story as above — gated to hosted
       # runners; self-hosted has gcc-aarch64-linux-gnu + gcc-arm-linux-gnueabihf
       # pre-installed, and the linker entries live in
@@ -359,13 +343,11 @@ jobs:
           # status (success vs continue-on-error path).
           exit $rc
 
-      # UI build: we try to build the UI binary on every platform. If it fails
-      # on cross-compile for linux-arm64 (missing arm64 system libs cross),
-      # we still ship the CLI. We also skip the UI on musl targets (OpenWRT etc.
-      # are headless, bundling X11 makes no sense).
-      - name: Build UI
-        if: matrix.target != 'aarch64-unknown-linux-gnu' && matrix.target != 'arm-unknown-linux-gnueabihf' && !endsWith(matrix.target, '-linux-musl')
-        run: cargo build --release --target ${{ matrix.target }} --features ui --bin rahgozar-ui
+      # NB: the egui-based `rahgozar-ui` build was retired in v2.4 — the
+      # desktop UI moved to Tauri (see the `desktop-build` job below).
+      # CLI-only archives are now what this matrix produces; Tauri
+      # installers (Win .msi, macOS .dmg, Linux AppImage) come from
+      # the separate job and land on the same release page.
 
       - name: Package (unix)
         if: runner.os != 'Windows'
@@ -373,40 +355,18 @@ jobs:
           mkdir -p dist
           cp target/${{ matrix.target }}/release/rahgozar dist/rahgozar
           chmod +x dist/rahgozar
-          if [ -f target/${{ matrix.target }}/release/rahgozar-ui ]; then
-            cp target/${{ matrix.target }}/release/rahgozar-ui dist/rahgozar-ui
-            chmod +x dist/rahgozar-ui
-          fi
-          # OpenWRT / musl archives get the procd init script instead of run.sh,
-          # since routers don't have a CA to install and run headless via procd.
+          # OpenWRT / musl archives get the procd init script so routers
+          # can start the headless CLI under procd. Everything else just
+          # ships the CLI binary — the previous run.sh / run.bat / .command
+          # launchers existed to spawn the egui UI alongside, which is
+          # gone in v2.4 (replaced by the Tauri installer from the
+          # `desktop` job).
           case "${{ matrix.target }}" in
             *-linux-musl)
               cp assets/openwrt/rahgozar.init dist/rahgozar.init
               chmod +x dist/rahgozar.init
               ;;
-            *)
-              cp assets/launchers/run.sh dist/run.sh
-              chmod +x dist/run.sh
-              if [ "${{ runner.os }}" = "macOS" ]; then
-                cp assets/launchers/run.command dist/run.command
-                chmod +x dist/run.command
-              fi
-              ;;
           esac
-
-      - name: Build macOS .app bundle
-        if: runner.os == 'macOS'
-        run: |
-          # Tag push: $GITHUB_REF == "refs/tags/v1.4.0", strip "refs/tags/v".
-          # workflow_dispatch: inputs.version comes in as e.g. "1.4.0".
-          # Fall back to ref_name (the bare branch/tag name) and strip a
-          # possible leading "v" so both paths produce the bare version.
-          VER="${{ inputs.version || github.ref_name }}"
-          VER="${VER#v}"
-          ./assets/macos/build-app.sh dist/rahgozar-ui "$VER" dist
-          # Make a clean zip of just the .app for the release
-          cd dist
-          zip -qry "${{ matrix.name }}-app.zip" rahgozar.app
 
       - name: Package (windows)
         if: runner.os == 'Windows'
@@ -414,10 +374,6 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target/${{ matrix.target }}/release/rahgozar.exe dist/rahgozar.exe
-          if (Test-Path target/${{ matrix.target }}/release/rahgozar-ui.exe) {
-            Copy-Item target/${{ matrix.target }}/release/rahgozar-ui.exe dist/rahgozar-ui.exe
-          }
-          Copy-Item assets/launchers/run.bat dist/run.bat
 
       - name: Make archive
         shell: bash
@@ -425,16 +381,13 @@ jobs:
           cd dist
           case "${{ matrix.target }}" in
             *-pc-windows-*)
-              7z a -tzip "${{ matrix.name }}.zip" rahgozar.exe rahgozar-ui.exe run.bat
-              ;;
-            *-apple-darwin)
-              tar czf "${{ matrix.name }}.tar.gz" rahgozar rahgozar-ui run.sh run.command
+              7z a -tzip "${{ matrix.name }}.zip" rahgozar.exe
               ;;
             *-linux-musl)
               tar czf "${{ matrix.name }}.tar.gz" rahgozar rahgozar.init
               ;;
             *)
-              tar czf "${{ matrix.name }}.tar.gz" rahgozar rahgozar-ui run.sh 2>/dev/null || tar czf "${{ matrix.name }}.tar.gz" rahgozar run.sh
+              tar czf "${{ matrix.name }}.tar.gz" rahgozar
               ;;
           esac
 
@@ -444,8 +397,284 @@ jobs:
           path: |
             dist/${{ matrix.name }}.tar.gz
             dist/${{ matrix.name }}.zip
-            dist/${{ matrix.name }}-app.zip
           if-no-files-found: ignore
+
+  # Desktop UI (Tauri) build — replaces the egui `rahgozar-ui` binary
+  # that used to live under the matrix above. One job per supported
+  # desktop OS; each emits the platform-native installer (.msi on
+  # Windows, .dmg on macOS, .deb + .AppImage on Linux) and uploads
+  # them as artifacts that the `release` job later attaches to the
+  # release page.
+  #
+  # NB: code-signing certificates are NOT plumbed in yet. The Tauri
+  # bundler will produce unsigned installers — Windows users will see
+  # the SmartScreen warning, macOS users will need to right-click →
+  # Open to bypass Gatekeeper on first launch. To enable signing,
+  # populate the relevant secrets per
+  # https://v2.tauri.app/distribute/sign/ and uncomment the env
+  # blocks in the bundle step.
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: rahgozar-desktop-linux-amd64
+            artifact_paths: |
+              desktop/src-tauri/target/release/bundle/deb/*.deb
+              desktop/src-tauri/target/release/bundle/rpm/*.rpm
+              desktop/src-tauri/target/release/bundle/appimage/*.AppImage
+          - os: macos-latest
+            name: rahgozar-desktop-macos
+            artifact_paths: |
+              desktop/src-tauri/target/release/bundle/dmg/*.dmg
+              desktop/src-tauri/target/release/bundle/macos/*.app.tar.gz
+          - os: windows-latest
+            name: rahgozar-desktop-windows-amd64
+            artifact_paths: |
+              desktop/src-tauri/target/release/bundle/msi/*.msi
+              desktop/src-tauri/target/release/bundle/nsis/*.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Tauri 2 system deps on Linux — Webkit2GTK 4.1 for the embedded
+      # webview, plus the same X11 / GL deps a typical GUI app needs.
+      - name: Install Linux Tauri system deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: desktop/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # The Tauri target dir is nested under `desktop/`, so we
+          # point rust-cache there. Separate cache key from the CLI
+          # matrix so the two don't share / clobber.
+          workspaces: desktop/src-tauri -> target
+          key: tauri-${{ runner.os }}
+
+      - name: Install frontend deps
+        working-directory: desktop
+        run: npm ci
+
+      # Regenerate the platform icon set from `src-tauri/icons/icon.svg`
+      # before bundling. The committed tree contains ONLY the SVG (all
+      # the derived .png/.ico/.icns/Square*/iOS/Android files are
+      # `.gitignore`d so the repo doesn't drift between source and
+      # generated artifacts). tauri.conf.json references the generated
+      # ICO + PNG paths, so without this step `tauri build` fails on a
+      # clean checkout with "icons/icon.ico not found".
+      - name: Regenerate icons from SVG
+        working-directory: desktop
+        run: npm run icons
+
+      - name: Build Tauri bundle
+        working-directory: desktop
+        run: npm run tauri build
+        env:
+          CI: true
+          # ── Tauri updater signing ─────────────────────────────────
+          # `tauri-plugin-updater` uses its own ed25519 signing scheme
+          # (NOT the minisign key in `MINISIGN_*` — those are separate
+          # signatures attached to the CLI / APK artifacts by the
+          # `sign` job further down). Tauri's CLI reads these two env
+          # vars during `tauri build`, signs each updater-eligible
+          # artifact (.msi, .app.tar.gz, .AppImage), and writes a
+          # matching `.sig` file next to it. The frontend's
+          # `tauri-plugin-updater` then verifies that `.sig` against
+          # the public key baked into `tauri.conf.json` before
+          # applying an update.
+          #
+          # One-time setup:
+          #   1. Generate the keypair locally (do NOT commit the
+          #      private key):
+          #        cd desktop
+          #        npx @tauri-apps/cli signer generate
+          #        # Save the printed public key into
+          #        # `desktop/src-tauri/tauri.conf.json::plugins.updater.pubkey`
+          #        # and commit that. Save the private key file aside
+          #        # — you'll paste its contents into the secret below.
+          #   2. Push the secrets to GitHub:
+          #        gh secret set TAURI_SIGNING_PRIVATE_KEY < /path/to/tauri.key
+          #        # If you set a passphrase during generate:
+          #        gh secret set TAURI_SIGNING_PRIVATE_KEY_PASSWORD --body 'your-passphrase'
+          #
+          # The bundle step gracefully no-ops on signing when these
+          # are unset (the artifact builds, just without a `.sig` —
+          # the updater plugin then refuses to apply it, which is the
+          # right failure mode while the key is still being staged).
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      # Updater artifacts: with `bundle.createUpdaterArtifacts: true`
+      # in tauri.conf.json, the bundler emits `.sig` files next to
+      # each installer. We collect both here so the release manifest
+      # generator (next job) has signatures to reference.
+      - name: List bundle output
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          find desktop/src-tauri/target/release/bundle -maxdepth 3 -type f \
+            \( -name '*.msi' -o -name '*.dmg' -o -name '*.AppImage' \
+               -o -name '*.deb' -o -name '*.rpm' -o -name '*.exe' \
+               -o -name '*.tar.gz' -o -name '*.sig' \) \
+            -printf '%p\n' | sort
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            ${{ matrix.artifact_paths }}
+            desktop/src-tauri/target/release/bundle/**/*.sig
+          if-no-files-found: error
+
+  # Generate `latest.json` — the manifest that `tauri-plugin-updater`
+  # fetches at runtime to decide whether to offer an update. Format
+  # documented at https://v2.tauri.app/plugin/updater/#manifest .
+  #
+  # Runs after all three `desktop` matrix jobs finish so we have
+  # Windows + macOS + Linux installers + their `.sig` files in one
+  # place. Walks the downloaded artifacts, builds one platform entry
+  # per (target, signature) pair, and uploads the resulting JSON as
+  # `manifest` — picked up + attached to the GitHub Release page by
+  # the `release` job. Tauri's updater plugin points at
+  # `releases/latest/download/latest.json` which GitHub redirects to
+  # the freshly-tagged release's asset by name, so the next launch
+  # of an old client sees the new manifest and can pull v(n+1).
+  desktop-manifest:
+    needs: [desktop]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve version
+        id: ver
+        shell: bash
+        run: |
+          # Same path the other jobs use — tag push gives us the
+          # version via `github.ref_name` (with the leading `v`);
+          # workflow_dispatch uses `inputs.version` (bare).
+          VER="${{ inputs.version || github.ref_name }}"
+          VER="${VER#v}"
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+
+      - name: Download desktop artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: rahgozar-desktop-*
+          merge-multiple: true
+
+      - name: List downloaded
+        run: ls -la dist/ || true
+
+      - name: Build latest.json
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          # Owner/repo path for the GitHub Release download URLs the
+          # manifest references. Hard-coded rather than read from
+          # `github.repository` so a manifest baked on a fork still
+          # points back at the canonical release page.
+          REPO_PATH: dazzling-no-more/rahgozar
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          python3 - <<'PY'
+          import json, os, re, base64, pathlib
+
+          version = os.environ["VERSION"]
+          repo = os.environ["REPO_PATH"]
+          dist = pathlib.Path("dist")
+
+          # Tauri's updater consumes a fixed set of `target` keys.
+          # Match each downloaded artifact's filename against the
+          # pattern its platform produces; pair each one with the
+          # accompanying `.sig` so the plugin can verify before apply.
+          # Patterns are intentionally loose (suffix match) so a
+          # version bump or naming tweak doesn't silently drop a
+          # platform from the manifest — the manifest test below
+          # would still catch a missed pair.
+          PLATFORM_MATCHERS = [
+              # (Tauri target key, suffix the installer file ends with)
+              ("windows-x86_64", ".msi"),
+              ("darwin-x86_64", "x64.app.tar.gz"),
+              ("darwin-aarch64", "aarch64.app.tar.gz"),
+              ("darwin-universal", ".app.tar.gz"),  # fallback if not split
+              ("linux-x86_64", ".AppImage"),
+          ]
+
+          # Collect signatures first — every Tauri-signed artifact gets
+          # a `.sig` next to it, content is the base64 ed25519 sig the
+          # plugin expects.
+          sig_for = {}
+          for sig in dist.rglob("*.sig"):
+              sig_for[sig.stem] = sig.read_text().strip()
+
+          platforms = {}
+          for key, suffix in PLATFORM_MATCHERS:
+              # Pick the FIRST match per platform (sorted for stability
+              # across CI re-runs). If both `darwin-universal` and a
+              # split mac artifact exist, the split wins because it's
+              # checked first in the list above.
+              matches = sorted(p for p in dist.rglob(f"*{suffix}"))
+              if not matches:
+                  continue
+              # Skip if we already filled this key via a more-specific
+              # match earlier in PLATFORM_MATCHERS.
+              if key in platforms:
+                  continue
+              installer = matches[0]
+              sig = sig_for.get(installer.name)
+              if not sig:
+                  # No signature → don't ship the entry. Better to omit
+                  # the platform than to ship an entry the updater
+                  # plugin will then refuse to apply.
+                  print(f"WARN: no .sig for {installer.name}, skipping {key}")
+                  continue
+              # URL points at the release asset. The Tauri updater
+              # follows redirects, so `releases/download/v{ver}/...`
+              # works even if GitHub serves a CDN URL.
+              url = (
+                  f"https://github.com/{repo}/releases/download/v{version}/"
+                  + installer.name
+              )
+              platforms[key] = {"signature": sig, "url": url}
+
+          manifest = {
+              "version": version,
+              "notes": f"See https://github.com/{repo}/releases/tag/v{version}",
+              "pub_date": os.environ.get("PUB_DATE", ""),
+              "platforms": platforms,
+          }
+          # `pub_date` is optional in the spec but the plugin logs a
+          # warning if it's missing — leave it empty rather than
+          # synthesising a fake timestamp.
+          out = pathlib.Path("out/latest.json")
+          out.write_text(json.dumps(manifest, indent=2))
+          print(f"wrote {out}")
+          print(json.dumps(manifest, indent=2))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rahgozar-desktop-manifest
+          path: out/latest.json
+          if-no-files-found: error
 
   # Android build — separate job so it doesn't inflate the matrix. The
   # Rust side here cross-compiles to FOUR ABIs (arm64-v8a, armeabi-v7a,
@@ -1016,17 +1245,22 @@ jobs:
   # self-hosted runners avoids contention with Linux build jobs from
   # the next tag if two releases overlap.
   release:
-    needs: [build, android, sign]
+    needs: [build, desktop, desktop-manifest, android, sign]
     # When `sign` is skipped (signing not yet enabled in repo vars) we
     # still want the release to proceed with unsigned artifacts. GH
     # Actions' default behaviour skips dependent jobs whenever ANY needed
     # job is skipped — this `if:` overrides that so a skipped `sign`
-    # doesn't block release, but a `sign` *failure* still does.
+    # doesn't block release, but a `sign` *failure* still does. Same
+    # treatment for `desktop` / `desktop-manifest`: if the Tauri build
+    # fails on a platform (e.g. missing macOS notarisation env), the
+    # CLI + APK release still ships.
     if: |
       always()
       && needs.build.result == 'success'
       && needs.android.result == 'success'
       && (needs.sign.result == 'success' || needs.sign.result == 'skipped')
+      && (needs.desktop.result == 'success' || needs.desktop.result == 'skipped' || needs.desktop.result == 'failure')
+      && (needs.desktop-manifest.result == 'success' || needs.desktop-manifest.result == 'skipped' || needs.desktop-manifest.result == 'failure')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -1183,7 +1417,12 @@ jobs:
             --pattern '*.tar.gz' \
             --pattern '*.zip' \
             --pattern '*.apk' \
-            --pattern '*.minisig'
+            --pattern '*.minisig' \
+            --pattern '*.msi' \
+            --pattern '*.dmg' \
+            --pattern '*.AppImage' \
+            --pattern '*.deb' \
+            --pattern 'latest.json'
           echo "--- artifacts/ contents ---"
           ls -la artifacts/
 
@@ -1195,21 +1434,43 @@ jobs:
 
           mkdir -p releases
 
-          # Wipe old binary artifacts (.apk, .tar.gz, .zip, .minisig) but
-          # keep README.md and .gitattributes — those are folder-level
-          # docs that stay constant across versions and shouldn't be
-          # regenerated on every release.
+          # Wipe old binary artifacts but keep README.md and
+          # .gitattributes — those are folder-level docs that stay
+          # constant across versions and shouldn't be regenerated on
+          # every release. Pattern now covers the Tauri desktop
+          # installer formats added in v2.4 (.msi / .dmg / .AppImage /
+          # .deb) plus the latest.json updater manifest.
           find releases -maxdepth 1 -type f \
-            \( -name '*.apk' -o -name '*.tar.gz' -o -name '*.zip' -o -name '*.minisig' \) \
+            \( -name '*.apk' -o -name '*.tar.gz' -o -name '*.zip' \
+               -o -name '*.minisig' -o -name '*.msi' -o -name '*.dmg' \
+               -o -name '*.AppImage' -o -name '*.deb' \
+               -o -name 'latest.json' \) \
             -delete
 
-          # Copy desktop archives. Their names already include the
-          # platform identifier (rahgozar-linux-amd64.tar.gz, etc.) and
-          # are version-stable — no rename needed.
+          # Copy CLI archives (rahgozar-linux-amd64.tar.gz, etc.).
+          # Version-stable filenames, no rename needed.
           for f in artifacts/*.tar.gz artifacts/*.zip; do
             [ -f "$f" ] || continue
             cp "$f" "releases/$(basename "$f")"
           done
+
+          # Copy Tauri desktop installers. Same `rahgozar-desktop-*`
+          # prefix the desktop matrix produces; one installer format
+          # per platform. Users on GitHub-Releases-page-filtered ISPs
+          # who hit the in-repo `releases/` fallback get the desktop
+          # UI through this path.
+          for f in artifacts/*.msi artifacts/*.dmg artifacts/*.AppImage artifacts/*.deb; do
+            [ -f "$f" ] || continue
+            cp "$f" "releases/$(basename "$f")"
+          done
+
+          # Updater manifest. `tauri-plugin-updater` clients point at
+          # `releases/latest/download/latest.json` — copying it into
+          # the in-repo fallback keeps the auto-update flow working
+          # even when the release-page redirect is filtered.
+          if [ -f artifacts/latest.json ]; then
+            cp artifacts/latest.json releases/latest.json
+          fi
 
           # Android APKs come with the version baked into the name
           # (rahgozar-android-universal-v1.7.5.apk). Copy all of them so

@@ -1,0 +1,94 @@
+/* Tailwind 4 single-import entry. Custom design tokens defined in
+   `@theme` are immediately available as utility classes (e.g.
+   `bg-base`, `text-primary`, `border-border-subtle`). The palette
+   mirrors the values we picked for the egui theme in
+   `src/bin/ui/theme.rs` so the visual brand stays the same as we cut
+   over from egui → Tauri. */
+@import "tailwindcss";
+
+@theme {
+  /* ── Backgrounds ─────────────────────────────────────────────────── */
+  --color-base: #101114;
+  --color-surface: #16181c;
+  --color-raised: #1e2126;
+  --color-input: #1a1c21;
+
+  /* ── Borders ─────────────────────────────────────────────────────── */
+  --color-border-subtle: #282c32;
+  --color-border-strong: #3c4149;
+
+  /* ── Text ────────────────────────────────────────────────────────── */
+  --color-primary: #e1e4ea;
+  --color-secondary: #a0a5ac;
+  --color-muted: #6e737c;
+
+  /* ── Accent + semantic ───────────────────────────────────────────── */
+  --color-accent: #60a5fa;
+  --color-accent-hover: #78b4ff;
+  --color-success: #5ec88a;
+  --color-warn: #f4bf4f;
+  --color-error: #f46464;
+
+  /* ── Typography ──────────────────────────────────────────────────── */
+  /* Inter for Latin, Vazirmatn for Persian/Arabic — the webview's text
+     stack falls through automatically per glyph, so a mixed-script
+     label like "rahgozar (ره‌گذر)" renders correctly in both halves. */
+  --font-sans: "Inter", "Vazirmatn", system-ui, -apple-system, sans-serif;
+  --font-mono: ui-monospace, "Cascadia Code", "JetBrains Mono", Menlo,
+    monospace;
+}
+
+/* Light-theme override.
+ *
+ * Tailwind 4 generates utility classes from the `@theme` block above
+ * that resolve to `var(--color-base)` etc. By rewriting those CSS
+ * variables under `[data-theme="light"]`, every utility class
+ * (`bg-base`, `text-primary`, `border-border-subtle`, …) flips to the
+ * light palette without any per-class duplication.
+ *
+ * `App.svelte` syncs `theme.current` onto `<html data-theme="...">`
+ * so this selector matches once a user toggles. Default is dark
+ * (no `data-theme` attribute or `data-theme="dark"`).
+ *
+ * Light palette is tuned for the same hue family as the dark one
+ * (cool greys with a slight blue lean) so the brand doesn't shift
+ * dramatically between themes — only the lightness flips. Accents
+ * stay roughly the same hue, dialled slightly darker for contrast
+ * against the lighter surfaces.
+ */
+[data-theme="light"] {
+  --color-base: #f6f7f9;
+  --color-surface: #ffffff;
+  --color-raised: #f1f3f6;
+  --color-input: #ffffff;
+  --color-border-subtle: #e2e5ea;
+  --color-border-strong: #c8ccd2;
+  --color-primary: #1c1f24;
+  --color-secondary: #555b65;
+  --color-muted: #828891;
+  --color-accent: #2563eb;
+  --color-accent-hover: #1d4ed8;
+  --color-success: #2f9a5e;
+  --color-warn: #c08416;
+  --color-error: #d44545;
+}
+
+/* Document-level defaults. The body uses primary text on the base
+   background so untouched pages still have correct contrast even
+   before any component classes apply. */
+body {
+  font-family: var(--font-sans);
+  background-color: var(--color-base);
+  color: var(--color-primary);
+  margin: 0;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Persian / Arabic switch. When the user picks FA, we set `lang="fa"`
+   and `dir="rtl"` on the <html> element from Svelte; this rule keeps
+   the body font-family preference unchanged but makes anything that
+   reads `:lang(fa)` flip to the Persian face first. */
+:lang(fa) {
+  font-family: "Vazirmatn", "Inter", system-ui, sans-serif;
+}

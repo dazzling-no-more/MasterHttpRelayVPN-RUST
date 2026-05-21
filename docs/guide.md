@@ -70,10 +70,9 @@ Each archive contains:
 | file | purpose |
 |---|---|
 | `rahgozar` / `rahgozar.exe` | CLI. Headless use, servers, automation. No system deps on macOS / Windows. |
-| `rahgozar-ui` / `rahgozar-ui.exe` | Desktop UI (egui). Config form, Start / Stop / Test buttons, live stats, log panel. |
-| `run.sh` / `run.command` / `run.bat` | Platform launcher: installs the MITM CA (needs sudo / admin) then starts the UI. Use this on first run. |
+| `rahgozar-desktop-*.msi` / `.dmg` / `.AppImage` / `.deb` | Platform-native installer for the **desktop UI** (Tauri-bundled). Replaces the previous egui `rahgozar-ui` binary as of v2.4. |
 
-macOS archives also ship `rahgozar.app` (in `*-app.zip`) — double-click in Finder. Run `rahgozar --install-cert` or `run.command` once first to install the CA.
+macOS users: install via the `.dmg` and drag rahgozar to Applications. First launch needs `rahgozar --install-cert` (CLI binary) once to install the MITM CA. Windows / Linux users run the installer normally; the desktop UI installs the CA from inside the app.
 
 <p align="center"><img src="ui-screenshot.png" alt="rahgozar desktop UI showing config form, live traffic stats, Start/Stop/Test buttons, and log panel" width="420"></p>
 
@@ -380,7 +379,7 @@ This port focuses on the **`apps_script` mode** — the only one that reliably w
 - [x] Header filtering (strip connection-specific, brotli)
 - [x] `test` and `scan-ips` subcommands
 - [x] Script IDs masked in logs (`prefix…suffix`) so logs don't leak deployment IDs
-- [x] Desktop UI (egui) — cross-platform, no bundler needed
+- [x] Desktop UI (Tauri) — cross-platform native installers (.msi / .dmg / .AppImage / .deb)
 - [x] Optional upstream SOCKS5 chaining for non-HTTP traffic (Telegram MTProto, IMAP, SSH…)
 - [x] Connection pool pre-warm on startup
 - [x] Per-connection SNI rotation across `{www, mail, drive, docs, calendar}.google.com`

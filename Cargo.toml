@@ -1,6 +1,16 @@
+[workspace]
+# Multi-crate workspace so the new Tauri desktop app at `desktop/src-tauri`
+# can path-depend on the rahgozar core via `rahgozar = { path = "../.." }`.
+# The root crate (rahgozar core + CLI + legacy egui UI bin) is still the
+# primary package; `desktop/src-tauri` is the only additional member.
+# `resolver = "2"` is required for the dep-feature unification Tauri 2
+# expects across the workspace.
+members = ["desktop/src-tauri"]
+resolver = "2"
+
 [package]
 name = "rahgozar"
-version = "2.3.0"
+version = "2.4.0"
 edition = "2021"
 description = "rahgozar — community continuation of mhrv-rs (Rust port of MasterHttpRelayVPN). DPI bypass via Google Apps Script relay with domain fronting."
 license = "MIT"
@@ -9,22 +19,21 @@ license = "MIT"
 name = "rahgozar"
 path = "src/lib.rs"
 # `cdylib` lets the Android app dlopen librahgozar.so via System.loadLibrary.
-# `rlib` keeps the desktop binaries linking normally — same .rlib is used
-# for `rahgozar` and `rahgozar-ui` builds on macOS/Linux/Windows.
+# `rlib` keeps the CLI binary (`src/main.rs`) and the Tauri desktop
+# crate (`desktop/src-tauri`, which path-deps on us across the
+# workspace) linking through the same .rlib on macOS/Linux/Windows.
 crate-type = ["rlib", "cdylib"]
 
 [[bin]]
 name = "rahgozar"
 path = "src/main.rs"
 
-[[bin]]
-name = "rahgozar-ui"
-path = "src/bin/ui.rs"
-required-features = ["ui"]
+# The egui-based `rahgozar-ui` binary was retired in v2.4 — the
+# Tauri-backed app at `desktop/` replaces it. See
+# `desktop/src-tauri/Cargo.toml` for the new desktop entry point.
 
 [features]
 default = []
-ui = ["dep:eframe"]
 # Pipelining-internal counters + the JNI export that backs the Android
 # debug overlay. Off by default — the overlay is itself debug-only on
 # Android (see android/app/src/debug/AndroidManifest.xml), and the
@@ -85,21 +94,11 @@ portable-atomic = { version = "1", features = ["fallback"] }
 # snapshot of all three pointers with one atomic op.
 arc-swap = "1"
 
-# Optional UI dep: only pulled in when --features ui is set.
-# Both `glow` (OpenGL 2+) and `wgpu` (DX12/Vulkan/Metal) are compiled in;
-# the binary picks one at startup — glow by default for compat with the
-# egui look-and-feel we've been shipping, but falls back to wgpu when
-# `MHRV_RENDERER=wgpu` is set. Issue #28: users on older Windows
-# hardware / RDP / VMs without OpenGL 2.0 crash with
-# `egui_glow requires opengl 2.0+` — the wgpu backend uses DX12/Vulkan
-# instead and covers those boxes.
-eframe = { version = "0.28", default-features = false, features = [
-    "default_fonts",
-    "glow",
-    "wgpu",
-    "persistence",
-    "accesskit",
-], optional = true }
+# eframe / egui were dropped in v2.4 — the desktop UI moved to Tauri at
+# `desktop/` (Rust backend + Svelte/Tailwind frontend) so Persian text
+# shaping, light/dark theming, and modern web-style layout all work
+# out of the box. The Tauri crate's own `Cargo.toml` at
+# `desktop/src-tauri/Cargo.toml` owns the UI dep tree now.
 url = "2.5.8"
 
 # Unix-only deps. Must come after `[dependencies]` because starting a new

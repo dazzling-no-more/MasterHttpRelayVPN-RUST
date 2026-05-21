@@ -4,17 +4,27 @@ This folder contains the prebuilt binaries from the latest release, committed di
 
 Current version: **v2.3.0**
 
+**Note (v2.4):** the legacy egui desktop UI (`rahgozar-ui` /
+`rahgozar-ui.exe`) and the launcher scripts (`run.sh`, `run.bat`,
+`run.command`) have been retired. The desktop GUI is now distributed
+as a platform-native installer built with Tauri (see the
+`rahgozar-desktop-*` rows below). The CLI binary archives still ship
+on every release for users who want to drive the proxy headless or
+from another process.
+
 | File | Platform | Contents |
 |---|---|---|
 | `rahgozar-android-universal-v2.3.0.apk` | Android 7.0+ (all ABIs) | Universal APK — arm64-v8a, armeabi-v7a, x86_64, x86 in one file |
-| `rahgozar-linux-amd64.tar.gz` | Linux x86_64 | `rahgozar`, `rahgozar-ui`, `run.sh` |
-| `rahgozar-linux-arm64.tar.gz` | Linux aarch64 | `rahgozar`, `run.sh` (CLI only) |
-| `rahgozar-raspbian-armhf.tar.gz` | Raspberry Pi / ARMv7 hardfloat | `rahgozar`, `run.sh` (CLI only) |
-| `rahgozar-macos-amd64.tar.gz` | macOS Intel | `rahgozar`, `rahgozar-ui`, `run.sh`, `run.command` |
-| `rahgozar-macos-amd64-app.zip` | macOS Intel | `rahgozar.app` bundle (double-click from Finder) |
-| `rahgozar-macos-arm64.tar.gz` | macOS Apple Silicon | `rahgozar`, `rahgozar-ui`, `run.sh`, `run.command` |
-| `rahgozar-macos-arm64-app.zip` | macOS Apple Silicon | `rahgozar.app` bundle (double-click from Finder) |
-| `rahgozar-windows-amd64.zip` | Windows x86_64 | `rahgozar.exe`, `rahgozar-ui.exe`, `run.bat` |
+| `rahgozar-desktop-windows-amd64.msi` | Windows 10 / 11 x86_64 | Tauri-bundled desktop UI installer (MSI) |
+| `rahgozar-desktop-macos.dmg` | macOS 11+ (Intel + Apple Silicon) | Tauri-bundled desktop UI disk image |
+| `rahgozar-desktop-linux-amd64.AppImage` | Linux x86_64 | Portable Tauri-bundled desktop UI |
+| `rahgozar-desktop-linux-amd64.deb` | Debian / Ubuntu x86_64 | Tauri-bundled desktop UI package |
+| `rahgozar-linux-amd64.tar.gz` | Linux x86_64 | `rahgozar` CLI |
+| `rahgozar-linux-arm64.tar.gz` | Linux aarch64 | `rahgozar` CLI |
+| `rahgozar-raspbian-armhf.tar.gz` | Raspberry Pi / ARMv7 hardfloat | `rahgozar` CLI |
+| `rahgozar-macos-amd64.tar.gz` | macOS Intel | `rahgozar` CLI |
+| `rahgozar-macos-arm64.tar.gz` | macOS Apple Silicon | `rahgozar` CLI |
+| `rahgozar-windows-amd64.zip` | Windows x86_64 | `rahgozar.exe` CLI |
 | `rahgozar-linux-musl-amd64.tar.gz` | OpenWRT / Alpine x86_64 | static `rahgozar` + `rahgozar.init` (procd) |
 | `rahgozar-linux-musl-arm64.tar.gz` | OpenWRT / Alpine aarch64 | static `rahgozar` + `rahgozar.init` (procd) |
 

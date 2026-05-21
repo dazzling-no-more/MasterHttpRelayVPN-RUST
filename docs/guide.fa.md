@@ -72,10 +72,9 @@ DPI سانسورگر فقط SNI داخل TLS را می‌بیند و اجازه 
 | فایل | کاربرد |
 |---|---|
 | `rahgozar` / `rahgozar.exe` | CLI. استفادهٔ headless، سرور، اتوماسیون. روی مک / ویندوز بدون وابستگی سیستمی. |
-| `rahgozar-ui` / `rahgozar-ui.exe` | UI دسکتاپ (egui). فرم کانفیگ، دکمه‌های Start / Stop / Test، آمار زنده، پنل log. |
-| `run.sh` / `run.command` / `run.bat` | راه‌انداز پلتفرم: گواهی MITM را نصب می‌کند (نیاز به sudo / admin) و UI را باز می‌کند. در اولین اجرا از این استفاده کن. |
+| `rahgozar-desktop-*.msi` / `.dmg` / `.AppImage` / `.deb` | نصب‌کنندهٔ بومی **UI دسکتاپ** (با Tauri). از نسخه v2.4 جایگزین باینری قبلی `rahgozar-ui` (egui) شده است. |
 
-آرشیوهای مک شامل `rahgozar.app` (در `*-app.zip`) هم هستند — در Finder دو بار کلیک کن. یک‌بار `rahgozar --install-cert` یا `run.command` را اجرا کن تا CA نصب شود.
+کاربران مک از طریق `.dmg` نصب کرده و rahgozar را به Applications بکشند. در اولین اجرا یک‌بار `rahgozar --install-cert` (باینری CLI) را اجرا کنند تا گواهی MITM نصب شود. کاربران ویندوز / لینوکس نصب‌کننده را به شکل عادی اجرا می‌کنند؛ UI دسکتاپ از داخل برنامه CA را نصب می‌کند.
 
 <p align="center"><img src="ui-screenshot.png" alt="UI دسکتاپ rahgozar شامل فرم کانفیگ، آمار ترافیک زنده، دکمه‌های Start/Stop/Test و پنل log" width="420"></p>
 
@@ -390,7 +389,7 @@ logread -e rahgozar -f       # تمام لاگ
 | فیلتر هدر | حذف connection-specific و brotli |
 | Subcommand‌ها | `test` و `scan-ips` و `test-sni` |
 | ماسک Script ID | به‌صورت `prefix…suffix` در لاگ، تا Deployment ID افشا نشود |
-| UI دسکتاپ | egui — کراس‌پلتفرم، بدون bundler |
+| UI دسکتاپ | Tauri — نصب‌کننده‌های بومی کراس‌پلتفرم (.msi / .dmg / .AppImage / .deb) |
 | چِین SOCKS5 upstream | اختیاری برای ترافیک غیر-HTTP (MTProto تلگرام، IMAP، SSH …) |
 | Pre-warm pool | اولین درخواست TLS handshake به لبهٔ گوگل را skip می‌کند |
 | چرخش SNI per-connection | بین `{www, mail, drive, docs, calendar}.google.com` |

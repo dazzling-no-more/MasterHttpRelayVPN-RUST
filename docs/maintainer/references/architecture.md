@@ -105,8 +105,9 @@ Iran ISPs occasionally filter specific Google IPs (#313 pattern). When this happ
 ## Key files in the repo
 
 - `src/main.rs` — CLI binary entry point. `init_logging()` reads `config.log_level`. `Cmd::Test`, `Cmd::ScanIps`, etc. as subcommands.
-- `src/bin/ui.rs` — UI binary entry (Windows + Android via JNI). Shares lib code via `rahgozar::*`. The `install_ui_tracing` function (post-v1.8.2) reads `RUST_LOG > config.log_level > info,hyper=warn`.
 - `src/lib.rs` — re-exports for the lib + Android JNI shim.
+- `desktop/src-tauri/src/` — Tauri desktop UI backend. `lib.rs::run` registers commands; `commands.rs` exposes `get_status` / `start_proxy` / `stop_proxy` / `test_relay` / `scan_ips` / `save_config` / `save_raw_config` etc. `logbridge.rs` tees tracing into a Tauri event channel for the Logs tab. `state.rs` holds the live proxy handle + log ring buffer. Replaced the retired egui `rahgozar-ui` binary in v2.4.
+- `desktop/src/` — Svelte 5 + Tailwind 4 frontend. `lib/i18n.svelte.ts` (EN + FA dicts), `lib/theme.svelte.ts` (light/dark), `lib/updater.svelte.ts` (tauri-plugin-updater wrapper), `lib/components/{Status,Tunnel,Logs,Advanced,About}Tab.svelte`.
 - `src/domain_fronter.rs` — the SNI-rewrite TLS dialer + the `DomainFronter` orchestrator. `DEFAULT_GOOGLE_SNI_POOL` lives here.
 - `src/proxy_server.rs` — HTTP/SOCKS5 listeners, dispatch logic, DoH bypass, MITM mode entry.
 - `src/tunnel_client.rs` — Full mode batch client. Decoy detection + script_id-in-logs added v1.8.1; softer 6-cause message v1.8.3.
