@@ -27,6 +27,8 @@ from another process.
 | `rahgozar-windows-amd64.zip` | Windows x86_64 | `rahgozar.exe` CLI |
 | `rahgozar-linux-musl-amd64.tar.gz` | OpenWRT / Alpine x86_64 | static `rahgozar` + `rahgozar.init` (procd) |
 | `rahgozar-linux-musl-arm64.tar.gz` | OpenWRT / Alpine aarch64 | static `rahgozar` + `rahgozar.init` (procd) |
+| `rahgozar-tunnel-node-linux-musl-amd64.tar.gz` | Any Linux x86_64 VPS | static `tunnel-node` (full-mode exit-node bridge) |
+| `rahgozar-tunnel-node-linux-musl-arm64.tar.gz` | Any Linux aarch64 VPS | static `tunnel-node` (full-mode exit-node bridge) |
 
 ## Download via git clone
 

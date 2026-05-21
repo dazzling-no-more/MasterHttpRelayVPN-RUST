@@ -82,7 +82,46 @@ docker build -t tunnel-node .
 docker run -p 8080:8080 -e TUNNEL_AUTH_KEY=your-secret tunnel-node
 ```
 
-### Direct binary
+### Prebuilt static binary (no Docker, no Rust toolchain)
+
+For users who want a single static binary instead of a container. Each release publishes a fully-static musl build for the two common VPS architectures — works on any Linux distro (Alpine, Debian, Ubuntu, RHEL, …) without libc compatibility concerns.
+
+```bash
+# Pick the asset that matches your VPS:
+#   x86_64  → rahgozar-tunnel-node-linux-musl-amd64.tar.gz
+#   aarch64 → rahgozar-tunnel-node-linux-musl-arm64.tar.gz
+curl -LO https://github.com/dazzling-no-more/rahgozar/releases/latest/download/rahgozar-tunnel-node-linux-musl-amd64.tar.gz
+tar xzf rahgozar-tunnel-node-linux-musl-amd64.tar.gz
+
+# Generate a secret (save it for CodeFull.gs).
+SECRET=$(openssl rand -hex 24)
+
+# Run.
+TUNNEL_AUTH_KEY="$SECRET" PORT=8080 ./tunnel-node
+```
+
+Drop it under systemd / OpenRC / supervisord / `tmux` — whatever your VPS prefers. A minimal systemd unit:
+
+```ini
+# /etc/systemd/system/rahgozar-tunnel.service
+[Unit]
+Description=Rahgozar tunnel-node bridge
+After=network.target
+
+[Service]
+Environment=TUNNEL_AUTH_KEY=your-secret
+Environment=PORT=8080
+ExecStart=/usr/local/bin/tunnel-node
+Restart=on-failure
+DynamicUser=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Each release archive is signed with the rahgozar minisign key — verify with `minisign -Vm <archive> -p rahgozar-update.pub` if you want provenance before running.
+
+### Build from source
 
 ```bash
 cd tunnel-node

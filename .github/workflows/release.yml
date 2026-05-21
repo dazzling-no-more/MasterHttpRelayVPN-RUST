@@ -265,23 +265,41 @@ jobs:
       # Fully-static musl builds for OpenWRT / Alpine / libc-less systems.
       # messense/rust-musl-cross ships a pre-built musl toolchain so `ring`
       # (rustls' crypto backend) cross-compiles cleanly on both archs.
-      - name: Build CLI (musl via docker)
+      #
+      # We also build the `tunnel-node` server bridge in the same docker
+      # run `tunnel-node/Cargo.toml` carries an
+      # empty `[workspace]` opt-out so it's a standalone crate with its
+      # own target/ — built via `--manifest-path tunnel-node/Cargo.toml`.
+      # Sharing the docker container saves ~30 s of cold-start per leg.
+      - name: Build CLI + tunnel-node (musl via docker)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           docker run --rm -v "$PWD":/src -w /src \
             -e RAHGOZAR_UPDATE_PUBKEY \
             messense/rust-musl-cross:x86_64-musl \
-            cargo build --release --target x86_64-unknown-linux-musl --bin rahgozar
-          sudo chown -R "$(id -u):$(id -g)" target
+            bash -c '
+              set -eux
+              cargo build --release --target x86_64-unknown-linux-musl --bin rahgozar
+              cargo build --release \
+                --manifest-path tunnel-node/Cargo.toml \
+                --target x86_64-unknown-linux-musl --bin tunnel-node
+            '
+          sudo chown -R "$(id -u):$(id -g)" target tunnel-node/target
 
-      - name: Build CLI (musl via docker, arm64)
+      - name: Build CLI + tunnel-node (musl via docker, arm64)
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: |
           docker run --rm -v "$PWD":/src -w /src \
             -e RAHGOZAR_UPDATE_PUBKEY \
             messense/rust-musl-cross:aarch64-musl \
-            cargo build --release --target aarch64-unknown-linux-musl --bin rahgozar
-          sudo chown -R "$(id -u):$(id -g)" target
+            bash -c '
+              set -eux
+              cargo build --release --target aarch64-unknown-linux-musl --bin rahgozar
+              cargo build --release \
+                --manifest-path tunnel-node/Cargo.toml \
+                --target aarch64-unknown-linux-musl --bin tunnel-node
+            '
+          sudo chown -R "$(id -u):$(id -g)" target tunnel-node/target
 
       # OpenWRT MT7621 / mipsel-softfloat. messense doesn't publish a
       # `:mipsel-musl-softfloat` tag — the mipsel-musl image is
@@ -363,6 +381,15 @@ jobs:
               chmod +x dist/rahgozar.init
               ;;
           esac
+          # tunnel-node static binary, amd64/arm64 musl only — the
+          # bridge runs on the *exit* node (a real VPS), not on
+          # OpenWRT routers, so we skip the mipsel-softfloat leg.
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl|aarch64-unknown-linux-musl)
+              cp tunnel-node/target/${{ matrix.target }}/release/tunnel-node dist/tunnel-node
+              chmod +x dist/tunnel-node
+              ;;
+          esac
 
       - name: Package (windows)
         if: runner.os == 'Windows'
@@ -386,6 +413,18 @@ jobs:
               tar czf "${{ matrix.name }}.tar.gz" rahgozar
               ;;
           esac
+          # Separate tarball for tunnel-node so users who just want the
+          # exit-node bridge don't have to download the desktop CLI too.
+          # The `sign` job globs `dist/*.tar.gz` so these archives get
+          # signed automatically alongside the CLI ones.
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl)
+              tar czf "rahgozar-tunnel-node-linux-musl-amd64.tar.gz" tunnel-node
+              ;;
+            aarch64-unknown-linux-musl)
+              tar czf "rahgozar-tunnel-node-linux-musl-arm64.tar.gz" tunnel-node
+              ;;
+          esac
 
       - uses: actions/upload-artifact@v4
         with:
@@ -393,6 +432,7 @@ jobs:
           path: |
             dist/${{ matrix.name }}.tar.gz
             dist/${{ matrix.name }}.zip
+            dist/rahgozar-tunnel-node-linux-musl-*.tar.gz
           if-no-files-found: ignore
 
   # Desktop UI (Tauri) build — replaces the egui `rahgozar-ui` binary
