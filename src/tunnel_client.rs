@@ -80,6 +80,11 @@ const REPLY_TIMEOUT_SLACK: Duration = Duration::from_secs(5);
 /// connect saves one Apps Script round-trip per new flow.
 const CLIENT_FIRST_DATA_WAIT: Duration = Duration::from_millis(50);
 
+/// Retry budget for `connect_data` when the Apps Script transport fails
+/// before we get any tunnel-node response. Kept to one retry and gated to
+/// TLS-looking first bytes so cleartext HTTP requests are not replayed.
+const CONNECT_DATA_TRANSPORT_RETRIES: usize = 1;
+
 /// Floor depth after a drop (first empty reply).
 const INFLIGHT_IDLE: usize = 1;
 
@@ -1315,7 +1320,7 @@ fn should_fire(pending_len: usize, payload_bytes: usize, op_bytes: usize) -> boo
 fn is_handshake_priority(msg: &MuxMsg) -> bool {
     match msg {
         MuxMsg::Connect { .. } | MuxMsg::ConnectData { .. } => true,
-        MuxMsg::Data { data, .. } => matches!(data.as_ref(), [0x16, 0x03, ..]),
+        MuxMsg::Data { data, .. } => is_tls_record_handshake(data),
         MuxMsg::UdpOpen { .. } | MuxMsg::UdpData { .. } | MuxMsg::Close { .. } => false,
     }
 }
@@ -1809,64 +1814,85 @@ async fn connect_with_initial_data(
     data: Bytes,
     mux: &Arc<TunnelMux>,
 ) -> std::io::Result<ConnectDataOutcome> {
-    let (reply_tx, reply_rx) = oneshot::channel();
-    mux.send(MuxMsg::ConnectData {
-        host: host.to_string(),
-        port,
-        data,
-        reply: reply_tx,
-    })
-    .await;
+    let attempts = if is_tls_record_handshake(&data) {
+        CONNECT_DATA_TRANSPORT_RETRIES + 1
+    } else {
+        1
+    };
 
-    let resp = match reply_rx.await {
-        Ok(Ok((resp, _script_id))) => resp,
-        Ok(Err(e)) => {
-            if is_connect_data_unsupported_error_str(&e) {
-                tracing::debug!("connect_data unsupported for {}:{}: {}", host, port, e);
-                return Ok(ConnectDataOutcome::Unsupported);
+    for attempt in 0..attempts {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        mux.send(MuxMsg::ConnectData {
+            host: host.to_string(),
+            port,
+            data: data.clone(),
+            reply: reply_tx,
+        })
+        .await;
+
+        let resp = match reply_rx.await {
+            Ok(Ok((resp, _script_id))) => resp,
+            Ok(Err(e)) => {
+                if is_connect_data_unsupported_error_str(&e) {
+                    tracing::debug!("connect_data unsupported for {}:{}: {}", host, port, e);
+                    return Ok(ConnectDataOutcome::Unsupported);
+                }
+                if attempt + 1 < attempts && is_retryable_connect_data_transport_error(&e) {
+                    tracing::warn!(
+                        "tunnel connect_data transport error for {}:{} (attempt {}/{}): {}; retrying",
+                        host,
+                        port,
+                        attempt + 1,
+                        attempts,
+                        e
+                    );
+                    continue;
+                }
+                tracing::error!("tunnel connect_data error for {}:{}: {}", host, port, e);
+                // Outer transport failure (relay/Apps Script never reached the
+                // tunnel-node). Don't poison the destination cache from here —
+                // see `connect_plain` for the same reasoning.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionRefused,
+                    e,
+                ));
             }
+            Err(_) => {
+                return Err(std::io::Error::other("mux channel closed"));
+            }
+        };
+
+        if is_connect_data_unsupported_response(&resp) {
+            tracing::debug!(
+                "connect_data unsupported for {}:{}: {:?}",
+                host,
+                port,
+                resp.e
+            );
+            return Ok(ConnectDataOutcome::Unsupported);
+        }
+
+        if let Some(ref e) = resp.e {
             tracing::error!("tunnel connect_data error for {}:{}: {}", host, port, e);
-            // Outer transport failure (relay/Apps Script never reached the
-            // tunnel-node). Don't poison the destination cache from here —
-            // see `connect_plain` for the same reasoning.
+            // `resp.e` is the tunnel-node's own connect result — cache it.
+            mux.record_unreachable_if_match(host, port, e);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionRefused,
-                e,
+                e.clone(),
             ));
         }
-        Err(_) => {
-            return Err(std::io::Error::other("mux channel closed"));
-        }
-    };
 
-    if is_connect_data_unsupported_response(&resp) {
-        tracing::debug!(
-            "connect_data unsupported for {}:{}: {:?}",
-            host,
-            port,
-            resp.e
-        );
-        return Ok(ConnectDataOutcome::Unsupported);
+        let Some(sid) = resp.sid.clone() else {
+            return Err(std::io::Error::other("tunnel connect_data: no session id"));
+        };
+
+        return Ok(ConnectDataOutcome::Opened {
+            sid,
+            response: resp,
+        });
     }
 
-    if let Some(ref e) = resp.e {
-        tracing::error!("tunnel connect_data error for {}:{}: {}", host, port, e);
-        // `resp.e` is the tunnel-node's own connect result — cache it.
-        mux.record_unreachable_if_match(host, port, e);
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::ConnectionRefused,
-            e.clone(),
-        ));
-    }
-
-    let Some(sid) = resp.sid.clone() else {
-        return Err(std::io::Error::other("tunnel connect_data: no session id"));
-    };
-
-    Ok(ConnectDataOutcome::Opened {
-        sid,
-        response: resp,
-    })
+    unreachable!("connect_data attempts is always at least one")
 }
 
 /// Decide whether a response indicates the tunnel-node (or apps_script
@@ -1899,6 +1925,19 @@ fn is_connect_data_unsupported_response(resp: &TunnelResponse) -> bool {
 fn is_connect_data_unsupported_error_str(e: &str) -> bool {
     let e = e.to_ascii_lowercase();
     (e.contains("unknown op") || e.contains("unknown tunnel op")) && e.contains("connect_data")
+}
+
+fn is_retryable_connect_data_transport_error(e: &str) -> bool {
+    let e = e.to_ascii_lowercase();
+    e.contains("peer closed connection without sending tls close_notify")
+        || e.contains("unexpected eof")
+        || e.contains("early eof")
+        || e.contains("connection reset")
+        || e.contains("broken pipe")
+}
+
+fn is_tls_record_handshake(data: &[u8]) -> bool {
+    matches!(data, [0x16, 0x03, ..])
 }
 
 /// Metadata for one in-flight Data op, returned alongside its reply.
@@ -2672,6 +2711,18 @@ mod tests {
         }
     }
 
+    fn opened_resp(sid: &str) -> TunnelResponse {
+        TunnelResponse {
+            sid: Some(sid.to_string()),
+            d: None,
+            pkts: None,
+            eof: None,
+            e: None,
+            code: None,
+            seq: None,
+        }
+    }
+
     #[test]
     fn unsupported_detection_via_structured_code() {
         assert!(is_connect_data_unsupported_response(&resp_with(
@@ -2726,6 +2777,130 @@ mod tests {
             None,
             Some("connect_data: bad port"),
         )));
+    }
+
+    #[test]
+    fn retryable_connect_data_transport_error_matches_transient_io() {
+        assert!(is_retryable_connect_data_transport_error(
+            "io: peer closed connection without sending TLS close_notify"
+        ));
+        assert!(is_retryable_connect_data_transport_error(
+            "io: unexpected eof"
+        ));
+        assert!(is_retryable_connect_data_transport_error(
+            "io: connection reset by peer"
+        ));
+        assert!(!is_retryable_connect_data_transport_error(
+            "batch timed out"
+        ));
+        assert!(!is_retryable_connect_data_transport_error(
+            "connect failed: Network is unreachable"
+        ));
+        assert!(!is_retryable_connect_data_transport_error(
+            "unknown op: connect_data"
+        ));
+    }
+
+    #[test]
+    fn tls_record_handshake_detection_is_narrow() {
+        assert!(is_tls_record_handshake(&[0x16, 0x03, 0x03]));
+        assert!(is_tls_record_handshake(&[0x16, 0x03]));
+        assert!(!is_tls_record_handshake(&[0x16]));
+        assert!(!is_tls_record_handshake(&[0x16, 0x04, 0x00]));
+        assert!(!is_tls_record_handshake(b"GET / HTTP/1.1\r\n\r\n"));
+    }
+
+    #[tokio::test]
+    async fn connect_data_retries_tls_transport_error_once() {
+        let (mux, mut rx) = mux_for_test();
+        let mux_for_task = mux.clone();
+        let task = tokio::spawn(async move {
+            connect_with_initial_data(
+                "example.com",
+                443,
+                Bytes::from_static(&[0x16, 0x03, 0x03, 0x00, 0x01]),
+                &mux_for_task,
+            )
+            .await
+        });
+
+        let first = rx.recv().await.expect("first connect_data");
+        let reply = match first {
+            MuxMsg::ConnectData { data, reply, .. } => {
+                assert_eq!(data.as_ref(), &[0x16, 0x03, 0x03, 0x00, 0x01]);
+                reply
+            }
+            other => panic!(
+                "expected first ConnectData, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        };
+        let _ = reply.send(Err(
+            "io: peer closed connection without sending TLS close_notify".into(),
+        ));
+
+        let second = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .expect("retry should be sent")
+            .expect("second connect_data");
+        let reply = match second {
+            MuxMsg::ConnectData { data, reply, .. } => {
+                assert_eq!(data.as_ref(), &[0x16, 0x03, 0x03, 0x00, 0x01]);
+                reply
+            }
+            other => panic!(
+                "expected retry ConnectData, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        };
+        let _ = reply.send(Ok((opened_resp("sid-retry"), "script-b".to_string())));
+
+        let outcome = task.await.expect("task").expect("connect_data result");
+        match outcome {
+            ConnectDataOutcome::Opened { sid, .. } => assert_eq!(sid, "sid-retry"),
+            ConnectDataOutcome::Unsupported => panic!("retry should open"),
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_data_does_not_retry_cleartext_transport_error() {
+        let (mux, mut rx) = mux_for_test();
+        let mux_for_task = mux.clone();
+        let task = tokio::spawn(async move {
+            connect_with_initial_data(
+                "example.com",
+                80,
+                Bytes::from_static(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"),
+                &mux_for_task,
+            )
+            .await
+        });
+
+        let first = rx.recv().await.expect("first connect_data");
+        let reply = match first {
+            MuxMsg::ConnectData { data, reply, .. } => {
+                assert!(data.starts_with(b"GET "));
+                reply
+            }
+            other => panic!(
+                "expected first ConnectData, got {:?}",
+                std::mem::discriminant(&other)
+            ),
+        };
+        let _ = reply.send(Err(
+            "io: peer closed connection without sending TLS close_notify".into(),
+        ));
+
+        let err = match task.await.expect("task") {
+            Ok(ConnectDataOutcome::Opened { .. }) => panic!("cleartext retry should not open"),
+            Ok(ConnectDataOutcome::Unsupported) => panic!("cleartext retry should not fallback"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::ConnectionRefused);
+        assert!(
+            rx.try_recv().is_err(),
+            "cleartext connect_data must not emit a retry"
+        );
     }
 
     #[test]
