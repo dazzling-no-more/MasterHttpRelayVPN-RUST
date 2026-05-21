@@ -530,11 +530,14 @@ jobs:
         shell: bash
         run: |
           set +e
+          # `-print` instead of GNU's `-printf '%p\n'` — macOS runners
+          # ship BSD find, which doesn't understand -printf. The output
+          # is identical for the simple "%p\n" format.
           find target/release/bundle -maxdepth 3 -type f \
             \( -name '*.msi' -o -name '*.dmg' -o -name '*.AppImage' \
                -o -name '*.deb' -o -name '*.rpm' -o -name '*.exe' \
                -o -name '*.tar.gz' -o -name '*.sig' \) \
-            -printf '%p\n' | sort
+            -print | sort
 
       - uses: actions/upload-artifact@v4
         with:

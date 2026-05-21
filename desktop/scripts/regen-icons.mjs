@@ -27,10 +27,16 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const projectRoot = join(__dirname, "..");
 const svg = join(projectRoot, "src-tauri", "icons", "icon.svg");
 
+// Node 24 tightened spawn() on Windows: it no longer special-cases .cmd
+// shims, so `spawn("npx.cmd", ...)` fails with EINVAL even though that
+// was the documented Node 20 workaround. Routing through the system
+// shell on Windows restores the prior behaviour. Linux/macOS keep
+// shell: false to avoid the extra word-splitting layer.
+const isWin = process.platform === "win32";
 const child = spawn(
-  process.platform === "win32" ? "npx.cmd" : "npx",
+  isWin ? "npx.cmd" : "npx",
   ["@tauri-apps/cli", "icon", svg, "--output", join(projectRoot, "src-tauri", "icons")],
-  { stdio: "inherit", cwd: projectRoot },
+  { stdio: "inherit", cwd: projectRoot, shell: isWin },
 );
 
 child.on("exit", (code) => {
