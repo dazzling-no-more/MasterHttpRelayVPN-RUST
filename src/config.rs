@@ -1844,7 +1844,7 @@ mod rt_tests {
   "heartbeat_failure_threshold": 5,
   "allow_brotli_zstd": true
 }"#;
-        let tmp = std::env::temp_dir().join("mhrv-rt-test.json");
+        let tmp = std::env::temp_dir().join("rahgozar-rt-test.json");
         std::fs::write(&tmp, json).unwrap();
         let cfg = Config::load(&tmp).expect("config should load");
         assert_eq!(cfg.mode, "apps_script");
@@ -1952,7 +1952,7 @@ mod rt_tests {
   "log_level": "info",
   "verify_ssl": true
 }"#;
-        let tmp = std::env::temp_dir().join("mhrv-rt-min.json");
+        let tmp = std::env::temp_dir().join("rahgozar-rt-min.json");
         std::fs::write(&tmp, json).unwrap();
         let cfg = Config::load(&tmp).expect("minimal config should load");
         assert_eq!(cfg.mode, "apps_script");

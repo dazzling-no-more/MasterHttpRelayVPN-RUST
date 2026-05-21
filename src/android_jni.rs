@@ -220,7 +220,7 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_startProxy(
             let rt = match tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(4)
                 .enable_all()
-                .thread_name("mhrv-worker")
+                .thread_name("rahgozar-worker")
                 .build()
             {
                 Ok(r) => r,

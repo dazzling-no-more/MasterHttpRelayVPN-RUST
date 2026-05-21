@@ -8,7 +8,7 @@ import androidx.core.os.LocaleListCompat
 /**
  * Application-level setup. The only job here right now is to catch
  * uncaught JVM exceptions and route them through logcat under the
- * `mhrv-crash` tag BEFORE the process dies. Without this the crashes
+ * `rahgozar-crash` tag BEFORE the process dies. Without this the crashes
  * appear as opaque "App closed unexpectedly" with no line number in
  * `adb logcat` — we re-raise the exception afterwards so the default
  * handler still prints its stack trace and Android still shows the
@@ -19,7 +19,7 @@ import androidx.core.os.LocaleListCompat
  * including the tun2proxy worker and the log-drain coroutine —
  * important because those don't have an activity in scope.
  */
-class MhrvApp : Application() {
+class RahgozarApp : Application() {
     override fun onCreate() {
         super.onCreate()
 
@@ -67,7 +67,7 @@ class MhrvApp : Application() {
     }
 
     companion object {
-        private const val CRASH_TAG = "mhrv-crash"
-        private const val APP_TAG = "MhrvApp"
+        private const val CRASH_TAG = "rahgozar-crash"
+        private const val APP_TAG = "RahgozarApp"
     }
 }

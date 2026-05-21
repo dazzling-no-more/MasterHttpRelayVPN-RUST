@@ -41,12 +41,12 @@ import com.dazzlingnomore.mhrv.ConnectionMode
 import com.dazzlingnomore.mhrv.CuratedGroups
 import com.dazzlingnomore.mhrv.DEFAULT_SNI_POOL
 import com.dazzlingnomore.mhrv.FrontingGroup
-import com.dazzlingnomore.mhrv.MhrvConfig
 import com.dazzlingnomore.mhrv.Mode
 import com.dazzlingnomore.mhrv.Native
 import com.dazzlingnomore.mhrv.NetworkDetect
 import com.dazzlingnomore.mhrv.ProfileStore
 import com.dazzlingnomore.mhrv.R
+import com.dazzlingnomore.mhrv.RahgozarConfig
 import com.dazzlingnomore.mhrv.SplitMode
 import com.dazzlingnomore.mhrv.UiLang
 import com.dazzlingnomore.mhrv.UpdateInstaller
@@ -110,7 +110,7 @@ fun HomeScreen(
     // cheap at this write rate, avoids "I tapped Start before saving" bugs.
     var cfg by remember { mutableStateOf(ConfigStore.load(ctx)) }
 
-    fun persist(new: MhrvConfig) {
+    fun persist(new: RahgozarConfig) {
         // In-memory state goes through unconditionally so the form
         // doesn't snap back to old bytes mid-edit. Disk state is
         // gated on the write succeeding — if config.json didn't
@@ -709,7 +709,7 @@ fun HomeScreen(
             // mux counters. Release users would just see a confusing
             // panel of integers next to no benefit, so strip it from
             // release builds the same way the system-overlay variant
-            // is stripped (see MhrvVpnService.showDebugOverlay).
+            // is stripped (see RahgozarVpnService.showDebugOverlay).
             if (BuildConfig.DEBUG) {
                 PipelineDebugCard()
             }
@@ -794,8 +794,8 @@ fun HomeScreen(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AppSplittingEditor(
-    cfg: MhrvConfig,
-    onChange: (MhrvConfig) -> Unit,
+    cfg: RahgozarConfig,
+    onChange: (RahgozarConfig) -> Unit,
 ) {
     val ctx = LocalContext.current
     var pickerOpen by remember { mutableStateOf(false) }
@@ -1162,8 +1162,8 @@ private sealed class ProbeState {
 
 @Composable
 private fun SniPoolEditor(
-    cfg: MhrvConfig,
-    onChange: (MhrvConfig) -> Unit,
+    cfg: RahgozarConfig,
+    onChange: (RahgozarConfig) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
 
@@ -1650,8 +1650,8 @@ internal fun parseDiscoverResult(json: String?): DiscoverState {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun FrontingGroupsEditor(
-    cfg: MhrvConfig,
-    onChange: (MhrvConfig) -> Unit,
+    cfg: RahgozarConfig,
+    onChange: (RahgozarConfig) -> Unit,
 ) {
     val scope = rememberCoroutineScope()
     val ctx = LocalContext.current
@@ -1931,8 +1931,8 @@ private fun FrontingGroupsEditor(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun AdvancedSettings(
-    cfg: MhrvConfig,
-    onChange: (MhrvConfig) -> Unit,
+    cfg: RahgozarConfig,
+    onChange: (RahgozarConfig) -> Unit,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
         // verify_ssl

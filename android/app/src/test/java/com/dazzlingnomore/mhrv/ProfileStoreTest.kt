@@ -17,7 +17,7 @@ import org.robolectric.RobolectricTestRunner
 import java.io.File
 
 /**
- * Unit coverage for [ProfileStore] and the [ConfigStore]/[MhrvConfig]
+ * Unit coverage for [ProfileStore] and the [ConfigStore]/[RahgozarConfig]
  * surfaces it touches. These tests pin the invariants documented in
  * the class headers — drift here means desktop and Android can
  * diverge silently on the same profile data, which is the whole
@@ -128,12 +128,12 @@ class ProfileStoreTest {
      * The data-loss bug we fixed: unknown fields used to be dropped
      * the moment the user edited any form field (because persist()
      * runs cfg.toJson() which only emits modelled keys). The fix
-     * was to capture unknown keys into MhrvConfig.extrasJson and
+     * was to capture unknown keys into RahgozarConfig.extrasJson and
      * re-emit them. This test asserts: load → toJson round-trips
      * unknown fields.
      */
     @Test
-    fun mhrvconfig_toJson_preserves_unknown_fields() {
+    fun rahgozarconfig_toJson_preserves_unknown_fields() {
         val originalJson =
             """
             {
@@ -201,9 +201,9 @@ class ProfileStoreTest {
 
     @Test
     fun delete_active_clears_pointer() {
-        ProfileStore.upsert(ctx, "a", MhrvConfig(appsScriptUrls = listOf("A"), authKey = "x"))
-        ProfileStore.upsert(ctx, "b", MhrvConfig(appsScriptUrls = listOf("B"), authKey = "y"))
-        ProfileStore.upsert(ctx, "c", MhrvConfig(appsScriptUrls = listOf("C"), authKey = "z"))
+        ProfileStore.upsert(ctx, "a", RahgozarConfig(appsScriptUrls = listOf("A"), authKey = "x"))
+        ProfileStore.upsert(ctx, "b", RahgozarConfig(appsScriptUrls = listOf("B"), authKey = "y"))
+        ProfileStore.upsert(ctx, "c", RahgozarConfig(appsScriptUrls = listOf("C"), authKey = "z"))
         assertEquals(ProfileStore.MutationResult.Ok, ProfileStore.delete(ctx, "c"))
         val state = ProfileStore.load(ctx)
         assertEquals("", state.active)
@@ -213,8 +213,8 @@ class ProfileStoreTest {
 
     @Test
     fun delete_non_active_keeps_pointer() {
-        ProfileStore.upsert(ctx, "a", MhrvConfig(appsScriptUrls = listOf("A"), authKey = "x"))
-        ProfileStore.upsert(ctx, "b", MhrvConfig(appsScriptUrls = listOf("B"), authKey = "y"))
+        ProfileStore.upsert(ctx, "a", RahgozarConfig(appsScriptUrls = listOf("A"), authKey = "x"))
+        ProfileStore.upsert(ctx, "b", RahgozarConfig(appsScriptUrls = listOf("B"), authKey = "y"))
         ProfileStore.delete(ctx, "a")
         assertEquals("b", ProfileStore.load(ctx).active)
     }
@@ -222,7 +222,7 @@ class ProfileStoreTest {
     @Test
     fun upsert_writes_snapshot_to_live_config_json() {
         val cfg =
-            MhrvConfig(
+            RahgozarConfig(
                 mode = Mode.APPS_SCRIPT,
                 appsScriptUrls = listOf("A"),
                 authKey = "secret",
@@ -240,7 +240,7 @@ class ProfileStoreTest {
 
     @Test
     fun insertNew_writes_snapshot_to_live_config_json() {
-        val cfg = MhrvConfig(appsScriptUrls = listOf("X"), authKey = "k")
+        val cfg = RahgozarConfig(appsScriptUrls = listOf("X"), authKey = "k")
         val r = ProfileStore.insertNew(ctx, "first", cfg)
         assertEquals(ProfileStore.MutationResult.Ok, r)
         assertTrue(configFile.exists())
@@ -253,7 +253,7 @@ class ProfileStoreTest {
      */
     @Test
     fun clearActiveIfAny_clears_when_set() {
-        ProfileStore.upsert(ctx, "p", MhrvConfig(appsScriptUrls = listOf("A"), authKey = "k"))
+        ProfileStore.upsert(ctx, "p", RahgozarConfig(appsScriptUrls = listOf("A"), authKey = "k"))
         assertEquals("p", ProfileStore.load(ctx).active)
         ProfileStore.clearActiveIfAny(ctx)
         val state = ProfileStore.load(ctx)
@@ -284,8 +284,8 @@ class ProfileStoreTest {
 
     @Test
     fun rename_collision_does_not_mutate_state() {
-        ProfileStore.upsert(ctx, "a", MhrvConfig(appsScriptUrls = listOf("A"), authKey = "x"))
-        ProfileStore.upsert(ctx, "b", MhrvConfig(appsScriptUrls = listOf("B"), authKey = "y"))
+        ProfileStore.upsert(ctx, "a", RahgozarConfig(appsScriptUrls = listOf("A"), authKey = "x"))
+        ProfileStore.upsert(ctx, "b", RahgozarConfig(appsScriptUrls = listOf("B"), authKey = "y"))
         val r = ProfileStore.rename(ctx, "a", "b")
         assertEquals(ProfileStore.MutationResult.Duplicate, r)
         val state = ProfileStore.load(ctx)
@@ -295,7 +295,7 @@ class ProfileStoreTest {
 
     @Test
     fun upsert_empty_name_is_rejected() {
-        val r = ProfileStore.upsert(ctx, "   ", MhrvConfig())
+        val r = ProfileStore.upsert(ctx, "   ", RahgozarConfig())
         assertEquals(ProfileStore.MutationResult.EmptyName, r)
         assertFalse("nothing should be written for empty name", profilesFile.exists())
     }
@@ -305,13 +305,13 @@ class ProfileStoreTest {
         ProfileStore.insertNew(
             ctx,
             "p",
-            MhrvConfig(appsScriptUrls = listOf("first"), authKey = "k"),
+            RahgozarConfig(appsScriptUrls = listOf("first"), authKey = "k"),
         )
         val r =
             ProfileStore.insertNew(
                 ctx,
                 "p",
-                MhrvConfig(appsScriptUrls = listOf("second"), authKey = "k"),
+                RahgozarConfig(appsScriptUrls = listOf("second"), authKey = "k"),
             )
         assertEquals(ProfileStore.MutationResult.Duplicate, r)
         val applied = ProfileStore.applyProfile(ctx, "p")
@@ -419,7 +419,7 @@ class ProfileStoreTest {
             ProfileStore.upsert(
                 ctx,
                 "p",
-                MhrvConfig(appsScriptUrls = listOf("A"), authKey = "k"),
+                RahgozarConfig(appsScriptUrls = listOf("A"), authKey = "k"),
             )
         assertTrue(r is ProfileStore.MutationResult.CorruptOnDisk)
         assertEquals(before, profilesFile.readText())
@@ -433,7 +433,7 @@ class ProfileStoreTest {
             ProfileStore.upsert(
                 ctx,
                 "p",
-                MhrvConfig(appsScriptUrls = listOf("A"), authKey = "k"),
+                RahgozarConfig(appsScriptUrls = listOf("A"), authKey = "k"),
             )
         assertEquals(ProfileStore.MutationResult.Ok, r)
         assertEquals("p", ProfileStore.load(ctx).active)
@@ -450,7 +450,7 @@ class ProfileStoreTest {
      */
     @Test
     fun save_leaves_no_tmp_or_bak_behind_on_success() {
-        ProfileStore.upsert(ctx, "p", MhrvConfig(appsScriptUrls = listOf("A"), authKey = "k"))
+        ProfileStore.upsert(ctx, "p", RahgozarConfig(appsScriptUrls = listOf("A"), authKey = "k"))
         assertFalse(File(ctx.filesDir, "profiles.json.tmp").exists())
         assertFalse(File(ctx.filesDir, "profiles.json.bak").exists())
     }
@@ -460,14 +460,14 @@ class ProfileStoreTest {
     @Test
     fun applyProfile_decoded_view_matches_snapshot_subset() {
         val cfg =
-            MhrvConfig(
+            RahgozarConfig(
                 mode = Mode.FULL,
                 appsScriptUrls = listOf("Z"),
                 authKey = "topsecret",
                 parallelRelay = 3,
             )
         ProfileStore.upsert(ctx, "fullmode", cfg)
-        ConfigStore.save(ctx, MhrvConfig(mode = Mode.DIRECT))
+        ConfigStore.save(ctx, RahgozarConfig(mode = Mode.DIRECT))
         val applied = ProfileStore.applyProfile(ctx, "fullmode")
         assertTrue(applied is ProfileStore.ApplyResult.Ok)
         val out = (applied as ProfileStore.ApplyResult.Ok).cfg
@@ -493,7 +493,7 @@ class ProfileStoreTest {
             """.trimIndent()
         profilesFile.writeText(bad)
         // Plant a known-good live config so we can assert it's unchanged.
-        ConfigStore.save(ctx, MhrvConfig(authKey = "preserve-me"))
+        ConfigStore.save(ctx, RahgozarConfig(authKey = "preserve-me"))
         val before = configFile.readText()
 
         val r = ProfileStore.applyProfile(ctx, "bad")
@@ -529,7 +529,7 @@ class ProfileStoreTest {
 
     @Test
     fun applyProfile_missing_returns_NotFound_without_side_effects() {
-        ConfigStore.save(ctx, MhrvConfig(authKey = "preserve-me"))
+        ConfigStore.save(ctx, RahgozarConfig(authKey = "preserve-me"))
         val before = configFile.readText()
         val applied = ProfileStore.applyProfile(ctx, "does-not-exist")
         assertTrue(applied is ProfileStore.ApplyResult.NotFound)
@@ -538,7 +538,7 @@ class ProfileStoreTest {
 
     @Test
     fun unique_copy_name_increments_on_collision() {
-        ProfileStore.upsert(ctx, "p", MhrvConfig(appsScriptUrls = listOf("A"), authKey = "k"))
+        ProfileStore.upsert(ctx, "p", RahgozarConfig(appsScriptUrls = listOf("A"), authKey = "k"))
         ProfileStore.duplicate(ctx, "p", "p (copy)")
         val state = ProfileStore.load(ctx)
         val unique = ProfileStore.uniqueCopyName(state, "p")
@@ -566,7 +566,7 @@ class ProfileStoreTest {
         ProfileStore.upsert(
             ctx,
             "home",
-            MhrvConfig(appsScriptUrls = listOf("OLD"), authKey = "old"),
+            RahgozarConfig(appsScriptUrls = listOf("OLD"), authKey = "old"),
         )
         val profilesBefore = profilesFile.readText()
 
@@ -582,7 +582,7 @@ class ProfileStoreTest {
                 ProfileStore.upsert(
                     ctx,
                     "home",
-                    MhrvConfig(appsScriptUrls = listOf("NEW"), authKey = "new"),
+                    RahgozarConfig(appsScriptUrls = listOf("NEW"), authKey = "new"),
                 )
             assertEquals(ProfileStore.MutationResult.SaveFailed, r)
             // profiles.json must be UNCHANGED — the bug guard.
@@ -605,7 +605,7 @@ class ProfileStoreTest {
         ProfileStore.upsert(
             ctx,
             "home",
-            MhrvConfig(appsScriptUrls = listOf("OLD"), authKey = "old"),
+            RahgozarConfig(appsScriptUrls = listOf("OLD"), authKey = "old"),
         )
         val profilesBefore = profilesFile.readText()
 
@@ -622,7 +622,7 @@ class ProfileStoreTest {
                 ProfileStore.upsert(
                     ctx,
                     "home",
-                    MhrvConfig(appsScriptUrls = listOf("NEW"), authKey = "new"),
+                    RahgozarConfig(appsScriptUrls = listOf("NEW"), authKey = "new"),
                 )
             assertEquals(ProfileStore.MutationResult.PartialConfigOnly, r)
 
@@ -652,12 +652,12 @@ class ProfileStoreTest {
         ProfileStore.upsert(
             ctx,
             "home",
-            MhrvConfig(appsScriptUrls = listOf("HOME_ID"), authKey = "homekey"),
+            RahgozarConfig(appsScriptUrls = listOf("HOME_ID"), authKey = "homekey"),
         )
         ProfileStore.upsert(
             ctx,
             "other",
-            MhrvConfig(appsScriptUrls = listOf("OTHER_ID"), authKey = "otherkey"),
+            RahgozarConfig(appsScriptUrls = listOf("OTHER_ID"), authKey = "otherkey"),
         )
         val profilesBefore = profilesFile.readText()
         assertEquals("other", ProfileStore.load(ctx).active)

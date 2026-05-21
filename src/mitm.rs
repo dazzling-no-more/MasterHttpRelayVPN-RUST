@@ -301,7 +301,7 @@ mod tests {
     fn tempdir() -> PathBuf {
         let mut p = std::env::temp_dir();
         let n: u64 = rand::random();
-        p.push(format!("mhrv-test-{:x}", n));
+        p.push(format!("rahgozar-test-{:x}", n));
         std::fs::create_dir_all(&p).unwrap();
         p
     }

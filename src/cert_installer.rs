@@ -2099,7 +2099,7 @@ ID_LIKE=debian
         // cert8.db (legacy dbm:) profiles, skips siblings that have
         // neither, ignores plain files, and tolerates missing roots.
         let tmp = std::env::temp_dir().join(format!(
-            "mhrv-discover-{}-{:x}",
+            "rahgozar-discover-{}-{:x}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

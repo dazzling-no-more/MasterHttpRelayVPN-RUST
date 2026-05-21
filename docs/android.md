@@ -249,7 +249,7 @@ By default, Android apps opt out of trusting user-installed CAs (Android 7+ `Net
 | JS parts of a site don't load | Pre-v1.0 OPTIONS rejection | Upgrade to v1.0.0+. If still present: Live logs → grep for `Relay failed`, report |
 | All SNIs time out in the tester | `google_ip` is stale (Google rotated the A record) | Tap **Auto-detect google_ip** |
 | SNI tester red on some rows only | Those SNIs are DPI-filtered on your network | Uncheck the failing ones in the rotation pool |
-| App closes when tapping Stop | Was a v1.0.0/1.0.1 race bug | Upgrade to v1.0.2. If still present on v1.0.2+: `adb logcat -s MhrvVpnService mhrv-crash mhrv_rs` and report |
+| App closes when tapping Stop | Was a v1.0.0/1.0.1 race bug | Upgrade to v1.0.2. If still present on v1.0.2+: `adb logcat -s RahgozarVpnService rahgozar-crash rahgozar` and report |
 | `INSTALL_FAILED_UPDATE_INCOMPATIBLE` when upgrading | Old APK signed with a different key (pre-v1.0.2) | Uninstall first, then install the new APK. Only a one-time thing — v1.0.2 onward has a stable signature |
 | Chrome white-pages with no error | Often a rendering bug on the emulator with software GPU | Test on real hardware. Check `Live logs` to verify the relay is actually making requests |
 | Cloudflare Turnstile loop | [Known limitation](#cloudflare-turnstile-verify-you-are-human-loops) | No fix inside this architecture |
@@ -262,10 +262,10 @@ If you need to report a bug:
 ```sh
 adb logcat -c                              # clear
 # reproduce the issue in the app
-adb logcat -d | grep -E "MhrvVpnService|mhrv_rs|mhrv-crash|tun2proxy" > mhrv.log
+adb logcat -d | grep -E "RahgozarVpnService|rahgozar|rahgozar-crash|tun2proxy" > rahgozar.log
 ```
 
-Attach `mhrv.log` to your issue. Also include:
+Attach `rahgozar.log` to your issue. Also include:
 - Android version (Settings → About phone → Android version)
 - OEM (Pixel / Samsung / Xiaomi / …)
 - App version (tap the version badge in the top bar)

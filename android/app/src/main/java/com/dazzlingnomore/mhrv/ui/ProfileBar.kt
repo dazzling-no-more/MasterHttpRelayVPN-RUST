@@ -15,9 +15,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
-import com.dazzlingnomore.mhrv.MhrvConfig
 import com.dazzlingnomore.mhrv.ProfileStore
 import com.dazzlingnomore.mhrv.R
+import com.dazzlingnomore.mhrv.RahgozarConfig
 import com.dazzlingnomore.mhrv.UiLang
 import com.dazzlingnomore.mhrv.VpnState
 import kotlinx.coroutines.launch
@@ -33,7 +33,7 @@ import kotlinx.coroutines.launch
  *   - **Manage**: rename / duplicate / delete saved profiles.
  *
  * Switching a profile rewrites `config.json` to the snapshot (raw — no
- * round-trip through MhrvConfig, so unknown fields survive) and
+ * round-trip through RahgozarConfig, so unknown fields survive) and
  * triggers [onConfigChange] so the parent screen reloads its `cfg`
  * state from disk. If the new profile has a different `ui_lang`,
  * [onLangChange] is fired so the activity recreates with the right
@@ -46,8 +46,8 @@ import kotlinx.coroutines.launch
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProfileBar(
-    cfg: MhrvConfig,
-    onConfigChange: (MhrvConfig) -> Unit,
+    cfg: RahgozarConfig,
+    onConfigChange: (RahgozarConfig) -> Unit,
     onLangChange: (UiLang) -> Unit,
     onSnackbar: suspend (String) -> Unit,
 ) {
@@ -253,7 +253,7 @@ fun ProfileBar(
 
 @Composable
 private fun SaveAsProfileDialog(
-    cfg: MhrvConfig,
+    cfg: RahgozarConfig,
     existingNames: List<String>,
     onDismiss: () -> Unit,
     onSaved: (String) -> Unit,

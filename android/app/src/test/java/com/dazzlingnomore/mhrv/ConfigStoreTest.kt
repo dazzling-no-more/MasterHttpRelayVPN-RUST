@@ -35,7 +35,7 @@ class ConfigStoreTest {
     @Test
     fun frontingGroups_roundTripsThroughJson() {
         val cfg =
-            MhrvConfig(
+            RahgozarConfig(
                 mode = Mode.DIRECT,
                 frontingGroups = sampleGroups,
             )
@@ -52,7 +52,7 @@ class ConfigStoreTest {
 
     @Test
     fun frontingGroups_emptyListProducesNoKey() {
-        val cfg = MhrvConfig(frontingGroups = emptyList())
+        val cfg = RahgozarConfig(frontingGroups = emptyList())
         val json = JSONObject(cfg.toJson())
         // Skipping the key when empty matches the pattern used for the
         // other optional list fields (passthrough_hosts, sni_hosts) and

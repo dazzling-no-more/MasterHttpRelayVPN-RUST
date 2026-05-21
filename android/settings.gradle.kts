@@ -19,5 +19,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "mhrv-android"
+rootProject.name = "rahgozar-android"
 include(":app")

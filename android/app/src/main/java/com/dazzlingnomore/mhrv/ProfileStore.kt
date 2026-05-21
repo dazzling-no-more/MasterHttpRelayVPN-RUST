@@ -25,7 +25,7 @@ import java.io.File
  *     pretty-print) — any config fields this build doesn't model (e.g.
  *     `fronting_groups`, `exit_node`, `request_timeout_secs`) must
  *     round-trip without loss. NEVER pass the snapshot through
- *     `MhrvConfig` parse + `toJson()` on the apply path; that drops
+ *     `RahgozarConfig` parse + `toJson()` on the apply path; that drops
  *     unknown fields silently.
  *
  *  2. **`active` means "matches the live config".** `active = "name"`
@@ -295,11 +295,11 @@ object ProfileStore {
      */
     sealed class ApplyResult {
         data class Ok(
-            val cfg: MhrvConfig,
+            val cfg: RahgozarConfig,
         ) : ApplyResult()
 
         data class PartialConfigOnly(
-            val cfg: MhrvConfig,
+            val cfg: RahgozarConfig,
         ) : ApplyResult()
 
         object NotFound : ApplyResult()
@@ -311,7 +311,7 @@ object ProfileStore {
 
     /**
      * Switch the live config to a stored profile. The snapshot is
-     * written to `config.json` RAW (not through [MhrvConfig.toJson])
+     * written to `config.json` RAW (not through [RahgozarConfig.toJson])
      * so any fields this build doesn't model survive — this is what
      * lets the native runtime keep seeing desktop-only / future
      * Rust-side keys.
@@ -354,7 +354,7 @@ object ProfileStore {
         // so we re-check on the decoded result.
         val cfg =
             ConfigStore.decode(p.configJson)
-                ?: return ApplyResult.Failed("snapshot did not decode into MhrvConfig")
+                ?: return ApplyResult.Failed("snapshot did not decode into RahgozarConfig")
         val shapeErr = validateRuntimeShape(JSONObject(p.configJson), cfg)
         if (shapeErr != null) {
             return ApplyResult.Failed("snapshot would not pass runtime validation: $shapeErr")
@@ -391,7 +391,7 @@ object ProfileStore {
     fun applyProfileOrNull(
         ctx: Context,
         name: String,
-    ): MhrvConfig? =
+    ): RahgozarConfig? =
         when (val r = applyProfile(ctx, name)) {
             is ApplyResult.Ok -> r.cfg
             is ApplyResult.PartialConfigOnly -> r.cfg
@@ -415,7 +415,7 @@ object ProfileStore {
     fun upsert(
         ctx: Context,
         name: String,
-        cfg: MhrvConfig,
+        cfg: RahgozarConfig,
     ): MutationResult {
         val trimmed = name.trim()
         if (trimmed.isEmpty()) return MutationResult.EmptyName
@@ -446,7 +446,7 @@ object ProfileStore {
     fun insertNew(
         ctx: Context,
         name: String,
-        cfg: MhrvConfig,
+        cfg: RahgozarConfig,
     ): MutationResult {
         val trimmed = name.trim()
         if (trimmed.isEmpty()) return MutationResult.EmptyName
@@ -597,7 +597,7 @@ object ProfileStore {
      */
     private fun validateRuntimeShape(
         raw: JSONObject,
-        decoded: MhrvConfig,
+        decoded: RahgozarConfig,
     ): String? {
         val mode = raw.optString("mode", "")
         if (mode.isBlank()) return "missing required field `mode`"
@@ -685,7 +685,7 @@ object ProfileStore {
 
     /**
      * Strict encode: throws on any malformed snapshot. Should never
-     * happen in practice because snapshots come from [MhrvConfig.toJson]
+     * happen in practice because snapshots come from [RahgozarConfig.toJson]
      * (always valid) or were captured at parse time (already validated
      * by [parse]). A throw here means an invariant violation we'd
      * rather surface loudly than silently drop.

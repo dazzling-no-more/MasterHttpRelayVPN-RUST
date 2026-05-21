@@ -30,8 +30,8 @@ class UpdateInstallerTest {
             releaseUrl = "https://example.invalid/release",
             asset =
                 UpdateInstaller.ApkAsset(
-                    name = "mhrv-arm64-v8a.apk",
-                    url = "https://example.invalid/mhrv-arm64-v8a.apk",
+                    name = "rahgozar-android-arm64-v8a.apk",
+                    url = "https://example.invalid/rahgozar-android-arm64-v8a.apk",
                     sizeBytes = 12_345_678L,
                 ),
         )

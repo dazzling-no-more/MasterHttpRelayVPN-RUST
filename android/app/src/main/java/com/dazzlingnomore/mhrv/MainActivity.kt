@@ -22,7 +22,7 @@ import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.dazzlingnomore.mhrv.ui.CaInstallOutcome
 import com.dazzlingnomore.mhrv.ui.HomeScreen
-import com.dazzlingnomore.mhrv.ui.theme.MhrvTheme
+import com.dazzlingnomore.mhrv.ui.theme.RahgozarTheme
 import java.util.Locale
 
 // UiLang is in the outer package namespace already.
@@ -87,7 +87,7 @@ class MainActivity : AppCompatActivity() {
         handleDeepLink(intent)
 
         setContent {
-            MhrvTheme {
+            RahgozarTheme {
                 AppRoot()
             }
         }
@@ -163,7 +163,7 @@ class MainActivity : AppCompatActivity() {
                 // Only ask for the VPN-consent grant when the user has
                 // opted into VPN_TUN mode. In PROXY_ONLY we don't touch
                 // VpnService.prepare — firing the consent dialog there
-                // would be wrong (user said "no VPN") and MhrvVpnService
+                // would be wrong (user said "no VPN") and RahgozarVpnService
                 // wouldn't call establish() anyway.
                 val cfg = ConfigStore.load(this)
                 if (cfg.connectionMode == ConnectionMode.VPN_TUN) {
@@ -179,8 +179,8 @@ class MainActivity : AppCompatActivity() {
             },
             onStop = {
                 // Single-step graceful teardown. ACTION_STOP delivered via
-                // startService() reaches MhrvVpnService.onStartCommand,
-                // which spawns the `mhrv-teardown` background thread that
+                // startService() reaches RahgozarVpnService.onStartCommand,
+                // which spawns the `rahgozar-teardown` background thread that
                 // tears down tun2proxy + the Rust runtime and then calls
                 // stopSelf() at the end of teardown. Service stops on its
                 // own — we don't need (and must not) follow up with
@@ -190,11 +190,11 @@ class MainActivity : AppCompatActivity() {
                 // immediately after startService(stopAction), as belt-and-
                 // suspenders against a "force-closed then reopened zombie"
                 // case. That second call was firing onDestroy() while the
-                // mhrv-teardown thread was still running, racing two threads
+                // rahgozar-teardown thread was still running, racing two threads
                 // through the lifecycle and crashing on tap-to-disconnect.
                 // The service's runTeardown CAS-claims a teardownInProgress
                 // slot; a second concurrent caller (onDestroy racing the
-                // mhrv-teardown thread, etc.) skips fast rather than
+                // rahgozar-teardown thread, etc.) skips fast rather than
                 // blocking on lifecycleLock. The first caller still
                 // synchronises with startEverything via the lock, so the
                 // native side is never half-torn-down under a fresh start.
@@ -210,8 +210,8 @@ class MainActivity : AppCompatActivity() {
                 // Revoking it would force a re-prompt on next Start, which
                 // is worse UX.
                 val stopAction =
-                    Intent(this, MhrvVpnService::class.java)
-                        .setAction(MhrvVpnService.ACTION_STOP)
+                    Intent(this, RahgozarVpnService::class.java)
+                        .setAction(RahgozarVpnService.ACTION_STOP)
                 startService(stopAction)
             },
             onInstallCaConfirmed = {
@@ -241,7 +241,7 @@ class MainActivity : AppCompatActivity() {
             onCaOutcomeConsumed = { caOutcome = null },
             onLangChange = { lang ->
                 // Re-apply the new locale to the running process. AppCompatDelegate
-                // picks it up from MhrvApp.onCreate on process restart, so we
+                // picks it up from RahgozarApp.onCreate on process restart, so we
                 // recreate() the activity to take effect immediately — otherwise
                 // the user would have to swipe the app away and reopen it for
                 // RTL/LTR to swap.
@@ -270,7 +270,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startVpnService() {
-        val i = Intent(this, MhrvVpnService::class.java)
+        val i = Intent(this, RahgozarVpnService::class.java)
         startService(i)
     }
 
@@ -278,6 +278,6 @@ class MainActivity : AppCompatActivity() {
         private const val REQ_NOTIF = 42
 
         /** Deep link config waiting for user confirmation. Read by ConfigSharingBar. */
-        val pendingDeepLinkConfig = mutableStateOf<MhrvConfig?>(null)
+        val pendingDeepLinkConfig = mutableStateOf<RahgozarConfig?>(null)
     }
 }

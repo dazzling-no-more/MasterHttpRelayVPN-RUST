@@ -7,11 +7,11 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * JVM unit tests for `MhrvConfig.toJson()` and the shared
+ * JVM unit tests for `RahgozarConfig.toJson()` and the shared
  * `loadFromJson()` path that handles the `fronting_groups`
  * field. These pin the JSON-shape contract that flows:
  *
- *   `MhrvConfig` (Kotlin)
+ *   `RahgozarConfig` (Kotlin)
  *      → `toJson()` JSON string
  *      → Rust `Config` deserialization via `serde_json`
  *      → `proxy_server::ProxyServer::new()`
@@ -29,7 +29,7 @@ class ConfigStoreFrontingGroupsTest {
     @Test
     fun toJson_includes_fronting_groups_in_canonical_shape() {
         val cfg =
-            MhrvConfig(
+            RahgozarConfig(
                 mode = Mode.DIRECT,
                 frontingGroups =
                     listOf(
@@ -77,7 +77,7 @@ class ConfigStoreFrontingGroupsTest {
         // before they reach disk / Native.startProxy. This test
         // pins that filter.
         val cfg =
-            MhrvConfig(
+            RahgozarConfig(
                 mode = Mode.DIRECT,
                 frontingGroups =
                     listOf(
@@ -100,7 +100,7 @@ class ConfigStoreFrontingGroupsTest {
         // Keep the on-disk JSON small for first-time users who
         // never touch fronting groups. Empty array would still
         // deserialize correctly on the Rust side but adds noise.
-        val cfg = MhrvConfig(frontingGroups = emptyList())
+        val cfg = RahgozarConfig(frontingGroups = emptyList())
         val parsed = JSONObject(cfg.toJson())
         assertFalse(
             "empty fronting_groups should be omitted entirely",
@@ -115,7 +115,7 @@ class ConfigStoreFrontingGroupsTest {
         // pins both the encoder AND the decoder; a drift on either
         // side breaks this test.
         val original =
-            MhrvConfig(
+            RahgozarConfig(
                 mode = Mode.DIRECT,
                 frontingGroups =
                     listOf(

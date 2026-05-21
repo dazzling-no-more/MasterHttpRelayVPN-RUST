@@ -137,7 +137,7 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.2")
     // AppCompatDelegate.setApplicationLocales is the only thing we need
     // out of AppCompat — lets us flip the whole app locale at runtime
-    // from MhrvApp.onCreate without touching every composable.
+    // from RahgozarApp.onCreate without touching every composable.
     implementation("androidx.appcompat:appcompat:1.7.0")
 
     // Compose UI.

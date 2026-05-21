@@ -52,7 +52,7 @@ val TextPrimary = Color(0xFFC8C8C8)
 val TextSecondary = Color(0xFF8C8C8C)
 val TextLabel = Color(0xFFB4B4B4)
 
-private val MhrvDark =
+private val RahgozarDark =
     darkColorScheme(
         primary = AccentBlue,
         onPrimary = Color.White,
@@ -80,7 +80,7 @@ private val MhrvDark =
  * tight rounded-rectangles keeps the whole app visually consistent with
  * the desktop's squared-off controls instead of Material's default pills.
  */
-private val MhrvShapes =
+private val RahgozarShapes =
     Shapes(
         extraSmall = RoundedCornerShape(4.dp),
         small = RoundedCornerShape(4.dp),
@@ -90,10 +90,10 @@ private val MhrvShapes =
     )
 
 @Composable
-fun MhrvTheme(content: @Composable () -> Unit) {
+fun RahgozarTheme(content: @Composable () -> Unit) {
     MaterialTheme(
-        colorScheme = MhrvDark,
-        shapes = MhrvShapes,
+        colorScheme = RahgozarDark,
+        shapes = RahgozarShapes,
         content = content,
     )
 }

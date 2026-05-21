@@ -44,7 +44,7 @@ class PipelineDebugOverlay(
     // first time `hide()` runs (or `show()` fails). Once true, every
     // subsequent show()/hide() is a no-op except for thread-quit safety.
     // This closes two races:
-    //   1. MhrvVpnService posts `show()` on the main looper, but
+    //   1. RahgozarVpnService posts `show()` on the main looper, but
     //      service teardown runs first and calls `hide()` before the
     //      posted show executes. Without this flag, the late show()
     //      would add the view after stop and orphan it.
@@ -56,7 +56,7 @@ class PipelineDebugOverlay(
     /**
      * Add the overlay to the WindowManager. Returns true on success,
      * false if the OS refused (BadTokenException, SecurityException,
-     * etc.). The caller (MhrvVpnService) uses the return value to
+     * etc.). The caller (RahgozarVpnService) uses the return value to
      * decide whether to keep the overlay reference live — without it,
      * a one-time addView failure would stick a non-null but-not-shown
      * overlay onto the service, silently swallowing every later retry.

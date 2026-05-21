@@ -27,8 +27,8 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import com.dazzlingnomore.mhrv.ConfigStore
-import com.dazzlingnomore.mhrv.MhrvConfig
 import com.dazzlingnomore.mhrv.R
+import com.dazzlingnomore.mhrv.RahgozarConfig
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.qrcode.QRCodeWriter
 import com.journeyapps.barcodescanner.ScanContract
@@ -41,8 +41,8 @@ import kotlinx.coroutines.launch
 
 @Composable
 fun ConfigSharingBar(
-    cfg: MhrvConfig,
-    onImport: (MhrvConfig) -> Unit,
+    cfg: RahgozarConfig,
+    onImport: (RahgozarConfig) -> Unit,
     onSnackbar: suspend (String) -> Unit,
 ) {
     // Deep link import — requires confirmation before applying.
@@ -65,7 +65,7 @@ fun ConfigSharingBar(
 
     var showExportDialog by remember { mutableStateOf(false) }
     var showImportConfirm by remember { mutableStateOf(false) }
-    var pendingImport by remember { mutableStateOf<MhrvConfig?>(null) }
+    var pendingImport by remember { mutableStateOf<RahgozarConfig?>(null) }
 
     // QR scanner launcher — fires the ZXing embedded scanner activity.
     val scanLauncher =
@@ -263,7 +263,7 @@ fun ConfigSharingBar(
 
 @Composable
 private fun ImportConfirmDialog(
-    cfg: MhrvConfig,
+    cfg: RahgozarConfig,
     onConfirm: () -> Unit,
     onDismiss: () -> Unit,
 ) {

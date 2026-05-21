@@ -32,7 +32,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * via `addDisallowedApplication(packageName)`. Everything else on the
  * device still gets routed through us.
  */
-class MhrvVpnService : VpnService() {
+class RahgozarVpnService : VpnService() {
     private var tun: ParcelFileDescriptor? = null
     private var proxyHandle: Long = 0L
     private var tun2proxyThread: Thread? = null
@@ -82,7 +82,7 @@ class MhrvVpnService : VpnService() {
     // reads only). Stopped on pause and on teardown.
     //
     // notifTickerActive is AtomicBoolean (not plain Boolean) because
-    // stop is called from worker threads (mhrv-pause, mhrv-teardown)
+    // stop is called from worker threads (rahgozar-pause, rahgozar-teardown)
     // while the runnable executes on the main thread — without atomic
     // visibility, an in-flight tick could read a stale `true` and
     // reschedule itself even after stop has run. The runnable double-
@@ -137,7 +137,7 @@ class MhrvVpnService : VpnService() {
         return when (intent?.action) {
             ACTION_STOP -> {
                 // Sticky-true the stop flag IMMEDIATELY. Any in-flight
-                // mhrv-pause thread that's still inside runTeardown
+                // rahgozar-pause thread that's still inside runTeardown
                 // will see this when it reaches its post-teardown
                 // "paint paused notif" gate, and skip the notify ---
                 // without it, pause+stop arriving in quick succession
@@ -172,7 +172,7 @@ class MhrvVpnService : VpnService() {
                 Thread({
                     runTeardown()
                     // Belt-and-suspenders cancel: if any path (a racing
-                    // mhrv-pause whose teardown overlapped with us, a
+                    // rahgozar-pause whose teardown overlapped with us, a
                     // straggler tick, an upstream side-channel) managed
                     // to post NOTIF_ID after stopForeground removed it,
                     // explicitly cancel here so the user doesn't see a
@@ -184,7 +184,7 @@ class MhrvVpnService : VpnService() {
                     }
                     stopSelf()
                     Log.i(TAG, "teardown done, service stopping")
-                }, "mhrv-teardown").start()
+                }, "rahgozar-teardown").start()
                 START_NOT_STICKY
             }
 
@@ -224,7 +224,7 @@ class MhrvVpnService : VpnService() {
                         // Three gates on the paused-notif post. Each
                         // closes a real race seen in review:
                         //   1. Stop was requested during teardown:
-                        //      ACTION_STOP's mhrv-teardown is queued
+                        //      ACTION_STOP's rahgozar-teardown is queued
                         //      behind us and will cancel(NOTIF_ID)
                         //      next; we must not paint a "Paused"
                         //      that out-lives the service.
@@ -273,7 +273,7 @@ class MhrvVpnService : VpnService() {
                         }
                     }
                     Log.i(TAG, "Pause complete")
-                }, "mhrv-pause").start()
+                }, "rahgozar-pause").start()
                 // START_NOT_STICKY (not STICKY) — if Android kills a
                 // paused service for memory, we do NOT want a sticky
                 // restart that fires onStartCommand with a null intent,
@@ -304,7 +304,7 @@ class MhrvVpnService : VpnService() {
 
                     VpnLifecycleGuards.ResumeDecision.PROCEED -> {}
                 }
-                spawnStart("mhrv-resume")
+                spawnStart("rahgozar-resume")
                 START_STICKY
             }
 
@@ -319,7 +319,7 @@ class MhrvVpnService : VpnService() {
                 // startForeground call inside startEverything still
                 // fires well within Android's 5s budget --- the
                 // worker thread reaches it in milliseconds.
-                spawnStart("mhrv-start")
+                spawnStart("rahgozar-start")
                 START_STICKY
             }
         }
@@ -867,7 +867,7 @@ class MhrvVpnService : VpnService() {
                         } catch (t: Throwable) {
                             Log.w(TAG, "Tun2proxy.stop: ${t.message}")
                         }
-                    }, "mhrv-tun2proxy-stop").apply { start() }
+                    }, "rahgozar-tun2proxy-stop").apply { start() }
                 try {
                     stopper.join(2_000)
                 } catch (_: InterruptedException) {
@@ -945,7 +945,7 @@ class MhrvVpnService : VpnService() {
 
     override fun onDestroy() {
         Log.i(TAG, "onDestroy entered")
-        // Same gate as ACTION_STOP: prevent any racing mhrv-pause thread
+        // Same gate as ACTION_STOP: prevent any racing rahgozar-pause thread
         // from posting an ongoing "Paused" notification AFTER the service
         // is destroyed (e.g. VPN revoke fires onDestroy while pause is
         // still inside its synchronized block).
@@ -981,21 +981,21 @@ class MhrvVpnService : VpnService() {
             PendingIntent.getService(
                 this,
                 1,
-                Intent(this, MhrvVpnService::class.java).setAction(ACTION_STOP),
+                Intent(this, RahgozarVpnService::class.java).setAction(ACTION_STOP),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )
         val pauseIntent =
             PendingIntent.getService(
                 this,
                 2,
-                Intent(this, MhrvVpnService::class.java).setAction(ACTION_PAUSE),
+                Intent(this, RahgozarVpnService::class.java).setAction(ACTION_PAUSE),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )
         val resumeIntent =
             PendingIntent.getService(
                 this,
                 3,
-                Intent(this, MhrvVpnService::class.java).setAction(ACTION_RESUME),
+                Intent(this, RahgozarVpnService::class.java).setAction(ACTION_RESUME),
                 PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
             )
 
@@ -1090,7 +1090,7 @@ class MhrvVpnService : VpnService() {
     }
 
     companion object {
-        private const val TAG = "MhrvVpnService"
+        private const val TAG = "RahgozarVpnService"
         private const val CHANNEL_ID = "mhrv.vpn.status"
         private const val NOTIF_ID = 0x1001
         private const val MTU = 1500
@@ -1235,7 +1235,7 @@ internal class VpnLifecycleGuards {
      * is the SINGLE boundary at which a paused→running transition
      * happens: it makes a sibling tryResume see NOT_PAUSED (so a
      * Resume that arrived a beat later doesn't queue a second
-     * startEverything) and lets the queued mhrv-pause body's
+     * startEverything) and lets the queued rahgozar-pause body's
      * post-teardown notify gate see isPaused=false (so it skips
      * posting "Paused" over a service that's about to come back up).
      *

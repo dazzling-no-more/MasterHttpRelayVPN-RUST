@@ -256,7 +256,7 @@ curl -X POST 'http://localhost:8443/tunnel' \
 بالای فایل تنظیم کنید:
 
 ```js
-const AUTH_KEY = "your-mhrv-auth-key";
+const AUTH_KEY = "your-rahgozar-auth-key";
 const TUNNEL_URL = "http://YOUR_VPS_IP:8443/tunnel";
 const TUNNEL_AUTH_KEY = "your-tunnel-secret-here";  // match با docker run -e
 ```
@@ -268,7 +268,7 @@ const TUNNEL_AUTH_KEY = "your-tunnel-secret-here";  // match با docker run -e
 ```json
 {
   "mode": "full",
-  "auth_key": "your-mhrv-auth-key",
+  "auth_key": "your-rahgozar-auth-key",
   "script_ids": ["YOUR_DEPLOYMENT_ID"]
 }
 ```

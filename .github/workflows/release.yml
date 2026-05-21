@@ -913,7 +913,7 @@ jobs:
           # `set -x` later doesn't expose it to other steps' logs (the
           # file path is fine; the contents aren't).
           umask 077
-          KEY_FILE="$(mktemp -t mhrv-sign-XXXXXX.key)"
+          KEY_FILE="$(mktemp -t rahgozar-sign-XXXXXX.key)"
           # `printf` rather than `echo`: preserves the secret body without
           # shell-specific escapes, while ensuring the file ends with a
           # newline for tools that expect line-oriented minisign keys.

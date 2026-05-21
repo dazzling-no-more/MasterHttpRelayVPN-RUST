@@ -13,19 +13,19 @@
 //! Setup, one time:
 //!
 //! ```text
-//! minisign -G -p mhrv.pub -s mhrv.key      # keep mhrv.key offline
+//! minisign -G -p rahgozar.pub -s rahgozar.key      # keep rahgozar.key offline
 //! ```
 //!
 //! Build with:
 //!
 //! ```text
-//! RAHGOZAR_UPDATE_PUBKEY="$(tail -n1 mhrv.pub)" cargo build --release
+//! RAHGOZAR_UPDATE_PUBKEY="$(tail -n1 rahgozar.pub)" cargo build --release
 //! ```
 //!
 //! Per release, in CI:
 //!
 //! ```text
-//! minisign -Sm <asset> -s mhrv.key
+//! minisign -Sm <asset> -s rahgozar.key
 //! ```
 //!
 //! Upload `<asset>.minisig` next to the asset in the release.
@@ -955,19 +955,19 @@ mod desktop {
             };
             assert_eq!(s.swap_target(), PathBuf::from("/p/foo.exe"));
             let s = StagedUpdate {
-                staged_path: PathBuf::from("/Apps/Mhrv.app.new"),
-                relaunch_path: PathBuf::from("/Apps/Mhrv.app/Contents/MacOS/rahgozar-ui"),
+                staged_path: PathBuf::from("/Apps/Rahgozar.app.new"),
+                relaunch_path: PathBuf::from("/Apps/Rahgozar.app/Contents/MacOS/rahgozar-ui"),
             };
-            assert_eq!(s.swap_target(), PathBuf::from("/Apps/Mhrv.app"));
+            assert_eq!(s.swap_target(), PathBuf::from("/Apps/Rahgozar.app"));
         }
 
         #[cfg(target_os = "macos")]
         #[test]
         fn macos_bundle_for_exe_detects_layout() {
-            let inside = Path::new("/Applications/Mhrv.app/Contents/MacOS/rahgozar-ui");
+            let inside = Path::new("/Applications/Rahgozar.app/Contents/MacOS/rahgozar-ui");
             assert_eq!(
                 macos_bundle_for_exe(inside),
-                Some(PathBuf::from("/Applications/Mhrv.app"))
+                Some(PathBuf::from("/Applications/Rahgozar.app"))
             );
             let outside = Path::new("/usr/local/bin/rahgozar-ui");
             assert!(macos_bundle_for_exe(outside).is_none());

@@ -2,4 +2,4 @@
 # These methods are declared `external` in Kotlin — the JNI linker looks
 # them up by exact name at load time.
 -keep class com.dazzlingnomore.mhrv.Native { *; }
--keep class com.dazzlingnomore.mhrv.MhrvVpnService { *; }
+-keep class com.dazzlingnomore.mhrv.RahgozarVpnService { *; }

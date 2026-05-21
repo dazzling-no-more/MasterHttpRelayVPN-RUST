@@ -346,7 +346,7 @@ class VpnLifecycleGuardsTest {
 
     @Test
     fun shouldStopSelfIfIdle_whileStopping_isFalse() {
-        // Stop has been requested; mhrv-teardown will call stopSelf
+        // Stop has been requested; rahgozar-teardown will call stopSelf
         // when it's done. The no-op handler doesn't need to (and
         // shouldn't) double-call.
         val g = VpnLifecycleGuards()
@@ -362,7 +362,7 @@ class VpnLifecycleGuardsTest {
      * lock is to check `isStopRequested` and bail. This test pins that
      * contract.
      *
-     * Without this guard, a queued mhrv-start worker would acquire
+     * Without this guard, a queued rahgozar-start worker would acquire
      * lifecycleLock AFTER a quick teardown (which saw empty state and
      * released immediately) and proceed to call startForeground +
      * Native.startProxy, resurrecting a service the user already
@@ -402,10 +402,10 @@ class VpnLifecycleGuardsTest {
         assertEquals(PauseDecision.PROCEED, g.tryPause())
         // Stop arrives next.
         g.requestStop()
-        // The mhrv-pause worker, after its teardown, checks isStopRequested
+        // The rahgozar-pause worker, after its teardown, checks isStopRequested
         // and skips its notify.
         assertTrue(g.isStopRequested)
-        // The mhrv-start worker enters the lock and bails the same way.
+        // The rahgozar-start worker enters the lock and bails the same way.
         // (Modeled as a guards.isStopRequested read; the actual call site
         // is inside startEverything's synchronized block.)
         assertTrue(g.isStopRequested)
@@ -417,7 +417,7 @@ class VpnLifecycleGuardsTest {
 
     /**
      * Documents the per-generation worker-flag pattern used in
-     * `MhrvVpnService.startEverything` for tun2proxyRunning. Each
+     * `RahgozarVpnService.startEverything` for tun2proxyRunning. Each
      * worker captures a FRESH `AtomicBoolean` and only mutates that
      * captured local in its finally; the service-side field is
      * reassigned on each fresh spawn. A zombie worker from a

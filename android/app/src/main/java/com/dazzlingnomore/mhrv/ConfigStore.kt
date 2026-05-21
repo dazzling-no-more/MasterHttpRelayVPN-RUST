@@ -108,7 +108,7 @@ data class FrontingGroup(
     val domains: List<String>,
 )
 
-data class MhrvConfig(
+data class RahgozarConfig(
     val mode: Mode = Mode.APPS_SCRIPT,
     val listenHost: String = "0.0.0.0",
     val listenPort: Int = 8080,
@@ -462,13 +462,13 @@ data class MhrvConfig(
 object ConfigStore {
     private const val FILE = "config.json"
 
-    fun load(ctx: Context): MhrvConfig {
+    fun load(ctx: Context): RahgozarConfig {
         val f = File(ctx.filesDir, FILE)
-        if (!f.exists()) return MhrvConfig()
+        if (!f.exists()) return RahgozarConfig()
         return try {
             loadFromJson(JSONObject(f.readText()))
         } catch (_: Throwable) {
-            MhrvConfig()
+            RahgozarConfig()
         }
     }
 
@@ -482,7 +482,7 @@ object ConfigStore {
      */
     fun save(
         ctx: Context,
-        cfg: MhrvConfig,
+        cfg: RahgozarConfig,
     ): Boolean {
         val f = File(ctx.filesDir, FILE)
         val tmp = File(ctx.filesDir, "$FILE.tmp")
@@ -500,8 +500,8 @@ object ConfigStore {
 
     /** Encode config as a shareable base64 string with prefix.
      *  Only includes non-default fields to keep the hash short. */
-    fun encode(cfg: MhrvConfig): String {
-        val defaults = MhrvConfig()
+    fun encode(cfg: RahgozarConfig): String {
+        val defaults = RahgozarConfig()
         val obj = JSONObject()
 
         // Always include essential fields.
@@ -627,7 +627,7 @@ object ConfigStore {
         }
 
     /** Try to decode an encoded config string or raw JSON. Returns null on failure. */
-    fun decode(encoded: String): MhrvConfig? {
+    fun decode(encoded: String): RahgozarConfig? {
         val trimmed = encoded.trim()
         // Try raw JSON first.
         if (trimmed.startsWith("{")) {
@@ -638,7 +638,7 @@ object ConfigStore {
                 null
             }
         }
-        // Try mhrv:// base64 encoded (possibly DEFLATE-compressed).
+        // Try rahgozar:// base64 encoded (possibly DEFLATE-compressed).
         val payload = if (trimmed.startsWith(HASH_PREFIX)) trimmed.removePrefix(HASH_PREFIX) else trimmed
         return try {
             val raw = android.util.Base64.decode(payload, android.util.Base64.NO_WRAP or android.util.Base64.URL_SAFE)
@@ -651,7 +651,7 @@ object ConfigStore {
         }
     }
 
-    /** Check if a string looks like an encoded mhrv config. */
+    /** Check if a string looks like an encoded rahgozar config. */
     fun looksLikeConfig(text: String): Boolean {
         val t = text.trim()
         if (t.startsWith(HASH_PREFIX)) return true
@@ -666,7 +666,7 @@ object ConfigStore {
     }
 
     /**
-     * Acceptance gate for "is this JSON shaped like an mhrv config?".
+     * Acceptance gate for "is this JSON shaped like a rahgozar config?".
      * Accepts any of `mode`, `auth_key`, `script_id` (Rust output),
      * or `script_ids` (legacy Android output). `script_id` was added
      * after the parser was taught to read both shapes — without it,
@@ -681,15 +681,15 @@ object ConfigStore {
 
     /**
      * Keys this build models. Anything outside this set is captured
-     * into [MhrvConfig.extrasJson] at parse time and re-emitted by
-     * [MhrvConfig.toJson] so the native runtime keeps seeing
+     * into [RahgozarConfig.extrasJson] at parse time and re-emitted by
+     * [RahgozarConfig.toJson] so the native runtime keeps seeing
      * desktop-only / future Rust-side fields (`exit_node`,
      * `request_timeout_secs`, `disable_padding`, `auto_blacklist_*`,
      * `hosts`, `normalize_x_graphql`, `google_ip_validation`,
      * `scan_batch_size`, etc.).
      *
      * Updating this set is a deliberate act — add a key here only
-     * when [MhrvConfig] gains a real field for it.
+     * when [RahgozarConfig] gains a real field for it.
      */
     private val MODELLED_KEYS: Set<String> =
         setOf(
@@ -743,7 +743,7 @@ object ConfigStore {
      * `src/test/` can drive a JSON-only round-trip without going
      * through the disk path.
      */
-    internal fun loadFromJson(obj: JSONObject): MhrvConfig {
+    internal fun loadFromJson(obj: JSONObject): RahgozarConfig {
         // Read deployment IDs from both `script_id` (Rust output) and
         // `script_ids` (legacy Android output). Each can be a scalar
         // string OR an array of strings.
@@ -772,7 +772,7 @@ object ConfigStore {
         }
         val extrasStr = if (extras.length() > 0) extras.toString() else ""
 
-        return MhrvConfig(
+        return RahgozarConfig(
             mode =
                 when (obj.optString("mode", "apps_script")) {
                     "direct" -> Mode.DIRECT

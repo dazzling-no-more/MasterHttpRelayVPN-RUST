@@ -116,6 +116,6 @@ Iran ISPs occasionally filter specific Google IPs (#313 pattern). When this happ
 - `src/config.rs` — `Config` struct + JSON serde. Default values, validation.
 - `assets/apps_script/Code.gs` and `CodeFull.gs` — server-side scripts. Edit these and tell users to redeploy as new version in Apps Script.
 - `tunnel-node/` — separate Rust crate for the Full-mode VPS container. README + README.fa.md (Persian translation).
-- `android/app/src/main/java/com/therealaleph/mhrv/` — Android Kotlin glue. `MhrvVpnService.kt` is the VPNService that calls into Rust via JNI. `ConfigStore.kt` is the form/preferences round-trip.
+- `android/app/src/main/java/com/dazzlingnomore/mhrv/` — Android Kotlin glue. `RahgozarVpnService.kt` is the VPNService that calls into Rust via JNI. `ConfigStore.kt` is the form/preferences round-trip. (Package path keeps `mhrv` because the Android applicationId can't change without breaking upgrade paths for existing users.)
 - `docs/changelog/` — versioned changelog files. Format: Persian, then `---`, then English.
 - `.github/workflows/release.yml` — release CI: builds for all platforms, attaches to GitHub release.

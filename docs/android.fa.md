@@ -262,7 +262,7 @@ VpnService TUN  ──► tun2proxy (داخل فرایند)
 | قسمت‌های `JS` سایت `load` نمی‌شوند | رد `OPTIONS` قبل از v1.0.0 | به v1.0.0+ به‌روزرسانی کنید. اگر باز هم بود: `Live logs` → `Relay failed` پیدا کنید، گزارش دهید |
 | همه `SNI`ها در `tester` تایم‌اوت | `google_ip` قدیمی است (گوگل `A record` را عوض کرده) | **Auto-detect google_ip** را بزنید |
 | `SNI tester` فقط بعضی ردیف‌ها قرمز | آن `SNI`ها در شبکهٔ شما `DPI-filtered` هستند | تیک ردیف‌های خراب را بردارید |
-| برنامه با ضربه به `Stop` بسته می‌شود | باگ `race` نسخهٔ ۱.۰.۰/۱.۰.۱ | به v1.0.2 به‌روزرسانی کنید. اگر روی v1.0.2+ هست: `adb logcat -s MhrvVpnService mhrv-crash mhrv_rs` و گزارش دهید |
+| برنامه با ضربه به `Stop` بسته می‌شود | باگ `race` نسخهٔ ۱.۰.۰/۱.۰.۱ | به v1.0.2 به‌روزرسانی کنید. اگر روی v1.0.2+ هست: `adb logcat -s RahgozarVpnService rahgozar-crash rahgozar` و گزارش دهید |
 | هنگام `update`، `INSTALL_FAILED_UPDATE_INCOMPATIBLE` | APK قدیمی با کلید متفاوت امضا شده (قبل از v1.0.2) | ابتدا `uninstall` کنید، سپس APK جدید را نصب کنید. فقط یک‌بار — از v1.0.2 به بعد امضا ثابت است |
 | `Chrome` سفید بدون خطا | معمولاً باگ `render` روی `emulator` با `GPU` نرم‌افزاری | روی دستگاه واقعی تست کنید. `Live logs` را ببینید آیا رله واقعاً درخواست می‌فرستد |
 | حلقهٔ `Cloudflare Turnstile` | [محدودیت شناخته‌شده](#cloudflare-turnstile-verify-you-are-human-حلقهٔ-بی‌پایان) | در این معماری راه‌حلی ندارد |
@@ -277,12 +277,12 @@ VpnService TUN  ──► tun2proxy (داخل فرایند)
 ```sh
 adb logcat -c                              # پاک‌سازی
 # مشکل را در برنامه بازتولید کنید
-adb logcat -d | grep -E "MhrvVpnService|mhrv_rs|mhrv-crash|tun2proxy" > mhrv.log
+adb logcat -d | grep -E "RahgozarVpnService|rahgozar|rahgozar-crash|tun2proxy" > rahgozar.log
 ```
 
 </div>
 
-`mhrv.log` را به `issue` پیوست کنید. اینها را هم بگویید:
+`rahgozar.log` را به `issue` پیوست کنید. اینها را هم بگویید:
 - نسخهٔ اندروید (`Settings → About phone → Android version`)
 - `OEM` (Pixel / Samsung / Xiaomi / …)
 - نسخهٔ برنامه (روی `badge` نسخه در `top bar` ضربه بزنید)

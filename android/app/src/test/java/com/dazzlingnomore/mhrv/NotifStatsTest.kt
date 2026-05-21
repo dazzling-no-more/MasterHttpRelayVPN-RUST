@@ -11,7 +11,7 @@ import java.util.Locale
  *
  * These two functions are pulled out as top-level `internal` helpers
  * specifically so the JVM unit-test suite can exercise them without
- * spinning up the service. The rest of MhrvVpnService is Android-only
+ * spinning up the service. The rest of RahgozarVpnService is Android-only
  * (Notification, Handler, JNI) and would require Robolectric or
  * instrumentation tests.
  *

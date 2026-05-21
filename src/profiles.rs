@@ -472,8 +472,11 @@ mod tests {
     use serde_json::json;
 
     fn temp_profiles_path(label: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("mhrv-profiles-{}-{}", label, std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "rahgozar-profiles-{}-{}",
+            label,
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("profiles.json")
     }
@@ -603,7 +606,7 @@ mod tests {
 
     #[test]
     fn missing_file_loads_empty() {
-        let path = std::env::temp_dir().join("mhrv-profiles-missing.json");
+        let path = std::env::temp_dir().join("rahgozar-profiles-missing.json");
         let _ = std::fs::remove_file(&path);
         let pf = ProfilesFile::load_from(&path).unwrap();
         assert!(pf.profiles.is_empty());
@@ -686,7 +689,7 @@ mod tests {
     /// for path-injecting tests of [`apply_profile_with_paths`].
     fn temp_pair(label: &str) -> (PathBuf, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
-            "mhrv-apply-{}-{}-{}",
+            "rahgozar-apply-{}-{}-{}",
             label,
             std::process::id(),
             // monotonic nanos as a tie-breaker between concurrent test threads
