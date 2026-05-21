@@ -410,10 +410,11 @@ pub(crate) mod pipeline_debug {
 /// Ports where the *server* speaks first (SMTP banner, SSH identification,
 /// POP3/IMAP greeting, FTP banner). On these, waiting for client bytes
 /// gains nothing and just adds handshake latency — skip the pre-read.
-/// HTTP on 80 also qualifies because a naive HTTP client may not flush
-/// the request line immediately after the CONNECT reply.
+/// HTTP on 80 is intentionally not listed: normal HTTP clients speak
+/// first, and bundling the request line into `connect_data` can save a
+/// whole Apps Script batch RTT.
 fn is_server_speaks_first(port: u16) -> bool {
-    matches!(port, 21 | 22 | 25 | 80 | 110 | 143 | 587)
+    matches!(port, 21 | 22 | 25 | 110 | 143 | 587)
 }
 
 /// Recognize the tunnel-node's connect-error strings that mean
@@ -2823,14 +2824,14 @@ mod tests {
 
     #[test]
     fn server_speaks_first_covers_common_protocols() {
-        for p in [21u16, 22, 25, 80, 110, 143, 587] {
+        for p in [21u16, 22, 25, 110, 143, 587] {
             assert!(
                 is_server_speaks_first(p),
                 "port {} should be server-first",
                 p
             );
         }
-        for p in [443u16, 8443, 853, 993, 1234] {
+        for p in [80u16, 443, 8443, 853, 993, 1234] {
             assert!(
                 !is_server_speaks_first(p),
                 "port {} should NOT be server-first",
