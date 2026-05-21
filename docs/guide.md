@@ -74,8 +74,6 @@ Each archive contains:
 
 macOS users: install via the `.dmg` and drag rahgozar to Applications. First launch needs `rahgozar --install-cert` (CLI binary) once to install the MITM CA. Windows / Linux users run the installer normally; the desktop UI installs the CA from inside the app.
 
-<p align="center"><img src="ui-screenshot.png" alt="rahgozar desktop UI showing config form, live traffic stats, Start/Stop/Test buttons, and log panel" width="420"></p>
-
 Linux UI also needs `libxkbcommon`, `libwayland-client`, `libxcb`, `libgl`, `libx11`, `libgtk-3`. On most desktop distros these are already there; on a headless box install them via your package manager, or just use the CLI.
 
 ## Where files live on disk

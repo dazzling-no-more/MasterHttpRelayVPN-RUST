@@ -35,7 +35,7 @@
      block clicks on the page underneath when there are no toasts. The
      toasts themselves re-enable pointer events for their hover/click. -->
 <div
-  class="pointer-events-none fixed end-4 top-16 z-50 flex max-w-sm flex-col gap-2"
+  class="pointer-events-none fixed inset-e-4 top-16 z-50 flex max-w-sm flex-col gap-2"
   aria-live="polite"
 >
   {#each toast.list as t (t.id)}

@@ -3,7 +3,7 @@
   //
   // Strings here go through `t()` so the FA toggle in the header
   // flips them along with the rest of the surface. The proper noun
-  // "rahgozar" stays Latin in English mode and switches to "ره‌گذر"
+  // "rahgozar" stays Latin in English mode and switches to "رهگذر"
   // in Persian, matching what the Android release notes do.
 
   import { onMount } from "svelte";

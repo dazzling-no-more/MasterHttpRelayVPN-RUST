@@ -1,9 +1,6 @@
 /* Tailwind 4 single-import entry. Custom design tokens defined in
    `@theme` are immediately available as utility classes (e.g.
-   `bg-base`, `text-primary`, `border-border-subtle`). The palette
-   mirrors the values we picked for the egui theme in
-   `src/bin/ui/theme.rs` so the visual brand stays the same as we cut
-   over from egui → Tauri. */
+   `bg-base`, `text-primary`, `border-border-subtle`). */
 @import "tailwindcss";
 
 @theme {
@@ -32,7 +29,7 @@
   /* ── Typography ──────────────────────────────────────────────────── */
   /* Inter for Latin, Vazirmatn for Persian/Arabic — the webview's text
      stack falls through automatically per glyph, so a mixed-script
-     label like "rahgozar (ره‌گذر)" renders correctly in both halves. */
+     label like "rahgozar (رهگذر)" renders correctly in both halves. */
   --font-sans: "Inter", "Vazirmatn", system-ui, -apple-system, sans-serif;
   --font-mono: ui-monospace, "Cascadia Code", "JetBrains Mono", Menlo,
     monospace;

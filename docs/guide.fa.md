@@ -76,8 +76,6 @@ DPI سانسورگر فقط SNI داخل TLS را می‌بیند و اجازه 
 
 کاربران مک از طریق `.dmg` نصب کرده و rahgozar را به Applications بکشند. در اولین اجرا یک‌بار `rahgozar --install-cert` (باینری CLI) را اجرا کنند تا گواهی MITM نصب شود. کاربران ویندوز / لینوکس نصب‌کننده را به شکل عادی اجرا می‌کنند؛ UI دسکتاپ از داخل برنامه CA را نصب می‌کند.
 
-<p align="center"><img src="ui-screenshot.png" alt="UI دسکتاپ rahgozar شامل فرم کانفیگ، آمار ترافیک زنده، دکمه‌های Start/Stop/Test و پنل log" width="420"></p>
-
 UI لینوکس به این کتابخانه‌ها نیاز دارد: `libxkbcommon`, `libwayland-client`, `libxcb`, `libgl`, `libx11`, `libgtk-3`. روی اکثر توزیع‌های دسکتاپی از قبل نصب‌اند؛ روی سیستم headless یا با package manager نصب کن یا از CLI استفاده کن.
 
 ## محل ذخیرهٔ فایل‌ها

@@ -1,4 +1,4 @@
-// Internationalisation for the desktop UI.
+// Internationalization for the desktop UI.
 //
 // Two responsibilities:
 //   1. Hold the current language as a Svelte 5 rune so every consumer
@@ -275,7 +275,7 @@ const EN: Record<string, string> = {
   // ── Advanced tab ──────────────────────────────────────────────────
   "advanced.heading": "Raw config",
   "advanced.help":
-    "Direct editor for config.json. Use this for fields the Tunnel form doesn't expose (fronting_groups, sni_hosts, custom tuning knobs, log colours). Changes take effect on next Start.",
+    "Direct editor for config.json. Use this for fields the Tunnel form doesn't expose (fronting_groups, sni_hosts, custom tuning knobs, log colors). Changes take effect on next Start.",
   "advanced.loading": "Loading config.json…",
   "advanced.save": "Save",
   "advanced.saved": "config.json saved",
@@ -293,7 +293,7 @@ const EN: Record<string, string> = {
 
 const FA: Record<string, string> = {
   // ── App chrome ────────────────────────────────────────────────────
-  "app.name": "ره‌گذر",
+  "app.name": "رهگذر",
   "app.tagline": "دور زدن سانسور با ریلی Google Apps Script و دامین فرانتینگ.",
 
   // ── Tabs ──────────────────────────────────────────────────────────
@@ -338,7 +338,7 @@ const FA: Record<string, string> = {
 
   "ca.heading": "گواهی MITM",
   "ca.help":
-    "ره‌گذر یک CA محلی ساخته تا بتواند HTTPS را در مسیر پراکسی رمزگشایی و دوباره رمزگذاری کند. برای جلوگیری از هشدارهای گواهی، آن را در trust store سیستم نصب کنید.",
+    "رهگذر یک CA محلی ساخته تا بتواند HTTPS را در مسیر پراکسی رمزگشایی و دوباره رمزگذاری کند. برای جلوگیری از هشدارهای گواهی، آن را در trust store سیستم نصب کنید.",
   "ca.state.trusted": "نصب‌شده",
   "ca.state.not_trusted": "نصب نشده",
   "ca.state.not_yet_minted": "در اولین شروع ساخته خواهد شد",
@@ -506,7 +506,7 @@ const FA: Record<string, string> = {
 /**
  * Substitute `{name}` placeholders in a translated string. Keeps the
  * substitution out of every call site (`t("foo.bar").replace(...)`)
- * and gives a single place to extend with pluralisation rules later
+ * and gives a single place to extend with pluralization rules later
  * if we need them.
  */
 export function tn(key: string, params: Record<string, string | number>): string {
