@@ -83,9 +83,16 @@ const CLIENT_FIRST_DATA_WAIT: Duration = Duration::from_millis(50);
 /// Floor depth after a drop (first empty reply).
 const INFLIGHT_IDLE: usize = 1;
 
-/// Optimistic starting depth — every session gets 2 in-flight polls
-/// without needing an elevation permit. Drops to IDLE on first empty.
-const INFLIGHT_OPTIMIST: usize = 2;
+/// Optimistic starting depth. A fresh HTTPS flow often has one empty
+/// prefill poll plus two small client upload records ready immediately
+/// after `connect_data` returns (TLS Finished + encrypted request). With
+/// only two slots, that second upload waits a full Apps Script batch RTT;
+/// three slots let it ride the first post-connect batch without needing
+/// an elevated-session permit. A fourth optimistic slot mostly becomes
+/// an extra empty poll on short HTTPS flows and can delay in-order
+/// delivery if it grabs data before older empty replies return. Drops to
+/// IDLE after consecutive empties.
+const INFLIGHT_OPTIMIST: usize = 3;
 
 /// Maximum pipeline depth when data is actively flowing. Ramps up on
 /// data-bearing replies, drops back to IDLE after consecutive empties.
@@ -3053,7 +3060,7 @@ mod tests {
             ),
         }
 
-        // With pipelining (INFLIGHT_OPTIMIST=2), the second op is
+        // With pipelining, a later op is
         // launched after a 1 s stagger sleep, so we need to wait long
         // enough for it to arrive. Reply to any remaining messages so the
         // loop can exit cleanly.
@@ -3981,13 +3988,13 @@ mod tests {
             }
         });
 
-        // With pipelining (N=2), the loop may send two ops before we
+        // With pipelining, the loop may send several ops before we
         // can write client data. Collect all initial ops, reply to each,
         // then write data and check a subsequent op carries it.
         let mut pending_replies: Vec<BatchedReply> = Vec::new();
         let mut seq: u64 = 0;
 
-        // Drain initial ops (up to N=2).
+        // Drain initial ops (up to the active cap).
         while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(500), rx.recv()).await
         {
             if let MuxMsg::Data { reply, .. } = msg {
@@ -4110,7 +4117,7 @@ mod tests {
         });
 
         // Collect the first two MuxMsgs — the optimist-depth pipeline
-        // emits seq=0 then seq=1.
+        // emits seq=0 then seq=1 first, even if more refills follow.
         let mut first_reply: Option<BatchedReply> = None;
         let mut second_reply: Option<BatchedReply> = None;
         let mut second_seq: Option<u64> = None;
@@ -4190,7 +4197,7 @@ mod tests {
             }
         });
 
-        // Optimist-depth pipeline emits seq=0 then seq=1.
+        // Optimist-depth pipeline emits seq=0 then seq=1 first.
         let mut first_reply: Option<BatchedReply> = None;
         let mut second_reply: Option<BatchedReply> = None;
         let (mut first_seq, mut second_seq) = (None, None);

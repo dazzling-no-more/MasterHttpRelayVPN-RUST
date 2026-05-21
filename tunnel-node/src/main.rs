@@ -69,8 +69,8 @@ const STRAGGLER_SETTLE_MAX: Duration = Duration::from_millis(1000);
 /// Script), short enough to fit inside the client's 30 s `BATCH_TIMEOUT`.
 ///
 /// The pipelining redesign (upstream PR #1115) changed the trade-off
-/// shape entirely. Each session now keeps `INFLIGHT_OPTIMIST` (=2) to
-/// `INFLIGHT_ACTIVE` (=4) batches in flight at once, so a poll resolving
+/// shape entirely. Each session now keeps `INFLIGHT_OPTIMIST` (=3) to
+/// `INFLIGHT_ACTIVE` (=6) batches in flight at once, so a poll resolving
 /// at 4 s is invisible to the client: a sibling slot is still holding
 /// the channel open and will collect any push data the moment it
 /// arrives. The Telegram-stability concern that motivated 15 s no longer
