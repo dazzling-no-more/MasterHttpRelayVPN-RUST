@@ -111,6 +111,18 @@ jobs:
                   count=1,
               )
               if new == src:
+                  # No-op can mean two things: (a) the anchor line is
+                  # missing (real error), or (b) the version is already
+                  # at the target — legitimate when an earlier refactor
+                  # pre-bumped the file (e.g. v2.4.0 Tauri migration set
+                  # Cargo.toml to "2.4.0" before the release PR ran).
+                  # Distinguish by re-checking for the exact target line.
+                  if re.search(
+                      rf'name = "rahgozar"\nversion = "{re.escape(ver)}"',
+                      src,
+                  ):
+                      print(f"{path} already at {ver}, no-op")
+                      continue
                   sys.exit(f"ERROR: rahgozar version line not found in {path}")
               p.write_text(new)
               print(f"{path} -> {ver}")
