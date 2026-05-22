@@ -98,9 +98,10 @@ class RahgozarVpnService : VpnService() {
                 try {
                     val blob = Native.statsJson(proxyHandle)
                     if (blob.isBlank()) {
-                        // Native.statsJson returns blank when the
-                        // active mode (typically Mode.DIRECT) doesn't
-                        // run the Apps Script relay and so has no
+                        // Native.statsJson returns blank in any mode
+                        // that doesn't run the Apps Script relay —
+                        // DIRECT and LOCAL_BYPASS today, plus any
+                        // future cred-free mode — and so has no
                         // today_calls / today_bytes to show. The
                         // blank state is permanent for the lifetime
                         // of the handle, so polling every 2s is pure
@@ -427,10 +428,14 @@ class RahgozarVpnService : VpnService() {
             startForeground(NOTIF_ID, buildNotif(NotifState.RUNNING, statsJson = ""))
 
             // Deployment ID + auth key are required for apps_script and full
-            // modes — both talk to Apps Script. Only `direct` mode runs
-            // without them. Closes #73 regression where direct-mode users
-            // hit this branch and crashed on startForeground timeout.
-            val needsCreds = cfg.mode != Mode.DIRECT
+            // modes — both talk to Apps Script. Other modes (direct,
+            // local_bypass) run without them. Defers to
+            // [Mode.usesAppsScriptRelay] rather than open-coding the
+            // mode list so a future cred-free mode picks the right
+            // side without another allowlist edit here. Closes #73
+            // regression where direct-mode users hit this branch and
+            // crashed on startForeground timeout.
+            val needsCreds = cfg.mode.usesAppsScriptRelay()
             if (needsCreds && (!cfg.hasDeploymentId || cfg.authKey.isBlank())) {
                 Log.e(TAG, "Config is incomplete — deployment ID + auth key required for ${cfg.mode}")
                 try {
@@ -1054,7 +1059,8 @@ class RahgozarVpnService : VpnService() {
      * `statsJson` is a populated StatsSnapshot (Apps Script relay modes)
      * we show today's call count / bytes / countdown to the Pacific-time
      * quota reset — the trio the user actually cares about for daily
-     * Google quota tracking. For non-relay modes (direct / full-only)
+     * Google quota tracking. For modes that don't use the Apps
+     * Script relay (direct / local_bypass — see [Mode.usesAppsScriptRelay])
      * statsJson is "" and we fall back to the local-listener port info
      * that's been in the notification historically.
      */

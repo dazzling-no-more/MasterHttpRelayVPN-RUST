@@ -41,14 +41,16 @@
     <string name="mode_vpn_tun">VPN (TUN) — routes every app</string>
     <string name="mode_proxy_only">Proxy only — configure per-app</string>
 
-    <!-- Mode dropdown (apps_script / direct / full) -->
+    <!-- Mode dropdown (apps_script / direct / full / local_bypass) -->
     <string name="sec_mode">Mode</string>
     <string name="mode_apps_script_label">Apps Script (MITM)</string>
     <string name="mode_direct_label">Direct (no relay)</string>
     <string name="mode_full_label">Full tunnel (no cert)</string>
+    <string name="mode_local_bypass_label">Local Bypass (all-app, no cert)</string>
     <string name="help_mode_apps_script">Full DPI bypass through your deployed Apps Script relay.</string>
-    <string name="help_mode_direct">No Apps Script relay. Google traffic uses TLS-fragmentation direct dial (no MITM cert needed) and falls back to the SNI-rewrite tunnel if fragmentation can\'t beat your DPI. Useful as a bootstrap to open script.google.com and deploy Code.gs.</string>
+    <string name="help_mode_direct">No relay. Google + configured fronting groups get DPI bypass; everything else is raw TCP (instant, no overhead). Pick this if you only need Google access, or as a bootstrap to open script.google.com and deploy Code.gs.</string>
     <string name="help_mode_full">All traffic tunneled end-to-end through Apps Script + remote tunnel node. No certificate needed.</string>
+    <string name="help_mode_local_bypass">Local DPI bypass for every TLS host (not just Google). The real ClientHello is split across TCP segments and sent direct to the destination — no Apps Script, no VPS, no MITM cert. Pick this for full DPI coverage; costs ~300 ms per TLS handshake vs. raw TCP. Cannot bypass IP-level blocks (claude.ai, x.ai, …).</string>
 
     <!-- Deployment URL list -->
     <string name="field_deployment_url_index">#%1$d</string>

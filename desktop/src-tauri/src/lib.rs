@@ -82,6 +82,7 @@ pub fn run() {
             commands::scan_ips,
             commands::get_ca_status,
             commands::install_ca_cmd,
+            commands::mint_ca_if_missing,
             commands::remove_ca_cmd,
             commands::get_fronting_groups,
             commands::save_fronting_groups,

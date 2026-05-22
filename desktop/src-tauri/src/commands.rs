@@ -138,11 +138,11 @@ pub fn get_status(state: State<'_, Arc<AppState>>) -> StatusDto {
 /// Daily-usage snapshot for the Status tab's "Usage today" card.
 ///
 /// Only meaningful while a fronter-backed proxy is running (i.e. mode
-/// is `apps_script` or `full`). `direct` mode has no `DomainFronter`
-/// and so reports no stats; the frontend renders nothing in that
-/// case. `Option::None` is the across-the-board "we have nothing to
-/// show here" signal — no proxy, no fronter, or the running state
-/// got dropped between read and unwrap.
+/// is `apps_script` or `full`). `direct` and `local_bypass` modes have
+/// no `DomainFronter` and so report no stats; the frontend renders
+/// nothing in that case. `Option::None` is the across-the-board "we
+/// have nothing to show here" signal — no proxy, no fronter, or the
+/// running state got dropped between read and unwrap.
 ///
 /// Values:
 ///   - `today_calls`        — Apps Script relay invocations counted
@@ -431,13 +431,23 @@ pub struct ConfigUpdate {
 /// the JSON layer keeps the change scoped to this crate and means we
 /// don't have to touch the core lib's serialization story.
 ///
-/// Validation mirrors the egui `to_config` path: non-direct modes need
-/// at least one script ID + an auth key, ports must differ. Returns
-/// the saved `ConfigDto` so the caller can update local state without
-/// a separate `get_config` round-trip.
+/// Validation mirrors the egui `to_config` path: only relay-using
+/// modes need at least one script ID + an auth key, ports must differ.
+/// Returns the saved `ConfigDto` so the caller can update local state
+/// without a separate `get_config` round-trip.
+///
+/// "Needs creds" is gated by `Mode::uses_apps_script_relay` from the
+/// rahgozar core — the single source of truth so a future cred-free
+/// mode picks the right side without another allowlist edit here.
 #[tauri::command]
 pub fn save_config(update: ConfigUpdate) -> Result<ConfigDto, String> {
-    let is_direct = update.mode == "direct" || update.mode == "google_only";
+    use rahgozar::config::Mode;
+    // Parse via FromStr so unknown / typo'd modes from the UI are
+    // surfaced here rather than blowing up later when the proxy
+    // tries to start. The error message comes from
+    // `impl FromStr for Mode` and already lists the accepted shapes.
+    let mode: Mode = update.mode.parse().map_err(|e| format!("{e}"))?;
+    let needs_relay_creds = mode.uses_apps_script_relay();
 
     // Trim + drop blank rows the same way the egui form did, so a
     // trailing-empty entry from the row editor doesn't get persisted.
@@ -448,7 +458,7 @@ pub fn save_config(update: ConfigUpdate) -> Result<ConfigDto, String> {
         .filter(|s| !s.is_empty())
         .collect();
 
-    if !is_direct {
+    if needs_relay_creds {
         if cleaned_ids.is_empty() {
             return Err("At least one deployment ID is required".into());
         }
@@ -954,30 +964,22 @@ fn ensure_ca_minted() -> Result<(), String> {
 pub fn get_ca_status() -> CaStatusDto {
     let path = cert_ops::ca_cert_path();
     let path_str = path.display().to_string();
-    // Mint on-demand if the file isn't there yet. `MitmCertManager::new_in`
-    // is idempotent — if the keypair already exists it just loads, so
-    // calling this from a read-only-looking command is cheap. The
-    // previous shape returned "exists: false" here and waited for the
-    // user to hit Start, which led to the confusing UX where the CA
-    // card said "Will be created on first Start" and never refreshed
-    // even after Start ran. Eager-minting + a real file-exists check
-    // below makes the fingerprint available immediately on first
-    // launch, well before the user clicks anything.
+    // Pure read — never mints from a status query. Minting is the
+    // proxy start path's job (see `ensure_ca_minted` callers and
+    // `MitmCertManager::new_in` in `src/main.rs`). The frontend's
+    // CaCard is hidden in no-MITM modes (local_bypass / full), so
+    // status reads only fire when a user is actively configuring a
+    // MITM-using mode; minting on first Start there is correct
+    // timing. The card shows "Will be created on first Start" until
+    // then, which is accurate.
     if !path.exists() {
-        let _ = ensure_ca_minted();
-        // Re-check after mint. If minting failed (permission denied,
-        // disk full, …) we fall through to the not-yet-created path —
-        // the card shows the same "Will be created on first Start"
-        // message which is still technically accurate.
-        if !path.exists() {
-            return CaStatusDto {
-                exists: false,
-                trusted: false,
-                path: path_str,
-                fingerprint: None,
-                subject_cn: None,
-            };
-        }
+        return CaStatusDto {
+            exists: false,
+            trusted: false,
+            path: path_str,
+            fingerprint: None,
+            subject_cn: None,
+        };
     }
     let der = cert_ops::read_ca_der(&path);
     let fingerprint = der.as_deref().map(cert_ops::fingerprint_hex);
@@ -1019,6 +1021,25 @@ pub fn install_ca_cmd() -> Result<CaStatusDto, String> {
     ensure_ca_minted()?;
     let path = cert_ops::ca_cert_path();
     install_ca(&path).map_err(|e| format!("install failed: {}", e))?;
+    Ok(get_ca_status())
+}
+
+/// Mint the CA on disk if it doesn't already exist, then return the
+/// fresh status snapshot. Called from the frontend's `CaCard.onMount`
+/// when the user is actively configuring a MITM-using mode, so the
+/// install confirmation dialog has a fingerprint to display before
+/// the user has clicked Start.
+///
+/// Gated by the frontend: the CaCard is hidden in no-MITM modes
+/// (local_bypass / full), so this command never runs for users who
+/// don't need a CA. That restores the "install before first Start"
+/// UX (a relay-mode user could previously inspect + install the
+/// fingerprint immediately on launch) without re-introducing the
+/// surprise CA generation in no-MITM modes that the previous
+/// always-eager `get_ca_status` shape produced.
+#[tauri::command]
+pub fn mint_ca_if_missing() -> Result<CaStatusDto, String> {
+    ensure_ca_minted()?;
     Ok(get_ca_status())
 }
 

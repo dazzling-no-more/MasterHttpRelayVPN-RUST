@@ -181,7 +181,10 @@ const EN: Record<string, string> = {
     "All traffic end-to-end through Apps Script + a remote tunnel node. No MITM CA.",
   "tunnel.mode.direct.label": "Direct (SNI rewrite only)",
   "tunnel.mode.direct.help":
-    "No relay — SNI-rewrite tunnel only (Google edge + any fronting groups). Useful as a bootstrap.",
+    "No relay. Google + any configured fronting groups get DPI bypass; everything else is raw TCP (instant, no overhead). Pick this if you only need Google access, or as a bootstrap.",
+  "tunnel.mode.local_bypass.label": "Local Bypass (no relay, no cert)",
+  "tunnel.mode.local_bypass.help":
+    "Local DPI bypass for every TLS host (not just Google). The real ClientHello is split across TCP segments and sent direct to the destination — no Apps Script, no MITM CA. Pick this for full DPI coverage; costs ~300 ms per TLS handshake vs. raw TCP. Cannot bypass IP-level blocks.",
   "tunnel.section.fronting_groups": "Fronting groups (CDN edges)",
   "tunnel.fronting.help":
     "Route specific domains through a CDN edge instead of the Apps Script relay. Pick a hostname known to live on the CDN (e.g. python.org → Fastly, react.dev → Vercel) and click Discover — we'll resolve it and pick the best IP.",
@@ -392,7 +395,10 @@ const FA: Record<string, string> = {
     "تمام ترافیک از طریق Apps Script و یک گره تونل از راه دور. بدون نیاز به گواهی MITM.",
   "tunnel.mode.direct.label": "مستقیم (فقط بازنویسی SNI)",
   "tunnel.mode.direct.help":
-    "بدون ریلی — فقط تونل بازنویسی SNI (لبه گوگل و گروه‌های فرانتینگ). برای راه‌اندازی اولیه مفید است.",
+    "بدون ریلی. ترافیک گوگل و گروه‌های فرانتینگ پیکربندی‌شده از DPI عبور می‌کنند؛ بقیه به‌صورت TCP خام رد می‌شوند (آنی، بدون سربار). اگر فقط به دسترسی گوگل نیاز دارید یا برای راه‌اندازی اولیه از این گزینه استفاده کنید.",
+  "tunnel.mode.local_bypass.label": "عبور محلی (بدون ریلی، بدون گواهی)",
+  "tunnel.mode.local_bypass.help":
+    "عبور محلی از DPI برای همهٔ میزبان‌های TLS (نه فقط گوگل). ClientHello واقعی در چند قطعهٔ TCP تکه‌بندی می‌شود و مستقیماً به مقصد ارسال می‌گردد — نه Apps Script، نه گواهی MITM. برای پوشش کامل DPI این گزینه را انتخاب کنید؛ حدوداً ۳۰۰ میلی‌ثانیه به هر TLS handshake اضافه می‌شود. سایت‌هایی که در سطح IP بسته شده‌اند از این مسیر در دسترس نخواهند بود.",
   "tunnel.section.fronting_groups": "گروه‌های فرانتینگ (لبه‌های CDN)",
   "tunnel.fronting.help":
     "هدایت دامنه‌های مشخص از طریق یک لبه CDN به جای ریلی Apps Script. یک hostname شناخته‌شده روی CDN انتخاب کنید (مثلاً python.org → Fastly، react.dev → Vercel) و روی کشف کلیک کنید — DNS resolve و انتخاب بهترین IP خودکار انجام می‌شود.",

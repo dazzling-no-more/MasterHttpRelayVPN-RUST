@@ -68,11 +68,27 @@
   // than at module-eval time so the label / help text re-render when
   // the user toggles language. The wire `value` is always English —
   // it's the on-disk Config field.
-  const MODES = ["apps_script", "full", "direct"] as const;
+  const MODES = ["apps_script", "full", "direct", "local_bypass"] as const;
 
-  const isDirect = $derived(
-    config?.mode === "direct" || config?.mode === "google_only",
+  // direct / google_only (legacy alias) / local_bypass all skip the
+  // Apps Script relay, so the deployment-IDs + auth-key form is
+  // disabled under any of them. local_bypass goes a step further
+  // (no SNI rewrite, no MITM CA), but from this form's perspective
+  // both modes share the "Apps Script settings are inert" state.
+  const noRelay = $derived(
+    config?.mode === "direct" ||
+      config?.mode === "google_only" ||
+      config?.mode === "local_bypass",
   );
+
+  // LocalBypass goes a step further than "noRelay": it ignores
+  // front_domain, google_ip, the SNI pool, and fronting_groups. The
+  // dialer connects directly to the real destination and fragments
+  // its ClientHello — none of those knobs feed any code path. Hide
+  // the editors so users don't think changing the values matters in
+  // this mode. (Direct mode still needs them for the Google direct
+  // fragmentation pool and the SNI-rewrite fallback path.)
+  const isLocalBypass = $derived(config?.mode === "local_bypass");
 
   const dirty = $derived(
     config != null &&
@@ -160,12 +176,17 @@
     <!-- ── Fronting groups ────────────────────────────────────────
          Owns its own data lifecycle (loads / saves independent of
          this form's Save button) — see `FrontingGroupsSection.svelte`
-         for the reasoning. -->
-    <FrontingGroupsSection />
+         for the reasoning. Inert in LocalBypass (the dispatch never
+         consults `fronting_groups` there — `EarlyRoute::LocalBypass`
+         runs above the fronting-groups dispatch branch), so the
+         editor is hidden in that mode. -->
+    {#if !isLocalBypass}
+      <FrontingGroupsSection />
+    {/if}
 
     <!-- ── Apps Script relay ─────────────────────────────────────── -->
     <section
-      class="bg-surface border-border-subtle rounded-lg border p-5 {isDirect
+      class="bg-surface border-border-subtle rounded-lg border p-5 {noRelay
         ? 'opacity-50'
         : ''}"
     >
@@ -189,13 +210,13 @@
               <input
                 type="text"
                 bind:value={config.script_ids[i]}
-                disabled={isDirect}
+                disabled={noRelay}
                 class="bg-input border-border-subtle focus:border-accent flex-1 rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors disabled:cursor-not-allowed"
               />
               <button
                 type="button"
                 onclick={() => removeIdAt(i)}
-                disabled={isDirect}
+                disabled={noRelay}
                 aria-label={tn("tunnel.deployment_ids.remove_aria", {
                   n: i + 1,
                 })}
@@ -211,7 +232,7 @@
         <div class="mt-2 flex items-start gap-2">
           <textarea
             bind:value={addBuffer}
-            disabled={isDirect}
+            disabled={noRelay}
             rows="2"
             placeholder={t("tunnel.deployment_ids.placeholder")}
             class="bg-input border-border-subtle focus:border-accent placeholder:text-muted flex-1 rounded-md border px-3 py-2 font-mono text-xs outline-none transition-colors disabled:cursor-not-allowed"
@@ -219,7 +240,7 @@
           <button
             type="button"
             onclick={addFromBuffer}
-            disabled={isDirect || addBuffer.trim().length === 0}
+            disabled={noRelay || addBuffer.trim().length === 0}
             class="bg-accent hover:bg-accent-hover rounded-md px-4 py-2 text-sm font-semibold text-black transition-colors disabled:cursor-not-allowed disabled:opacity-50"
           >
             {t("tunnel.add")}
@@ -253,7 +274,7 @@
           type="password"
           autocomplete="off"
           bind:value={config.auth_key}
-          disabled={isDirect}
+          disabled={noRelay}
           class="bg-input border-border-subtle focus:border-accent mt-1.5 w-full rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors disabled:cursor-not-allowed"
         />
       </div>
@@ -323,43 +344,51 @@
             class="bg-input border-border-subtle focus:border-accent mt-1.5 w-full rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors"
           />
         </div>
-        <div class="col-span-2">
-          <label class="text-primary text-sm font-semibold" for="front-domain">
-            {t("tunnel.network.front_domain")}
-          </label>
-          <input
-            id="front-domain"
-            type="text"
-            bind:value={config.front_domain}
-            class="bg-input border-border-subtle focus:border-accent mt-1.5 w-full rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors"
-          />
-        </div>
-        <div class="col-span-2">
-          <label class="text-primary text-sm font-semibold" for="google-ip">
-            {t("tunnel.network.google_ip")}
-          </label>
-          <input
-            id="google-ip"
-            type="text"
-            bind:value={config.google_ip}
-            class="bg-input border-border-subtle focus:border-accent mt-1.5 w-full rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors"
-          />
-          <!-- SNI pool affordance. The active/total chip surfaces
-               "how many of the rotation hosts are currently
-               enabled" so a misconfiguration (everything disabled,
-               proxy can't handshake) is visible at a glance even
-               before opening the modal. -->
-          <button
-            type="button"
-            onclick={() => (sniModalOpen = true)}
-            class="border-border-subtle text-secondary hover:text-primary hover:border-border-strong mt-2 rounded-md border px-3 py-1 text-xs transition-colors"
-          >
-            {tn("tunnel.network.sni_pool_btn", {
-              active: sniSummary.active,
-              total: sniSummary.total,
-            })}
-          </button>
-        </div>
+        <!-- front_domain / google_ip / SNI pool all feed the
+             SNI-rewrite tunnel and the Google direct path. LocalBypass
+             ignores all three (it dials the real destination
+             directly and fragments the ClientHello), so the editors
+             are hidden in that mode to avoid implying the values
+             matter. -->
+        {#if !isLocalBypass}
+          <div class="col-span-2">
+            <label class="text-primary text-sm font-semibold" for="front-domain">
+              {t("tunnel.network.front_domain")}
+            </label>
+            <input
+              id="front-domain"
+              type="text"
+              bind:value={config.front_domain}
+              class="bg-input border-border-subtle focus:border-accent mt-1.5 w-full rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors"
+            />
+          </div>
+          <div class="col-span-2">
+            <label class="text-primary text-sm font-semibold" for="google-ip">
+              {t("tunnel.network.google_ip")}
+            </label>
+            <input
+              id="google-ip"
+              type="text"
+              bind:value={config.google_ip}
+              class="bg-input border-border-subtle focus:border-accent mt-1.5 w-full rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors"
+            />
+            <!-- SNI pool affordance. The active/total chip surfaces
+                 "how many of the rotation hosts are currently
+                 enabled" so a misconfiguration (everything disabled,
+                 proxy can't handshake) is visible at a glance even
+                 before opening the modal. -->
+            <button
+              type="button"
+              onclick={() => (sniModalOpen = true)}
+              class="border-border-subtle text-secondary hover:text-primary hover:border-border-strong mt-2 rounded-md border px-3 py-1 text-xs transition-colors"
+            >
+              {tn("tunnel.network.sni_pool_btn", {
+                active: sniSummary.active,
+                total: sniSummary.total,
+              })}
+            </button>
+          </div>
+        {/if}
       </div>
     </section>
 

@@ -830,6 +830,86 @@ pub fn matches_doh_host(host: &str, extra: &[String]) -> bool {
     extra.iter().any(|s| host_matches_doh_entry(h, s))
 }
 
+/// Early routing decision for `dispatch_tunnel`. Each variant maps to
+/// one terminal action that doesn't need to read from the socket — so
+/// classification is a pure function of the host, port, and config
+/// knobs, and is easy to unit-test exhaustively. The post-classification
+/// steps in `dispatch_tunnel` (fronting_groups, direct mode, SNI rewrite,
+/// Apps Script peek) all need to inspect socket bytes and stay in the
+/// async dispatcher itself.
+///
+/// Ordering is deliberate and load-bearing:
+///   - `PassthroughHostsMatch` wins over everything else so a user
+///     can opt out of *any* routing decision for a specific host.
+///   - `BlockDoh` wins above any mode-specific routing because it's
+///     a global policy in `config.rs` (`"immediately reject any
+///     CONNECT to a known DoH endpoint"`). Honouring it in every
+///     mode — including `local_bypass` — preserves that contract;
+///     the alternative (mode-specific exceptions) means strict-DoH
+///     deployments can be silently broken by a mode switch. Browser
+///     DoH falls back to tun2proxy's virtual DNS regardless of
+///     active mode.
+///   - `LocalBypass` then owns every remaining TLS host. It sits
+///     above `BypassDoh` because `BypassDoh` would route DoH hosts
+///     to raw TCP (no DPI bypass), and `LocalBypass`'s fragmented
+///     dial is strictly more capable on a no-relay mode where
+///     "bypass to raw" makes no sense.
+///   - `BlockDoh` wins over `BypassDoh` (a configured "block" is
+///     stronger than a "bypass"; matches the existing precedence).
+///   - `Full` wins over everything below because it tunnels via the
+///     mux instead of any host-specific path.
+///   - `Continue` means "keep going down the dispatcher's per-CONNECT
+///     decision tree" (fronting_groups → direct mode → SNI rewrite →
+///     Apps Script peek).
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum EarlyRoute {
+    PassthroughHostsMatch,
+    LocalBypass,
+    BlockDoh,
+    BypassDoh,
+    Full,
+    Continue,
+}
+
+/// Decide the early route for a CONNECT. Pure function — separated
+/// from `dispatch_tunnel` so the precedence rules (especially the
+/// LocalBypass-before-DoH and PassthroughHosts-first ones) are
+/// exhaustively unit-testable without spinning up a TcpStream / fake
+/// upstream / `ProxyServer`. The dispatcher's job is then just to
+/// match on the result and execute.
+pub(crate) fn classify_early_route(
+    host: &str,
+    port: u16,
+    mode: Mode,
+    passthrough_hosts: &[String],
+    bypass_doh_hosts: &[String],
+    block_doh: bool,
+    bypass_doh: bool,
+) -> EarlyRoute {
+    if matches_passthrough(host, passthrough_hosts) {
+        return EarlyRoute::PassthroughHostsMatch;
+    }
+    // `block_doh` is documented as a global policy ("immediately
+    // reject any CONNECT to a known DoH endpoint") and is checked
+    // before any mode-specific routing — including LocalBypass —
+    // so users who set `block_doh: true` keep their browser DNS
+    // pinned to the tun2proxy virtual DNS path across mode
+    // switches.
+    if block_doh && port == 443 && matches_doh_host(host, bypass_doh_hosts) {
+        return EarlyRoute::BlockDoh;
+    }
+    if mode == Mode::LocalBypass {
+        return EarlyRoute::LocalBypass;
+    }
+    if bypass_doh && port == 443 && matches_doh_host(host, bypass_doh_hosts) {
+        return EarlyRoute::BypassDoh;
+    }
+    if mode == Mode::Full {
+        return EarlyRoute::Full;
+    }
+    EarlyRoute::Continue
+}
+
 /// A `FrontingGroup` after one-time validation: the group's `sni` is
 /// parsed into a `ServerName` so we don't repay that on every dialed
 /// connection, and domain entries are pre-lower-cased + dot-trimmed
@@ -946,16 +1026,17 @@ fn build_mode_state(config: &Config) -> Result<ModeState, ProxyError> {
         .mode_kind()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("{e}")))?;
 
-    // `direct` mode skips the Apps Script relay entirely, so we must
-    // not try to construct the DomainFronter — it errors on a missing
-    // `script_id`, which is exactly the state a direct-mode user is in.
-    let fronter = match mode {
-        Mode::AppsScript | Mode::Full => {
-            let f =
-                DomainFronter::new(config).map_err(|e| std::io::Error::other(format!("{e}")))?;
-            Some(Arc::new(f))
-        }
-        Mode::Direct => None,
+    // Modes that don't use the Apps Script relay skip the DomainFronter
+    // entirely — its constructor errors on a missing `script_id`, which
+    // is exactly the state direct / local_bypass users are in.
+    // `Mode::uses_apps_script_relay` is the single source of truth so
+    // a future mode automatically picks the right side without another
+    // pattern-match drift bug.
+    let fronter = if mode.uses_apps_script_relay() {
+        let f = DomainFronter::new(config).map_err(|e| std::io::Error::other(format!("{e}")))?;
+        Some(Arc::new(f))
+    } else {
+        None
     };
 
     let tls_config = if config.verify_ssl {
@@ -1000,6 +1081,57 @@ fn build_mode_state(config: &Config) -> Result<ModeState, ProxyError> {
                  or mode=direct to use them, or remove the groups to silence \
                  this warning.",
             config.fronting_groups.len()
+        );
+    }
+    // Same shape for local_bypass. The dispatch's [`EarlyRoute::LocalBypass`]
+    // arm runs above the fronting-groups check on purpose: local_bypass
+    // is the "no MITM, fragment everything" mode by design, and an
+    // SNI-rewrite-via-CDN-edge route here would need the MITM CA the user
+    // explicitly opted out of. Surface this at startup so users don't
+    // wonder why their Vercel/Fastly groups silently stopped working
+    // after a mode switch.
+    if mode == Mode::LocalBypass && !config.fronting_groups.is_empty() {
+        tracing::warn!(
+            "config: fronting_groups has {} entries but mode=local_bypass — \
+                 local_bypass fragments every TLS host end-to-end (no MITM), \
+                 so groups never fire. Switch to mode=apps_script or \
+                 mode=direct to use them, or remove the groups to silence \
+                 this warning.",
+            config.fronting_groups.len()
+        );
+    }
+    // The fragmentation path in local_bypass cannot honour
+    // `upstream_socks5`: the engine writes the ClientHello as N small
+    // TCP segments, but a TCP-relay intermediary reassembles them and
+    // re-emits one segment to the real destination — so the SNI is
+    // back in a single packet and the DPI bypass is defeated. Other
+    // local_bypass code paths (a `passthrough_hosts` match, the
+    // non-TLS `Skip` fallthrough that lands on `plain_tcp_passthrough`)
+    // DO still honour the upstream proxy, because they're just raw
+    // TCP routing with no fragmentation invariant to preserve.
+    //
+    // The warning fires when both are set so users don't silently
+    // think their egress policy applies to fragmented flows. It
+    // intentionally does not reject the combination — a user with
+    // both passthrough_hosts+upstream_socks5 has a meaningful
+    // configuration: "route these specific hosts through SOCKS5,
+    // fragment everything else direct."
+    if mode == Mode::LocalBypass
+        && config
+            .upstream_socks5
+            .as_deref()
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+    {
+        tracing::warn!(
+            "config: upstream_socks5={} but mode=local_bypass — the fragmentation \
+             path requires direct TCP to the real destination (any SOCKS5 \
+             intermediary reassembles segments and defeats the bypass), so it \
+             ignores `upstream_socks5`. Other paths in this mode \
+             (passthrough_hosts matches, non-TLS fallthrough) DO still honour \
+             it. Remove `upstream_socks5`, or accept the split-honouring, to \
+             silence this warning.",
+            config.upstream_socks5.as_deref().unwrap_or("")
         );
     }
 
@@ -2682,75 +2814,180 @@ async fn dispatch_tunnel(
     rewrite_ctx: Arc<RewriteCtx>,
     tunnel_mux: Option<Arc<TunnelMux>>,
 ) -> std::io::Result<()> {
-    // 0. User-configured passthrough list wins over every other path.
-    //    If the host matches `passthrough_hosts`, we raw-TCP it (through
-    //    upstream_socks5 if set) and never touch Apps Script, SNI-rewrite,
-    //    or MITM. Point: saves Apps Script quota on hosts the user already
-    //    has reachability to, and avoids MITM-breaking cert pinning on
-    //    hosts the user knows are cert-pinned. Issues #39, #127.
-    if matches_passthrough(&host, &rewrite_ctx.passthrough_hosts) {
-        let via = rewrite_ctx.upstream_socks5.as_deref();
-        tracing::info!(
-            "dispatch {}:{} -> raw-tcp ({}) (passthrough_hosts match)",
-            host,
-            port,
-            via.unwrap_or("direct")
-        );
-        plain_tcp_passthrough(sock, &host, port, via).await;
-        return Ok(());
-    }
-
-    // 0.4. DoH block. Reject connections to known DoH endpoints so browsers
-    //      fall back to system DNS (tun2proxy virtual DNS — instant).
-    //      Takes priority over bypass_doh.
-    if rewrite_ctx.block_doh
-        && port == 443
-        && matches_doh_host(&host, &rewrite_ctx.bypass_doh_hosts)
-    {
-        tracing::info!("dispatch {}:{} -> blocked (block_doh)", host, port);
-        drop(sock);
-        return Ok(());
-    }
-
-    // 0.5. DoH bypass. DNS-over-HTTPS is the dominant per-flow DNS cost
-    //      in Full mode (every browser name lookup costs a ~2 s Apps
-    //      Script round-trip), and the tunnel adds no privacy beyond
-    //      what DoH already provides. Route known DoH hosts directly.
-    //      Port-gated to 443 so a non-TLS CONNECT to e.g. `dns.google:80`
-    //      doesn't get diverted off-tunnel by accident.
-    //      See `DEFAULT_DOH_HOSTS` and config.rs `tunnel_doh`.
-    if rewrite_ctx.bypass_doh
-        && port == 443
-        && matches_doh_host(&host, &rewrite_ctx.bypass_doh_hosts)
-    {
-        let via = rewrite_ctx.upstream_socks5.as_deref();
-        tracing::info!(
-            "dispatch {}:{} -> raw-tcp ({}) (doh bypass)",
-            host,
-            port,
-            via.unwrap_or("direct")
-        );
-        plain_tcp_passthrough(sock, &host, port, via).await;
-        return Ok(());
-    }
-
-    // 1. Full tunnel mode: ALL traffic goes through the batch multiplexer
-    //    (Apps Script → tunnel node → real TCP). No MITM, no cert.
-    if rewrite_ctx.mode == Mode::Full {
-        let mux = match tunnel_mux {
-            Some(m) => m,
-            None => {
-                tracing::error!(
-                    "dispatch {}:{} -> full mode but no tunnel mux (should not happen)",
-                    host,
-                    port
-                );
-                return Ok(());
+    // Early routing decisions that don't need socket reads live in the
+    // pure `classify_early_route` helper so the precedence (especially
+    // LocalBypass-above-DoH and passthrough_hosts-above-everything) is
+    // exhaustively unit-testable. See the [`EarlyRoute`] doc for the
+    // ordering rationale, and the dispatcher tests further down in
+    // this file for the regression-pinning cases.
+    let early = classify_early_route(
+        &host,
+        port,
+        rewrite_ctx.mode,
+        &rewrite_ctx.passthrough_hosts,
+        &rewrite_ctx.bypass_doh_hosts,
+        rewrite_ctx.block_doh,
+        rewrite_ctx.bypass_doh,
+    );
+    match early {
+        EarlyRoute::PassthroughHostsMatch => {
+            // User-configured passthrough list wins over every other path.
+            // The host matches `passthrough_hosts`, so we raw-TCP it
+            // (through upstream_socks5 if set) and never touch Apps
+            // Script, SNI-rewrite, or MITM. Point: saves Apps Script
+            // quota on hosts the user already has reachability to, and
+            // avoids MITM-breaking cert pinning on hosts the user
+            // knows are cert-pinned. Issues #39, #127.
+            let via = rewrite_ctx.upstream_socks5.as_deref();
+            tracing::info!(
+                "dispatch {}:{} -> raw-tcp ({}) (passthrough_hosts match)",
+                host,
+                port,
+                via.unwrap_or("direct")
+            );
+            plain_tcp_passthrough(sock, &host, port, via).await;
+            return Ok(());
+        }
+        EarlyRoute::LocalBypass => {
+            // Fragmented direct-to-destination for every TLS CONNECT
+            // (any port) except DoH-block matches and explicit
+            // passthrough_hosts (those branches won above). Raw
+            // passthrough for everything else. No Apps Script, no
+            // SNI-rewrite, no MITM CA install. Defeats DPI only;
+            // IP-blocked destinations stay unreachable.
+            //
+            // No `port == 443` gate by design: TLS in production
+            // runs on 443, 8443 (alt-HTTPS), 993 (IMAPS), 853 (DoT),
+            // 465 (SMTPS), etc. The TLS-handshake peek inside
+            // `try_local_bypass_tunnel` is the right discriminator
+            // — it returns `Skip(sock)` on any peek that isn't 0x16
+            // (TLS handshake content type), so non-TLS connections
+            // (HTTP on 80, SMTP on 25, server-first protocols
+            // generally) fall through to raw passthrough below with
+            // no false-positive fragmentation attempts.
+            // User-pinned `hosts: { foo.com: 1.2.3.4 }` is honoured
+            // in every other dispatch path in this file as a
+            // deliberate user choice ("this IP works on my network").
+            // LocalBypass had a hole where it ignored the override
+            // and connected to whatever `host` resolved to; thread
+            // the resolved IP through so fragmentation dials the
+            // pinned address while the ClientHello still carries
+            // the original SNI (the destination serves the right
+            // cert, browser pinning checks succeed).
+            let dial_override = hosts_override(&rewrite_ctx.hosts, &host).map(|s| s.to_string());
+            tracing::debug!(
+                "dispatch {}:{} -> local-bypass (TLS-peek fragmentation{})",
+                host,
+                port,
+                match dial_override.as_deref() {
+                    Some(ip) => format!(", dial={}", ip),
+                    None => String::new(),
+                },
+            );
+            match crate::direct_mode::try_local_bypass_tunnel(
+                sock,
+                &host,
+                port,
+                dial_override.as_deref(),
+            )
+            .await
+            {
+                Ok(crate::direct_mode::TunnelOutcome::Done) => return Ok(()),
+                Ok(crate::direct_mode::TunnelOutcome::Skip(s)) => {
+                    // Peeked non-TLS (HTTP on 80, server-first
+                    // protocol on whatever port). No ClientHello to
+                    // fragment, so the fragmentation-vs-SOCKS5
+                    // incompatibility doesn't apply here — honour
+                    // `upstream_socks5` like the passthrough_hosts
+                    // arm above does. The startup warning in
+                    // `build_mode_state` already tells users that
+                    // local_bypass split-honours upstream; this
+                    // branch is one of the "honour" sides.
+                    let via = rewrite_ctx.upstream_socks5.as_deref();
+                    tracing::info!(
+                        "dispatch {}:{} -> raw-tcp ({}) (local-bypass: peeked non-TLS)",
+                        host,
+                        port,
+                        via.unwrap_or("direct")
+                    );
+                    plain_tcp_passthrough(s, &host, port, via).await;
+                    return Ok(());
+                }
+                Ok(crate::direct_mode::TunnelOutcome::SkipPrefaced(_)) => {
+                    // `try_local_bypass_tunnel` does its raw-replay
+                    // fallback internally, so this variant never
+                    // reaches us. Guarded loudly so a future refactor
+                    // that adds it gets a log line, not a silent drop.
+                    tracing::error!(
+                        "local-bypass returned SkipPrefaced (unexpected); dropping {}:{}",
+                        host,
+                        port
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    tracing::debug!("local-bypass error for {}:{}: {}", host, port, e);
+                    return Ok(());
+                }
             }
-        };
-        tracing::info!("dispatch {}:{} -> full tunnel (via batch mux)", host, port);
-        crate::tunnel_client::tunnel_connection(sock, &host, port, &mux).await?;
-        return Ok(());
+        }
+        EarlyRoute::BlockDoh => {
+            // Reject connections to known DoH endpoints so browsers
+            // fall back to system DNS (tun2proxy virtual DNS —
+            // instant). Fires in every mode, including
+            // `local_bypass` — `block_doh` is documented as a
+            // global "immediately reject any CONNECT to a known DoH
+            // endpoint" policy, and a strict-DoH deployment relies
+            // on it surviving mode switches. See the precedence
+            // doc on [`EarlyRoute`]; the LocalBypass arm sits
+            // below this one on purpose.
+            tracing::info!("dispatch {}:{} -> blocked (block_doh)", host, port);
+            drop(sock);
+            return Ok(());
+        }
+        EarlyRoute::BypassDoh => {
+            // DNS-over-HTTPS is the dominant per-flow DNS cost in
+            // Full mode (every browser name lookup costs a ~2 s Apps
+            // Script round-trip), and the tunnel adds no privacy
+            // beyond what DoH already provides. Route known DoH
+            // hosts directly. Port-gated to 443 (inside the
+            // classifier) so a non-TLS CONNECT to e.g.
+            // `dns.google:80` doesn't get diverted off-tunnel by
+            // accident. See `DEFAULT_DOH_HOSTS` and config.rs
+            // `tunnel_doh`.
+            let via = rewrite_ctx.upstream_socks5.as_deref();
+            tracing::info!(
+                "dispatch {}:{} -> raw-tcp ({}) (doh bypass)",
+                host,
+                port,
+                via.unwrap_or("direct")
+            );
+            plain_tcp_passthrough(sock, &host, port, via).await;
+            return Ok(());
+        }
+        EarlyRoute::Full => {
+            // Full tunnel mode: ALL traffic goes through the batch
+            // multiplexer (Apps Script → tunnel node → real TCP).
+            // No MITM, no cert.
+            let mux = match tunnel_mux {
+                Some(m) => m,
+                None => {
+                    tracing::error!(
+                        "dispatch {}:{} -> full mode but no tunnel mux (should not happen)",
+                        host,
+                        port
+                    );
+                    return Ok(());
+                }
+            };
+            tracing::info!("dispatch {}:{} -> full tunnel (via batch mux)", host, port);
+            crate::tunnel_client::tunnel_connection(sock, &host, port, &mux).await?;
+            return Ok(());
+        }
+        EarlyRoute::Continue => {
+            // Fall through to the steps below that need the socket
+            // (fronting_groups peek, direct-mode TLS read, etc.).
+        }
     }
 
     // 2a. User-configured fronting groups (Vercel, Fastly, etc.). Wins
@@ -7597,5 +7834,168 @@ mod tests {
         assert_eq!(state.coalesce_max_ms.load(Ordering::Relaxed), 1000);
 
         state.mode_tasks.lock().await.abort_all();
+    }
+
+    // -------- classify_early_route routing-decision tests --------
+    //
+    // These pin the dispatcher's pre-socket decisions against the
+    // ordering rationale documented on `EarlyRoute`. Pure-function
+    // tests, no TcpStream / no real upstream / no ProxyServer —
+    // making it easy to add cases as the matrix grows.
+
+    /// `block_doh` is documented as a global policy that fires
+    /// regardless of mode. Strict-DoH deployments rely on
+    /// `block_doh: true` to keep browser DNS pinned to the
+    /// tun2proxy virtual DNS path across mode switches; honouring
+    /// it in LocalBypass preserves that contract. Pins the
+    /// precedence so a future "let LocalBypass own all routing"
+    /// reorder doesn't silently break it.
+    #[test]
+    fn block_doh_wins_over_local_bypass() {
+        let decision = classify_early_route(
+            "dns.google",
+            443,
+            Mode::LocalBypass,
+            &[],
+            &[],
+            /* block_doh = */ true,
+            /* bypass_doh = */ false,
+        );
+        assert_eq!(decision, EarlyRoute::BlockDoh);
+    }
+
+    /// `bypass_doh`, on the other hand, is a routing optimisation
+    /// (skip-the-relay) that makes no sense in LocalBypass — there
+    /// is no relay to skip. LocalBypass's fragmented dial is
+    /// strictly more capable than the bypass-to-raw-TCP path it
+    /// would otherwise take, so LocalBypass wins this one.
+    #[test]
+    fn local_bypass_wins_over_bypass_doh() {
+        let decision = classify_early_route(
+            "cloudflare-dns.com",
+            443,
+            Mode::LocalBypass,
+            &[],
+            &[],
+            /* block_doh = */ false,
+            /* bypass_doh = */ true,
+        );
+        assert_eq!(decision, EarlyRoute::LocalBypass);
+    }
+
+    /// And when both DoH gates are off, LocalBypass owns DoH hosts
+    /// the same way it owns any other TLS host — the fragmented
+    /// dial handles them. Pins the "every TLS host" guarantee
+    /// against the regression of someone accidentally introducing
+    /// a `Mode::LocalBypass` exclusion in the DoH matchers.
+    #[test]
+    fn local_bypass_owns_doh_host_when_no_doh_policy_set() {
+        let decision = classify_early_route(
+            "dns.google",
+            443,
+            Mode::LocalBypass,
+            &[],
+            &[],
+            /* block_doh = */ false,
+            /* bypass_doh = */ false,
+        );
+        assert_eq!(decision, EarlyRoute::LocalBypass);
+    }
+
+    /// LocalBypass routes any port — not just 443. Pins the
+    /// reviewer's "every TLS CONNECT" guarantee against a future
+    /// regression where someone re-adds a `port == 443` gate.
+    /// (The TLS-vs-non-TLS discrimination happens later, inside
+    /// `try_local_bypass_tunnel`'s peek.)
+    #[test]
+    fn local_bypass_fires_on_non_443_ports() {
+        for port in [8443u16, 993, 853, 465, 22222] {
+            let decision = classify_early_route(
+                "example.com",
+                port,
+                Mode::LocalBypass,
+                &[],
+                &[],
+                false,
+                false,
+            );
+            assert_eq!(
+                decision,
+                EarlyRoute::LocalBypass,
+                "port {} should route to LocalBypass",
+                port
+            );
+        }
+    }
+
+    /// User-configured `passthrough_hosts` beats every other route —
+    /// including LocalBypass. This is the escape hatch users tap
+    /// when fragmentation latency isn't worth it for a specific
+    /// host (e.g. a corporate intranet on the LAN). If LocalBypass
+    /// ever ate the passthrough entry, that escape hatch silently
+    /// stops working.
+    ///
+    /// Downstream invariant the dispatcher relies on: the
+    /// `PassthroughHostsMatch` arm in `dispatch_tunnel` reads
+    /// `rewrite_ctx.upstream_socks5` and passes it to
+    /// `plain_tcp_passthrough`, so a `passthrough_hosts` match in
+    /// `local_bypass` mode still honours the upstream SOCKS5 proxy.
+    /// That split-honouring (fragmentation can't honour upstream,
+    /// passthrough still does) is announced via the startup warning
+    /// in `build_mode_state`. Test stays at the classifier level
+    /// because asserting on `plain_tcp_passthrough`'s arguments
+    /// needs end-to-end scaffolding the rest of these tests don't
+    /// pull in.
+    #[test]
+    fn passthrough_hosts_wins_over_local_bypass() {
+        let decision = classify_early_route(
+            "intranet.corp",
+            443,
+            Mode::LocalBypass,
+            &["intranet.corp".to_string()],
+            &[],
+            false,
+            false,
+        );
+        assert_eq!(decision, EarlyRoute::PassthroughHostsMatch);
+    }
+
+    /// In relay-using modes the existing DoH precedence is unchanged:
+    /// block_doh > bypass_doh > Full > Continue. This test pins the
+    /// previously-existing behaviour so the refactor (moving the
+    /// branches into `classify_early_route`) didn't drift the
+    /// relay-mode side of the matrix.
+    #[test]
+    fn relay_modes_keep_doh_precedence() {
+        // block_doh fires for AppsScript+DoH+443.
+        let d = classify_early_route("dns.google", 443, Mode::AppsScript, &[], &[], true, false);
+        assert_eq!(d, EarlyRoute::BlockDoh);
+
+        // block_doh does NOT fire on non-443 (DoH is HTTPS-only and
+        // a non-443 CONNECT to dns.google is something else entirely).
+        let d = classify_early_route("dns.google", 853, Mode::AppsScript, &[], &[], true, false);
+        assert_eq!(d, EarlyRoute::Continue);
+
+        // bypass_doh fires only when block_doh is off (block wins).
+        let d = classify_early_route("dns.google", 443, Mode::AppsScript, &[], &[], false, true);
+        assert_eq!(d, EarlyRoute::BypassDoh);
+
+        // Full mode beats Continue for non-DoH hosts; DoH gates still
+        // win above Full in this matrix.
+        let d = classify_early_route("example.com", 443, Mode::Full, &[], &[], false, false);
+        assert_eq!(d, EarlyRoute::Full);
+        let d = classify_early_route("dns.google", 443, Mode::Full, &[], &[], true, false);
+        assert_eq!(d, EarlyRoute::BlockDoh);
+    }
+
+    /// Direct mode keeps falling through — its dispatch logic lives
+    /// in the socket-needing tail of `dispatch_tunnel`
+    /// (fronting_groups, Google direct fragmentation, SNI rewrite,
+    /// raw passthrough). Confirms the classifier doesn't accidentally
+    /// short-circuit it.
+    #[test]
+    fn direct_mode_returns_continue() {
+        let d = classify_early_route("example.com", 443, Mode::Direct, &[], &[], false, false);
+        assert_eq!(d, EarlyRoute::Continue);
     }
 }

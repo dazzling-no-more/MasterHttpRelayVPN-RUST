@@ -2,19 +2,27 @@
   // MITM CA card for the Status tab.
   //
   // Three render paths driven by the same status snapshot:
-  //   - exists=false:           the proxy hasn't run yet, so there's
-  //                             no CA on disk. The card explains
-  //                             "Will be created on first Start" and
-  //                             hides both buttons. The user clicks
-  //                             "Install CA" *after* a Start has
-  //                             minted the file (the install path
-  //                             also mints if missing — defensive).
+  //   - exists=false:           transient state — the CA isn't on
+  //                             disk yet. `onMount` calls
+  //                             `mint_ca_if_missing` (which only
+  //                             runs because StatusTab renders
+  //                             this card in MITM-using modes
+  //                             only), then refreshes status so
+  //                             we land on the next path. The
+  //                             card stays in a brief loading
+  //                             state until the mint returns.
   //   - exists=true, trusted=false:  show fingerprint + "Install CA"
   //                                  button. Install opens the
   //                                  confirm dialog below.
   //   - exists=true, trusted=true:   show "Trusted" badge + "Remove CA"
   //                                  button. Remove deletes the on-
   //                                  disk PEM + un-trusts.
+  //
+  // `get_ca_status` itself is a pure read — minting only happens via
+  // `mint_ca_if_missing` from `onMount` here and via `install_ca_cmd`
+  // when the user clicks Install. No-MITM modes (local_bypass /
+  // full) hide this card at the StatusTab level, so neither mint
+  // path runs for them.
   //
   // The confirm dialog is intentionally inline (own state in this
   // component) rather than a global modal stack — it's the only
@@ -35,11 +43,30 @@
 
   onMount(async () => {
     await refresh();
-    // Defense-in-depth: if the eager mint inside `get_ca_status`
-    // somehow failed on first load (permission denied, disk full),
-    // the proxy's own MITM init during a successful Start will
-    // mint the file. Subscribing to the status-change event picks
-    // that up without the user having to know to refresh the tab.
+    // Restore the "install before first Start" UX. CaCard is only
+    // rendered in MITM-using modes (apps_script / direct), so
+    // calling mint here is the right place to trigger CA
+    // generation lazily — no-MITM modes never reach this code.
+    // `get_ca_status` is a pure read now (it used to mint
+    // eagerly), so without this call a fresh install would show
+    // "Will be created on first Start" with no fingerprint and a
+    // disabled Install button. Idempotent: a no-op when the CA
+    // already exists.
+    if (status && !status.exists) {
+      try {
+        status = await api.mintCaIfMissing();
+      } catch (e) {
+        // Mint failures (permission denied, disk full) leave the
+        // card in the "not minted" state — the proxy will mint
+        // on next Start as a fallback. Log + don't toast (the
+        // Status tab keeps working).
+        // eslint-disable-next-line no-console
+        console.warn("mint_ca_if_missing failed:", e);
+      }
+    }
+    // If the proxy starts later and mints the file itself
+    // (e.g. mint here failed transiently), the status-change
+    // event will pick that up.
     unlistenStatus = await onStatusChange(() => {
       void refresh();
     });

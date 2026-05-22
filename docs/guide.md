@@ -12,6 +12,7 @@ This is the long version — every config option, every advanced mode, every tro
 - [Apps Script deployment](#apps-script-deployment)
   - [Cloudflare Worker variant (faster)](#cloudflare-worker-variant)
   - [Direct mode (when ISP blocks `script.google.com`)](#direct-mode)
+  - [Local Bypass mode (all-host DPI bypass, no relay, no cert)](#local-bypass-mode)
 - [CLI reference](#cli-reference)
   - [scan-ips API mode](#scan-ips-api-mode)
 - [Telegram via xray](#telegram-via-xray)
@@ -121,6 +122,30 @@ If your ISP is already blocking Google Apps Script (or all of Google), you need 
 6. In the UI / Android app / by editing `config.json`, switch mode to `apps_script`, paste the Deployment ID and your auth key, and restart.
 
 Verify reachability before even starting the proxy: `rahgozar test-sni` probes `*.google.com` directly and works without any config beyond `google_ip` + `front_domain`.
+
+### Local Bypass mode
+
+`local_bypass` is the "fragment everything" sibling of `direct`. Every TLS CONNECT (regardless of destination) gets its real ClientHello split across TCP segments and sent direct to the real destination IP — no Apps Script relay, no SNI-rewrite, no MITM CA install. Non-TLS traffic goes through as raw TCP.
+
+**Pick this when:**
+
+- You want DPI bypass for *every* TLS host, not just Google.
+- You don't want to install the MITM CA cert.
+- The destinations you care about are DPI-blocked but *not* IP-blocked. (Iran-blocked-by-IP destinations like `claude.ai` / `x.ai` / `chatgpt.com` stay unreachable — local fragmentation cannot help against an IP block. Use `apps_script` or `full` with an exit node for those.)
+
+**Pick `direct` instead when:**
+
+- You only need Google (gmail, drive, search, YouTube). `direct` is faster because non-Google traffic stays as raw TCP (zero overhead), while `local_bypass` adds ~300 ms per TLS handshake to every host for the fragmentation pacing.
+- You've configured `fronting_groups` for specific CDN-fronted hosts — `local_bypass` ignores `fronting_groups` entirely.
+- You're using rahgozar as Psiphon's / xray's upstream proxy (see [Use as upstream](use-as-upstream.md)).
+
+**Latency cost.** TLS handshakes pay the fragmentation pacing on every connect — profile p05 (the default) is 87 chunks × 5 ms = ~430 ms of inter-chunk delay on top of the normal TLS RTT. The first connect on a fresh network can be up to 6 s if profile p05 doesn't beat your local DPI and the race phase has to try other profiles; subsequent connects skip straight to whichever profile won. On most Iranian ISPs profile p05 works on the first try, so the typical hit is ~150–500 ms per handshake.
+
+**Cannot bypass IP blocks.** This bears repeating because it's the most common point of confusion. `local_bypass` evades **DPI** (the deep-packet-inspection layer that reads the SNI). It does not change which IPs are reachable. If your ISP firewalls outbound connections to a specific IP range (Iran blocks Anthropic, OpenAI, xAI, and a long list of others at the IP level), local fragmentation cannot route around that. You need a relay (Apps Script in `apps_script` mode) or a tunneled exit (`full` mode + tunnel node).
+
+**Android use.** This is where `local_bypass` shines. With `connection_mode: vpn_tun` (the default), Android's VpnService captures every app's traffic — not just Chrome's — and `local_bypass` then fragments every TLS handshake from every app. Many apps with **certificate pinning** (Google Meet, banking apps, some messengers) that break under the SNI-rewrite MITM in `apps_script` / `direct` modes work fine here because they see the destination's real certificate.
+
+**Config example.** Copy [`config.local_bypass.example.json`](../config.local_bypass.example.json) to `config.json`. No `script_id` or `auth_key` needed.
 
 ## CLI reference
 

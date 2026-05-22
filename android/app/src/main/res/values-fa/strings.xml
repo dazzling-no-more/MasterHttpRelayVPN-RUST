@@ -41,14 +41,16 @@
     <string name="mode_vpn_tun">VPN (TUN) — همهٔ برنامه‌ها رد می‌شوند</string>
     <string name="mode_proxy_only">فقط پروکسی — تنظیم per-app توسط کاربر</string>
 
-    <!-- Mode dropdown (apps_script / direct / full) -->
+    <!-- Mode dropdown (apps_script / direct / full / local_bypass) -->
     <string name="sec_mode">حالت</string>
     <string name="mode_apps_script_label">Apps Script (MITM)</string>
     <string name="mode_direct_label">مستقیم (بدون رله)</string>
     <string name="mode_full_label">تونل کامل (بدون گواهی)</string>
+    <string name="mode_local_bypass_label">عبور محلی (همهٔ اپ‌ها، بدون گواهی)</string>
     <string name="help_mode_apps_script">دور زدن کامل DPI از طریق رلهٔ Apps Script که خودتان deploy کرده‌اید.</string>
-    <string name="help_mode_direct">بدون رلهٔ Apps Script. ترافیک گوگل از مسیر تماس مستقیم با تکه‌بندی TLS رد می‌شود (نیاز به گواهی MITM ندارد) و اگر تکه‌بندی نتواند DPI شما را رد کند به تونل SNI-rewrite برمی‌گردد. برای باز کردن script.google.com و deploy کردن Code.gs مفید است.</string>
+    <string name="help_mode_direct">بدون رله. ترافیک گوگل و گروه‌های فرانتینگ پیکربندی‌شده از DPI عبور می‌کنند؛ بقیه به‌صورت TCP خام رد می‌شوند (آنی، بدون سربار). اگر فقط به دسترسی گوگل نیاز دارید یا می‌خواهید script.google.com را باز کنید و Code.gs را deploy کنید، این گزینه را انتخاب کنید.</string>
     <string name="help_mode_full">همهٔ ترافیک به‌صورت end-to-end از Apps Script + گرهٔ تونل از راه دور عبور می‌کند. به گواهی نیاز نیست.</string>
+    <string name="help_mode_local_bypass">عبور محلی از DPI برای همهٔ میزبان‌های TLS (نه فقط گوگل). ClientHello واقعی در چند قطعهٔ TCP تکه‌بندی می‌شود و مستقیماً به مقصد ارسال می‌گردد — نه Apps Script، نه VPS، نه گواهی MITM. برای پوشش کامل DPI این گزینه را انتخاب کنید؛ حدوداً ۳۰۰ میلی‌ثانیه به هر TLS handshake اضافه می‌شود. سایت‌هایی که ایران در سطح IP بسته است (claude.ai، x.ai، …) از این مسیر در دسترس نخواهند بود.</string>
 
     <!-- Deployment URL list -->
     <string name="field_deployment_url_index">#%1$d</string>

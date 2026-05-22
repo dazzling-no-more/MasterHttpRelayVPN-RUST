@@ -406,32 +406,40 @@ fun HomeScreen(
                         // so a subsequent field edit can't overwrite the
                         // fresh values with pre-resolve ones.
                         scope.launch {
-                            // Only auto-fill google_ip if it's empty.
-                            // Issue #71: some Iranian ISPs return
-                            // poisoned A records for www.google.com that
-                            // resolve but then refuse TLS (or route to a
-                            // Google IP that's not on the GFE and can't
-                            // handle our SNI-rewrite). If the user has
-                            // manually set a working IP
-                            // (e.g. 216.239.38.120), we must NOT
-                            // overwrite it with a poisoned fresh lookup
-                            // just because the two values differ. They
-                            // can still force a re-resolve via the
-                            // explicit "Auto-detect" button above.
+                            // LocalBypass has no relay path, so google_ip
+                            // / front_domain repair is dead weight — and
+                            // worse, the blocking resolveGoogleIp() call
+                            // adds startup latency for a knob this mode
+                            // doesn't read. Skip the repair entirely.
                             var updated = cfg
-                            if (updated.googleIp.isBlank()) {
-                                val fresh =
-                                    withContext(Dispatchers.IO) {
-                                        NetworkDetect.resolveGoogleIp()
+                            if (cfg.mode != Mode.LOCAL_BYPASS) {
+                                // Only auto-fill google_ip if it's empty.
+                                // Issue #71: some Iranian ISPs return
+                                // poisoned A records for www.google.com
+                                // that resolve but then refuse TLS (or
+                                // route to a Google IP that's not on the
+                                // GFE and can't handle our SNI-rewrite).
+                                // If the user has manually set a working
+                                // IP (e.g. 216.239.38.120), we must NOT
+                                // overwrite it with a poisoned fresh
+                                // lookup just because the two values
+                                // differ. They can still force a
+                                // re-resolve via the explicit
+                                // "Auto-detect" button above.
+                                if (updated.googleIp.isBlank()) {
+                                    val fresh =
+                                        withContext(Dispatchers.IO) {
+                                            NetworkDetect.resolveGoogleIp()
+                                        }
+                                    if (!fresh.isNullOrBlank()) {
+                                        updated = updated.copy(googleIp = fresh)
                                     }
-                                if (!fresh.isNullOrBlank()) {
-                                    updated = updated.copy(googleIp = fresh)
                                 }
-                            }
-                            if (updated.frontDomain.isBlank() ||
-                                updated.frontDomain.parseAsIpOrNull() != null
-                            ) {
-                                updated = updated.copy(frontDomain = "www.google.com")
+                                if (updated.frontDomain.isBlank() ||
+                                    updated.frontDomain.parseAsIpOrNull() != null
+                                ) {
+                                    updated = updated.copy(frontDomain = "www.google.com")
+                                }
                             }
                             if (updated !== cfg) persist(updated)
                             onStart()
@@ -440,8 +448,16 @@ fun HomeScreen(
                 },
                 enabled =
                     (
+                        // Connect is enabled when the proxy is already
+                        // running OR the current mode doesn't need
+                        // Apps Script creds OR creds are present.
+                        // [Mode.usesAppsScriptRelay] is the same
+                        // predicate the service-side and ProfileStore
+                        // gates use, so a future cred-free mode
+                        // lights up Connect automatically without
+                        // another edit here.
                         isVpnRunning ||
-                            cfg.mode == Mode.DIRECT ||
+                            !cfg.mode.usesAppsScriptRelay() ||
                             (cfg.hasDeploymentId && cfg.authKey.isNotBlank())
                     ) && !transitioning,
                 colors =
@@ -539,7 +555,7 @@ fun HomeScreen(
 
             Spacer(Modifier.height(4.dp))
 
-            val appsScriptEnabled = cfg.mode == Mode.APPS_SCRIPT || cfg.mode == Mode.FULL
+            val appsScriptEnabled = cfg.mode.usesAppsScriptRelay()
             // Wrapped in a collapsible so a long ID list (10+ deployments
             // is normal in full-tunnel rotations) doesn't dominate the
             // screen once it's set up. Starts expanded for first-run users
@@ -580,72 +596,84 @@ fun HomeScreen(
                 socks5Port = cfg.socks5Port ?: (cfg.listenPort + 1),
             )
 
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                OutlinedTextField(
-                    value = cfg.googleIp,
-                    onValueChange = { persist(cfg.copy(googleIp = it)) },
-                    label = { Text(stringResource(R.string.field_google_ip)) },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-                    modifier = Modifier.weight(1f),
-                )
-                OutlinedTextField(
-                    value = cfg.frontDomain,
-                    onValueChange = { persist(cfg.copy(frontDomain = it)) },
-                    label = { Text(stringResource(R.string.field_front_domain)) },
-                    singleLine = true,
-                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
-                    modifier = Modifier.weight(1f),
-                )
+            // google_ip / front_domain feed the SNI-rewrite tunnel and
+            // the Google direct path. LOCAL_BYPASS doesn't touch either
+            // (every TLS host is dialed directly with the browser's
+            // real ClientHello), so the row is just clutter that
+            // implies the values matter. Same applies to Auto-detect,
+            // SNI pool, and fronting groups below.
+            val showsGoogleFrontingFields = cfg.mode != Mode.LOCAL_BYPASS
+            if (showsGoogleFrontingFields) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    OutlinedTextField(
+                        value = cfg.googleIp,
+                        onValueChange = { persist(cfg.copy(googleIp = it)) },
+                        label = { Text(stringResource(R.string.field_google_ip)) },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                        modifier = Modifier.weight(1f),
+                    )
+                    OutlinedTextField(
+                        value = cfg.frontDomain,
+                        onValueChange = { persist(cfg.copy(frontDomain = it)) },
+                        label = { Text(stringResource(R.string.field_front_domain)) },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri),
+                        modifier = Modifier.weight(1f),
+                    )
+                }
             }
             // "Auto-detect" forces a fresh DNS resolution now. Start also
             // auto-resolves transparently, but exposing a button makes the
             // "I'm getting connect timeouts, is my google_ip stale?" case
             // a one-tap fix without needing to look up nslookup output.
-            TextButton(
-                onClick = {
-                    scope.launch {
-                        val fresh =
-                            withContext(Dispatchers.IO) {
-                                NetworkDetect.resolveGoogleIp()
-                            }
-                        if (!fresh.isNullOrBlank()) {
-                            var updated = cfg
-                            if (fresh != updated.googleIp) {
-                                updated = updated.copy(googleIp = fresh)
-                            }
-                            // Same repair logic as the Start button —
-                            // if front_domain has been corrupted into an
-                            // IP we can't use it for SNI, so put the
-                            // default hostname back.
-                            if (updated.frontDomain.isBlank() ||
-                                updated.frontDomain.parseAsIpOrNull() != null
-                            ) {
-                                updated = updated.copy(frontDomain = "www.google.com")
-                            }
-                            // Captured up-front so the lambda has access
-                            // to the format-string resources via context
-                            // before running on the IO dispatcher.
-                            if (updated !== cfg) {
-                                persist(updated)
-                                snackbar.showSnackbar(
-                                    ctx.getString(R.string.snack_google_ip_updated, fresh),
-                                )
+            // Hidden in LOCAL_BYPASS (no google_ip dependency).
+            if (showsGoogleFrontingFields) {
+                TextButton(
+                    onClick = {
+                        scope.launch {
+                            val fresh =
+                                withContext(Dispatchers.IO) {
+                                    NetworkDetect.resolveGoogleIp()
+                                }
+                            if (!fresh.isNullOrBlank()) {
+                                var updated = cfg
+                                if (fresh != updated.googleIp) {
+                                    updated = updated.copy(googleIp = fresh)
+                                }
+                                // Same repair logic as the Start button —
+                                // if front_domain has been corrupted into an
+                                // IP we can't use it for SNI, so put the
+                                // default hostname back.
+                                if (updated.frontDomain.isBlank() ||
+                                    updated.frontDomain.parseAsIpOrNull() != null
+                                ) {
+                                    updated = updated.copy(frontDomain = "www.google.com")
+                                }
+                                // Captured up-front so the lambda has access
+                                // to the format-string resources via context
+                                // before running on the IO dispatcher.
+                                if (updated !== cfg) {
+                                    persist(updated)
+                                    snackbar.showSnackbar(
+                                        ctx.getString(R.string.snack_google_ip_updated, fresh),
+                                    )
+                                } else {
+                                    snackbar.showSnackbar(
+                                        ctx.getString(R.string.snack_google_ip_current, fresh),
+                                    )
+                                }
                             } else {
-                                snackbar.showSnackbar(
-                                    ctx.getString(R.string.snack_google_ip_current, fresh),
-                                )
+                                snackbar.showSnackbar(ctx.getString(R.string.snack_dns_lookup_failed))
                             }
-                        } else {
-                            snackbar.showSnackbar(ctx.getString(R.string.snack_dns_lookup_failed))
                         }
-                    }
-                },
-                modifier = Modifier.align(Alignment.End),
-            ) { Text(stringResource(R.string.btn_auto_detect_google_ip)) }
+                    },
+                    modifier = Modifier.align(Alignment.End),
+                ) { Text(stringResource(R.string.btn_auto_detect_google_ip)) }
+            }
 
             // App splitting — only makes sense in VPN_TUN mode.
             // PROXY_ONLY has no system-level routing to partition.
@@ -655,24 +683,33 @@ fun HomeScreen(
                 }
             }
 
-            // SNI pool: collapsed by default. Users without a reason to
-            // touch it should leave Rust's auto-expansion to handle it.
-            CollapsibleSection(title = stringResource(R.string.sec_sni_pool_tester)) {
-                SniPoolEditor(
-                    cfg = cfg,
-                    onChange = ::persist,
-                )
-            }
+            // SNI pool + CDN fronting groups are both inert in
+            // LOCAL_BYPASS (no SNI rewrite, no CDN-edge dial — just
+            // direct fragmented connect to every real destination),
+            // so the editors are hidden in that mode to avoid
+            // implying the values matter.
+            if (showsGoogleFrontingFields) {
+                // SNI pool: collapsed by default. Users without a reason
+                // to touch it should leave Rust's auto-expansion to
+                // handle it.
+                CollapsibleSection(title = stringResource(R.string.sec_sni_pool_tester)) {
+                    SniPoolEditor(
+                        cfg = cfg,
+                        onChange = ::persist,
+                    )
+                }
 
-            // CDN fronting groups: collapsed by default. Surfaces the
-            // "discover front by hostname" flow that lets users add new
-            // CDN edges without hand-editing config.json. See
-            // docs/use-as-upstream.md for the underlying technique.
-            CollapsibleSection(title = stringResource(R.string.sec_fronting_groups)) {
-                FrontingGroupsEditor(
-                    cfg = cfg,
-                    onChange = ::persist,
-                )
+                // CDN fronting groups: collapsed by default. Surfaces
+                // the "discover front by hostname" flow that lets users
+                // add new CDN edges without hand-editing config.json.
+                // See docs/use-as-upstream.md for the underlying
+                // technique.
+                CollapsibleSection(title = stringResource(R.string.sec_fronting_groups)) {
+                    FrontingGroupsEditor(
+                        cfg = cfg,
+                        onChange = ::persist,
+                    )
+                }
             }
 
             // Advanced settings: collapsed by default.
@@ -688,11 +725,21 @@ fun HomeScreen(
             // the primary Connect/Disconnect button at the top. Kept down
             // here because cert install is a one-time setup step; daily
             // users never tap it again.
-            FilledTonalButton(
-                onClick = { showInstallDialog = true },
-                modifier = Modifier.fillMaxWidth(),
-            ) {
-                Text(stringResource(R.string.btn_install_mitm))
+            //
+            // Hidden in LOCAL_BYPASS / FULL: those modes don't use the
+            // MITM SNI-rewrite path at all (LocalBypass fragments TLS
+            // end-to-end; Full tunnels end-to-end through the relay),
+            // so offering a CA-install button there is misleading. The
+            // file still exists on disk and can be installed by hand if
+            // a user switches modes later.
+            val showsCertInstall = cfg.mode != Mode.LOCAL_BYPASS && cfg.mode != Mode.FULL
+            if (showsCertInstall) {
+                FilledTonalButton(
+                    onClick = { showInstallDialog = true },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(stringResource(R.string.btn_install_mitm))
+                }
             }
 
             // "Usage today (estimated)" — visible only while a proxy is
@@ -723,9 +770,16 @@ fun HomeScreen(
             // dominate the form after the user has learned the flow.
             // Starts expanded once for a fresh install so the first-run
             // instructions are immediately visible.
+            // The how-to walks through the Apps Script deploy + cert
+            // install flow. Auto-expand the first time a relay-mode
+            // user is missing those credentials, but stay collapsed
+            // for LOCAL_BYPASS (no relay, no cert) so we don't shove
+            // an irrelevant wall of text in their face on first run.
             CollapsibleSection(
                 title = stringResource(R.string.sec_how_to_use),
-                initiallyExpanded = cfg.appsScriptUrls.isEmpty() || cfg.authKey.isBlank(),
+                initiallyExpanded =
+                    cfg.mode.usesAppsScriptRelay() &&
+                        (cfg.appsScriptUrls.isEmpty() || cfg.authKey.isBlank()),
             ) {
                 HowToUseBody(cfg.listenPort)
             }
@@ -1060,7 +1114,7 @@ private fun DeploymentIdsField(
 }
 
 // =========================================================================
-// Mode dropdown: apps_script (default), direct (no relay), or full.
+// Mode dropdown: apps_script (default), direct, full, or local_bypass.
 // =========================================================================
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -1072,11 +1126,13 @@ private fun ModeDropdown(
     val labelApps = stringResource(R.string.mode_apps_script_label)
     val labelDirect = stringResource(R.string.mode_direct_label)
     val labelFull = stringResource(R.string.mode_full_label)
+    val labelLocalBypass = stringResource(R.string.mode_local_bypass_label)
     val currentLabel =
         when (mode) {
             Mode.APPS_SCRIPT -> labelApps
             Mode.DIRECT -> labelDirect
             Mode.FULL -> labelFull
+            Mode.LOCAL_BYPASS -> labelLocalBypass
         }
     var expanded by remember { mutableStateOf(false) }
 
@@ -1118,6 +1174,13 @@ private fun ModeDropdown(
                         expanded = false
                     },
                 )
+                DropdownMenuItem(
+                    text = { Text(labelLocalBypass) },
+                    onClick = {
+                        onChange(Mode.LOCAL_BYPASS)
+                        expanded = false
+                    },
+                )
             }
         }
 
@@ -1126,6 +1189,7 @@ private fun ModeDropdown(
                 Mode.APPS_SCRIPT -> stringResource(R.string.help_mode_apps_script)
                 Mode.DIRECT -> stringResource(R.string.help_mode_direct)
                 Mode.FULL -> stringResource(R.string.help_mode_full)
+                Mode.LOCAL_BYPASS -> stringResource(R.string.help_mode_local_bypass)
             }
         Text(
             help,

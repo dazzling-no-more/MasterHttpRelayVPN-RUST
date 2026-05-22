@@ -527,6 +527,42 @@ class ProfileStoreTest {
         )
     }
 
+    /**
+     * Mirror of [applyProfile_accepts_minimal_direct_snapshot] for
+     * the `local_bypass` mode. Pins the invariant that
+     * `validateRuntimeShape` gates the credential check on
+     * [Mode.usesAppsScriptRelay] rather than a hard-coded allowlist
+     * of mode strings — adding a future cred-free mode means
+     * flipping that one predicate, not chasing four allowlists.
+     */
+    @Test
+    fun applyProfile_accepts_minimal_local_bypass_snapshot() {
+        val ok =
+            """
+            {
+              "active": "",
+              "profiles": [{"name": "lb", "config": {"mode": "local_bypass"}}]
+            }
+            """.trimIndent()
+        profilesFile.writeText(ok)
+        val r = ProfileStore.applyProfile(ctx, "lb")
+        assertTrue(
+            "minimal local_bypass snapshot must apply, got ${r::class.simpleName}",
+            r is ProfileStore.ApplyResult.Ok,
+        )
+        // The applied config.json should round-trip back into a
+        // RahgozarConfig with mode = LOCAL_BYPASS. Without this
+        // assertion we could regress to the parser silently
+        // downgrading to APPS_SCRIPT (the `else -> Mode.APPS_SCRIPT`
+        // fallback in `loadFromJson`).
+        val applied = ConfigStore.load(ctx)
+        assertEquals(Mode.LOCAL_BYPASS, applied.mode)
+        assertFalse(
+            "local_bypass must not require Apps Script creds",
+            applied.mode.usesAppsScriptRelay(),
+        )
+    }
+
     @Test
     fun applyProfile_missing_returns_NotFound_without_side_effects() {
         ConfigStore.save(ctx, RahgozarConfig(authKey = "preserve-me"))

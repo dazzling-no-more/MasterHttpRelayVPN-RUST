@@ -276,8 +276,17 @@
 
   <!-- MITM CA card. Sits between the hero (does the proxy run?) and
        the config preview (what would it run with?). Its own data
-       lifecycle, no props from this component. -->
-  <CaCard />
+       lifecycle, no props from this component.
+       Hidden in no-MITM modes (local_bypass / full): those paths
+       never touch the CA, so advertising "install this root cert"
+       there is misleading and adds avoidable trust-store risk.
+       The card itself triggers a lazy mint in onMount when the file
+       is missing (via `mint_ca_if_missing`), so gating render here
+       is also what stops CA generation in no-MITM modes. Matches
+       the Android-side gate in HomeScreen. -->
+  {#if config && config.mode !== "local_bypass" && config.mode !== "full"}
+    <CaCard />
+  {/if}
 
   <!-- Read-only config preview. Real editor lives on the Tunnel tab. -->
   {#if config}

@@ -589,33 +589,41 @@ object ProfileStore {
      *
      * Rules:
      *   - `mode` must be present and one of "apps_script" | "direct"
-     *     | "full" (the legacy "google_only" alias is accepted as
-     *     direct, mirroring `Config::mode_kind`).
-     *   - apps_script / full modes require at least one non-empty
+     *     | "full" | "local_bypass" (the legacy "google_only" alias
+     *     is accepted as direct, mirroring `Config::mode_kind`).
+     *   - Modes that use the Apps Script relay (gated by
+     *     [Mode.usesAppsScriptRelay]) require at least one non-empty
      *     deployment ID (under either `script_id` or `script_ids`)
-     *     AND a non-empty, non-placeholder `auth_key`.
+     *     AND a non-empty, non-placeholder `auth_key`. Everything
+     *     else (direct, google_only alias, local_bypass) saves
+     *     without creds.
      */
     private fun validateRuntimeShape(
         raw: JSONObject,
         decoded: RahgozarConfig,
     ): String? {
-        val mode = raw.optString("mode", "")
-        if (mode.isBlank()) return "missing required field `mode`"
-        when (mode) {
-            "apps_script", "full" -> {
-                if (!decoded.hasDeploymentId) {
-                    return "$mode mode requires script_id (or script_ids)"
-                }
-                val auth = decoded.authKey.trim()
-                if (auth.isEmpty() || auth == "CHANGE_ME_TO_A_STRONG_SECRET") {
-                    return "$mode mode requires a non-placeholder auth_key"
-                }
+        val modeStr = raw.optString("mode", "")
+        if (modeStr.isBlank()) return "missing required field `mode`"
+        // Map the wire string to the canonical Mode enum so the
+        // credential check below defers to [Mode.usesAppsScriptRelay]
+        // — the same single-source-of-truth predicate the service-side
+        // gate uses. Unknown modes are rejected here so they never
+        // reach the runtime, mirroring `Config::mode_kind`.
+        val mode =
+            when (modeStr) {
+                "apps_script" -> Mode.APPS_SCRIPT
+                "direct", "google_only" -> Mode.DIRECT
+                "full" -> Mode.FULL
+                "local_bypass" -> Mode.LOCAL_BYPASS
+                else -> return "unknown mode '$modeStr'"
             }
-
-            "direct", "google_only" -> { /* no relay creds required */ }
-
-            else -> {
-                return "unknown mode '$mode'"
+        if (mode.usesAppsScriptRelay()) {
+            if (!decoded.hasDeploymentId) {
+                return "$modeStr mode requires script_id (or script_ids)"
+            }
+            val auth = decoded.authKey.trim()
+            if (auth.isEmpty() || auth == "CHANGE_ME_TO_A_STRONG_SECRET") {
+                return "$modeStr mode requires a non-placeholder auth_key"
             }
         }
         return null

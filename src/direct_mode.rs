@@ -29,7 +29,7 @@
 
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
@@ -313,14 +313,37 @@ pub fn is_google_domain(host: &str, google: &[String], sanctioned: &[String]) ->
 }
 
 fn strip_port(host: &str) -> &str {
-    // Strip a `:port` suffix but only if it looks like a port (digits
-    // only) — IPv6 literals contain colons that aren't port separators
-    // and arrive without brackets in some code paths.
-    match host.rsplit_once(':') {
-        Some((prefix, port)) if !prefix.is_empty() && port.chars().all(|c| c.is_ascii_digit()) => {
-            prefix
+    // Bracketed IPv6 (RFC 3986 host shape — `[v6]` or `[v6]:port`).
+    // Strip up to the closing `]` so `[::1]:443` -> `::1`. Without
+    // this the unbracketed fall-through below would mis-parse the
+    // final hextet of an IPv6 address as a port (e.g. `::1` reading
+    // `1` as a port and yielding `::`), conflating unrelated IPv6
+    // destinations under the same breaker key.
+    if let Some(rest) = host.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            return &rest[..end];
         }
-        _ => host,
+        // Malformed: opening bracket with no close. Treat as opaque
+        // and don't try to find a port — anything we do here is
+        // guessing.
+        return host;
+    }
+    // Unbracketed: differentiate IPv6 literal (no port — RFC 3986
+    // requires brackets when a port is present) from `host:port`
+    // by counting colons. 0 colons = bare host. Exactly 1 colon =
+    // standard `host:port`. 2+ colons = IPv6 literal, leave alone.
+    let colons = host.chars().filter(|c| *c == ':').count();
+    if colons == 1 {
+        match host.rsplit_once(':') {
+            Some((prefix, port))
+                if !prefix.is_empty() && port.chars().all(|c| c.is_ascii_digit()) =>
+            {
+                prefix
+            }
+            _ => host,
+        }
+    } else {
+        host
     }
 }
 
@@ -1062,7 +1085,6 @@ async fn dial_with_validation(
     if let Some(w) = tokio::time::timeout(
         ctx.fast_path_timeout,
         dial_one(
-            host,
             port,
             fast_front.clone(),
             fast_profile,
@@ -1097,9 +1119,8 @@ async fn dial_with_validation(
                 continue;
             }
             let f = f.clone();
-            let host_owned = host.to_string();
             let body = client_hello_owned.clone();
-            tasks.spawn(async move { dial_one(&host_owned, port, f, p, &body, sh_timeout).await });
+            tasks.spawn(async move { dial_one(port, f, p, &body, sh_timeout).await });
         }
     }
 
@@ -1126,8 +1147,14 @@ async fn dial_with_validation(
 /// read (typically the ServerHello prefix) are returned so the
 /// caller can write them back to the client before starting
 /// bidirectional copy.
+///
+/// `front` IS the TCP-connect address (whatever the caller decided —
+/// a Google-edge front for the original direct-mode path, the real
+/// destination for LocalBypass, or a user-pinned IP from
+/// `hosts_override`). The ClientHello bytes carry their own SNI
+/// untouched, so the destination still serves the right cert
+/// regardless of which address we dialed.
 async fn dial_one(
-    _host: &str,
     port: u16,
     front: String,
     profile: &'static Profile,
@@ -1135,7 +1162,15 @@ async fn dial_one(
     sh_timeout: Duration,
 ) -> Option<DialWinner> {
     let start = Instant::now();
-    let mut s = TcpStream::connect((front.as_str(), port)).await.ok()?;
+    // Strip `[`/`]` brackets that arrive on raw IPv6 literals
+    // (HTTP CONNECT `[::1]:443` shapes the host as `[::1]`, which
+    // `TcpStream::connect` won't resolve). The cheap inline trim
+    // keeps `dial_one` callable from both the Google front pool
+    // (where bracketed entries never occur) and the LocalBypass
+    // path (where they're real — see issue note in
+    // `try_local_bypass_tunnel`).
+    let dial_target = front.as_str().trim_start_matches('[').trim_end_matches(']');
+    let mut s = TcpStream::connect((dial_target, port)).await.ok()?;
     // TCP_NODELAY is mandatory: without it, Nagle coalesces our
     // fragment writes back into a single segment and the whole scheme
     // collapses.
@@ -1190,43 +1225,525 @@ async fn splice_after_handshake(client: TcpStream, upstream: TcpStream, server_b
     }
 }
 
+/// Hard bound on how long we'll wait for a client to finish sending
+/// its ClientHello after the 1-byte TLS peek succeeded. Without it a
+/// local app on the device can grief LocalBypass (or any other code
+/// path that calls `read_first_tls_record`) by sending `0x16` and
+/// then stalling — every such CONNECT pins a tokio task plus its
+/// socket indefinitely. 5 s is generous: a real client streams the
+/// rest of the ClientHello within a TCP RTT or two, so legitimate
+/// traffic finishes orders of magnitude under this deadline.
+const CLIENT_HELLO_READ_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Read until we have at least one complete TLS record (the
 /// ClientHello). Returns any trailing bytes already buffered in the
 /// same read call too — those bytes were sent by the client alongside
 /// the ClientHello and need to flow upstream as part of the same
 /// fragmented write.
+///
+/// Bounded by `CLIENT_HELLO_READ_TIMEOUT`. A stalled client surfaces
+/// as `io::ErrorKind::TimedOut` so callers can drop the connection.
 async fn read_first_tls_record(client: &mut TcpStream) -> std::io::Result<Vec<u8>> {
-    const MAX_FIRST: usize = 32 * 1024;
-    let mut buf: Vec<u8> = Vec::with_capacity(2048);
-    let mut tmp = [0u8; 4096];
-    loop {
-        let n = client.read(&mut tmp).await?;
-        if n == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "client closed before ClientHello",
-            ));
+    tokio::time::timeout(CLIENT_HELLO_READ_TIMEOUT, async move {
+        const MAX_FIRST: usize = 32 * 1024;
+        let mut buf: Vec<u8> = Vec::with_capacity(2048);
+        let mut tmp = [0u8; 4096];
+        loop {
+            let n = client.read(&mut tmp).await?;
+            if n == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "client closed before ClientHello",
+                ));
+            }
+            buf.extend_from_slice(&tmp[..n]);
+            if buf.len() < 5 {
+                continue;
+            }
+            if buf[0] != 0x16 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "not a TLS handshake",
+                ));
+            }
+            let rec_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
+            if buf.len() >= 5 + rec_len {
+                return Ok(buf);
+            }
+            if buf.len() > MAX_FIRST {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "ClientHello too large",
+                ));
+            }
         }
-        buf.extend_from_slice(&tmp[..n]);
-        if buf.len() < 5 {
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "ClientHello read exceeded CLIENT_HELLO_READ_TIMEOUT",
+        ))
+    })
+}
+
+// ---------- LocalBypass: fragmented dial to the real destination ----------
+//
+// The Google direct-mode path above always dials a *front* (one of a
+// small Google-edge pool) and validates with a ServerHello that the
+// front uses. LocalBypass uses the same fragmentation engine but dials
+// the **real destination** (host:port from the CONNECT request). No
+// front pool, no per-domain suffix gate, no SNI-rewrite fallback —
+// just "send the real ClientHello to the real server, split across
+// TCP segments, see if DPI lets it through."
+//
+// Last-winner is a single process-global AtomicUsize indexing into
+// PROFILES. Most DPI engines treat all destinations the same, so once
+// we find a profile that works for one host the others usually agree.
+// No per-host cache (would balloon to thousands of entries on a heavy
+// device), no disk persistence (cheap to re-race once after restart).
+
+/// Index into `PROFILES` of the last profile that produced a valid
+/// ServerHello via LocalBypass. `usize::MAX` is the "no preference"
+/// sentinel — we fall back to `default_profile()` then.
+static LOCAL_BYPASS_LAST_WINNER: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// LocalBypass-side circuit breaker. Per-destination scope: one bad
+/// host doesn't disable fragmentation for unrelated hosts. The
+/// previous shape was a single process-global counter, which meant
+/// three failures on (say) an IP-blocked `claude.ai` would briefly
+/// turn LocalBypass into raw passthrough for every other TLS host
+/// the user touched in the next 30 s — a real DPI-bypass regression
+/// across the rest of their browsing.
+///
+/// Why a breaker at all: when LocalBypass hits an IP-blocked
+/// destination (Iran's `claude.ai` / `x.ai` / `chatgpt.com` and
+/// similar), the fast-path + race phases cost ~6 s of latency
+/// before raw fallback runs and also fails. Aggressive retry
+/// behaviour from apps (Telegram-style DC rotation, browser
+/// auto-reload, push retries) then pays that 6 s on every attempt
+/// — bad latency and a real battery drain on Android. With the
+/// breaker tripped for that specific host, the dialer skips
+/// fragmentation entirely and goes straight to raw fallback (one
+/// ~5 s TCP connect that likely fails too). Net result on a
+/// fully-blocked destination: ~6 s saved per connection during the
+/// cooldown window, without contaminating other hosts.
+///
+/// Threshold + cooldown tuning is deliberately gentler than the
+/// Google direct breaker (2 fails / 60 s) because LocalBypass'
+/// false-negative rate is higher: destinations are arbitrary and
+/// some hosts genuinely don't respond within `SERVER_HELLO_TIMEOUT`
+/// for network-noise reasons. The runtime is still strictly bounded
+/// by the existing fast-path / race / fallback timeouts even with
+/// the breaker disabled, so these numbers aren't load-bearing in a
+/// "wrong-value-means-hang" sense — they just shape the
+/// bad-failure-mode latency curve per host.
+///
+/// Map growth: bounded by the `LOCAL_BYPASS_BREAKER_MAX_ENTRIES`
+/// cap. On insert, if at cap we evict every entry whose `until`
+/// has already passed (cheap O(N) sweep) and, if still at cap, the
+/// oldest one by `until`. N is small (a few hundred at most), so
+/// the sweep is fine on the hot path. A pathological client that
+/// CONNECTs to many distinct hostnames would otherwise be able to
+/// grow this unboundedly.
+const LOCAL_BYPASS_BREAKER_THRESHOLD: u32 = 3;
+const LOCAL_BYPASS_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
+const LOCAL_BYPASS_BREAKER_MAX_ENTRIES: usize = 256;
+
+#[derive(Debug, Clone, Copy)]
+struct LocalBypassBreakerEntry {
+    consecutive_failures: u32,
+    until: Option<Instant>,
+}
+
+static LOCAL_BYPASS_BREAKER_MAP: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, LocalBypassBreakerEntry>>,
+> = std::sync::OnceLock::new();
+
+fn local_bypass_breaker_map(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, LocalBypassBreakerEntry>> {
+    LOCAL_BYPASS_BREAKER_MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Normalise a destination key for the breaker map. Lowercased and
+/// port-stripped so `example.com:443` and `example.com:8443` share
+/// state (the failure mode is the host, not the port). Bracket
+/// handling lives inside [`strip_port`] so `[::1]:443` and `::1`
+/// land on the same key, but `::1` and `::2` stay distinct (the
+/// previous shape trimmed brackets first and then let an unbracketed
+/// IPv6 fall through to a single-colon port heuristic that
+/// conflated final hextets — see strip_port's doc comment).
+fn breaker_key(host: &str) -> String {
+    strip_port(host).to_ascii_lowercase()
+}
+
+fn local_bypass_breaker_tripped(host: &str) -> bool {
+    let key = breaker_key(host);
+    let map = match local_bypass_breaker_map().lock() {
+        Ok(g) => g,
+        // Lock poisoning means a previous writer panicked while
+        // holding the map. Recover the inner value and proceed —
+        // failing closed (assuming tripped) would silently break
+        // LocalBypass for every host until the next process
+        // restart. The map is purely advisory caching state, not
+        // a correctness barrier, so reading it post-poison is
+        // safe.
+        Err(p) => p.into_inner(),
+    };
+    let Some(entry) = map.get(&key) else {
+        return false;
+    };
+    let Some(until) = entry.until else {
+        return false;
+    };
+    Instant::now() < until
+}
+
+fn local_bypass_note_success(host: &str) {
+    let key = breaker_key(host);
+    let mut map = match local_bypass_breaker_map().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    // Successful dial → the breaker for this host is no longer
+    // useful. Removing (instead of resetting to zero) keeps the
+    // map small under normal browsing patterns: every successful
+    // first-time host gets one transient entry that immediately
+    // disappears.
+    map.remove(&key);
+}
+
+fn local_bypass_note_failure(host: &str) {
+    let key = breaker_key(host);
+    let mut map = match local_bypass_breaker_map().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    // Prune + bounded-cap. Done inside the same critical section
+    // as the upsert below so the cap is honoured exactly. The
+    // cleanup is conditional on being at-or-past cap, so warm
+    // paths (a single bad host) don't pay the O(N) sweep at all.
+    if map.len() >= LOCAL_BYPASS_BREAKER_MAX_ENTRIES && !map.contains_key(&key) {
+        let now = Instant::now();
+        map.retain(|_, e| e.until.map_or(false, |t| now < t));
+        if map.len() >= LOCAL_BYPASS_BREAKER_MAX_ENTRIES {
+            // Still at cap → evict the entry expiring soonest.
+            // `min_by_key` on the `until` value; entries without an
+            // `until` (consecutive_failures < threshold) get
+            // dropped first via `None`-sorts-first ordering.
+            if let Some(oldest) = map
+                .iter()
+                .min_by_key(|(_, e)| e.until)
+                .map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest);
+            }
+        }
+    }
+    let entry = map.entry(key.clone()).or_insert(LocalBypassBreakerEntry {
+        consecutive_failures: 0,
+        until: None,
+    });
+    entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+    if entry.consecutive_failures >= LOCAL_BYPASS_BREAKER_THRESHOLD {
+        entry.until = Some(Instant::now() + LOCAL_BYPASS_BREAKER_COOLDOWN);
+        tracing::warn!(
+            "local-bypass circuit breaker tripped for '{}' after {} consecutive failures; \
+             skipping fragmentation for {:?}",
+            key,
+            entry.consecutive_failures,
+            LOCAL_BYPASS_BREAKER_COOLDOWN
+        );
+    }
+}
+
+/// True when the profile actually fragments the ClientHello — i.e. its
+/// strategy is not `Passthrough` (which sends the hello as one byte
+/// stream and so doesn't beat any DPI). LocalBypass deliberately
+/// refuses to race or cache passthrough profiles: on a host where DPI
+/// happens to be looking elsewhere, the passthrough profile can win
+/// the race purely because it skipped the inter-chunk pacing delays
+/// — and then the global last-winner cache makes every subsequent
+/// connection use it too, silently degrading the documented "fragment
+/// every TLS host" guarantee to "send unfragmented." Filtering at the
+/// race spawn and at the remember-side both is belt-and-suspenders so
+/// a profile-list reorder can't sneak a passthrough back in.
+fn is_fragmenting_profile(p: &Profile) -> bool {
+    !matches!(p.strategy, SplitStrategy::Passthrough)
+}
+
+fn local_bypass_preferred_profile() -> &'static Profile {
+    let idx = LOCAL_BYPASS_LAST_WINNER.load(Ordering::Relaxed);
+    if let Some(profile) = PROFILES.get(idx) {
+        if is_fragmenting_profile(profile) {
+            return profile;
+        }
+    }
+    // No remembered winner yet (sentinel index) OR the remembered
+    // entry was somehow a passthrough variant (e.g. an older build
+    // wrote one before this guard existed and we picked it up from
+    // shared static state in tests). Fall back to the documented
+    // first-dial default, which is guaranteed fragmenting by
+    // construction in `PROFILES`.
+    default_profile()
+}
+
+fn local_bypass_remember(profile: &Profile) {
+    if !is_fragmenting_profile(profile) {
+        // Refuse to cache a passthrough win. See
+        // [`is_fragmenting_profile`] for the rationale; in short, a
+        // race won by `p00` means "this host happens not to be
+        // DPI-inspected" — which is exactly the case where the *next*
+        // host on the same network might still be DPI-inspected and
+        // needs real fragmentation. Storing p00 globally would
+        // silently turn LocalBypass into raw passthrough.
+        tracing::debug!(
+            "local-bypass: refusing to cache non-fragmenting profile {}",
+            profile.id
+        );
+        return;
+    }
+    if let Some(idx) = PROFILES.iter().position(|p| p.id == profile.id) {
+        LOCAL_BYPASS_LAST_WINNER.store(idx, Ordering::Relaxed);
+    }
+}
+
+/// LocalBypass tunnel entry point. Mirrors `try_tunnel`'s outcome
+/// surface so the dispatcher's match arm stays uniform, but the
+/// internals are simpler:
+///   - `Done` — fragmented dial committed (or post-fragmentation raw
+///     fallback ran). Either way the socket is fully consumed.
+///   - `Skip(sock)` — peek said this isn't TLS; dispatcher continues
+///     with the untouched socket (typically into raw passthrough).
+///   - `SkipPrefaced` — never returned. LocalBypass has no
+///     SNI-rewrite fallback to hand the prefaced stream to, so a
+///     fragmentation failure resolves into an in-place raw-replay
+///     fallback below and `Done`.
+///
+/// Fast-path-then-race: cached-or-default profile first under
+/// `FAST_PATH_TIMEOUT`; on failure all remaining profiles race in
+/// parallel under `RACE_TIMEOUT`. Both timeouts and the ServerHello
+/// validation are reused verbatim from the Google direct path. The
+/// winning profile updates the process-wide last-winner so subsequent
+/// connects on this network skip straight to it.
+///
+/// `dial_target` separates the TCP-connect address from the SNI/cert
+/// host so a user-pinned `hosts: { mail.google.com: 1.2.3.4 }`
+/// override is honoured: we still send a ClientHello with the
+/// original SNI (so the destination serves the right cert and the
+/// browser's pinning checks succeed), but we connect to the pinned
+/// IP instead of resolving the hostname. `None` means "dial whatever
+/// `host` resolves to" — the no-override default. Breaker keying
+/// stays on `host` (the SNI) because failure modes are per-hostname,
+/// not per-IP — a pinned IP that's bad for `mail.google.com` could
+/// still be fine for another hostname mapped to the same IP.
+pub async fn try_local_bypass_tunnel(
+    mut sock: TcpStream,
+    host: &str,
+    port: u16,
+    dial_target: Option<&str>,
+) -> std::io::Result<TunnelOutcome> {
+    // 1. TLS-peek. Non-TLS bounces back to the dispatcher so it can
+    //    handle e.g. an SMTP CONNECT via plain passthrough.
+    let mut peek = [0u8; 1];
+    let peek_res = tokio::time::timeout(Duration::from_millis(300), sock.peek(&mut peek)).await;
+    match peek_res {
+        Ok(Ok(1)) if peek[0] == 0x16 => {}
+        _ => return Ok(TunnelOutcome::Skip(sock)),
+    }
+
+    // 2. Read full ClientHello. Failure here means the client closed
+    //    on us mid-handshake — nothing to do, drop and return Done.
+    let client_hello = match read_first_tls_record(&mut sock).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!(
+                "local-bypass: ClientHello read failed for {}:{}: {}",
+                host,
+                port,
+                e
+            );
+            return Ok(TunnelOutcome::Done);
+        }
+    };
+
+    // 2.5. Per-host circuit breaker — if recent connections to THIS
+    //      destination have all failed fragmentation+race+fallback,
+    //      skip straight to raw fallback for this host. Saves the
+    //      ~6 s fast-path/race cost on retry-storms against
+    //      IP-blocked destinations; the per-host scope means a bad
+    //      host doesn't disable fragmentation for unrelated hosts
+    //      (a process-global breaker would briefly turn LocalBypass
+    //      into raw passthrough for everything after three bad
+    //      attempts at e.g. claude.ai). See `LOCAL_BYPASS_BREAKER_*`
+    //      for the trip threshold and cooldown rationale.
+    if local_bypass_breaker_tripped(host) {
+        tracing::debug!(
+            "local-bypass {}:{} -> raw fallback (breaker tripped for host)",
+            host,
+            port,
+        );
+        local_bypass_raw_fallback(sock, host, port, &client_hello, dial_target).await;
+        return Ok(TunnelOutcome::Done);
+    }
+
+    // Resolve the connect target now so `dial_one`'s `front` argument
+    // is a single canonical string for both the fast path and the
+    // race phase. `None` means "resolve from `host`" — the no-override
+    // default. When the caller passed an override (user-pinned IP via
+    // `RewriteCtx::hosts`), we connect there instead while still
+    // sending the original SNI in the ClientHello. The destination
+    // serves a cert for `host`, so browser TLS validation and
+    // app-level pinning continue to work.
+    let connect_target = dial_target.unwrap_or(host).to_string();
+
+    // 3. Fast path with the cached/default profile.
+    let preferred = local_bypass_preferred_profile();
+    if let Some(w) = tokio::time::timeout(
+        FAST_PATH_TIMEOUT,
+        dial_one(
+            port,
+            connect_target.clone(),
+            preferred,
+            &client_hello,
+            SERVER_HELLO_TIMEOUT,
+        ),
+    )
+    .await
+    .ok()
+    .flatten()
+    {
+        local_bypass_remember(w.profile);
+        local_bypass_note_success(host);
+        tracing::info!(
+            "local-bypass {}:{} (profile={}, ServerHello in {}ms)",
+            host,
+            port,
+            w.profile.id,
+            w.handshake_ms,
+        );
+        splice_after_handshake(sock, w.upstream, w.server_bytes).await;
+        return Ok(TunnelOutcome::Done);
+    }
+    tracing::debug!(
+        "local-bypass fast path failed for {}:{} (profile {}), racing",
+        host,
+        port,
+        preferred.id
+    );
+
+    // 4. Race the remaining fragmenting profiles in parallel. First
+    //    ServerHello wins; rest get cancelled. Passthrough (p00) is
+    //    excluded by [`is_fragmenting_profile`] — letting it race
+    //    would let a non-DPI'd host accidentally crown it the global
+    //    winner and silently turn LocalBypass into raw passthrough
+    //    for every subsequent connection. See the doc comment on
+    //    `is_fragmenting_profile`.
+    let mut tasks = tokio::task::JoinSet::new();
+    let hello_owned = client_hello.clone();
+    let connect_target_owned = connect_target.clone();
+    for p in PROFILES.iter() {
+        if p.id == preferred.id || !is_fragmenting_profile(p) {
             continue;
         }
-        if buf[0] != 0x16 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "not a TLS handshake",
-            ));
+        let target = connect_target_owned.clone();
+        let hello = hello_owned.clone();
+        tasks.spawn(async move { dial_one(port, target, p, &hello, SERVER_HELLO_TIMEOUT).await });
+    }
+    let outer = tokio::time::timeout(RACE_TIMEOUT, async {
+        while let Some(joined) = tasks.join_next().await {
+            if let Ok(Some(w)) = joined {
+                return Some(w);
+            }
         }
-        let rec_len = u16::from_be_bytes([buf[3], buf[4]]) as usize;
-        if buf.len() >= 5 + rec_len {
-            return Ok(buf);
+        None
+    })
+    .await
+    .ok()
+    .flatten();
+    tasks.shutdown().await;
+
+    let win = match outer {
+        Some(w) => w,
+        None => {
+            // Every profile failed. Trip the per-host breaker
+            // counter so an app retry-storm against an IP-blocked
+            // destination doesn't pay the full fast-path + race
+            // budget on every attempt. Then fall back to a fresh
+            // raw TCP connection with the buffered ClientHello
+            // replayed unfragmented. On a DPI network the replay
+            // also fails (DPI will RST as soon as it reads the
+            // unfragmented SNI). That's the best a no-VPS mode can
+            // do — the alternative is silently dropping the
+            // connection.
+            local_bypass_note_failure(host);
+            tracing::info!(
+                "local-bypass {}:{} -> raw fallback (all profiles failed)",
+                host,
+                port,
+            );
+            local_bypass_raw_fallback(sock, host, port, &client_hello, dial_target).await;
+            return Ok(TunnelOutcome::Done);
         }
-        if buf.len() > MAX_FIRST {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "ClientHello too large",
-            ));
-        }
+    };
+
+    local_bypass_remember(win.profile);
+    local_bypass_note_success(host);
+    tracing::info!(
+        "local-bypass {}:{} (race winner profile={}, ServerHello in {}ms)",
+        host,
+        port,
+        win.profile.id,
+        win.handshake_ms,
+    );
+    splice_after_handshake(sock, win.upstream, win.server_bytes).await;
+    Ok(TunnelOutcome::Done)
+}
+
+/// Fresh-TCP raw replay of the buffered ClientHello. Used when every
+/// fragmentation profile failed and we have no relay to fall back to
+/// (LocalBypass is a relay-free mode). DPI will most likely RST
+/// this too, but we attempt it so connections that failed for
+/// non-DPI reasons (transient network blip, upstream timeout) still
+/// get a shot.
+///
+/// Honours the same `dial_target` override as `try_local_bypass_tunnel`:
+/// a user-pinned `hosts: { mail.google.com: 1.2.3.4 }` keeps applying
+/// on the fallback path so the override isn't silently bypassed when
+/// fragmentation fails.
+async fn local_bypass_raw_fallback(
+    client: TcpStream,
+    host: &str,
+    port: u16,
+    client_hello: &[u8],
+    dial_target: Option<&str>,
+) {
+    // Same bracket trim as `dial_one`: HTTP CONNECT IPv6 literals
+    // arrive as `[::1]`, which `TcpStream::connect` refuses to parse.
+    // Without this the raw-replay fallback would silently fail for
+    // every IPv6 destination in LocalBypass mode.
+    let connect_target = dial_target.unwrap_or(host);
+    let dial_target = connect_target.trim_start_matches('[').trim_end_matches(']');
+    let upstream = match tokio::time::timeout(
+        Duration::from_secs(5),
+        TcpStream::connect((dial_target, port)),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        _ => return,
+    };
+    let _ = upstream.set_nodelay(true);
+    let (mut cr, mut cw) = client.into_split();
+    let (mut ur, mut uw) = upstream.into_split();
+    if uw.write_all(client_hello).await.is_err() {
+        return;
+    }
+    let c2u = tokio::io::copy(&mut cr, &mut uw);
+    let u2c = tokio::io::copy(&mut ur, &mut cw);
+    tokio::select! {
+        _ = c2u => {}
+        _ = u2c => {}
     }
 }
 
@@ -1804,7 +2321,6 @@ mod tests {
         let port: u16 = port.parse().unwrap();
         let hello = minimal_client_hello();
         let winner = dial_one(
-            "example.com",
             port,
             host.to_string(),
             &PROFILES[0], // p00 passthrough — irrelevant, just need a profile
@@ -1828,7 +2344,6 @@ mod tests {
         let port: u16 = port.parse().unwrap();
         let hello = minimal_client_hello();
         let winner = dial_one(
-            "example.com",
             port,
             host.to_string(),
             &PROFILES[0],
@@ -1871,7 +2386,6 @@ mod tests {
         let (host, port) = addr.split_once(':').unwrap();
         let port: u16 = port.parse().unwrap();
         let result = dial_one(
-            "example.com",
             port,
             host.to_string(),
             &PROFILES[0],
@@ -1894,7 +2408,6 @@ mod tests {
         let (host, port) = addr.split_once(':').unwrap();
         let port: u16 = port.parse().unwrap();
         let result = dial_one(
-            "example.com",
             port,
             host.to_string(),
             &PROFILES[0],
@@ -1917,7 +2430,6 @@ mod tests {
         let (host, port) = addr.split_once(':').unwrap();
         let port: u16 = port.parse().unwrap();
         let result = dial_one(
-            "example.com",
             port,
             host.to_string(),
             &PROFILES[0],
@@ -1995,7 +2507,6 @@ mod tests {
         let port: u16 = port.parse().unwrap();
         let hello = minimal_client_hello();
         let winner = dial_one(
-            "example.com",
             port,
             host.to_string(),
             &PROFILES[0],
@@ -2070,5 +2581,291 @@ mod tests {
         prefaced.read_to_end(&mut got).await.unwrap();
         assert_eq!(&got, b"BEFOREAFTER");
         server.await.unwrap();
+    }
+
+    /// Construct a (client_end, proxy_end) pair of connected TCP
+    /// sockets via an ephemeral loopback listener. The `proxy_end` is
+    /// what we'd normally hand into `try_local_bypass_tunnel` (it's
+    /// the side that's been accepted by our SOCKS5 listener); the
+    /// `client_end` is what we use in the test to simulate the
+    /// browser pushing bytes.
+    async fn loopback_pair() -> (TcpStream, TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connect_fut = tokio::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+        let (proxy_end, _) = listener.accept().await.unwrap();
+        let client_end = connect_fut.await.unwrap();
+        (client_end, proxy_end)
+    }
+
+    /// LocalBypass on a non-443 TLS port commits when the upstream
+    /// returns a valid ServerHello prefix. Pins the "every TLS
+    /// CONNECT" guarantee: a future regression that re-adds a
+    /// `port == 443` gate (whether in the dialer or in the
+    /// dispatcher) fails one of this test, the
+    /// `local_bypass_fires_on_non_443_ports` classifier test in
+    /// `proxy_server.rs`, or both. TLS in production runs on
+    /// 8443 (alt-HTTPS), 993 (IMAPS), 853 (DoT), 465 (SMTPS) and
+    /// other ports — gating them out silently breaks DPI bypass
+    /// on those services.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn local_bypass_commits_on_tls_handshake_on_arbitrary_port() {
+        let (upstream_addr, _h) = fake_server(FakeServerMode::Echo).await;
+        let (uhost, uport) = upstream_addr.split_once(':').unwrap();
+        let uport: u16 = uport.parse().unwrap();
+        // Sanity: the test must be running on a port the dispatcher's
+        // *previous* `port == 443` gate would have rejected. Loopback
+        // listeners get random high ports, so this is automatic, but
+        // assert it loudly so a future test maintainer can't silently
+        // re-introduce the regression by hand-picking 443.
+        assert_ne!(
+            uport, 443,
+            "ephemeral loopback port must differ from 443 — the whole \
+             point of this regression test"
+        );
+
+        let (mut client_end, proxy_end) = loopback_pair().await;
+        // Push a minimal ClientHello into the client side so the
+        // dialer's `read_first_tls_record` can consume one record.
+        let hello = minimal_client_hello();
+        client_end.write_all(&hello).await.unwrap();
+        client_end.flush().await.unwrap();
+
+        let outcome = try_local_bypass_tunnel(proxy_end, uhost, uport, None)
+            .await
+            .expect("dial result");
+        assert!(
+            matches!(outcome, TunnelOutcome::Done),
+            "expected Done after a successful fragmented dial to {}, got {:?}",
+            upstream_addr,
+            std::mem::discriminant(&outcome)
+        );
+    }
+
+    /// Port-stripping is IPv6-aware. Pins the regression where the
+    /// previous "last-colon + all-digits = port" heuristic mangled
+    /// IPv6 literals: `::1` was being read as host `::` + port `1`,
+    /// so unrelated IPv6 destinations (`::1`, `::2`, `::3`) all
+    /// collapsed onto the same `::` key in the breaker map and
+    /// could share state. The bracketed RFC 3986 shape `[v6]:port`
+    /// is also handled so `[::1]:443` and `::1` agree.
+    #[test]
+    fn strip_port_handles_ipv6_literals_and_bracketed_forms() {
+        // Bare hosts and v4 keep working — no regressions in the
+        // common case.
+        assert_eq!(strip_port("example.com"), "example.com");
+        assert_eq!(strip_port("example.com:443"), "example.com");
+        assert_eq!(strip_port("192.168.1.1"), "192.168.1.1");
+        assert_eq!(strip_port("192.168.1.1:443"), "192.168.1.1");
+
+        // Unbracketed IPv6: 2+ colons means "literal, no port". The
+        // final hextet is NOT a port even when it's all digits.
+        assert_eq!(strip_port("::1"), "::1");
+        assert_eq!(strip_port("fe80::1"), "fe80::1");
+        assert_eq!(strip_port("2001:db8::1"), "2001:db8::1");
+        // Distinct keys for distinct hosts — the previous bug
+        // conflated them.
+        assert_ne!(strip_port("::1"), strip_port("::2"));
+        assert_ne!(strip_port("fe80::1"), strip_port("fe80::2"));
+
+        // Bracketed IPv6: the brackets are RFC 3986 host syntax, and
+        // a port may follow. Strip both shapes to the bare literal.
+        assert_eq!(strip_port("[::1]"), "::1");
+        assert_eq!(strip_port("[::1]:443"), "::1");
+        assert_eq!(strip_port("[fe80::1]:8443"), "fe80::1");
+        // `[v6]` and `v6` should produce the same key so the
+        // breaker entry isn't split by syntactic accident.
+        assert_eq!(strip_port("[::1]:443"), strip_port("::1"));
+
+        // Malformed: opening bracket with no close. Don't guess —
+        // leave it opaque rather than risk over-stripping.
+        assert_eq!(strip_port("[::1"), "[::1");
+    }
+
+    /// breaker_key is the lowercased + port-stripped form used as
+    /// the breaker map key. Pins the IPv6 distinctness: failures
+    /// keyed on `::1` must not also trip `::2`.
+    #[test]
+    fn breaker_key_keeps_ipv6_hosts_distinct() {
+        assert_eq!(breaker_key("::1"), "::1");
+        assert_eq!(breaker_key("[::1]:443"), "::1");
+        assert_eq!(breaker_key("::2"), "::2");
+        assert_ne!(breaker_key("::1"), breaker_key("::2"));
+        assert_ne!(
+            breaker_key("[fe80::1]:443"),
+            breaker_key("[fe80::2]:443"),
+            "different IPv6 literals must produce different breaker keys",
+        );
+    }
+
+    /// Per-host breaker scope: failures on host A must NOT trip the
+    /// breaker for host B. The previous shape used a single
+    /// process-global counter, so three failures on a single
+    /// IP-blocked destination (e.g. `claude.ai` in Iran) silently
+    /// disabled fragmentation for every other TLS host the user
+    /// touched for the next 30 s — a real DPI-bypass regression
+    /// across the rest of their browsing. This test isolates the
+    /// failure scope so a future "let's go back to a global
+    /// counter for simplicity" refactor fails loudly.
+    #[test]
+    fn breaker_failures_on_one_host_do_not_trip_other_hosts() {
+        // Clean the shared state so prior tests don't poison the
+        // assertion. The breaker map is process-global by necessity
+        // (it caches across CONNECTs in production); test isolation
+        // happens here via the lock-and-clear at entry.
+        {
+            let mut map = local_bypass_breaker_map().lock().unwrap();
+            map.clear();
+        }
+        for _ in 0..LOCAL_BYPASS_BREAKER_THRESHOLD {
+            local_bypass_note_failure("blocked.example.test");
+        }
+        assert!(
+            local_bypass_breaker_tripped("blocked.example.test"),
+            "breaker should trip after {} failures on the SAME host",
+            LOCAL_BYPASS_BREAKER_THRESHOLD,
+        );
+        assert!(
+            !local_bypass_breaker_tripped("unrelated.example.test"),
+            "breaker for OTHER host must stay closed — global-scope \
+             contamination would silently turn LocalBypass into raw \
+             passthrough for unrelated hosts",
+        );
+        // Port-stripping + case-insensitivity: the key is normalised
+        // so `Host:443` and `host:8443` and `HOST` all share state.
+        assert!(
+            local_bypass_breaker_tripped("BLOCKED.example.test:443"),
+            "breaker_key should normalise case + port",
+        );
+        // A successful dial clears the entry so it doesn't linger
+        // beyond the cooldown. Belt-and-suspenders: future code that
+        // accidentally retains-after-success would see stale "still
+        // tripped" reads on the next connect.
+        local_bypass_note_success("blocked.example.test");
+        assert!(
+            !local_bypass_breaker_tripped("blocked.example.test"),
+            "successful dial must clear the breaker for that host",
+        );
+        // Cleanup so we don't leak state to sibling tests.
+        {
+            let mut map = local_bypass_breaker_map().lock().unwrap();
+            map.clear();
+        }
+    }
+
+    /// The passthrough profile (`p00`, `SplitStrategy::Passthrough`)
+    /// is never accepted as a LocalBypass winner — neither cached
+    /// preferred nor raced — because letting it win would silently
+    /// turn the mode into raw passthrough for every subsequent
+    /// connection. Pin both gates: the [`is_fragmenting_profile`]
+    /// classifier, and the [`local_bypass_remember`] refusal to
+    /// store a non-fragmenting profile.
+    #[test]
+    fn local_bypass_excludes_passthrough_profile() {
+        // p00 is the passthrough profile in PROFILES.
+        let p00 = PROFILES
+            .iter()
+            .find(|p| p.id == "p00")
+            .expect("p00 must exist in PROFILES");
+        assert!(
+            !is_fragmenting_profile(p00),
+            "p00 must classify as non-fragmenting"
+        );
+        // Every other documented profile must classify as fragmenting
+        // — if a future profile is added with Passthrough strategy
+        // and a non-p00 id, this catches it before it can poison the
+        // cache.
+        for p in PROFILES.iter() {
+            if p.id == "p00" {
+                continue;
+            }
+            assert!(
+                is_fragmenting_profile(p),
+                "PROFILES entry '{}' must be fragmenting (or join p00 in the exclusion list)",
+                p.id
+            );
+        }
+        // Remember-side guard: a synthetic call with p00 must not
+        // poison `LOCAL_BYPASS_LAST_WINNER`. We can't read the
+        // post-call value reliably because the static is shared with
+        // other tests, but we can observe that `local_bypass_preferred_profile`
+        // refuses to surface p00 even if the slot somehow held it.
+        // Force the slot directly to p00's index, then check.
+        let p00_idx = PROFILES.iter().position(|p| p.id == "p00").unwrap();
+        LOCAL_BYPASS_LAST_WINNER.store(p00_idx, Ordering::Relaxed);
+        let preferred = local_bypass_preferred_profile();
+        assert_ne!(
+            preferred.id, "p00",
+            "preferred_profile must never surface p00, even if the slot somehow holds it"
+        );
+        // Restore the sentinel so we don't leak state to sibling tests.
+        LOCAL_BYPASS_LAST_WINNER.store(usize::MAX, Ordering::Relaxed);
+    }
+
+    /// LocalBypass returns `Skip(sock)` when the peek says "not TLS",
+    /// so the dispatcher can route the connection through plain TCP
+    /// passthrough. This is the discriminator that makes dropping
+    /// the `port == 443` gate safe: even when the LocalBypass branch
+    /// receives a non-TLS connect (e.g. an SMTP control on port 25,
+    /// an HTTP request on port 80), the dialer doesn't blow up — it
+    /// hands the socket back untouched.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn local_bypass_returns_skip_on_non_tls_peek() {
+        let (mut client_end, proxy_end) = loopback_pair().await;
+        // ASCII "GET " — first byte 0x47, not 0x16. Real HTTP, not
+        // TLS. The dialer's peek discriminator must spot this.
+        client_end.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+        client_end.flush().await.unwrap();
+
+        let outcome = try_local_bypass_tunnel(proxy_end, "127.0.0.1", 80, None)
+            .await
+            .expect("peek result");
+        assert!(
+            matches!(outcome, TunnelOutcome::Skip(_)),
+            "expected Skip on non-TLS peek, got discriminant {:?}",
+            std::mem::discriminant(&outcome)
+        );
+    }
+
+    /// `dial_target` override threads the user-pinned IP from
+    /// `RewriteCtx::hosts` into the fragmentation dial while the
+    /// ClientHello's SNI stays the original hostname. The dispatcher
+    /// resolves the override and passes it down; without that wiring,
+    /// local_bypass silently bypasses the override and connects to
+    /// whatever `host` resolves to via the system resolver.
+    ///
+    /// Test fixture: `host = "fake.host.example"` (deliberately
+    /// unresolvable) + `dial_target = Some("127.0.0.1")` pointing at
+    /// the fake echo server. If the override is honoured, the dial
+    /// hits the echo server and commits. If the override is dropped,
+    /// the dial attempts DNS lookup of "fake.host.example" which
+    /// fails — the test then doesn't observe a `Done`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn local_bypass_honours_dial_target_override() {
+        let (upstream_addr, _h) = fake_server(FakeServerMode::Echo).await;
+        let (uhost, uport) = upstream_addr.split_once(':').unwrap();
+        let uport: u16 = uport.parse().unwrap();
+
+        let (mut client_end, proxy_end) = loopback_pair().await;
+        let hello = minimal_client_hello();
+        client_end.write_all(&hello).await.unwrap();
+        client_end.flush().await.unwrap();
+
+        // SNI host that the system resolver definitely cannot resolve,
+        // so a forgotten override leaves us with a DNS-lookup failure
+        // rather than masking the bug behind a coincidentally-correct
+        // resolution.
+        let sni_host = "fake.host.example.invalid.test";
+        let outcome = try_local_bypass_tunnel(proxy_end, sni_host, uport, Some(uhost))
+            .await
+            .expect("dial result");
+        assert!(
+            matches!(outcome, TunnelOutcome::Done),
+            "dial_target override must steer the TCP connect to the pinned IP \
+             ({}) regardless of the SNI host ({}). Got discriminant {:?}",
+            uhost,
+            sni_host,
+            std::mem::discriminant(&outcome),
+        );
     }
 }

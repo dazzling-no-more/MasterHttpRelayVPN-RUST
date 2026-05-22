@@ -322,9 +322,25 @@ async fn main() -> ExitCode {
                  ALL traffic is tunneled end-to-end through Apps Script + tunnel node."
             );
         }
+        rahgozar::config::Mode::LocalBypass => {
+            tracing::warn!(
+                "local-bypass mode: every TLS CONNECT is dialed direct to the \
+                 real destination with the ClientHello split across TCP \
+                 segments (no Apps Script, no SNI-rewrite, no MITM CA). \
+                 Defeats DPI only — IP-blocked destinations remain \
+                 unreachable. Non-TLS traffic passes through raw."
+            );
+        }
     }
 
-    // Initialize MITM manager (generates CA on first run).
+    // Initialize MITM manager (generates CA on first run). Done
+    // unconditionally — even in `local_bypass` / `full` modes that
+    // don't use the cert today — because `ProxyServer::switch_mode`
+    // can later flip into a relay mode at runtime, and the type
+    // signature on `ProxyServer::new` requires a present (not
+    // optional) `MitmCertManager`. The cert files (~3 KB) sit on
+    // disk until first use, no OS-trust-store install happens in
+    // no-cert modes (see the `args.no_cert_check` gate below).
     let base = rahgozar::data_dir::data_dir();
     let mitm = match MitmCertManager::new_in(&base) {
         Ok(m) => m,
@@ -335,7 +351,7 @@ async fn main() -> ExitCode {
     };
     let ca_path = base.join(CA_CERT_FILE);
 
-    if !args.no_cert_check && mode != rahgozar::config::Mode::Full {
+    if !args.no_cert_check && mode.uses_mitm_ca() {
         if !is_ca_trusted(&ca_path) {
             tracing::warn!("MITM CA is not (obviously) trusted — attempting install...");
             match install_ca(&ca_path) {

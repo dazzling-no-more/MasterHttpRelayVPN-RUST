@@ -29,6 +29,14 @@ pub enum Mode {
     /// not break.
     Direct,
     Full,
+    /// Local-only DPI bypass: every TLS CONNECT is dialed straight to
+    /// its real destination IP with the browser's real ClientHello
+    /// split across TCP segments (the same fragmentation engine
+    /// `direct_mode.rs` uses for Google traffic). No Apps Script, no
+    /// VPS, no MITM CA install. Defeats DPI-only blocks; cannot help
+    /// against IP-level blocks (the destination must still be
+    /// reachable from the user's network).
+    LocalBypass,
 }
 
 impl Mode {
@@ -37,6 +45,59 @@ impl Mode {
             Mode::AppsScript => "apps_script",
             Mode::Direct => "direct",
             Mode::Full => "full",
+            Mode::LocalBypass => "local_bypass",
+        }
+    }
+
+    /// True iff this mode talks to the user's Apps Script deployment
+    /// (and therefore requires a non-empty `script_id` + `auth_key`).
+    /// Single source of truth — UI / config validator / profile-store
+    /// allowlists should all defer here rather than open-coding the
+    /// `apps_script || full` match, which is the kind of duplicated
+    /// allowlist that silently drifts when a new mode lands. The
+    /// negation "no relay needed" covers both `direct` (no relay
+    /// configured) and `local_bypass` (no relay used) symmetrically.
+    pub fn uses_apps_script_relay(self) -> bool {
+        matches!(self, Mode::AppsScript | Mode::Full)
+    }
+
+    /// True iff this mode terminates inbound TLS with a MITM cert at
+    /// any point — i.e. uses the MITM CA on disk for at least one
+    /// dispatch path. Separate predicate from
+    /// [`uses_apps_script_relay`] because the truth tables differ:
+    /// `Direct` uses the MITM CA (SNI-rewrite tunnel, fronting
+    /// groups, direct-mode SkipPrefaced fallback) but does NOT use
+    /// the relay; `Full` uses the relay but never MITMs (the
+    /// dispatcher short-circuits to the tunnel mux before any
+    /// MITM logic runs). A naive "negation of one is the other"
+    /// would silently install the CA in Full mode and skip it in
+    /// Direct — a real regression.
+    ///
+    /// Used by the CLI startup path (`src/main.rs`) to gate
+    /// `install_ca` / `is_ca_trusted` checks, and by the desktop
+    /// `StatusTab` / `CaCard` to decide whether to render CA-status
+    /// UI. Adding a new mode is a deliberate edit here; the test
+    /// `mode_uses_mitm_ca_predicate` pins the truth table.
+    pub fn uses_mitm_ca(self) -> bool {
+        matches!(self, Mode::AppsScript | Mode::Direct)
+    }
+}
+
+impl std::str::FromStr for Mode {
+    type Err = ConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "apps_script" => Ok(Mode::AppsScript),
+            "direct" => Ok(Mode::Direct),
+            // Deprecated alias; see `Mode` docstring and `mode_kind()`.
+            "google_only" => Ok(Mode::Direct),
+            "full" => Ok(Mode::Full),
+            "local_bypass" => Ok(Mode::LocalBypass),
+            other => Err(ConfigError::Invalid(format!(
+                "unknown mode '{}' (expected 'apps_script', 'direct', 'full', or 'local_bypass')",
+                other
+            ))),
         }
     }
 }
@@ -1098,7 +1159,7 @@ impl Config {
 
     pub fn validate(&self) -> Result<(), ConfigError> {
         let mode = self.mode_kind()?;
-        if mode == Mode::AppsScript || mode == Mode::Full {
+        if mode.uses_apps_script_relay() {
             if self.auth_key.trim().is_empty() || self.auth_key == "CHANGE_ME_TO_A_STRONG_SECRET" {
                 return Err(ConfigError::Invalid(
                     "auth_key must be set to a strong secret".into(),
@@ -1209,20 +1270,10 @@ impl Config {
     }
 
     pub fn mode_kind(&self) -> Result<Mode, ConfigError> {
-        match self.mode.as_str() {
-            "apps_script" => Ok(Mode::AppsScript),
-            "direct" => Ok(Mode::Direct),
-            // Deprecated alias. `google_only` was the name of `direct`
-            // before fronting_groups generalized the mode beyond
-            // Google's edge. Accepted forever so old configs keep
-            // working — the UI rewrites it on next save.
-            "google_only" => Ok(Mode::Direct),
-            "full" => Ok(Mode::Full),
-            other => Err(ConfigError::Invalid(format!(
-                "unknown mode '{}' (expected 'apps_script', 'direct', or 'full')",
-                other
-            ))),
-        }
+        // Delegates to `impl FromStr for Mode` so the string-to-enum
+        // mapping (including the `google_only` back-compat alias) is
+        // a single source of truth. See the impl for the rationale.
+        self.mode.parse::<Mode>()
     }
 
     pub fn script_ids_resolved(&self) -> Vec<String> {
@@ -1345,6 +1396,102 @@ mod tests {
         cfg.validate()
             .expect("direct must validate without script_id / auth_key");
         assert_eq!(cfg.mode_kind().unwrap(), Mode::Direct);
+    }
+
+    #[test]
+    fn parses_local_bypass_without_script_id() {
+        // local_bypass: no relay, no MITM CA. Like Direct, neither
+        // script_id nor auth_key is required because nothing reaches
+        // Apps Script in this mode.
+        let s = r#"{
+            "mode": "local_bypass"
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        cfg.validate()
+            .expect("local_bypass must validate without script_id / auth_key");
+        assert_eq!(cfg.mode_kind().unwrap(), Mode::LocalBypass);
+        assert_eq!(Mode::LocalBypass.as_str(), "local_bypass");
+    }
+
+    #[test]
+    fn mode_uses_apps_script_relay_predicate() {
+        // Single source of truth for "this mode needs script_id +
+        // auth_key". Every UI / backend / profile-store gate defers
+        // here rather than open-coding `mode == AppsScript || mode
+        // == Full`, which is the kind of allowlist that drifts when
+        // a new mode lands.
+        assert!(
+            Mode::AppsScript.uses_apps_script_relay(),
+            "apps_script obviously needs the relay"
+        );
+        assert!(
+            Mode::Full.uses_apps_script_relay(),
+            "full tunnel goes through Apps Script too"
+        );
+        assert!(
+            !Mode::Direct.uses_apps_script_relay(),
+            "direct mode has no relay path"
+        );
+        assert!(
+            !Mode::LocalBypass.uses_apps_script_relay(),
+            "local_bypass intentionally has no relay path"
+        );
+    }
+
+    #[test]
+    fn mode_uses_mitm_ca_predicate() {
+        // Separate truth table from `uses_apps_script_relay`. Direct
+        // and AppsScript both rely on the MITM CA for SNI-rewrite
+        // tunnelling (fronting groups, Google edge direct, the
+        // direct-mode SkipPrefaced fallback); Full and LocalBypass
+        // never MITM. A naive "uses_apps_script_relay implies
+        // uses_mitm_ca" assumption would silently install the CA in
+        // Full mode and skip it in Direct.
+        assert!(
+            Mode::AppsScript.uses_mitm_ca(),
+            "apps_script terminates TLS inbound for relay dispatch"
+        );
+        assert!(
+            Mode::Direct.uses_mitm_ca(),
+            "direct uses the MITM CA for SNI-rewrite tunnelling \
+             (Google edge, fronting groups, SkipPrefaced fallback)"
+        );
+        assert!(
+            !Mode::Full.uses_mitm_ca(),
+            "full tunnel short-circuits to the tunnel mux before any MITM"
+        );
+        assert!(
+            !Mode::LocalBypass.uses_mitm_ca(),
+            "local_bypass passes the real ClientHello through (no MITM)"
+        );
+    }
+
+    #[test]
+    fn mode_from_str_round_trips_via_as_str() {
+        // Every variant produced by `as_str()` must parse back via
+        // `FromStr` to the same variant. The desktop `save_config`
+        // command relies on this round-trip — if it ever skews (e.g.
+        // a new variant added to `as_str` but missing from
+        // `FromStr`), the desktop save path silently fails.
+        for m in [
+            Mode::AppsScript,
+            Mode::Direct,
+            Mode::Full,
+            Mode::LocalBypass,
+        ] {
+            let parsed: Mode = m
+                .as_str()
+                .parse()
+                .unwrap_or_else(|e| panic!("{} must FromStr-parse: {}", m.as_str(), e));
+            assert_eq!(parsed, m);
+        }
+        // google_only is a deprecated alias for direct — must keep
+        // parsing forever or existing user configs break on upgrade.
+        let alias: Mode = "google_only".parse().unwrap();
+        assert_eq!(alias, Mode::Direct);
+        // Bogus mode produces a useful error rather than silently
+        // accepting it.
+        assert!("not_a_real_mode".parse::<Mode>().is_err());
     }
 
     #[test]

@@ -28,6 +28,17 @@ pub async fn run(config: &Config) -> bool {
         tracing::error!("{}", msg);
         return false;
     }
+    if matches!(config.mode_kind(), Ok(Mode::LocalBypass)) {
+        let msg = "`rahgozar test` probes the Apps Script relay, which isn't \
+                   wired up in local_bypass mode (no relay exists). To verify \
+                   local-bypass end-to-end, start the proxy and load an \
+                   HTTPS site via 127.0.0.1:8085 (HTTP) or :8086 (SOCKS5) — \
+                   the proxy logs show `local-bypass <host>:443 (profile=p..)` \
+                   when fragmentation succeeds.";
+        println!("{}", msg);
+        tracing::error!("{}", msg);
+        return false;
+    }
     if matches!(config.mode_kind(), Ok(Mode::Full)) {
         // Issue #160: Test Relay used to silently fall through to the
         // apps_script path here, which made it look like the user's

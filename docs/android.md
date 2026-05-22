@@ -52,6 +52,8 @@ Setup time: **~10 minutes** if your Apps Script deployment already exists, ~15 m
 | **Data usage** | ~5 MB for the APK, then ~2 MB overhead per GB of browsing (base64 + JSON wrapping) |
 
 > **Scope note.** rahgozar relays through Apps Script. That's what makes it cheap and DPI-resilient, but it's also what imposes the [known limitations](#known-limitations) below. If you're evaluating against a real VPN (WireGuard/Tailscale/OpenVPN), skim that section first.
+>
+> **Don't need a relay?** If your goal is "make every app on my phone defeat DPI" but the destinations you care about aren't IP-blocked (just DPI-inspected — most social media, news, etc.), the **Local Bypass** mode skips Apps Script entirely and fragments every TLS handshake locally. No Apps Script deployment, no auth key, no MITM cert install. Steps 2 and 5 below are unnecessary in that mode. Trade-off: ~300 ms added to every TLS handshake, and it cannot bypass IP-level blocks (Iran-blocked-by-IP sites like `claude.ai` / `x.ai` / `chatgpt.com` stay unreachable). See [Local Bypass mode in the full guide](guide.md#local-bypass-mode).
 
 ---
 
@@ -235,7 +237,9 @@ Each `/exec` has a daily execution limit (20k/day for consumer Google accounts, 
 
 ### Most non-browser apps ignore user CAs
 
-By default, Android apps opt out of trusting user-installed CAs (Android 7+ `Network Security Config` default). Banking apps, Netflix, Spotify, most messengers — they'll fail with cert errors through rahgozar. The TUN routes their traffic to us; they just refuse our leaf. Only apps that explicitly opt in (browsers, curl, some developer tools) will work. This is a general MITM-proxy limitation.
+By default, Android apps opt out of trusting user-installed CAs (Android 7+ `Network Security Config` default). Banking apps, Netflix, Spotify, most messengers, the Google Meet Android app — they'll fail with cert errors through rahgozar in `apps_script` or `direct` mode. The TUN routes their traffic to us; they just refuse our leaf. Only apps that explicitly opt in (browsers, curl, some developer tools) will work in those modes. This is a general MITM-proxy limitation.
+
+**`local_bypass` mode side-steps this entirely**: no MITM happens, so the app sees the destination's real cert chain and pinning works. The catch is that `local_bypass` only beats **DPI**, not IP-level blocks — see [the mode comparison in the full guide](guide.md#local-bypass-mode). For pinning-strict apps whose destinations are *also* IP-blocked from Iran (Anthropic / OpenAI / xAI clients), only `full` mode with a tunnel-node exit gets you both DPI and IP-block bypass at once.
 
 ---
 

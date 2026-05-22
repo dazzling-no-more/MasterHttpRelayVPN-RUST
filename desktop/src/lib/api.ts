@@ -119,6 +119,14 @@ export const api = {
   getCaStatus(): Promise<CaStatusDto> {
     return invoke<CaStatusDto>("get_ca_status");
   },
+  /** Mint the CA on disk if it doesn't exist yet, then return the
+   *  fresh status. Called by CaCard.onMount in MITM-using modes so
+   *  the user can inspect the fingerprint + install the cert
+   *  before clicking Start. Idempotent — no-ops if the file is
+   *  already on disk. */
+  mintCaIfMissing(): Promise<CaStatusDto> {
+    return invoke<CaStatusDto>("mint_ca_if_missing");
+  },
   installCa(): Promise<CaStatusDto> {
     return invoke<CaStatusDto>("install_ca_cmd");
   },

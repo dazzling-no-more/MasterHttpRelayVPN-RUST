@@ -75,8 +75,33 @@ enum class UiLang { AUTO, FA, EN }
  *   string `"google_only"` is still accepted on parse for back-compat.
  * - [FULL] — full tunnel mode. ALL traffic is tunneled end-to-end through
  *   Apps Script + a remote tunnel node. No certificate installation needed.
+ * - [LOCAL_BYPASS] — local-only DPI bypass. Every TLS CONNECT (from any
+ *   app, courtesy of the VpnService TUN) gets its real ClientHello split
+ *   across TCP segments and sent directly to the real destination IP.
+ *   No Apps Script, no VPS, no MITM CA. Defeats DPI only — IP-blocked
+ *   destinations remain unreachable (so this won't help with sites Iran
+ *   blocks at the IP level like claude.ai / x.ai; use Apps Script or
+ *   Full for those).
  */
-enum class Mode { APPS_SCRIPT, DIRECT, FULL }
+enum class Mode {
+    APPS_SCRIPT,
+    DIRECT,
+    FULL,
+    LOCAL_BYPASS,
+    ;
+
+    /**
+     * True iff this mode talks to the user's Apps Script deployment
+     * and therefore needs a deployment ID + auth_key. Mirrors the
+     * Rust-side [`Mode::uses_apps_script_relay`](../../../../../../src/config.rs).
+     * Single source of truth — UI gates, profile-shape validators,
+     * and the service-side credential check all defer here rather
+     * than open-coding the `APPS_SCRIPT || FULL` match, which is
+     * the kind of allowlist that silently drifts when a new mode
+     * lands.
+     */
+    fun usesAppsScriptRelay(): Boolean = this == APPS_SCRIPT || this == FULL
+}
 
 /**
  * One multi-edge fronting group. Mirrors the Rust-side `FrontingGroup`
@@ -284,6 +309,7 @@ data class RahgozarConfig(
                         Mode.APPS_SCRIPT -> "apps_script"
                         Mode.DIRECT -> "direct"
                         Mode.FULL -> "full"
+                        Mode.LOCAL_BYPASS -> "local_bypass"
                     },
                 )
                 put("listen_host", listenHost)
@@ -511,6 +537,7 @@ object ConfigStore {
                 Mode.APPS_SCRIPT -> "apps_script"
                 Mode.DIRECT -> "direct"
                 Mode.FULL -> "full"
+                Mode.LOCAL_BYPASS -> "local_bypass"
             },
         )
         val ids =
@@ -782,6 +809,8 @@ object ConfigStore {
                     "google_only" -> Mode.DIRECT
 
                     "full" -> Mode.FULL
+
+                    "local_bypass" -> Mode.LOCAL_BYPASS
 
                     else -> Mode.APPS_SCRIPT
                 },

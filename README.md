@@ -17,7 +17,7 @@
 
 - 🌐 **عبور از DPI / مسدودسازی SNI** با لبهٔ گوگل به‌عنوان رله
 - 💯 **کاملاً رایگان** — روی سهمیهٔ رایگان حساب گوگل خودت
-- ⚡ **یک فایل کوچک** (~۳ مگابایت)، بدون پایتون، بدون Node.js، بدون وابستگی
+- ⚡ **دانلودهای سبک** (CLI حدود ۳ مگابایت، نصاب دسکتاپ حدود ۵ مگابایت، APK اندروید حدود ۲۰ مگابایت برای هر معماری)، بدون پایتون، بدون Node.js، بدون وابستگی
 - 🖥️ **روی** مک، ویندوز، لینوکس، اندروید، روتر OpenWRT کار می‌کند
 - 🦊 **هر مرورگر یا برنامه‌ای** که از HTTP proxy یا SOCKS5 پشتیبانی کند
 
@@ -157,6 +157,8 @@
 
 **می‌خواهم از رهگذر به‌عنوان پروکسی upstream برای Psiphon (یا xray) استفاده کنم.** رهگذر را در حالت `direct` اجرا کن و در تنظیمات Psiphon قسمت *upstream proxy* را روی host:port که زیر دکمهٔ Connect نمایش داده می‌شود تنظیم کن. هاست‌هایی که در لیست fronting قرار ندارند به‌صورت raw TCP عبور می‌کنند، پس ترافیک bootstrap سایفون به سرورهای سایفون دست‌نخورده می‌رسد. [docs/use-as-upstream.fa.md](docs/use-as-upstream.fa.md).
 
+**می‌خواهم DPI را دور بزنم ولی نمی‌خواهم Apps Script deploy کنم یا گواهی MITM نصب کنم.** حالت `local_bypass` را از منوی Mode انتخاب کن (در اپ اندروید، UI دسکتاپ، یا با تنظیم `"mode": "local_bypass"` در `config.json`). هر TLS handshake به‌صورت محلی تکه‌بندی می‌شود و مستقیماً به مقصد واقعی می‌رود — نه رله، نه گواهی، `cert pinning` واقعی کار می‌کند. **در اندروید**، ترافیک همهٔ اپ‌ها به‌طور خودکار از طریق VpnService گرفته می‌شود. **در دسکتاپ**، فقط اپ‌هایی که از پروکسی سیستم (`127.0.0.1:8085`) استفاده می‌کنند سود می‌برند — مرورگرها و بیشتر اپ‌های آگاه به پروکسی سیستم؛ اپ‌های native که شبکه‌سازی hardcoded دارند تغییری نمی‌کنند. نکته در هر دو پلتفرم: فقط DPI را دور می‌زند، نه انسداد در سطح IP (پس `claude.ai` / `x.ai` / سرویس‌های گوگل که با تحریم بسته‌اند هنوز به `apps_script` یا `full` نیاز دارند). [حالت Local Bypass](docs/guide.fa.md#حالت-local-bypass).
+
 **جست‌وجوی گوگلم بدون JavaScript ظاهر می‌شود.** `User-Agent` Apps Script ثابت روی `Google-Apps-Script` است (گوگل نمی‌گذارد اسکریپت‌ها عوضش کنند)، پس بعضی سایت‌ها نسخهٔ بدون JS برمی‌گردانند. راه‌حل: دامنهٔ مورد نظر را به `hosts` اضافه کن تا از تونل بازنویسی SNI با User-Agent واقعی مرورگرت برود. `google.com`، `youtube.com`، `fonts.googleapis.com` به‌طور پیش‌فرض در این لیست‌اند.
 
 **سؤالات بیشتر:** [FAQ کامل در راهنمای بلند](docs/guide.fa.md#سؤالات-رایج).
@@ -217,7 +219,7 @@
 
 - 🌐 **Bypasses DPI / SNI blocking** by using Google's edge as a relay
 - 💯 **Completely free** — runs on your own Google account's free tier
-- ⚡ **One small file** (~3 MB), no Python, no Node.js, no dependencies
+- ⚡ **Lightweight downloads** (CLI ~3 MB, desktop installer ~5 MB, Android ~20 MB per-arch APK), no Python, no Node.js, no dependencies
 - 🖥️ **Works on** Mac, Windows, Linux, Android, OpenWRT routers
 - 🦊 **Any browser or app** that supports HTTP proxy or SOCKS5
 
@@ -358,6 +360,8 @@ If something doesn't work:
 **ISP blocks `script.google.com` itself.** rahgozar has a `direct` mode that uses only the SNI-rewrite tunnel (no Apps Script). Use it once to access `script.google.com` to deploy your script, then switch to apps_script mode. See [direct mode](docs/guide.md#direct-mode).
 
 **I want to use rahgozar as Psiphon's (or xray's) upstream proxy.** Run rahgozar in `direct` mode and point Psiphon's *upstream proxy* setting at the host:port shown under the Connect button. Unfronted hosts pass through as raw TCP, so Psiphon's bootstrap traffic reaches Psiphon's servers untouched. See [docs/use-as-upstream.md](docs/use-as-upstream.md).
+
+**I want DPI bypass without deploying Apps Script or installing the MITM cert.** Switch to `local_bypass` mode in the Mode dropdown (Android app, desktop UI, or `"mode": "local_bypass"` in `config.json`). Every TLS handshake gets fragmented locally and sent direct to the real destination — no relay, no cert, real cert pinning works. **On Android**, every app's traffic is captured automatically via VpnService. **On desktop**, only apps that honor the system proxy (`127.0.0.1:8085`) benefit — browsers and most system-proxy-aware apps; native apps with hardcoded networking are unchanged. Catch on both platforms: only beats DPI, not IP-level blocks (so `claude.ai` / `x.ai` / sanctions-blocked Google services still need `apps_script` or `full` mode). See [Local Bypass mode](docs/guide.md#local-bypass-mode).
 
 **My Google search shows up without JavaScript.** The Apps Script `User-Agent` is fixed to `Google-Apps-Script` (Google won't let scripts change it), so some sites serve a no-JS fallback. Workaround: add the affected domain to your `hosts` map so it goes through the SNI-rewrite tunnel with your real browser User-Agent. `google.com`, `youtube.com`, `fonts.googleapis.com` are already on this list by default.
 
