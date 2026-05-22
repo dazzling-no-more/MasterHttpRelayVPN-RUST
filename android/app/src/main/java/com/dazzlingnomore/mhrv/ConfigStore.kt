@@ -133,13 +133,26 @@ data class FrontingGroup(
     val domains: List<String>,
 )
 
+/**
+ * One row in the Apps Script deployment-IDs list. [url] may be a bare
+ * Deployment ID OR the full `/macros/s/.../exec` URL — `extractId()`
+ * normalises both. [enabled] lets the user park an ID without deleting
+ * it: disabled rows persist on disk (saved as `{id, enabled: false}`
+ * under `script_id`) and skip the runtime round-robin. Mirrors the Rust
+ * `ScriptIdEntry` shape.
+ */
+data class DeploymentEntry(
+    val url: String,
+    val enabled: Boolean = true,
+)
+
 data class RahgozarConfig(
     val mode: Mode = Mode.APPS_SCRIPT,
     val listenHost: String = "0.0.0.0",
     val listenPort: Int = 8080,
     val socks5Port: Int? = 1081,
-    /** One Apps Script ID or deployment URL per entry. */
-    val appsScriptUrls: List<String> = emptyList(),
+    /** One Apps Script ID or deployment URL per entry, with per-row enabled flag. */
+    val appsScriptUrls: List<DeploymentEntry> = emptyList(),
     val authKey: String = "",
     val frontDomain: String = "www.google.com",
     /** Rotation pool of SNI hostnames; empty means "let Rust auto-expand". */
@@ -294,10 +307,14 @@ data class RahgozarConfig(
     }
 
     fun toJson(): String {
-        val ids =
+        // Normalise each row to a bare ID (entries may be full deployment
+        // URLs from old configs or fresh paste) and drop blanks. The
+        // enabled flag rides along — disabled rows persist so the user
+        // can re-enable without re-typing.
+        val entries =
             appsScriptUrls
-                .map { extractId(it) }
-                .filter { it.isNotEmpty() }
+                .map { DeploymentEntry(url = extractId(it.url), enabled = it.enabled) }
+                .filter { it.url.isNotEmpty() }
 
         val obj =
             JSONObject().apply {
@@ -319,7 +336,37 @@ data class RahgozarConfig(
                 // In direct mode these are unused by the Rust side, but we
                 // still persist whatever the user typed so flipping back to
                 // apps_script mode doesn't wipe their settings.
-                put("script_ids", JSONArray().apply { ids.forEach { put(it) } })
+                //
+                // Prefer the legacy bare-string shape when no row is
+                // disabled — older rahgozar / Android builds (pre-disable
+                // flag) only know how to read strings, and a config
+                // written here may be sideloaded onto one of them via
+                // QR / clipboard. Only escalate to `[{id, enabled}]`
+                // when a row actually needs the flag. The Rust reader
+                // accepts both shapes via the `untagged` enum.
+                if (entries.isNotEmpty()) {
+                    val allEnabled = entries.all { it.enabled }
+                    if (allEnabled) {
+                        put(
+                            "script_id",
+                            JSONArray().apply { entries.forEach { put(it.url) } },
+                        )
+                    } else {
+                        put(
+                            "script_id",
+                            JSONArray().apply {
+                                entries.forEach { e ->
+                                    put(
+                                        JSONObject().apply {
+                                            put("id", e.url)
+                                            put("enabled", e.enabled)
+                                        },
+                                    )
+                                }
+                            },
+                        )
+                    }
+                }
                 put("auth_key", authKey)
 
                 put("front_domain", frontDomain)
@@ -480,9 +527,14 @@ data class RahgozarConfig(
         return obj.toString(2)
     }
 
-    /** Convenience: is there at least one usable deployment ID? */
+    /**
+     * Convenience: is there at least one enabled, usable deployment ID?
+     * Disabled rows are filtered out — the relay can't dispatch through
+     * them, so they don't satisfy the "do we have credentials?" gate
+     * the UI uses to decide whether to disable the start button.
+     */
     val hasDeploymentId: Boolean get() =
-        appsScriptUrls.any { extractId(it).isNotEmpty() }
+        appsScriptUrls.any { it.enabled && extractId(it.url).isNotEmpty() }
 }
 
 object ConfigStore {
@@ -540,20 +592,50 @@ object ConfigStore {
                 Mode.LOCAL_BYPASS -> "local_bypass"
             },
         )
-        val ids =
-            cfg.appsScriptUrls.mapNotNull { url ->
+        // Normalise each entry to a bare ID and keep its enabled flag —
+        // sharing carries disabled rows so the receiver doesn't have to
+        // re-disable IDs they've already chosen to park.
+        val entries =
+            cfg.appsScriptUrls.mapNotNull { entry ->
                 val marker = "/macros/s/"
-                val i = url.indexOf(marker)
-                if (i >= 0) {
-                    var s = url.substring(i + marker.length)
-                    val slash = s.indexOf('/')
-                    if (slash >= 0) s = s.substring(0, slash)
-                    s.trim().ifEmpty { null }
-                } else {
-                    url.trim().ifEmpty { null }
-                }
+                val raw = entry.url
+                val normalised =
+                    if (raw.indexOf(marker) >= 0) {
+                        var s = raw.substring(raw.indexOf(marker) + marker.length)
+                        val slash = s.indexOf('/')
+                        if (slash >= 0) s = s.substring(0, slash)
+                        s.trim()
+                    } else {
+                        raw.trim()
+                    }
+                if (normalised.isEmpty()) null else DeploymentEntry(normalised, entry.enabled)
             }
-        if (ids.isNotEmpty()) obj.put("script_ids", JSONArray().apply { ids.forEach { put(it) } })
+        if (entries.isNotEmpty()) {
+            // Mirror `toJson()`: prefer the legacy bare-string shape when
+            // no row is disabled, so a QR share into an older client
+            // still parses. Escalate to objects only when needed.
+            val allEnabled = entries.all { it.enabled }
+            if (allEnabled) {
+                obj.put(
+                    "script_id",
+                    JSONArray().apply { entries.forEach { put(it.url) } },
+                )
+            } else {
+                obj.put(
+                    "script_id",
+                    JSONArray().apply {
+                        entries.forEach { e ->
+                            put(
+                                JSONObject().apply {
+                                    put("id", e.url)
+                                    put("enabled", e.enabled)
+                                },
+                            )
+                        }
+                    },
+                )
+            }
+        }
         if (cfg.authKey.isNotBlank()) obj.put("auth_key", cfg.authKey)
 
         // Only include non-default values.
@@ -771,15 +853,32 @@ object ConfigStore {
      * through the disk path.
      */
     internal fun loadFromJson(obj: JSONObject): RahgozarConfig {
-        // Read deployment IDs from both `script_id` (Rust output) and
-        // `script_ids` (legacy Android output). Each can be a scalar
-        // string OR an array of strings.
-        val ids =
-            buildList<String> {
+        // Read deployment IDs from both `script_id` (current canonical
+        // key, written by Rust and by recent Android builds) and
+        // `script_ids` (legacy Android plural). Each can be a scalar
+        // string, an array of strings, or an array of `{id, enabled}`
+        // objects (the new shape that carries the disable flag).
+        //
+        // Dedupe by ID. When the same ID appears under both keys, the
+        // first occurrence wins — so the row order from `script_id`
+        // (the modern key) is preserved over `script_ids`.
+        val rawEntries =
+            buildList<DeploymentEntry> {
                 addAll(readScriptIdList(obj, "script_id"))
                 addAll(readScriptIdList(obj, "script_ids"))
-            }.filter { it.isNotBlank() }.distinct()
-        val urls = ids.map { "https://script.google.com/macros/s/$it/exec" }
+            }.filter { it.url.isNotBlank() }
+        val seen = mutableSetOf<String>()
+        val entries =
+            rawEntries.mapNotNull { e ->
+                if (seen.add(e.url)) {
+                    DeploymentEntry(
+                        url = "https://script.google.com/macros/s/${e.url}/exec",
+                        enabled = e.enabled,
+                    )
+                } else {
+                    null
+                }
+            }
         val sni =
             obj
                 .optJSONArray("sni_hosts")
@@ -817,7 +916,7 @@ object ConfigStore {
             listenHost = obj.optString("listen_host", "0.0.0.0"),
             listenPort = obj.optInt("listen_port", 8080),
             socks5Port = obj.optInt("socks5_port", 1081).takeIf { it > 0 },
-            appsScriptUrls = urls,
+            appsScriptUrls = entries,
             authKey = obj.optString("auth_key", ""),
             frontDomain = obj.optString("front_domain", "www.google.com"),
             sniHosts = sni,
@@ -914,31 +1013,47 @@ object ConfigStore {
     }
 
     /**
-     * Read a list of deployment IDs from `key`. Accepts:
-     *   - a JSON string scalar ("abc")
-     *   - a JSON array of strings (["abc","def"])
+     * Read a list of deployment-ID entries from `key`. Accepts:
+     *   - a JSON string scalar ("abc") — legacy, enabled = true
+     *   - a JSON array of strings (["abc","def"]) — legacy, all enabled
+     *   - a JSON array of objects ([{"id":"abc","enabled":true}, ...]) — new
+     *   - mixed arrays (a bare string inside an array defaults to enabled)
      *
-     * Mirrors the Rust [ScriptId] enum's `untagged` deserialize so both
-     * shapes interop with desktop. Returns an empty list if the key
-     * is absent or shaped wrong.
+     * Mirrors the Rust [ScriptId] enum's `untagged` deserialize so all
+     * shapes interop. Returns an empty list when the key is absent or
+     * shaped wrong.
      */
     private fun readScriptIdList(
         obj: JSONObject,
         key: String,
-    ): List<String> {
+    ): List<DeploymentEntry> {
         if (!obj.has(key)) return emptyList()
         // Array form first.
         obj.optJSONArray(key)?.let { arr ->
             return buildList {
                 for (i in 0 until arr.length()) {
-                    val s = arr.optString(i, "")
-                    if (s.isNotBlank()) add(s)
+                    when (val elem = arr.opt(i)) {
+                        is String -> {
+                            if (elem.isNotBlank()) add(DeploymentEntry(elem, true))
+                        }
+
+                        is JSONObject -> {
+                            val id = elem.optString("id", "")
+                            if (id.isNotBlank()) {
+                                add(DeploymentEntry(id, elem.optBoolean("enabled", true)))
+                            }
+                        }
+
+                        // Numbers/null/booleans inside the array are silently skipped —
+                        // hand-edited junk shouldn't crash the load path.
+                        else -> {}
+                    }
                 }
             }
         }
         // Scalar form.
         val s = obj.optString(key, "")
-        return if (s.isNotBlank()) listOf(s) else emptyList()
+        return if (s.isNotBlank()) listOf(DeploymentEntry(s, true)) else emptyList()
     }
 }
 

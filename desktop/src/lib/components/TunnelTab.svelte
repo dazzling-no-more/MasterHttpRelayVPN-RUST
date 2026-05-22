@@ -97,6 +97,11 @@
   );
 
   // ── Deployment IDs row editor ────────────────────────────────────
+  // Rows are objects (id + enabled). Newly-added rows default to
+  // enabled; the checkbox in the row lets the user park an ID without
+  // deleting it (saved as `enabled: false` on disk so they can flip it
+  // back on later without re-typing). Same pattern the SNI pool modal
+  // uses for disabling probe targets.
   function removeIdAt(i: number) {
     if (!config) return;
     config.script_ids = config.script_ids.filter((_, idx) => idx !== i);
@@ -107,11 +112,25 @@
     const parsed = addBuffer
       .split(/[\s,]+/)
       .map((s) => s.trim())
-      .filter((s) => s.length > 0);
+      .filter((s) => s.length > 0)
+      .map((id) => ({ id, enabled: true }));
     if (parsed.length === 0) return;
     config.script_ids = [...config.script_ids, ...parsed];
     addBuffer = "";
   }
+
+  // Match `save_config`'s validation: blank IDs are dropped on save,
+  // so the inline summary must count the same population — otherwise
+  // a row that's checked but still empty inflates the chip into
+  // "1 of 1 enabled" while save would error with "all disabled".
+  // `nonBlankTotal` is the population we report; `enabledIdCount` is
+  // the enabled subset within it.
+  const nonBlankTotal = $derived(
+    config?.script_ids.filter((e) => e.id.trim() !== "").length ?? 0,
+  );
+  const enabledIdCount = $derived(
+    config?.script_ids.filter((e) => e.enabled && e.id.trim() !== "").length ?? 0,
+  );
 
   // ── Save ─────────────────────────────────────────────────────────
   async function onSave() {
@@ -202,16 +221,27 @@
         <p class="text-muted text-xs">{t("tunnel.deployment_ids.help")}</p>
 
         <div class="space-y-1.5">
-          {#each config.script_ids as _id, i (i)}
+          {#each config.script_ids as entry, i (i)}
             <div class="flex items-center gap-2">
+              <input
+                type="checkbox"
+                bind:checked={config.script_ids[i].enabled}
+                disabled={noRelay}
+                aria-label={tn("tunnel.deployment_ids.enable_aria", {
+                  n: i + 1,
+                })}
+                class="accent-accent h-4 w-4 cursor-pointer disabled:cursor-not-allowed"
+              />
               <span class="text-muted w-7 text-end font-mono text-xs">
                 {String(i + 1).padStart(2, "0")}.
               </span>
               <input
                 type="text"
-                bind:value={config.script_ids[i]}
+                bind:value={config.script_ids[i].id}
                 disabled={noRelay}
-                class="bg-input border-border-subtle focus:border-accent flex-1 rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors disabled:cursor-not-allowed"
+                class="bg-input border-border-subtle focus:border-accent flex-1 rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors disabled:cursor-not-allowed {entry.enabled
+                  ? ''
+                  : 'text-muted line-through opacity-60'}"
               />
               <button
                 type="button"
@@ -247,17 +277,30 @@
           </button>
         </div>
 
-        <!-- Count summary. -->
-        {#if config.script_ids.length === 0}
+        <!-- Count summary: enabled / total.
+             - All rows blank → render the "tip" copy (functionally the
+               same state as zero rows, even though there are blank
+               placeholders the user typed and emptied again).
+             - All-disabled error only fires when the relay is actually
+               in play (`!noRelay`) and the user has at least one
+               non-blank row — otherwise it'd mislabel direct /
+               local_bypass mode (which save accepts with zero IDs),
+               or front-run the "At least one deployment ID is
+               required" error that save would actually emit for an
+               all-blank list. -->
+        {#if nonBlankTotal === 0}
           <p class="text-muted text-xs">{t("tunnel.deployment_ids.tip_more")}</p>
-        {:else if config.script_ids.length === 1}
-          <p class="text-muted text-xs">
-            {t("tunnel.deployment_ids.one_configured")}
+        {:else if !noRelay && enabledIdCount === 0}
+          <p class="text-error text-xs">
+            {tn("tunnel.deployment_ids.all_disabled", {
+              total: nonBlankTotal,
+            })}
           </p>
         {:else}
           <p class="text-success text-xs">
-            {tn("tunnel.deployment_ids.many_configured", {
-              n: config.script_ids.length,
+            {tn("tunnel.deployment_ids.summary", {
+              enabled: enabledIdCount,
+              total: nonBlankTotal,
             })}
           </p>
         {/if}

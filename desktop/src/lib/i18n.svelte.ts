@@ -168,7 +168,7 @@ const EN: Record<string, string> = {
   "status.config_field.deployment_ids": "Deployment IDs",
   "status.config_field.log_level": "Log level",
   "status.deployment_ids.none": "(none)",
-  "status.deployment_ids.count": "{n} configured",
+  "status.deployment_ids.count": "{enabled} of {total} enabled",
   "status.socks5_chip": "(socks5 :{port})",
   "status.read_config_error": "Couldn't read config: {error}",
 
@@ -217,14 +217,15 @@ const EN: Record<string, string> = {
   "tunnel.deployment_ids.help":
     "One ID per row. The proxy round-robins between them and sidelines any ID that hits its daily quota for 10 minutes before retrying.",
   "tunnel.deployment_ids.remove_aria": "Remove deployment ID {n}",
+  "tunnel.deployment_ids.enable_aria": "Toggle deployment ID {n}",
   "tunnel.deployment_ids.placeholder":
     "paste one or more IDs (newline / comma / space separated)",
   "tunnel.add": "+ Add",
   "tunnel.deployment_ids.tip_more": "Tip: add more IDs for round-robin with auto-failover.",
-  "tunnel.deployment_ids.one_configured":
-    "1 ID configured · add more for round-robin failover.",
-  "tunnel.deployment_ids.many_configured":
-    "{n} IDs — round-robin with auto-failover on quota.",
+  "tunnel.deployment_ids.summary":
+    "{enabled} of {total} enabled — round-robin with auto-failover on quota.",
+  "tunnel.deployment_ids.all_disabled":
+    "{total} configured but all disabled — enable at least one to use the relay.",
   "tunnel.auth_key.label": "Auth key",
   "tunnel.auth_key.help": "Same value as AUTH_KEY inside your Code.gs.",
   "tunnel.section.network": "Network",
@@ -384,7 +385,7 @@ const FA: Record<string, string> = {
   "status.config_field.deployment_ids": "شناسه‌های Deployment",
   "status.config_field.log_level": "سطح گزارش",
   "status.deployment_ids.none": "(هیچ‌کدام)",
-  "status.deployment_ids.count": "{n} پیکربندی‌شده",
+  "status.deployment_ids.count": "{enabled} از {total} فعال",
   "status.socks5_chip": "(SOCKS5 :{port})",
   "status.read_config_error": "خواندن تنظیمات ممکن نشد: {error}",
 
@@ -433,15 +434,16 @@ const FA: Record<string, string> = {
   "tunnel.deployment_ids.help":
     "هر شناسه در یک ردیف. پراکسی بین آن‌ها چرخشی توزیع می‌کند و هر شناسه‌ای که به سقف سهمیه روزانه برسد ۱۰ دقیقه کنار گذاشته می‌شود.",
   "tunnel.deployment_ids.remove_aria": "حذف شناسه شماره {n}",
+  "tunnel.deployment_ids.enable_aria": "فعال/غیرفعال کردن شناسه شماره {n}",
   "tunnel.deployment_ids.placeholder":
     "یک یا چند شناسه را وارد کنید (با خط جدید / کاما / فاصله)",
   "tunnel.add": "+ افزودن",
   "tunnel.deployment_ids.tip_more":
     "نکته: برای چرخش با تعویض خودکار، شناسه‌های بیشتری اضافه کنید.",
-  "tunnel.deployment_ids.one_configured":
-    "۱ شناسه پیکربندی شده · برای چرخش، تعداد بیشتری اضافه کنید.",
-  "tunnel.deployment_ids.many_configured":
-    "{n} شناسه — چرخش با تعویض خودکار در صورت اتمام سهمیه.",
+  "tunnel.deployment_ids.summary":
+    "از {total} شناسه پیکربندی‌شده، {enabled} مورد فعال است — چرخش با تعویض خودکار در صورت اتمام سهمیه.",
+  "tunnel.deployment_ids.all_disabled":
+    "همهٔ {total} شناسه غیرفعال‌اند — برای استفاده از ریلی، حداقل یکی را فعال کنید.",
   "tunnel.auth_key.label": "کلید احراز هویت",
   "tunnel.auth_key.help": "همان مقدار AUTH_KEY در Code.gs شما.",
   "tunnel.section.network": "شبکه",

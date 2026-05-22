@@ -32,7 +32,7 @@ use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
 use rahgozar::cdn_discover::{self, DiscoveredFront};
 use rahgozar::cert_installer::{install_ca, is_ca_trusted_by_subject, remove_ca};
-use rahgozar::config::{Config, FrontingGroup, ScriptId};
+use rahgozar::config::{Config, FrontingGroup};
 use rahgozar::data_dir;
 use rahgozar::domain_fronter::DEFAULT_GOOGLE_SNI_POOL;
 use rahgozar::mitm::MitmCertManager;
@@ -238,13 +238,23 @@ pub fn get_stats(state: State<'_, Arc<AppState>>) -> Option<UsageDto> {
 /// so the Svelte form bindings stay shallow and the JSON the frontend
 /// gets matches what the form will eventually post back. Sub-fields
 /// the egui UI exposed are added here as the corresponding UI lands.
+/// One row in the Tunnel form's deployment-IDs editor. The `enabled`
+/// flag lets the user park an ID without deleting it; disabled entries
+/// persist on disk but are filtered out of the runtime relay pool.
+/// Mirrors `rahgozar::config::ScriptIdEntry` on the wire.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ScriptIdDto {
+    pub id: String,
+    pub enabled: bool,
+}
+
 #[derive(Serialize)]
 pub struct ConfigDto {
     pub mode: String,
     pub listen_host: String,
     pub listen_port: u16,
     pub socks5_port: Option<u16>,
-    pub script_ids: Vec<String>,
+    pub script_ids: Vec<ScriptIdDto>,
     pub auth_key: String,
     pub front_domain: String,
     pub google_ip: String,
@@ -279,11 +289,16 @@ pub fn get_config() -> Result<ConfigDto, String> {
     let cfg: Config =
         serde_json::from_slice(&bytes).map_err(|e| format!("parse {}: {}", path.display(), e))?;
 
-    let script_ids = match cfg.script_id.as_ref().or(cfg.script_ids.as_ref()) {
-        Some(ScriptId::One(s)) => vec![s.clone()],
-        Some(ScriptId::Many(v)) => v.clone(),
-        None => Vec::new(),
-    };
+    // Use the canonical entry view so disabled rows round-trip into
+    // the UI (legacy bare-string configs come back as enabled=true).
+    let script_ids: Vec<ScriptIdDto> = cfg
+        .script_id_entries()
+        .into_iter()
+        .map(|e| ScriptIdDto {
+            id: e.id,
+            enabled: e.enabled,
+        })
+        .collect();
 
     Ok(ConfigDto {
         mode: cfg.mode,
@@ -457,7 +472,7 @@ pub struct ConfigUpdate {
     pub listen_host: String,
     pub listen_port: u16,
     pub socks5_port: Option<u16>,
-    pub script_ids: Vec<String>,
+    pub script_ids: Vec<ScriptIdDto>,
     pub auth_key: String,
     pub front_domain: String,
     pub google_ip: String,
@@ -486,6 +501,77 @@ pub struct ConfigUpdate {
 /// "Needs creds" is gated by `Mode::uses_apps_script_relay` from the
 /// rahgozar core — the single source of truth so a future cred-free
 /// mode picks the right side without another allowlist edit here.
+/// Render the cleaned deployment-ID list to the canonical `script_id`
+/// wire value. Pure — call sites already trim + drop blank rows before
+/// invoking. Returns `None` when the list is empty so the caller can
+/// drop the key from the JSON document.
+///
+/// Shape rules (downgrade-compat with pre-disable-flag binaries):
+///   - empty                              → `None` (caller removes key)
+///   - 1 row, enabled                     → bare string `"A"`
+///   - N rows, all enabled                → `["A","B",…]`
+///   - any row disabled                   → `[{"id":"A","enabled":true}, …]`
+///
+/// The Rust reader (`Config::script_id_entries`) accepts every form,
+/// so a freshly-written all-enabled config still loads on older
+/// rahgozar builds that predate the object shape.
+fn script_id_wire(cleaned: &[ScriptIdDto]) -> Option<serde_json::Value> {
+    if cleaned.is_empty() {
+        return None;
+    }
+    let all_enabled = cleaned.iter().all(|e| e.enabled);
+    if all_enabled {
+        if cleaned.len() == 1 {
+            return Some(serde_json::Value::String(cleaned[0].id.clone()));
+        }
+        return Some(serde_json::Value::Array(
+            cleaned
+                .iter()
+                .map(|e| serde_json::Value::String(e.id.clone()))
+                .collect(),
+        ));
+    }
+    Some(serde_json::Value::Array(
+        cleaned
+            .iter()
+            .map(|e| {
+                let mut m = serde_json::Map::new();
+                m.insert("id".into(), serde_json::Value::String(e.id.clone()));
+                m.insert("enabled".into(), serde_json::Value::Bool(e.enabled));
+                serde_json::Value::Object(m)
+            })
+            .collect(),
+    ))
+}
+
+/// Relay-mode credential gate. Returns Ok when either (a) the mode
+/// doesn't use the Apps Script relay, or (b) the user has supplied at
+/// least one enabled non-blank deployment ID and a non-blank auth key.
+///
+/// Direct / local_bypass modes intentionally accept any list shape
+/// (including all-disabled) — they don't dispatch through the relay,
+/// so the credential list is inert and we still persist it so a flip
+/// back to apps_script doesn't wipe the user's settings.
+fn check_relay_creds(
+    needs_relay_creds: bool,
+    cleaned: &[ScriptIdDto],
+    auth_key: &str,
+) -> Result<(), String> {
+    if !needs_relay_creds {
+        return Ok(());
+    }
+    if cleaned.is_empty() {
+        return Err("At least one deployment ID is required".into());
+    }
+    if !cleaned.iter().any(|e| e.enabled) {
+        return Err("At least one enabled deployment ID is required".into());
+    }
+    if auth_key.trim().is_empty() {
+        return Err("Auth key is required".into());
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub fn save_config(update: ConfigUpdate) -> Result<ConfigDto, String> {
     use rahgozar::config::Mode;
@@ -498,21 +584,19 @@ pub fn save_config(update: ConfigUpdate) -> Result<ConfigDto, String> {
 
     // Trim + drop blank rows the same way the egui form did, so a
     // trailing-empty entry from the row editor doesn't get persisted.
-    let cleaned_ids: Vec<String> = update
+    // The enabled flag rides along — disabled rows stay on disk so
+    // the user can re-enable them without re-typing.
+    let cleaned_ids: Vec<ScriptIdDto> = update
         .script_ids
         .iter()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .map(|e| ScriptIdDto {
+            id: e.id.trim().to_string(),
+            enabled: e.enabled,
+        })
+        .filter(|e| !e.id.is_empty())
         .collect();
 
-    if needs_relay_creds {
-        if cleaned_ids.is_empty() {
-            return Err("At least one deployment ID is required".into());
-        }
-        if update.auth_key.trim().is_empty() {
-            return Err("Auth key is required".into());
-        }
-    }
+    check_relay_creds(needs_relay_creds, &cleaned_ids, &update.auth_key)?;
     if let Some(s) = update.socks5_port {
         if s == update.listen_port {
             return Err("HTTP and SOCKS5 ports must differ".into());
@@ -561,28 +645,17 @@ pub fn save_config(update: ConfigUpdate) -> Result<ConfigDto, String> {
         serde_json::Value::String(update.log_level.clone()),
     );
 
-    // Collapse the IDs into the wire shape — single id → bare string
-    // (`script_id: "AKfy…"`), multiple → array, none → key absent.
-    // Always drop the legacy `script_ids` alias so we don't ship a
-    // file with both keys populated.
+    // Always drop the legacy `script_ids` plural alias so we don't
+    // ship a file with both keys populated (the reader would merge
+    // them — see `Config::script_id_entries` — but it's cleaner to
+    // canonicalise on save).
     obj.remove("script_ids");
-    match cleaned_ids.as_slice() {
-        [] => {
+    match script_id_wire(&cleaned_ids) {
+        Some(v) => {
+            obj.insert("script_id".into(), v);
+        }
+        None => {
             obj.remove("script_id");
-        }
-        [one] => {
-            obj.insert("script_id".into(), serde_json::Value::String(one.clone()));
-        }
-        many => {
-            obj.insert(
-                "script_id".into(),
-                serde_json::Value::Array(
-                    many.iter()
-                        .cloned()
-                        .map(serde_json::Value::String)
-                        .collect(),
-                ),
-            );
         }
     }
 
@@ -1194,4 +1267,136 @@ pub fn save_raw_config(text: String) -> Result<(), String> {
     let value: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("re-parse for write: {}", e))?;
     write_config_json(&value)
+}
+
+// ── Tests ──────────────────────────────────────────────────────────────
+//
+// Pure-function coverage for the bits of `save_config` that don't need
+// disk I/O. The full `save_config` path also touches `config.json`
+// (which `data_dir::config_path()` resolves to a per-user location);
+// exercising that here would require either a OnceLock-set
+// `set_data_dir()` (single-shot, racy across parallel tests) or
+// process-isolated integration tests. Extracting `script_id_wire` and
+// `check_relay_creds` as pure helpers gives us the same coverage
+// without that machinery.
+
+#[cfg(test)]
+mod save_path_tests {
+    use super::*;
+
+    fn entry(id: &str, enabled: bool) -> ScriptIdDto {
+        ScriptIdDto {
+            id: id.into(),
+            enabled,
+        }
+    }
+
+    // ── Wire shape ─────────────────────────────────────────────────
+
+    #[test]
+    fn script_id_wire_empty_returns_none() {
+        assert!(script_id_wire(&[]).is_none());
+    }
+
+    #[test]
+    fn script_id_wire_single_enabled_writes_bare_string() {
+        // Downgrade-compat: a one-row all-enabled list is the most
+        // common shape and must remain readable by pre-disable-flag
+        // binaries.
+        let v = script_id_wire(&[entry("A", true)]).expect("non-empty");
+        assert_eq!(v, serde_json::Value::String("A".into()));
+    }
+
+    #[test]
+    fn script_id_wire_all_enabled_multi_writes_string_array() {
+        let v = script_id_wire(&[entry("A", true), entry("B", true), entry("C", true)])
+            .expect("non-empty");
+        assert_eq!(
+            v,
+            serde_json::json!(["A", "B", "C"]),
+            "all-enabled multi-row must remain a bare-string array for older clients",
+        );
+    }
+
+    #[test]
+    fn script_id_wire_mixed_disabled_writes_object_array() {
+        let v = script_id_wire(&[entry("A", true), entry("B", false), entry("C", true)])
+            .expect("non-empty");
+        assert_eq!(
+            v,
+            serde_json::json!([
+                {"id": "A", "enabled": true},
+                {"id": "B", "enabled": false},
+                {"id": "C", "enabled": true},
+            ]),
+            "any disabled row escalates to the object form so the flag survives",
+        );
+    }
+
+    #[test]
+    fn script_id_wire_all_disabled_writes_object_array() {
+        // Edge case: every row disabled. Save's validation rejects
+        // this in relay modes (covered separately by check_relay_creds
+        // tests below); in direct / local_bypass modes it's accepted,
+        // so the wire emitter must still produce a sensible shape.
+        let v = script_id_wire(&[entry("A", false), entry("B", false)]).expect("non-empty");
+        assert_eq!(
+            v,
+            serde_json::json!([
+                {"id": "A", "enabled": false},
+                {"id": "B", "enabled": false},
+            ]),
+        );
+    }
+
+    // ── Validation gate ────────────────────────────────────────────
+
+    #[test]
+    fn check_relay_creds_relay_mode_rejects_empty_list() {
+        let err = check_relay_creds(true, &[], "secret").expect_err("empty list must error");
+        assert!(
+            err.contains("At least one deployment ID is required"),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    fn check_relay_creds_relay_mode_rejects_all_disabled() {
+        let err = check_relay_creds(true, &[entry("A", false), entry("B", false)], "secret")
+            .expect_err("all-disabled must error in relay mode");
+        assert!(
+            err.contains("At least one enabled deployment ID is required"),
+            "got: {err}",
+        );
+    }
+
+    #[test]
+    fn check_relay_creds_relay_mode_rejects_blank_auth_key() {
+        let err = check_relay_creds(true, &[entry("A", true)], "   ")
+            .expect_err("blank auth_key must error in relay mode");
+        assert!(err.contains("Auth key is required"), "got: {err}");
+    }
+
+    #[test]
+    fn check_relay_creds_relay_mode_accepts_one_enabled() {
+        check_relay_creds(true, &[entry("A", false), entry("B", true)], "secret")
+            .expect("any enabled row + auth_key satisfies the gate");
+    }
+
+    #[test]
+    fn check_relay_creds_non_relay_mode_accepts_empty_list() {
+        // Direct / local_bypass: no relay credentials needed, so an
+        // empty list is fine.
+        check_relay_creds(false, &[], "")
+            .expect("direct/local_bypass must accept zero deployment IDs");
+    }
+
+    #[test]
+    fn check_relay_creds_non_relay_mode_accepts_all_disabled() {
+        // Direct / local_bypass: persist the (inert) list as-is so
+        // flipping back to apps_script doesn't wipe what the user
+        // typed previously.
+        check_relay_creds(false, &[entry("A", false), entry("B", false)], "")
+            .expect("direct/local_bypass must accept an all-disabled list");
+    }
 }

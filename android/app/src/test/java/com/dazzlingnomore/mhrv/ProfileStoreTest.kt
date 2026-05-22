@@ -47,6 +47,16 @@ class ProfileStoreTest {
     }
 
     /**
+     * Wrap bare IDs/URLs into [DeploymentEntry]s with `enabled = true`.
+     * Most ProfileStore tests use `appsScriptUrls` as throwaway content
+     * to make configs distinguishable — they don't care about the
+     * enabled flag, so this keeps fixture lines short and readable.
+     * Tests that care about disabled rows construct
+     * [DeploymentEntry] inline with `enabled = false`.
+     */
+    private fun depEntries(vararg ids: String): List<DeploymentEntry> = ids.map { DeploymentEntry(it, true) }
+
+    /**
      * Recursive cleanup so a test that mid-flight created a directory
      * at a file path (the injected-write-failure trick) doesn't leak
      * into the next test. Plain [File.delete] won't remove a non-empty
@@ -169,7 +179,12 @@ class ProfileStoreTest {
         configFile.writeText(rustScalar)
         val cfg = ConfigStore.load(ctx)
         assertEquals(1, cfg.appsScriptUrls.size)
-        assertTrue(cfg.appsScriptUrls.first().contains("DESKTOP_ID"))
+        assertTrue(
+            cfg.appsScriptUrls
+                .first()
+                .url
+                .contains("DESKTOP_ID"),
+        )
         assertTrue("hasDeploymentId must be true", cfg.hasDeploymentId)
     }
 
@@ -197,13 +212,180 @@ class ProfileStoreTest {
         assertEquals(3, cfg.appsScriptUrls.size)
     }
 
+    /**
+     * Object form parses, the enabled flag is preserved through
+     * [ConfigStore.load], and the disabled row is invisible to the
+     * "do we have credentials?" gate but still present on the model
+     * so the user can flip it back on.
+     */
+    @Test
+    fun configstore_reads_script_id_object_form_with_disabled_row() {
+        val objForm =
+            """
+            {
+              "mode": "apps_script",
+              "auth_key": "k",
+              "script_id": [
+                {"id": "A", "enabled": true},
+                {"id": "B", "enabled": false},
+                {"id": "C", "enabled": true}
+              ]
+            }
+            """.trimIndent()
+        configFile.writeText(objForm)
+        val cfg = ConfigStore.load(ctx)
+        assertEquals(3, cfg.appsScriptUrls.size)
+        assertTrue("A must be enabled", cfg.appsScriptUrls[0].enabled)
+        assertFalse("B must be disabled", cfg.appsScriptUrls[1].enabled)
+        assertTrue("C must be enabled", cfg.appsScriptUrls[2].enabled)
+        assertTrue("at least one usable row → hasDeploymentId true", cfg.hasDeploymentId)
+    }
+
+    /**
+     * Disabled rows survive a load → save round-trip. Without this
+     * a user toggling a row off would only have it parked until the
+     * next save — at which point [toJson] would silently drop it
+     * and we'd regress to "disable = delete".
+     */
+    @Test
+    fun configstore_round_trip_preserves_disabled_row() {
+        val cfg =
+            RahgozarConfig(
+                mode = Mode.APPS_SCRIPT,
+                appsScriptUrls =
+                    listOf(
+                        DeploymentEntry("https://script.google.com/macros/s/A/exec", true),
+                        DeploymentEntry("https://script.google.com/macros/s/B/exec", false),
+                    ),
+                authKey = "k",
+            )
+        ConfigStore.save(ctx, cfg)
+        // Confirm the on-disk shape carries the enabled flag — a
+        // build that downgraded to bare strings would lose the flag.
+        val onDisk = JSONObject(configFile.readText())
+        val arr = onDisk.getJSONArray("script_id")
+        assertEquals(2, arr.length())
+        val first = arr.getJSONObject(0)
+        val second = arr.getJSONObject(1)
+        assertEquals("A", first.optString("id"))
+        assertTrue(first.optBoolean("enabled", false))
+        assertEquals("B", second.optString("id"))
+        assertFalse(second.optBoolean("enabled", true))
+
+        val reloaded = ConfigStore.load(ctx)
+        assertEquals(2, reloaded.appsScriptUrls.size)
+        assertTrue(reloaded.appsScriptUrls[0].enabled)
+        assertFalse(reloaded.appsScriptUrls[1].enabled)
+    }
+
+    /**
+     * Downgrade-compat: when no row is disabled, [toJson] must keep
+     * the legacy bare-string array shape so an older rahgozar build
+     * (one that doesn't know the `{id, enabled}` form) can still
+     * parse a config written by this build.
+     */
+    @Test
+    fun configstore_writes_legacy_string_array_when_all_enabled() {
+        val cfg =
+            RahgozarConfig(
+                mode = Mode.APPS_SCRIPT,
+                appsScriptUrls =
+                    listOf(
+                        DeploymentEntry("https://script.google.com/macros/s/A/exec", true),
+                        DeploymentEntry("https://script.google.com/macros/s/B/exec", true),
+                    ),
+                authKey = "k",
+            )
+        ConfigStore.save(ctx, cfg)
+        val onDisk = JSONObject(configFile.readText())
+        val arr = onDisk.getJSONArray("script_id")
+        assertEquals(2, arr.length())
+        // Bare strings, NOT objects — an older parser would crash on
+        // `{id,enabled}` shapes here.
+        assertEquals("A", arr.getString(0))
+        assertEquals("B", arr.getString(1))
+    }
+
+    /**
+     * `hasDeploymentId` must require an *enabled* row — the relay
+     * round-robin filters out disabled IDs, so a profile with every
+     * row parked is functionally credential-less. The HomeScreen
+     * "Connect" gate and the section-expand logic both lean on this.
+     */
+    @Test
+    fun hasDeploymentId_false_when_all_rows_disabled() {
+        val cfg =
+            RahgozarConfig(
+                mode = Mode.APPS_SCRIPT,
+                appsScriptUrls =
+                    listOf(
+                        DeploymentEntry("https://script.google.com/macros/s/A/exec", false),
+                        DeploymentEntry("https://script.google.com/macros/s/B/exec", false),
+                    ),
+                authKey = "k",
+            )
+        assertFalse(
+            "all rows disabled → hasDeploymentId must be false",
+            cfg.hasDeploymentId,
+        )
+        // And: flipping one back on flips the gate.
+        val flipped =
+            cfg.copy(
+                appsScriptUrls =
+                    cfg.appsScriptUrls.mapIndexed { i, e ->
+                        if (i == 0) e.copy(enabled = true) else e
+                    },
+            )
+        assertTrue(flipped.hasDeploymentId)
+    }
+
+    /**
+     * ApplyProfile must refuse a snapshot whose every script_id row
+     * is disabled, in the same way it refuses a missing key. The
+     * Rust validator backs this — `script_ids_resolved()` filters to
+     * enabled-only, so an all-disabled `script_id` looks like an
+     * empty list to `Config::validate`, and ApplyProfile sniffs that
+     * via `validateRuntimeShape`.
+     */
+    @Test
+    fun applyProfile_refuses_all_disabled_apps_script_snapshot() {
+        val bad =
+            """
+            {
+              "active": "bad",
+              "profiles": [{
+                "name": "bad",
+                "config": {
+                  "mode": "apps_script",
+                  "auth_key": "k",
+                  "script_id": [
+                    {"id": "A", "enabled": false},
+                    {"id": "B", "enabled": false}
+                  ]
+                }
+              }]
+            }
+            """.trimIndent()
+        profilesFile.writeText(bad)
+        // Plant a known-good live config to confirm it's untouched.
+        ConfigStore.save(ctx, RahgozarConfig(authKey = "preserve-me"))
+        val before = configFile.readText()
+
+        val r = ProfileStore.applyProfile(ctx, "bad")
+        assertTrue(
+            "expected Failed, got ${r::class.simpleName}",
+            r is ProfileStore.ApplyResult.Failed,
+        )
+        assertEquals(before, configFile.readText())
+    }
+
     // ---- Invariant 2: active == "matches the live config" ----
 
     @Test
     fun delete_active_clears_pointer() {
-        ProfileStore.upsert(ctx, "a", RahgozarConfig(appsScriptUrls = listOf("A"), authKey = "x"))
-        ProfileStore.upsert(ctx, "b", RahgozarConfig(appsScriptUrls = listOf("B"), authKey = "y"))
-        ProfileStore.upsert(ctx, "c", RahgozarConfig(appsScriptUrls = listOf("C"), authKey = "z"))
+        ProfileStore.upsert(ctx, "a", RahgozarConfig(appsScriptUrls = depEntries("A"), authKey = "x"))
+        ProfileStore.upsert(ctx, "b", RahgozarConfig(appsScriptUrls = depEntries("B"), authKey = "y"))
+        ProfileStore.upsert(ctx, "c", RahgozarConfig(appsScriptUrls = depEntries("C"), authKey = "z"))
         assertEquals(ProfileStore.MutationResult.Ok, ProfileStore.delete(ctx, "c"))
         val state = ProfileStore.load(ctx)
         assertEquals("", state.active)
@@ -213,8 +395,8 @@ class ProfileStoreTest {
 
     @Test
     fun delete_non_active_keeps_pointer() {
-        ProfileStore.upsert(ctx, "a", RahgozarConfig(appsScriptUrls = listOf("A"), authKey = "x"))
-        ProfileStore.upsert(ctx, "b", RahgozarConfig(appsScriptUrls = listOf("B"), authKey = "y"))
+        ProfileStore.upsert(ctx, "a", RahgozarConfig(appsScriptUrls = depEntries("A"), authKey = "x"))
+        ProfileStore.upsert(ctx, "b", RahgozarConfig(appsScriptUrls = depEntries("B"), authKey = "y"))
         ProfileStore.delete(ctx, "a")
         assertEquals("b", ProfileStore.load(ctx).active)
     }
@@ -224,7 +406,7 @@ class ProfileStoreTest {
         val cfg =
             RahgozarConfig(
                 mode = Mode.APPS_SCRIPT,
-                appsScriptUrls = listOf("A"),
+                appsScriptUrls = depEntries("A"),
                 authKey = "secret",
                 googleIp = "1.2.3.4",
             )
@@ -240,7 +422,7 @@ class ProfileStoreTest {
 
     @Test
     fun insertNew_writes_snapshot_to_live_config_json() {
-        val cfg = RahgozarConfig(appsScriptUrls = listOf("X"), authKey = "k")
+        val cfg = RahgozarConfig(appsScriptUrls = depEntries("X"), authKey = "k")
         val r = ProfileStore.insertNew(ctx, "first", cfg)
         assertEquals(ProfileStore.MutationResult.Ok, r)
         assertTrue(configFile.exists())
@@ -253,7 +435,7 @@ class ProfileStoreTest {
      */
     @Test
     fun clearActiveIfAny_clears_when_set() {
-        ProfileStore.upsert(ctx, "p", RahgozarConfig(appsScriptUrls = listOf("A"), authKey = "k"))
+        ProfileStore.upsert(ctx, "p", RahgozarConfig(appsScriptUrls = depEntries("A"), authKey = "k"))
         assertEquals("p", ProfileStore.load(ctx).active)
         ProfileStore.clearActiveIfAny(ctx)
         val state = ProfileStore.load(ctx)
@@ -284,8 +466,8 @@ class ProfileStoreTest {
 
     @Test
     fun rename_collision_does_not_mutate_state() {
-        ProfileStore.upsert(ctx, "a", RahgozarConfig(appsScriptUrls = listOf("A"), authKey = "x"))
-        ProfileStore.upsert(ctx, "b", RahgozarConfig(appsScriptUrls = listOf("B"), authKey = "y"))
+        ProfileStore.upsert(ctx, "a", RahgozarConfig(appsScriptUrls = depEntries("A"), authKey = "x"))
+        ProfileStore.upsert(ctx, "b", RahgozarConfig(appsScriptUrls = depEntries("B"), authKey = "y"))
         val r = ProfileStore.rename(ctx, "a", "b")
         assertEquals(ProfileStore.MutationResult.Duplicate, r)
         val state = ProfileStore.load(ctx)
@@ -305,20 +487,20 @@ class ProfileStoreTest {
         ProfileStore.insertNew(
             ctx,
             "p",
-            RahgozarConfig(appsScriptUrls = listOf("first"), authKey = "k"),
+            RahgozarConfig(appsScriptUrls = depEntries("first"), authKey = "k"),
         )
         val r =
             ProfileStore.insertNew(
                 ctx,
                 "p",
-                RahgozarConfig(appsScriptUrls = listOf("second"), authKey = "k"),
+                RahgozarConfig(appsScriptUrls = depEntries("second"), authKey = "k"),
             )
         assertEquals(ProfileStore.MutationResult.Duplicate, r)
         val applied = ProfileStore.applyProfile(ctx, "p")
         assertTrue(applied is ProfileStore.ApplyResult.Ok)
         val cfg = (applied as ProfileStore.ApplyResult.Ok).cfg
         assertEquals(
-            listOf("https://script.google.com/macros/s/first/exec"),
+            listOf(DeploymentEntry("https://script.google.com/macros/s/first/exec", true)),
             cfg.appsScriptUrls,
         )
     }
@@ -419,7 +601,7 @@ class ProfileStoreTest {
             ProfileStore.upsert(
                 ctx,
                 "p",
-                RahgozarConfig(appsScriptUrls = listOf("A"), authKey = "k"),
+                RahgozarConfig(appsScriptUrls = depEntries("A"), authKey = "k"),
             )
         assertTrue(r is ProfileStore.MutationResult.CorruptOnDisk)
         assertEquals(before, profilesFile.readText())
@@ -433,7 +615,7 @@ class ProfileStoreTest {
             ProfileStore.upsert(
                 ctx,
                 "p",
-                RahgozarConfig(appsScriptUrls = listOf("A"), authKey = "k"),
+                RahgozarConfig(appsScriptUrls = depEntries("A"), authKey = "k"),
             )
         assertEquals(ProfileStore.MutationResult.Ok, r)
         assertEquals("p", ProfileStore.load(ctx).active)
@@ -450,7 +632,7 @@ class ProfileStoreTest {
      */
     @Test
     fun save_leaves_no_tmp_or_bak_behind_on_success() {
-        ProfileStore.upsert(ctx, "p", RahgozarConfig(appsScriptUrls = listOf("A"), authKey = "k"))
+        ProfileStore.upsert(ctx, "p", RahgozarConfig(appsScriptUrls = depEntries("A"), authKey = "k"))
         assertFalse(File(ctx.filesDir, "profiles.json.tmp").exists())
         assertFalse(File(ctx.filesDir, "profiles.json.bak").exists())
     }
@@ -462,7 +644,7 @@ class ProfileStoreTest {
         val cfg =
             RahgozarConfig(
                 mode = Mode.FULL,
-                appsScriptUrls = listOf("Z"),
+                appsScriptUrls = depEntries("Z"),
                 authKey = "topsecret",
                 parallelRelay = 3,
             )
@@ -574,7 +756,7 @@ class ProfileStoreTest {
 
     @Test
     fun unique_copy_name_increments_on_collision() {
-        ProfileStore.upsert(ctx, "p", RahgozarConfig(appsScriptUrls = listOf("A"), authKey = "k"))
+        ProfileStore.upsert(ctx, "p", RahgozarConfig(appsScriptUrls = depEntries("A"), authKey = "k"))
         ProfileStore.duplicate(ctx, "p", "p (copy)")
         val state = ProfileStore.load(ctx)
         val unique = ProfileStore.uniqueCopyName(state, "p")
@@ -602,7 +784,7 @@ class ProfileStoreTest {
         ProfileStore.upsert(
             ctx,
             "home",
-            RahgozarConfig(appsScriptUrls = listOf("OLD"), authKey = "old"),
+            RahgozarConfig(appsScriptUrls = depEntries("OLD"), authKey = "old"),
         )
         val profilesBefore = profilesFile.readText()
 
@@ -618,7 +800,7 @@ class ProfileStoreTest {
                 ProfileStore.upsert(
                     ctx,
                     "home",
-                    RahgozarConfig(appsScriptUrls = listOf("NEW"), authKey = "new"),
+                    RahgozarConfig(appsScriptUrls = depEntries("NEW"), authKey = "new"),
                 )
             assertEquals(ProfileStore.MutationResult.SaveFailed, r)
             // profiles.json must be UNCHANGED — the bug guard.
@@ -641,7 +823,7 @@ class ProfileStoreTest {
         ProfileStore.upsert(
             ctx,
             "home",
-            RahgozarConfig(appsScriptUrls = listOf("OLD"), authKey = "old"),
+            RahgozarConfig(appsScriptUrls = depEntries("OLD"), authKey = "old"),
         )
         val profilesBefore = profilesFile.readText()
 
@@ -658,7 +840,7 @@ class ProfileStoreTest {
                 ProfileStore.upsert(
                     ctx,
                     "home",
-                    RahgozarConfig(appsScriptUrls = listOf("NEW"), authKey = "new"),
+                    RahgozarConfig(appsScriptUrls = depEntries("NEW"), authKey = "new"),
                 )
             assertEquals(ProfileStore.MutationResult.PartialConfigOnly, r)
 
@@ -688,12 +870,12 @@ class ProfileStoreTest {
         ProfileStore.upsert(
             ctx,
             "home",
-            RahgozarConfig(appsScriptUrls = listOf("HOME_ID"), authKey = "homekey"),
+            RahgozarConfig(appsScriptUrls = depEntries("HOME_ID"), authKey = "homekey"),
         )
         ProfileStore.upsert(
             ctx,
             "other",
-            RahgozarConfig(appsScriptUrls = listOf("OTHER_ID"), authKey = "otherkey"),
+            RahgozarConfig(appsScriptUrls = depEntries("OTHER_ID"), authKey = "otherkey"),
         )
         val profilesBefore = profilesFile.readText()
         assertEquals("other", ProfileStore.load(ctx).active)

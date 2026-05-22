@@ -102,19 +102,72 @@ impl std::str::FromStr for Mode {
     }
 }
 
+/// One row in the deployment-ID list as serialised. Either a bare
+/// string (legacy form — `["A","B"]`) or an object with an enabled
+/// flag (new form — `[{"id":"A","enabled":true}]`). Bare strings
+/// default to enabled. Hand-edited mixed arrays also load.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ScriptIdEntryWire {
+    Bare(String),
+    Object {
+        id: String,
+        #[serde(default = "default_true")]
+        enabled: bool,
+    },
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl ScriptIdEntryWire {
+    pub fn into_entry(self) -> ScriptIdEntry {
+        match self {
+            ScriptIdEntryWire::Bare(id) => ScriptIdEntry { id, enabled: true },
+            ScriptIdEntryWire::Object { id, enabled } => ScriptIdEntry { id, enabled },
+        }
+    }
+}
+
+/// Canonical in-memory shape: id + enabled flag. The desktop / Android
+/// UIs round-trip this directly; the runtime relay consumes only the
+/// `enabled == true` subset via `Config::script_ids_resolved()`.
+#[derive(Debug, Clone)]
+pub struct ScriptIdEntry {
+    pub id: String,
+    pub enabled: bool,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum ScriptId {
     One(String),
-    Many(Vec<String>),
+    Many(Vec<ScriptIdEntryWire>),
 }
 
 impl ScriptId {
-    pub fn into_vec(self) -> Vec<String> {
+    /// Flatten to canonical entries, preserving on-disk order. Legacy
+    /// bare-string rows surface as `enabled: true`.
+    pub fn into_entries(self) -> Vec<ScriptIdEntry> {
         match self {
-            ScriptId::One(s) => vec![s],
-            ScriptId::Many(v) => v,
+            ScriptId::One(s) => vec![ScriptIdEntry {
+                id: s,
+                enabled: true,
+            }],
+            ScriptId::Many(v) => v.into_iter().map(ScriptIdEntryWire::into_entry).collect(),
         }
+    }
+
+    /// Enabled-only IDs — what the relay actually rotates through.
+    /// Disabled rows are silently dropped here; they only re-appear in
+    /// the UI round-trip via `Config::script_id_entries()`.
+    pub fn into_vec(self) -> Vec<String> {
+        self.into_entries()
+            .into_iter()
+            .filter(|e| e.enabled)
+            .map(|e| e.id)
+            .collect()
     }
 }
 
@@ -1277,13 +1330,42 @@ impl Config {
     }
 
     pub fn script_ids_resolved(&self) -> Vec<String> {
-        if let Some(s) = &self.script_ids {
-            return s.clone().into_vec();
-        }
+        self.script_id_entries()
+            .into_iter()
+            .filter(|e| e.enabled)
+            .map(|e| e.id)
+            .collect()
+    }
+
+    /// Full entry list with `enabled` flags preserved, in on-disk order.
+    /// UI code (desktop `get_config`, Android config load) calls this to
+    /// round-trip disabled rows; the relay must use
+    /// `script_ids_resolved()` to avoid routing through disabled IDs.
+    ///
+    /// Hand-edited configs (or migrations between platforms) can carry
+    /// BOTH `script_id` (canonical, what Rust + recent Android write)
+    /// and `script_ids` (legacy plural alias). Merge with `script_id`
+    /// winning on ID collision — otherwise a UI round-trip can silently
+    /// discard the canonical entries by reading only the legacy ones
+    /// and then writing them back. Matches the merge+dedupe order
+    /// Android's `loadFromJson` uses.
+    pub fn script_id_entries(&self) -> Vec<ScriptIdEntry> {
+        let mut out: Vec<ScriptIdEntry> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut absorb = |s: &ScriptId| {
+            for entry in s.clone().into_entries() {
+                if seen.insert(entry.id.clone()) {
+                    out.push(entry);
+                }
+            }
+        };
         if let Some(s) = &self.script_id {
-            return s.clone().into_vec();
+            absorb(s);
         }
-        Vec::new()
+        if let Some(s) = &self.script_ids {
+            absorb(s);
+        }
+        out
     }
 
     /// Sanitised `apps_script_lang` — trimmed, lowercased, and validated
@@ -1361,6 +1443,89 @@ mod tests {
         }"#;
         let cfg: Config = serde_json::from_str(s).unwrap();
         assert_eq!(cfg.script_ids_resolved(), vec!["A", "B", "C"]);
+    }
+
+    #[test]
+    fn parses_script_id_entries_with_enabled_flag() {
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "MY_SECRET_KEY_123",
+            "script_id": [
+                {"id": "A", "enabled": true},
+                {"id": "B", "enabled": false},
+                {"id": "C", "enabled": true}
+            ]
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        // Runtime sees only the enabled subset…
+        assert_eq!(cfg.script_ids_resolved(), vec!["A", "C"]);
+        // …but the UI round-trip preserves order + flags.
+        let entries = cfg.script_id_entries();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].id, "A");
+        assert!(entries[0].enabled);
+        assert_eq!(entries[1].id, "B");
+        assert!(!entries[1].enabled);
+        assert_eq!(entries[2].id, "C");
+        assert!(entries[2].enabled);
+    }
+
+    #[test]
+    fn parses_mixed_legacy_and_object_entries() {
+        // Hand-edited configs may interleave bare strings with objects;
+        // bare strings default to enabled.
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "MY_SECRET_KEY_123",
+            "script_id": ["A", {"id": "B", "enabled": false}, "C"]
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        assert_eq!(cfg.script_ids_resolved(), vec!["A", "C"]);
+        assert_eq!(cfg.script_id_entries().len(), 3);
+    }
+
+    #[test]
+    fn merges_script_id_and_script_ids_with_canonical_first() {
+        // A config that carries BOTH keys (e.g. hand-edited, or a
+        // round-trip between platforms with different writers): the
+        // canonical `script_id` must win on ID collision, so a desktop
+        // get_config → save sequence can't silently discard a
+        // canonical entry by reading only the legacy plural.
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "MY_SECRET_KEY_123",
+            "script_id":  [{"id": "A", "enabled": false}, {"id": "B", "enabled": true}],
+            "script_ids": [{"id": "A", "enabled": true},  {"id": "C", "enabled": true}]
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        let entries = cfg.script_id_entries();
+        // Order: A (canonical), B (canonical), C (plural — new ID).
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0].id, "A");
+        assert!(!entries[0].enabled, "canonical script_id wins on A");
+        assert_eq!(entries[1].id, "B");
+        assert!(entries[1].enabled);
+        assert_eq!(entries[2].id, "C");
+        assert!(entries[2].enabled);
+        // Resolved (runtime) view skips A (disabled).
+        assert_eq!(cfg.script_ids_resolved(), vec!["B", "C"]);
+    }
+
+    #[test]
+    fn all_disabled_entries_fail_validation_for_apps_script() {
+        // `script_ids_resolved()` filters to enabled-only, so a config
+        // with every row disabled looks the same to validation as one
+        // with no rows at all — the relay can't run either way.
+        let s = r#"{
+            "mode": "apps_script",
+            "auth_key": "MY_SECRET_KEY_123",
+            "script_id": [
+                {"id": "A", "enabled": false},
+                {"id": "B", "enabled": false}
+            ]
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

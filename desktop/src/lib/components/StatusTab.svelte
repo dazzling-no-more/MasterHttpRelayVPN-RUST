@@ -324,7 +324,10 @@
           {#if config.script_ids.length === 0}
             <span class="text-muted">{t("status.deployment_ids.none")}</span>
           {:else}
-            {tn("status.deployment_ids.count", { n: config.script_ids.length })}
+            {tn("status.deployment_ids.count", {
+              enabled: config.script_ids.filter((e) => e.enabled).length,
+              total: config.script_ids.length,
+            })}
           {/if}
         </dd>
 

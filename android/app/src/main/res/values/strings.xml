@@ -55,6 +55,7 @@
     <!-- Deployment URL list -->
     <string name="field_deployment_url_index">#%1$d</string>
     <string name="btn_add_url">+ Add</string>
+    <string name="cd_deployment_enable">Toggle deployment ID #%1$d</string>
 
     <!-- SNI latency display -->
     <string name="sni_latency_ms_fmt">%1$d ms</string>

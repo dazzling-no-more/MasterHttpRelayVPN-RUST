@@ -55,6 +55,7 @@
     <!-- Deployment URL list -->
     <string name="field_deployment_url_index">#%1$d</string>
     <string name="btn_add_url">افزودن +</string>
+    <string name="cd_deployment_enable">فعال/غیرفعال کردن شناسهٔ #%1$d</string>
 
     <!-- SNI latency display -->
     <string name="sni_latency_ms_fmt">%1$d میلی‌ثانیه</string>

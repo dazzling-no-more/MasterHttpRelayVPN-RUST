@@ -268,10 +268,11 @@ private fun ImportConfirmDialog(
     onDismiss: () -> Unit,
 ) {
     val ids =
-        cfg.appsScriptUrls.mapNotNull { url ->
+        cfg.appsScriptUrls.mapNotNull { entry ->
             val marker = "/macros/s/"
-            val i = url.indexOf(marker)
-            val raw = if (i >= 0) url.substring(i + marker.length).substringBefore("/") else url
+            val u = entry.url
+            val i = u.indexOf(marker)
+            val raw = if (i >= 0) u.substring(i + marker.length).substringBefore("/") else u
             raw.trim().takeIf { it.isNotEmpty() }
         }
     val preview = ids.take(3).joinToString("\n") { "  ${it.take(20)}…" }

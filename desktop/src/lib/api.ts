@@ -20,12 +20,23 @@ export interface StatusDto {
   last_error: string | null;
 }
 
+/**
+ * One row in the deployment-IDs editor. `enabled === false` parks the
+ * ID without deleting it — disabled rows stay in config.json so the
+ * user can flip them back on without re-typing. Mirrors
+ * `ScriptIdDto` on the Rust side.
+ */
+export interface ScriptIdDto {
+  id: string;
+  enabled: boolean;
+}
+
 export interface ConfigDto {
   mode: string;
   listen_host: string;
   listen_port: number;
   socks5_port: number | null;
-  script_ids: string[];
+  script_ids: ScriptIdDto[];
   auth_key: string;
   front_domain: string;
   google_ip: string;

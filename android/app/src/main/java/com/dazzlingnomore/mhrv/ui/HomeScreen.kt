@@ -28,6 +28,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.ImeAction
@@ -40,6 +42,7 @@ import com.dazzlingnomore.mhrv.ConfigStore
 import com.dazzlingnomore.mhrv.ConnectionMode
 import com.dazzlingnomore.mhrv.CuratedGroups
 import com.dazzlingnomore.mhrv.DEFAULT_SNI_POOL
+import com.dazzlingnomore.mhrv.DeploymentEntry
 import com.dazzlingnomore.mhrv.FrontingGroup
 import com.dazzlingnomore.mhrv.Mode
 import com.dazzlingnomore.mhrv.Native
@@ -564,7 +567,7 @@ fun HomeScreen(
                 title = stringResource(R.string.sec_apps_script_relay),
                 initiallyExpanded =
                     appsScriptEnabled &&
-                        (cfg.appsScriptUrls.isEmpty() || cfg.authKey.isBlank()),
+                        (!cfg.hasDeploymentId || cfg.authKey.isBlank()),
             ) {
                 DeploymentIdsField(
                     urls = cfg.appsScriptUrls,
@@ -779,7 +782,7 @@ fun HomeScreen(
                 title = stringResource(R.string.sec_how_to_use),
                 initiallyExpanded =
                     cfg.mode.usesAppsScriptRelay() &&
-                        (cfg.appsScriptUrls.isEmpty() || cfg.authKey.isBlank()),
+                        (!cfg.hasDeploymentId || cfg.authKey.isBlank()),
             ) {
                 HowToUseBody(cfg.listenPort)
             }
@@ -1018,8 +1021,8 @@ private val ID_SEPARATORS = Regex("[\\s,;]+")
 
 @Composable
 private fun DeploymentIdsField(
-    urls: List<String>,
-    onChange: (List<String>) -> Unit,
+    urls: List<DeploymentEntry>,
+    onChange: (List<DeploymentEntry>) -> Unit,
     enabled: Boolean = true,
 ) {
     var newEntry by remember { mutableStateOf("") }
@@ -1030,35 +1033,70 @@ private fun DeploymentIdsField(
             style = MaterialTheme.typography.labelLarge,
         )
 
-        // Existing entries — each with its own row and a remove button.
-        // A bulk paste into an existing row also expands into multiple
-        // entries, so users don't have to find the "+ Add" field to do it.
-        urls.forEachIndexed { index, url ->
+        // Existing entries — each with its own checkbox (park without
+        // deleting), URL input, and remove button. A bulk paste into an
+        // existing row still expands into multiple entries; the pasted
+        // rows inherit the current row's enabled flag so a user toggling
+        // a row off and pasting into it doesn't silently mass-enable.
+        urls.forEachIndexed { index, entry ->
+            // Capture the per-row description outside the semantics
+            // modifier — `stringResource` is `@Composable` and can't be
+            // called from the modifier lambda (which runs in the
+            // layout/semantics phase, not composition).
+            val checkboxCd =
+                stringResource(R.string.cd_deployment_enable, index + 1)
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.fillMaxWidth(),
             ) {
+                Checkbox(
+                    checked = entry.enabled,
+                    onCheckedChange = { checked ->
+                        val updated = urls.toMutableList()
+                        updated[index] = entry.copy(enabled = checked)
+                        onChange(updated)
+                    },
+                    enabled = enabled,
+                    modifier = Modifier.semantics { contentDescription = checkboxCd },
+                )
                 OutlinedTextField(
-                    value = url,
+                    value = entry.url,
                     onValueChange = { edited ->
                         val parts = edited.split(ID_SEPARATORS).filter { it.isNotBlank() }
                         val updated = urls.toMutableList()
                         if (parts.size > 1) {
-                            // Bulk paste into this row: expand in place.
+                            // Bulk paste into this row: expand in place,
+                            // inheriting the current row's enabled flag.
                             updated.removeAt(index)
-                            updated.addAll(index, parts)
+                            updated.addAll(
+                                index,
+                                parts.map { DeploymentEntry(it, entry.enabled) },
+                            )
                         } else {
                             // Normal typing — preserve raw input so the
                             // caret/whitespace doesn't get reformatted on
                             // every keystroke.
-                            updated[index] = edited
+                            updated[index] = entry.copy(url = edited)
                         }
                         onChange(updated)
                     },
                     enabled = enabled,
                     modifier = Modifier.weight(1f),
                     singleLine = true,
-                    textStyle = MaterialTheme.typography.bodySmall,
+                    textStyle =
+                        if (entry.enabled) {
+                            MaterialTheme.typography.bodySmall
+                        } else {
+                            // Visually mute disabled rows so the user can
+                            // see at a glance which IDs are parked.
+                            // Strike-through + reduced contrast — same
+                            // pattern the SNI pool modal uses on disabled
+                            // hosts.
+                            MaterialTheme.typography.bodySmall.copy(
+                                textDecoration = androidx.compose.ui.text.style.TextDecoration.LineThrough,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        },
                     label = { Text(stringResource(R.string.field_deployment_url_index, index + 1)) },
                 )
                 IconButton(
@@ -1074,7 +1112,8 @@ private fun DeploymentIdsField(
 
         // "Add" row: multi-line text field + button. Multi-line so a user
         // can paste a long list at once (newline-separated is the natural
-        // form when copying out of the desktop UI's textarea).
+        // form when copying out of the desktop UI's textarea). Newly-
+        // added rows default to enabled — disabling is an explicit act.
         Row(
             verticalAlignment = Alignment.Top,
             modifier = Modifier.fillMaxWidth(),
@@ -1094,7 +1133,7 @@ private fun DeploymentIdsField(
                 onClick = {
                     val parts = newEntry.split(ID_SEPARATORS).filter { it.isNotBlank() }
                     if (parts.isNotEmpty()) {
-                        onChange(urls + parts)
+                        onChange(urls + parts.map { DeploymentEntry(it, true) })
                         newEntry = ""
                     }
                 },
