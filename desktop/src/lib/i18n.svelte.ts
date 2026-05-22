@@ -149,7 +149,9 @@ const EN: Record<string, string> = {
   // ── Updater ───────────────────────────────────────────────────────
   "update.available_title": "Update available",
   "update.available_body": "v{version} is ready to install.",
+  "update.available_body_portable": "v{version} is available — open the release page to download a fresh portable .exe.",
   "update.install": "Install & restart",
+  "update.open_release_page": "Open release page",
   "update.dismiss": "Later",
   "update.checking": "Checking for updates…",
   "update.up_to_date": "You're on the latest version.",
@@ -363,7 +365,9 @@ const FA: Record<string, string> = {
 
   "update.available_title": "به‌روزرسانی موجود است",
   "update.available_body": "نسخه v{version} آماده نصب است.",
+  "update.available_body_portable": "نسخه v{version} موجود است — صفحهٔ ریلیز را باز کنید و فایل portable .exe جدید را دانلود کنید.",
   "update.install": "نصب و راه‌اندازی مجدد",
+  "update.open_release_page": "باز کردن صفحهٔ ریلیز",
   "update.dismiss": "بعداً",
   "update.checking": "در حال بررسی به‌روزرسانی…",
   "update.up_to_date": "شما در آخرین نسخه هستید.",

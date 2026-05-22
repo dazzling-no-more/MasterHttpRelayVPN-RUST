@@ -72,6 +72,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::version,
+            commands::is_portable_install,
             commands::get_status,
             commands::get_stats,
             commands::get_config,

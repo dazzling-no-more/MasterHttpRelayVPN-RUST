@@ -112,6 +112,15 @@ jobs:
           - target: x86_64-pc-windows-gnu
             os: windows-latest
             name: rahgozar-windows-amd64
+          # ── Windows arm64 (Snapdragon X / Surface Pro X+11, MSVC) ──────────
+          # Native arm64 Windows ships on Copilot+ PCs (2024+). Cross-built
+          # from windows-latest's pre-installed MSVC arm64 toolset (VS 2022
+          # NativeDesktop workload). `aarch64-pc-windows-msvc` is Rust tier-2
+          # with prebuilt std, so `rustup target add` is all the setup it
+          # needs — no MinGW dance like the GNU amd64 leg above.
+          - target: aarch64-pc-windows-msvc
+            os: windows-latest
+            name: rahgozar-windows-arm64
           # ── Linux musl (static, OpenWRT / Alpine / libc-less) ─────────────
           # Built via the messense/rust-musl-cross docker images that
           # ship a complete musl toolchain. ubuntu-latest has docker
@@ -123,6 +132,17 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             name: rahgozar-linux-musl-arm64
+          # ── OpenWRT armv7 (Cortex-A7/A9 routers, hard-float musl) ──────────
+          # Covers a big chunk of mid-2010s+ home routers: ipq40xx, mt7622,
+          # ipq806x (Netgear Nighthawk R7800, GL.iNet Brume/Beryl, TP-Link
+          # Archer C2600, Linksys WRT3200ACM, etc.). The existing
+          # `arm-unknown-linux-gnueabihf` leg is glibc-Raspbian and doesn't
+          # run on OpenWRT (musl). Built via the messense armv7-musleabihf
+          # image — same docker pattern as the amd64/arm64 musl legs above.
+          # tier-2, has prebuilt std, so no `-Z build-std` dance.
+          - target: armv7-unknown-linux-musleabihf
+            os: ubuntu-latest
+            name: rahgozar-openwrt-armv7-musleabihf
           # ── OpenWRT MT7621 (mipsel-softfloat, Rust tier-3) ────────────────
           # Dozens of cheap home routers run this chipset and they
           # *specifically* need the soft-float variant — MT7621 has no
@@ -135,12 +155,31 @@ jobs:
             os: ubuntu-latest
             name: rahgozar-openwrt-mipsel-softfloat
             mipsel_softfloat: true
+          # ── OpenWRT MIPS big-endian (mips-musl soft-float, Rust tier-3) ───
+          # Covers the AR71XX/AR9XXX-era Atheros router platforms still in
+          # active OpenWRT use: TP-Link Archer C7, WDR4300, Ubiquiti
+          # EdgeRouter Lite, etc. Big-endian MIPS32.
+          #
+          # `mips-unknown-linux-musl` is Rust tier-3 AND its target spec
+          # bakes in `+soft-float` — see
+          # https://codebrowser.dev/rust/rust/compiler/rustc_target/src/spec/targets/mips_unknown_linux_musl.rs.html
+          # — so the emitted code is soft-float by default; no extra
+          # RUSTFLAGS dance like the mipsel leg needed. Hence the
+          # `-softfloat` suffix on the artifact name, matching reality.
+          # Same tier-3 treatment as mipsel (nightly + `-Z build-std`
+          # inside messense's mips-musl image) and `continue-on-error:
+          # true` so a regression doesn't block desktop/Android.
+          - target: mips-unknown-linux-musl
+            os: ubuntu-latest
+            name: rahgozar-openwrt-mips-softfloat
+            mips_softfloat: true
 
     runs-on: ${{ matrix.os }}
-    # mipsel-softfloat is best-effort: the Rust tier-3 target occasionally
-    # regresses. Letting it fail keeps the main release going so
-    # desktop/Android users aren't blocked by MT7621 router support.
-    continue-on-error: ${{ matrix.mipsel_softfloat == true }}
+    # Tier-3 musl targets (mipsel-softfloat, mips-softfloat) are best-effort:
+    # nightly Rust occasionally regresses one of them. Letting either fail
+    # keeps the main release going so desktop/Android/CLI users aren't
+    # blocked by router support.
+    continue-on-error: ${{ matrix.mipsel_softfloat == true || matrix.mips_softfloat == true }}
 
     steps:
       # Heal any root-owned leftovers from a previous mipsel docker
@@ -165,10 +204,10 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      # Skip the host-level rustup install for mipsel-softfloat — that
-      # target is tier-3 in stable Rust (no prebuilt stdlib available
-      # via rustup), and the docker image we use for this build ships
-      # its own Rust toolchain + std. Trying to pass
+      # Skip the host-level rustup install for tier-3 musl targets
+      # (mipsel-softfloat, mips-softfloat) — those are tier-3 in stable
+      # Rust (no prebuilt stdlib via rustup), and the docker images we
+      # use ship their own nightly + std. Trying to pass e.g.
       # `targets: mipsel-unknown-linux-musl` to dtolnay/rust-toolchain
       # errors out with "error: component 'rust-std' for target
       # 'mipsel-unknown-linux-musl' is unavailable for download", which
@@ -183,7 +222,7 @@ jobs:
       # entry that required 1.77.2), reintroduce a `matrix.rust_toolchain`
       # override and substitute it for the literal `stable` below.
       - uses: dtolnay/rust-toolchain@master
-        if: matrix.mipsel_softfloat != true
+        if: matrix.mipsel_softfloat != true && matrix.mips_softfloat != true
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
@@ -202,7 +241,7 @@ jobs:
       # error from a stale cargo. We want target/ + registry caching, NOT
       # bin pruning. rustup is pre-installed on the runners anyway.
       - uses: Swatinem/rust-cache@v2
-        if: matrix.mipsel_softfloat != true
+        if: matrix.mipsel_softfloat != true && matrix.mips_softfloat != true
         with:
           key: ${{ matrix.target }}-stable
           cache-bin: "false"
@@ -259,7 +298,12 @@ jobs:
           Add-Content -Path $env:USERPROFILE/.cargo/config.toml -Value "linker = '$gcc'"
 
       - name: Build CLI
-        if: "!endsWith(matrix.target, '-linux-musl')"
+        # Skip ALL musl variants — they each have a dedicated docker step
+        # below. `endsWith(…, '-linux-musl')` used to be the gate, but it
+        # misses `armv7-unknown-linux-musleabihf`; `contains(…, 'musl')`
+        # catches every triple that should go through docker (musl, musleabi,
+        # musleabihf) without false positives on glibc/Darwin/Windows.
+        if: "!contains(matrix.target, 'musl')"
         run: cargo build --release --target ${{ matrix.target }} --bin rahgozar
 
       # Fully-static musl builds for OpenWRT / Alpine / libc-less systems.
@@ -300,6 +344,38 @@ jobs:
                 --target aarch64-unknown-linux-musl --bin tunnel-node
             '
           sudo chown -R "$(id -u):$(id -g)" target tunnel-node/target
+
+      # OpenWRT armv7 hard-float (Cortex-A7/A9). tunnel-node is NOT built
+      # here — the bridge runs on the *exit* node (a real VPS), not on
+      # consumer routers, so it ships only for the amd64/arm64 musl legs.
+      #
+      # Uses the `set +e` + `trap … EXIT` chown pattern from the mipsel /
+      # mips tier-3 legs below: if `docker run` exits non-zero (transient
+      # network pull failure, OOM, regression in messense's image, etc.),
+      # the post-docker `sudo chown` would otherwise be skipped because
+      # bash -e short-circuits on the docker failure. That leaves
+      # target/ root-owned and breaks `actions/checkout@v4` on every
+      # subsequent self-hosted run with EACCES on target/.rustc_info.json
+      # (which is exactly why the "Pre-checkout — clean root-owned
+      # files" step at the top of this job exists as a safety net).
+      # The trap fires on any exit path and brings ownership back to
+      # the runner user; the explicit `exit $rc` propagates the docker
+      # exit code as this step's status so the job still fails when it
+      # should.
+      - name: Build CLI (musl via docker, armv7)
+        if: matrix.target == 'armv7-unknown-linux-musleabihf'
+        run: |
+          set +e
+          trap 'sudo chown -R "$(id -u):$(id -g)" target 2>/dev/null || true' EXIT
+          docker run --rm -v "$PWD":/src -w /src \
+            -e RAHGOZAR_UPDATE_PUBKEY \
+            messense/rust-musl-cross:armv7-musleabihf \
+            bash -c '
+              set -eux
+              cargo build --release --target armv7-unknown-linux-musleabihf --bin rahgozar
+            '
+          rc=$?
+          exit $rc
 
       # OpenWRT MT7621 / mipsel-softfloat. messense doesn't publish a
       # `:mipsel-musl-softfloat` tag — the mipsel-musl image is
@@ -357,6 +433,33 @@ jobs:
           # status (success vs continue-on-error path).
           exit $rc
 
+      # MIPS big-endian soft-float (Atheros AR71XX/AR9XXX routers). Same
+      # tier-3 nightly-+-build-std treatment as mipsel-softfloat above.
+      # No explicit `+soft-float` RUSTFLAGS — the Rust target spec for
+      # `mips-unknown-linux-musl` already pins `features: "+soft-float"`,
+      # so the emitted code is soft-float regardless. Same root-owned-
+      # workspace healing via trap as the mipsel leg.
+      - name: Build CLI (mips-musl via docker)
+        if: matrix.target == 'mips-unknown-linux-musl' && matrix.mips_softfloat == true
+        run: |
+          set +e
+          trap 'sudo chown -R "$(id -u):$(id -g)" target 2>/dev/null || true' EXIT
+          docker run --rm -v "$PWD":/src -w /src \
+            -e RAHGOZAR_UPDATE_PUBKEY \
+            messense/rust-musl-cross:mips-musl \
+            bash -c '
+              set -eux
+              rustup toolchain uninstall nightly 2>/dev/null || true
+              rustup toolchain install nightly --profile minimal
+              rustup component add rust-src --toolchain nightly
+              cargo +nightly build --release \
+                -Z build-std=std,panic_abort \
+                --target mips-unknown-linux-musl \
+                --bin rahgozar
+            '
+          rc=$?
+          exit $rc
+
       # NB: the egui-based `rahgozar-ui` build was retired in v2.4 — the
       # desktop UI moved to Tauri (see the `desktop-build` job below).
       # CLI-only archives are now what this matrix produces; Tauri
@@ -375,8 +478,10 @@ jobs:
           # launchers existed to spawn the egui UI alongside, which is
           # gone in v2.4 (replaced by the Tauri installer from the
           # `desktop` job).
+          # Pattern covers `-linux-musl` (amd64/arm64/mipsel/mips) plus the
+          # armv7 `-linux-musleabihf` variant.
           case "${{ matrix.target }}" in
-            *-linux-musl)
+            *-linux-musl|*-linux-musleabihf)
               cp assets/openwrt/rahgozar.init dist/rahgozar.init
               chmod +x dist/rahgozar.init
               ;;
@@ -406,7 +511,7 @@ jobs:
             *-pc-windows-*)
               7z a -tzip "${{ matrix.name }}.zip" rahgozar.exe
               ;;
-            *-linux-musl)
+            *-linux-musl|*-linux-musleabihf)
               tar czf "${{ matrix.name }}.tar.gz" rahgozar rahgozar.init
               ;;
             *)
@@ -471,9 +576,25 @@ jobs:
               target/release/bundle/macos/*.app.tar.gz
           - os: windows-latest
             name: rahgozar-desktop-windows-amd64
+            # `target/release/bundle/portable/` is staged after `tauri build`
+            # by the "Stage Windows portable exe" step below — it lifts the
+            # unpackaged Tauri binary (`target/release/rahgozar-desktop.exe`)
+            # under a friendly name so users who don't want to run the MSI
+            # installer can just double-click the .exe. Relies on WebView2
+            # being present, which is the case on Windows 10 20H1+ (May 2020)
+            # and every Win11.
+            #
+            # Why `target/release/bundle/portable/` and not just `portable/`:
+            # actions/upload-artifact@v4 strips the longest-common-parent
+            # directory of all matched files. Keeping the staging path under
+            # the same `target/release/bundle/` root as the MSI/NSIS lets
+            # the action strip `target/release/bundle/` uniformly, so the
+            # downloaded layout stays `dist/{msi,nsis,portable}/...` and the
+            # sign / release / commit-releases steps see a consistent shape.
             artifact_paths: |
               target/release/bundle/msi/*.msi
               target/release/bundle/nsis/*.exe
+              target/release/bundle/portable/*.exe
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -560,6 +681,41 @@ jobs:
           # right failure mode while the key is still being staged).
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+
+      # Portable Windows .exe. `tauri build` always emits an unpackaged
+      # binary at `target/release/rahgozar-desktop.exe` alongside the MSI /
+      # NSIS bundles — that's the artifact MSI installs into Program Files.
+      # We lift it under a friendly name so users who don't want an installer
+      # can just double-click the .exe. Implications:
+      #   - Needs WebView2 on the host. Windows 10 20H1+ (May 2020) and all
+      #     Windows 11 ship it; older Win10 users get a clear error and can
+      #     install Edge WebView2 Runtime separately.
+      #   - Not in `latest.json` — Tauri's auto-updater only resolves MSI
+      #     for Windows. Portable users update by visiting the GitHub
+      #     release page (the in-app updater detects portable via the
+      #     `is_portable_install` IPC command and routes accordingly —
+      #     see desktop/src/lib/updater.svelte.ts).
+      #   - IS minisign-signed by the `sign` job below — the loop globs
+      #     `dist/portable/rahgozar-portable-*.exe` alongside the CLI /
+      #     APK archives, and a post-loop assertion fails the job if any
+      #     staged portable .exe didn't get a matching `.minisig`. The
+      #     Tauri bundle sig (`.sig`) that ships with .msi / .app.tar.gz /
+      #     .AppImage is for in-app auto-updates; the minisign `.minisig`
+      #     here is for manual verification by anyone downloading the
+      #     portable directly from the release page.
+      - name: Stage Windows portable exe
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Sibling of msi/ and nsis/ under target/release/bundle/, so
+          # upload-artifact strips the same `target/release/bundle/` prefix
+          # for all three groups and downstream jobs see `dist/portable/...`
+          # in the same shape as `dist/msi/...` / `dist/nsis/...`.
+          $portableDir = "target/release/bundle/portable"
+          New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+          Copy-Item target/release/rahgozar-desktop.exe `
+            "$portableDir/rahgozar-portable-windows-amd64.exe"
+          Get-ChildItem $portableDir
 
       # Updater artifacts: with `bundle.createUpdaterArtifacts: true`
       # in tauri.conf.json, the bundler emits `.sig` files next to
@@ -884,8 +1040,29 @@ jobs:
   # `minisign` because rsign2 cross-installs the same way on every runner
   # we have (Linux self-hosted, Linux GH-hosted) via `cargo install`.
   sign:
-    needs: [build, android]
-    if: ${{ vars.MINISIGN_SIGNING_ENABLED == 'true' }}
+    # `desktop` is in `needs:` purely for ORDERING — sign waits until
+    # desktop finishes so the staged portable .exe artifact is available
+    # to glob over. But desktop failing must NOT cause sign to be
+    # skipped: with signing enabled the release page's pubkey-baked
+    # updater (see src/update_apply.rs::verify_minisig) refuses any
+    # downloaded asset without a matching `.minisig`, so a "sign got
+    # skipped because desktop failed" path would publish CLI+APK with
+    # the right pubkey but no signatures and break every existing
+    # client's auto-update flow.
+    #
+    # The `always()` plus explicit success checks for build/android
+    # decouple sign's RUN decision from desktop's RESULT: sign runs as
+    # long as build+android succeed and signing is enabled, regardless
+    # of desktop's outcome. The for-loop further down uses `[ -f "$f" ]`
+    # so a missing portable .exe (because desktop failed) is silently
+    # skipped — the CLI / APK signatures still get produced and the
+    # release ships consistently-signed.
+    needs: [build, android, desktop]
+    if: |
+      always()
+      && vars.MINISIGN_SIGNING_ENABLED == 'true'
+      && needs.build.result == 'success'
+      && needs.android.result == 'success'
     runs-on: ubuntu-latest
     env:
       RSIGN2_VERSION: 0.6.5
@@ -980,7 +1157,19 @@ jobs:
 
           shopt -s nullglob
           signed=0
-          for f in dist/*.tar.gz dist/*.zip dist/*.apk; do
+          # Globs cover every artifact that ships outside the Tauri bundle
+          # signing chain. `dist/portable/rahgozar-portable-*.exe` is the
+          # Windows portable .exe — it lives nested under `portable/` because
+          # upload-artifact preserves the subdir layout under
+          # `target/release/bundle/`. The MSI/NSIS installers already get
+          # their own `.sig` from `tauri build`'s updater signing and stay
+          # out of this glob deliberately, since mixing two signature
+          # schemes on the same artifact only confuses downstream
+          # verifiers. The portable .exe doesn't get the Tauri sig (it's
+          # the unpackaged binary, not a bundle output), which is why it
+          # specifically needs to be picked up here.
+          for f in dist/*.tar.gz dist/*.zip dist/*.apk \
+                   dist/portable/rahgozar-portable-*.exe; do
             [ -f "$f" ] || continue
             echo "::group::sign $(basename "$f")"
             # `-W` = "this key is NOT password-protected, skip decryption."
@@ -1007,14 +1196,46 @@ jobs:
           done
           echo "signed ${signed} artifacts"
           if [ "${signed}" -eq 0 ]; then
-            echo "::warning::no artifacts matched dist/*.{tar.gz,zip,apk}"
+            echo "::warning::no artifacts matched dist/*.{tar.gz,zip,apk} or dist/portable/rahgozar-portable-*.exe"
+          fi
+
+          # Hard assertion: every staged portable .exe MUST have a
+          # matching .minisig at this point. The for-loop above tolerates
+          # missing files (`[ -f "$f" ] || continue`) — the right behavior
+          # for the optional CLI / APK globs, since a tag-only build that
+          # ran android-only or a partial matrix would otherwise fail
+          # signing for the absent legs. But for the portable .exe we
+          # need a stronger guarantee: any portable binary that DID make
+          # it into dist/ must be signed before publish. Without this,
+          # a future regression that breaks `rsign sign` only for the
+          # portable case (e.g. weird .exe header bytes tripping rsign2,
+          # or a path-quoting bug) would silently ship an unsigned
+          # downloadable binary — re-introducing the same audit-trail
+          # gap the `always()` fix in `sign:if` closed at the job level.
+          # Fail loud here so the release page never shows an unsigned
+          # `rahgozar-portable-*.exe`.
+          shopt -s nullglob
+          unsigned_portable=()
+          for exe in dist/portable/rahgozar-portable-*.exe; do
+            [ -f "$exe" ] || continue
+            if [ ! -f "${exe}.minisig" ]; then
+              unsigned_portable+=( "$exe" )
+            fi
+          done
+          if [ "${#unsigned_portable[@]}" -gt 0 ]; then
+            printf '::error::portable .exe missing minisig: %s\n' \
+              "${unsigned_portable[@]}"
+            exit 1
           fi
 
       - name: Upload signatures
         uses: actions/upload-artifact@v4
         with:
           name: minisign-signatures
-          path: dist/*.minisig
+          # `**` catches the portable .exe's signature nested under
+          # `dist/portable/` alongside the flat `dist/*.minisig` from
+          # CLI / APK signing.
+          path: dist/**/*.minisig
           if-no-files-found: error
 
   # Build + publish the tunnel-node Docker image to GHCR. Issue: every
@@ -1472,6 +1693,7 @@ jobs:
             --pattern '*.dmg' \
             --pattern '*.AppImage' \
             --pattern '*.deb' \
+            --pattern 'rahgozar-portable-*.exe' \
             --pattern 'latest.json'
           echo "--- artifacts/ contents ---"
           ls -la artifacts/
@@ -1494,6 +1716,7 @@ jobs:
             \( -name '*.apk' -o -name '*.tar.gz' -o -name '*.zip' \
                -o -name '*.minisig' -o -name '*.msi' -o -name '*.dmg' \
                -o -name '*.AppImage' -o -name '*.deb' \
+               -o -name '*.exe' \
                -o -name 'latest.json' \) \
             -delete
 
@@ -1508,8 +1731,12 @@ jobs:
           # prefix the desktop matrix produces; one installer format
           # per platform. Users on GitHub-Releases-page-filtered ISPs
           # who hit the in-repo `releases/` fallback get the desktop
-          # UI through this path.
-          for f in artifacts/*.msi artifacts/*.dmg artifacts/*.AppImage artifacts/*.deb; do
+          # UI through this path. The portable Windows .exe is included
+          # via the `rahgozar-portable-*.exe` glob — `gh release download`
+          # already filters out the NSIS installer .exe at fetch time
+          # so we don't have to disambiguate here.
+          for f in artifacts/*.msi artifacts/*.dmg artifacts/*.AppImage artifacts/*.deb \
+                   artifacts/rahgozar-portable-*.exe; do
             [ -f "$f" ] || continue
             cp "$f" "releases/$(basename "$f")"
           done

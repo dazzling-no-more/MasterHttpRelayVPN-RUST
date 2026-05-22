@@ -1,6 +1,6 @@
 [package]
 name = "rahgozar-desktop"
-version = "2.4.0"
+version = "2.6.0"
 description = "rahgozar — DPI bypass via Apps Script relay (Tauri desktop UI)"
 authors = ["dazzling-no-more"]
 license = "MIT"

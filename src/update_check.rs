@@ -419,27 +419,85 @@ fn split_url(url: &str) -> Option<(String, String)> {
 /// Given the GitHub API's `assets` array, pick the one that best matches
 /// this platform + arch. Returns None if nothing reasonable matched.
 fn pick_asset_for_platform(assets: &[serde_json::Value]) -> Option<ReleaseAsset> {
-    pick_asset_for_target(assets, std::env::consts::OS, std::env::consts::ARCH)
+    // `target_env` distinguishes glibc vs musl on linux and gnu/mingw vs
+    // msvc on Windows — critical because a glibc binary will segfault
+    // trying to dlopen ld-musl, and vice versa. `target_endian` separates
+    // mipsel (LE, MT7621) from mips (BE, Atheros AR71XX). Both are baked
+    // at compile time, so every built binary self-updates to its own
+    // flavor and never crosses ABIs.
+    //
+    // We preserve the three distinct `target_env` values rustc actually
+    // emits — "musl", "msvc", "gnu" — rather than collapsing non-musl
+    // to "gnu". Today only `("linux", *)` routes branch on env, so the
+    // Windows arm64 picker (`aarch64-pc-windows-msvc`) and the Windows
+    // amd64 picker (`x86_64-pc-windows-gnu`) both fall through to the
+    // env-agnostic Windows arms regardless. But preserving "msvc"
+    // keeps the running picker honest to what `cfg!(target_env)`
+    // reports at runtime, makes the Windows arm64 test exercise the
+    // same code path as a real native binary, and leaves us a clean
+    // hook for future split (e.g. if we ever ship `*-windows-msvc` vs
+    // `*-windows-gnu` for the same arch).
+    let env = if cfg!(target_env = "musl") {
+        "musl"
+    } else if cfg!(target_env = "msvc") {
+        "msvc"
+    } else {
+        "gnu"
+    };
+    let endian = if cfg!(target_endian = "big") {
+        "big"
+    } else {
+        "little"
+    };
+    pick_asset_for_target(
+        assets,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        env,
+        endian,
+    )
 }
 
-fn asset_preferences(os: &str, arch: &str) -> &'static [&'static [&'static str]] {
+fn asset_preferences(
+    os: &str,
+    arch: &str,
+    env: &str,
+    endian: &str,
+) -> &'static [&'static [&'static str]] {
     // Priority-ordered preference list of name *patterns* — first pattern
     // that matches any asset wins. All matches are case-insensitive
     // substrings.
+    //
+    // For (os, arch) pairs where multiple ABI flavors ship (linux gnu vs
+    // musl, mips little vs big endian), the match guards use `env` /
+    // `endian` to route to the right artifact. Critically we DO NOT fall
+    // back across ABIs — a musl arm binary that grabs raspbian-armhf
+    // would crash on first dlopen against ld-linux-armhf.so.3.
     match (os, arch) {
         // macOS: .app.zip is the nicest user experience (double-click).
         ("macos", "aarch64") => &[&["macos-arm64-app", ".zip"], &["macos-arm64", ".tar.gz"]],
         ("macos", "x86_64") => &[&["macos-amd64-app", ".zip"], &["macos-amd64", ".tar.gz"]],
+        // Windows arm64 is its own MSVC build (Snapdragon X / Surface Pro X+11).
+        // Everything else (x86_64, x86 via WoW64) gets the GNU/MinGW amd64 zip.
+        ("windows", "aarch64") => &[&["windows-arm64", ".zip"]],
         ("windows", _) => &[&["windows-amd64", ".zip"]],
-        ("linux", "aarch64") => &[
-            &["linux-arm64", ".tar.gz"],
-            &["linux-musl-arm64", ".tar.gz"],
-        ],
+        // Linux 64-bit: env picks the glibc (Debian/Ubuntu) build vs the
+        // static musl (OpenWRT/Alpine) build. No cross-env fallback —
+        // see top-level comment.
+        ("linux", "aarch64") if env == "musl" => &[&["linux-musl-arm64", ".tar.gz"]],
+        ("linux", "aarch64") => &[&["linux-arm64", ".tar.gz"]],
+        ("linux", "x86_64") if env == "musl" => &[&["linux-musl-amd64", ".tar.gz"]],
+        ("linux", "x86_64") => &[&["linux-amd64", ".tar.gz"]],
+        // Linux 32-bit ARM: musl ⇒ static OpenWRT armv7 build (ipq40xx /
+        // mt7622 / ipq806x routers); glibc ⇒ Raspbian armhf (Pi 2+).
+        ("linux", "arm") if env == "musl" => &[&["openwrt-armv7-musleabihf", ".tar.gz"]],
         ("linux", "arm") => &[&["raspbian-armhf", ".tar.gz"]],
-        ("linux", "x86_64") => &[
-            &["linux-amd64", ".tar.gz"],
-            &["linux-musl-amd64", ".tar.gz"],
-        ],
+        // Linux 32-bit MIPS: endian disambiguates mipsel (MT7621, etc.)
+        // from mips (Atheros AR71XX/AR9XXX). Both Rust targets emit
+        // soft-float code per the target spec, hence -softfloat in both
+        // artifact names. No glibc variant ships.
+        ("linux", "mips") if endian == "big" => &[&["openwrt-mips-softfloat", ".tar.gz"]],
+        ("linux", "mips") => &[&["openwrt-mipsel-softfloat", ".tar.gz"]],
         // Android: each per-arch APK matches its ABI. Universal is the
         // fallback when no per-arch build is published. The running
         // process's target_arch picks the right one — `Build.SUPPORTED_ABIS[0]`
@@ -463,8 +521,10 @@ fn pick_asset_for_target(
     assets: &[serde_json::Value],
     os: &str,
     arch: &str,
+    env: &str,
+    endian: &str,
 ) -> Option<ReleaseAsset> {
-    for needles in asset_preferences(os, arch) {
+    for needles in asset_preferences(os, arch, env, endian) {
         for a in assets {
             let name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let lower = name.to_ascii_lowercase();
@@ -563,9 +623,185 @@ mod tests {
             ("x86", "rahgozar-android-x86-v1.9.1.apk"),
         ];
         for (arch, expected) in cases {
-            let picked = pick_asset_for_target(arr, "android", arch).expect("should pick");
+            // Android cases don't depend on env/endian — pass placeholders.
+            let picked =
+                pick_asset_for_target(arr, "android", arch, "gnu", "little").expect("should pick");
             assert_eq!(picked.name, expected, "arch={arch}");
         }
+    }
+
+    // A canonical asset list mirroring what a real release page now
+    // produces post the Windows-arm64 / OpenWRT armv7 / MIPS additions.
+    // Helper so the multi-target tests below share one source of truth.
+    fn release_assets_fixture() -> serde_json::Value {
+        serde_json::json!([
+            // Desktop / CLI archives.
+            {"name": "rahgozar-linux-amd64.tar.gz", "browser_download_url": "https://x/lx-amd64", "size": 1},
+            {"name": "rahgozar-linux-arm64.tar.gz", "browser_download_url": "https://x/lx-arm64", "size": 2},
+            {"name": "rahgozar-linux-musl-amd64.tar.gz", "browser_download_url": "https://x/lx-musl-amd64", "size": 3},
+            {"name": "rahgozar-linux-musl-arm64.tar.gz", "browser_download_url": "https://x/lx-musl-arm64", "size": 4},
+            {"name": "rahgozar-raspbian-armhf.tar.gz", "browser_download_url": "https://x/raspbian", "size": 5},
+            {"name": "rahgozar-openwrt-armv7-musleabihf.tar.gz", "browser_download_url": "https://x/owrt-armv7", "size": 6},
+            {"name": "rahgozar-openwrt-mipsel-softfloat.tar.gz", "browser_download_url": "https://x/owrt-mipsel", "size": 7},
+            {"name": "rahgozar-openwrt-mips-softfloat.tar.gz", "browser_download_url": "https://x/owrt-mips", "size": 8},
+            {"name": "rahgozar-windows-amd64.zip", "browser_download_url": "https://x/win-amd64", "size": 9},
+            {"name": "rahgozar-windows-arm64.zip", "browser_download_url": "https://x/win-arm64", "size": 10},
+            {"name": "rahgozar-macos-amd64.tar.gz", "browser_download_url": "https://x/mac-amd64", "size": 11},
+            {"name": "rahgozar-macos-arm64.tar.gz", "browser_download_url": "https://x/mac-arm64", "size": 12},
+        ])
+    }
+
+    #[test]
+    fn pick_asset_windows_arm64_does_not_grab_amd64() {
+        let assets = release_assets_fixture();
+        let arr = assets.as_array().unwrap();
+        // env/endian don't affect Windows arm64 routing — pin to "msvc"/
+        // "little" anyway since that's what a real aarch64-pc-windows-msvc
+        // binary reports at cfg time.
+        let picked = pick_asset_for_target(arr, "windows", "aarch64", "msvc", "little")
+            .expect("should pick");
+        assert_eq!(picked.name, "rahgozar-windows-arm64.zip");
+
+        // And the existing x86_64 path still picks amd64 (regression
+        // guard for the wildcard arm of `("windows", _)`).
+        let picked =
+            pick_asset_for_target(arr, "windows", "x86_64", "gnu", "little").expect("should pick");
+        assert_eq!(picked.name, "rahgozar-windows-amd64.zip");
+    }
+
+    #[test]
+    fn pick_asset_linux_arm_musl_picks_openwrt_not_raspbian() {
+        let assets = release_assets_fixture();
+        let arr = assets.as_array().unwrap();
+        // A musl armv7 OpenWRT binary MUST self-update to the openwrt
+        // musl artifact — replacing it with raspbian-armhf (glibc) would
+        // segfault on the router.
+        let picked =
+            pick_asset_for_target(arr, "linux", "arm", "musl", "little").expect("should pick");
+        assert_eq!(picked.name, "rahgozar-openwrt-armv7-musleabihf.tar.gz");
+
+        // A glibc armhf (Raspberry Pi) binary still goes to raspbian.
+        let picked =
+            pick_asset_for_target(arr, "linux", "arm", "gnu", "little").expect("should pick");
+        assert_eq!(picked.name, "rahgozar-raspbian-armhf.tar.gz");
+    }
+
+    #[test]
+    fn pick_asset_linux_x86_64_respects_env() {
+        let assets = release_assets_fixture();
+        let arr = assets.as_array().unwrap();
+        let gnu =
+            pick_asset_for_target(arr, "linux", "x86_64", "gnu", "little").expect("should pick");
+        assert_eq!(gnu.name, "rahgozar-linux-amd64.tar.gz");
+
+        let musl =
+            pick_asset_for_target(arr, "linux", "x86_64", "musl", "little").expect("should pick");
+        assert_eq!(musl.name, "rahgozar-linux-musl-amd64.tar.gz");
+    }
+
+    #[test]
+    fn pick_asset_linux_aarch64_respects_env() {
+        let assets = release_assets_fixture();
+        let arr = assets.as_array().unwrap();
+        let gnu =
+            pick_asset_for_target(arr, "linux", "aarch64", "gnu", "little").expect("should pick");
+        assert_eq!(gnu.name, "rahgozar-linux-arm64.tar.gz");
+
+        let musl =
+            pick_asset_for_target(arr, "linux", "aarch64", "musl", "little").expect("should pick");
+        assert_eq!(musl.name, "rahgozar-linux-musl-arm64.tar.gz");
+    }
+
+    #[test]
+    fn pick_asset_mips_endianness_separates_artifacts() {
+        let assets = release_assets_fixture();
+        let arr = assets.as_array().unwrap();
+        let little =
+            pick_asset_for_target(arr, "linux", "mips", "musl", "little").expect("should pick");
+        assert_eq!(little.name, "rahgozar-openwrt-mipsel-softfloat.tar.gz");
+
+        let big = pick_asset_for_target(arr, "linux", "mips", "musl", "big").expect("should pick");
+        assert_eq!(big.name, "rahgozar-openwrt-mips-softfloat.tar.gz");
+    }
+
+    // ── No-cross-ABI-fallback invariants ─────────────────────────────────
+    //
+    // These tests pin the *safety* property of the picker: a binary
+    // built for ABI X must NEVER return an asset for ABI Y, even if Y
+    // is the only artifact on the release page. The positive-selection
+    // tests above prove the picker grabs the right asset when both
+    // flavors are present; these prove the picker FAILS CLOSED (returns
+    // None) when only the wrong flavor is available, so the updater
+    // surfaces a clean "no asset matched" instead of downloading a
+    // binary that would segfault on dlopen.
+
+    #[test]
+    fn pick_asset_no_fallback_musl_linux_x86_64_to_glibc() {
+        // Release page is missing the musl amd64 build (build leg
+        // failed); a running musl binary must NOT pick the glibc one.
+        let assets = serde_json::json!([
+            {"name": "rahgozar-linux-amd64.tar.gz", "browser_download_url": "https://x/glibc", "size": 1},
+        ]);
+        let arr = assets.as_array().unwrap();
+        assert!(pick_asset_for_target(arr, "linux", "x86_64", "musl", "little").is_none());
+    }
+
+    #[test]
+    fn pick_asset_no_fallback_glibc_linux_x86_64_to_musl() {
+        let assets = serde_json::json!([
+            {"name": "rahgozar-linux-musl-amd64.tar.gz", "browser_download_url": "https://x/musl", "size": 1},
+        ]);
+        let arr = assets.as_array().unwrap();
+        assert!(pick_asset_for_target(arr, "linux", "x86_64", "gnu", "little").is_none());
+    }
+
+    #[test]
+    fn pick_asset_no_fallback_musl_linux_aarch64_to_glibc() {
+        let assets = serde_json::json!([
+            {"name": "rahgozar-linux-arm64.tar.gz", "browser_download_url": "https://x/glibc", "size": 1},
+        ]);
+        let arr = assets.as_array().unwrap();
+        assert!(pick_asset_for_target(arr, "linux", "aarch64", "musl", "little").is_none());
+    }
+
+    #[test]
+    fn pick_asset_no_fallback_openwrt_arm_to_raspbian() {
+        // Critical: a musl armv7 OpenWRT binary picking up the
+        // Raspbian glibc armhf tarball would segfault on the router on
+        // first dynamic-linker resolution. The picker must return
+        // None here, not the only-available artifact.
+        let assets = serde_json::json!([
+            {"name": "rahgozar-raspbian-armhf.tar.gz", "browser_download_url": "https://x/raspbian", "size": 1},
+        ]);
+        let arr = assets.as_array().unwrap();
+        assert!(pick_asset_for_target(arr, "linux", "arm", "musl", "little").is_none());
+    }
+
+    #[test]
+    fn pick_asset_no_fallback_raspbian_to_openwrt_arm() {
+        let assets = serde_json::json!([
+            {"name": "rahgozar-openwrt-armv7-musleabihf.tar.gz", "browser_download_url": "https://x/owrt", "size": 1},
+        ]);
+        let arr = assets.as_array().unwrap();
+        assert!(pick_asset_for_target(arr, "linux", "arm", "gnu", "little").is_none());
+    }
+
+    #[test]
+    fn pick_asset_no_fallback_mips_endianness() {
+        // Big-endian MIPS must not accept the little-endian artifact —
+        // wrong-endian instructions are gibberish to the CPU decoder.
+        let only_little = serde_json::json!([
+            {"name": "rahgozar-openwrt-mipsel-softfloat.tar.gz", "browser_download_url": "https://x/le", "size": 1},
+        ]);
+        let arr = only_little.as_array().unwrap();
+        assert!(pick_asset_for_target(arr, "linux", "mips", "musl", "big").is_none());
+
+        // Symmetric: little-endian MIPS must not accept the BE artifact.
+        let only_big = serde_json::json!([
+            {"name": "rahgozar-openwrt-mips-softfloat.tar.gz", "browser_download_url": "https://x/be", "size": 1},
+        ]);
+        let arr = only_big.as_array().unwrap();
+        assert!(pick_asset_for_target(arr, "linux", "mips", "musl", "little").is_none());
     }
 
     #[test]

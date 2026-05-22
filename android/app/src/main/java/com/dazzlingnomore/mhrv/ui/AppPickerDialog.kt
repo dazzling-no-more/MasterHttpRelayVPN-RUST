@@ -189,11 +189,31 @@ private fun loadInstalledApps(
     // Only apps that have a launcher entry are user-visible — the rest
     // are content providers, platform helpers, etc. that the user would
     // never want to manually include/exclude.
-    val mainIntent =
+    //
+    // Two queries combined: the standard CATEGORY_LAUNCHER (phone /
+    // tablet home screens) AND CATEGORY_LEANBACK_LAUNCHER (Android TV
+    // home screens — Shield, Mi Box, Chromecast with Google TV). TV-
+    // only apps (a TV-tuned YouTube, a TV streaming client) advertise
+    // ONLY the leanback category; querying just LAUNCHER would silently
+    // drop them from the split-tunnel picker on TV devices. The dedup
+    // via distinctBy { packageName } below absorbs apps that advertise
+    // both (most cross-form apps do).
+    //
+    // Both queries also need a matching `<queries>` intent in
+    // AndroidManifest.xml so PackageManager actually returns metadata
+    // (label, icon) instead of empty stubs under API 30+ visibility
+    // restrictions — see the manifest's `<queries>` block.
+    val launcherIntent =
         android.content
             .Intent(android.content.Intent.ACTION_MAIN)
             .addCategory(android.content.Intent.CATEGORY_LAUNCHER)
-    val resolved = pm.queryIntentActivities(mainIntent, 0)
+    val leanbackIntent =
+        android.content
+            .Intent(android.content.Intent.ACTION_MAIN)
+            .addCategory(android.content.Intent.CATEGORY_LEANBACK_LAUNCHER)
+    val resolved =
+        pm.queryIntentActivities(launcherIntent, 0) +
+            pm.queryIntentActivities(leanbackIntent, 0)
     return resolved
         .asSequence()
         .mapNotNull { it.activityInfo?.applicationInfo }

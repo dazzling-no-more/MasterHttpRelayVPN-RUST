@@ -35,6 +35,25 @@
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <!--
+      Android TV / leanback support. Declaring `software.leanback` with
+      required="false" keeps the SAME APK installable on phones and TV
+      boxes both (Xiaomi MiBox, Nvidia Shield, Chromecast with Google TV,
+      etc.). The matching `hardware.touchscreen` required="false" is
+      mandatory: without it, Play Store + several TV launchers filter the
+      app out on DPad-only devices because Android assumes a touchscreen
+      by default. We don't gate routing on either feature at runtime, so
+      the manifest declaration is the only change needed for sideloaded
+      TV installs (Play Store distribution is moot — rahgozar is a
+      VPN-like proxy that wouldn't pass review anyway).
+    -->
+    <uses-feature
+        android:name="android.software.leanback"
+        android:required="false" />
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+
+    <!--
       App-launcher visibility filter. Complements QUERY_ALL_PACKAGES:
       the system uses `<queries>` as the allowlist for metadata reads
       (labels, icons) so we can render the picker rows with the app
@@ -45,11 +64,25 @@
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent>
+        <!--
+          Mirror entry for Leanback (Android TV) launcher apps — TV-only
+          apps (TV-tuned YouTube, streaming clients) advertise ONLY this
+          category, so without a matching <queries> intent PackageManager
+          returns empty metadata under API 30+ visibility restrictions
+          and they'd appear as blank rows in the split-tunnel app picker.
+          See AppPickerDialog.kt::loadInstalledApps for the corresponding
+          queryIntentActivities() call.
+        -->
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+        </intent>
     </queries>
 
     <application
         android:name=".RahgozarApp"
         android:allowBackup="false"
+        android:banner="@drawable/banner"
         android:dataExtractionRules="@xml/data_extraction_rules"
         android:fullBackupContent="false"
         android:icon="@mipmap/ic_launcher"
@@ -68,6 +101,19 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+            <!-- Android TV launcher entry. Without this, Leanback launchers
+                 (the default home on Nvidia Shield / Mi Box / Chromecast
+                 with Google TV) won't show the app even when the leanback
+                 uses-feature is declared above — they enumerate only
+                 activities advertising LEANBACK_LAUNCHER. We reuse
+                 MainActivity rather than building a separate Leanback
+                 BrowseFragment because the existing Compose UI is
+                 focus-navigable enough for the simple connect/disconnect
+                 flow; a TV-native landing page can come later. -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
             <!-- Deep link: tapping rahgozar://... in any app opens MainActivity
                  and auto-imports the encoded config. -->

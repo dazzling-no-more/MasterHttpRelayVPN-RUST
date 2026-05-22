@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Android TV home-screen banner. Required by Android's TV guidelines
+  (https://developer.android.com/training/tv/get-started/create) for
+  any app declaring a LEANBACK_LAUNCHER intent filter — leanback
+  launchers (Shield TV, Mi Box, Chromecast with Google TV, etc.) tile
+  apps as 320×180 banners on the home row, falling back to a generic
+  placeholder if `android:banner` is unset on the application.
+
+  Design: the same Persian-arch silhouette as the phone launcher icon
+  (see ic_launcher_foreground.xml), centered on a black ground at its
+  original 108-unit size — the icon stays large enough to read on a
+  living-room TV from a few meters away. Vector drawable rather than a
+  PNG in drawable-xhdpi/ keeps the repo binary-asset-free and lets us
+  re-skin from one source if the brand colors ever change.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="320dp"
+    android:height="180dp"
+    android:viewportWidth="320"
+    android:viewportHeight="180">
+    <!-- Solid black background. Matches the mipmap-anydpi-v26 launcher
+         icon's background so a phone user opening this on Android TV
+         (via Quickstep / Take a Tour) doesn't see two different bg colors. -->
+    <path
+        android:fillColor="#000000"
+        android:pathData="M0,0 L320,0 L320,180 L0,180 Z" />
+    <!-- Centered arch. Original path data is authored in a 108×108
+         viewport; translating (106,36) places it dead-center in the
+         320×180 banner (x: (320-108)/2 = 106, y: (180-108)/2 = 36). -->
+    <group
+        android:translateX="106"
+        android:translateY="36">
+        <path
+            android:fillType="evenOdd"
+            android:fillColor="#1ABC9C"
+            android:pathData="M27,80 L27,47 C27,28 81,28 81,47 L81,80 Z M41,80 L41,57 C41,42 67,42 67,57 L67,80 Z" />
+    </group>
+</vector>

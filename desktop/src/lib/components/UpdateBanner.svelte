@@ -46,7 +46,11 @@
         {t("update.available_title")}
       </p>
       <p class="text-success/80 text-xs">
-        {tn("update.available_body", { version: updater.state.version })}
+        {#if updater.state.portable}
+          {tn("update.available_body_portable", { version: updater.state.version })}
+        {:else}
+          {tn("update.available_body", { version: updater.state.version })}
+        {/if}
       </p>
     </div>
     <div class="flex items-center gap-2">
@@ -62,7 +66,11 @@
         onclick={() => updater.installAndRestart()}
         class="bg-success hover:bg-success/90 rounded-md px-4 py-1.5 text-xs font-semibold text-black transition-colors"
       >
-        {t("update.install")}
+        {#if updater.state.portable}
+          {t("update.open_release_page")}
+        {:else}
+          {t("update.install")}
+        {/if}
       </button>
     </div>
   </div>

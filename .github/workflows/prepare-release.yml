@@ -7,15 +7,28 @@
 #   gh workflow run prepare-release.yml -f version=1.6.6
 #
 # What it bumps in the PR:
-#   - Cargo.toml                        version = "X.Y.Z"
-#   - Cargo.lock                        rahgozar entry's version
-#   - android/app/build.gradle.kts      versionName = "X.Y.Z"
-#                                       versionCode = previous + 1
+#   - Cargo.toml                            version = "X.Y.Z"
+#   - Cargo.lock                            rahgozar + rahgozar-desktop entries
+#   - desktop/src-tauri/Cargo.toml          version = "X.Y.Z"
+#   - desktop/src-tauri/tauri.conf.json     version = "X.Y.Z"
+#     (Tauri reads THIS to compose bundle filenames — `rahgozar_X.Y.Z_x64_en-US.msi`,
+#     `rahgozar_X.Y.Z_amd64.AppImage`, etc. If we skip it, every release ships
+#     installer artifacts with the LAST-bumped version baked into their names —
+#     this was the v2.4.0 → v2.6.0 stale-filename bug: the Tauri version was
+#     last bumped manually for the v2.4 desktop migration, then never touched,
+#     so the v2.5.x / v2.6.0 release pages all ended up with `rahgozar_2.4.0_*`
+#     installers despite a clean tag push. The python pass below now keeps
+#     this file in sync with Cargo.toml automatically.)
+#   - android/app/build.gradle.kts          versionName = "X.Y.Z"
+#                                           versionCode = previous + 1
 #
 # What it leaves alone:
 #   - tunnel-node/Cargo.toml — versioned independently from the app.
 #     The docker tunnel image is tagged from the git release tag (not
 #     from this Cargo.toml), so we don't need to touch it.
+#   - desktop/package.json — the npm-side version (`"version": "0.1.0"`)
+#     is not used for bundle naming or any user-visible string; Tauri
+#     ignores it. Left at its placeholder for clarity.
 #
 # What it prefills in docs/changelog/v<version>.md:
 #   - Persian section: an inline `[FA] translate ...` placeholder line.
@@ -90,42 +103,82 @@ jobs:
           echo "version=${VER}" >> "$GITHUB_OUTPUT"
           echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
 
-      - name: Bump Cargo.toml + Cargo.lock
+      - name: Bump Cargo.toml + Cargo.lock + desktop manifests
         env:
           NEW_VER: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
-          # Edit both files via Python so we anchor on the `name = "rahgozar"`
-          # line and only touch the package's own version, not unrelated
-          # `version = "..."` lines elsewhere in the lockfile.
+          # Two passes here:
+          #   1. Cargo.toml + Cargo.lock — bump BOTH crate entries
+          #      (rahgozar at the workspace root + rahgozar-desktop in
+          #      desktop/src-tauri). Regex anchors on `name = "<crate>"`
+          #      so we only touch the package's own version, not the
+          #      hundreds of unrelated `version = "..."` lines elsewhere
+          #      in the lockfile or workspace.
+          #   2. desktop/src-tauri/tauri.conf.json — Tauri uses THIS
+          #      `version` field to compose bundle filenames. Missing
+          #      this bump = MSI/DMG/AppImage/DEB/RPM all ship with the
+          #      previously-bumped version in their names regardless of
+          #      what git tag the release workflow runs on. The v2.4.0
+          #      version persisted across v2.5.x / v2.6.0 release pages
+          #      until this fix landed.
           python3 <<'PY'
-          import os, re, pathlib, sys
+          import json, os, re, pathlib, sys
           ver = os.environ["NEW_VER"]
-          for path in ("Cargo.toml", "Cargo.lock"):
+
+          # ── pass 1: cargo manifests + lockfile ───────────────────────
+          # Each tuple: (path, list of crate names whose entry should be bumped).
+          # Cargo.lock has both crates; Cargo.toml only has rahgozar at the
+          # root; desktop/src-tauri/Cargo.toml only has rahgozar-desktop.
+          # `count=1` per substitution keeps us from accidentally bumping a
+          # transitive dep that happens to share a name (Cargo.lock has none
+          # today, but defense in depth).
+          cargo_targets = (
+              ("Cargo.toml", ("rahgozar",)),
+              ("desktop/src-tauri/Cargo.toml", ("rahgozar-desktop",)),
+              ("Cargo.lock", ("rahgozar", "rahgozar-desktop")),
+          )
+          for path, crates in cargo_targets:
               p = pathlib.Path(path)
               src = p.read_text()
-              new = re.sub(
-                  r'(name = "rahgozar"\nversion = ")[0-9.]+(")',
-                  rf'\g<1>{ver}\g<2>',
-                  src,
-                  count=1,
-              )
-              if new == src:
-                  # No-op can mean two things: (a) the anchor line is
-                  # missing (real error), or (b) the version is already
-                  # at the target — legitimate when an earlier refactor
-                  # pre-bumped the file (e.g. v2.4.0 Tauri migration set
-                  # Cargo.toml to "2.4.0" before the release PR ran).
-                  # Distinguish by re-checking for the exact target line.
-                  if re.search(
-                      rf'name = "rahgozar"\nversion = "{re.escape(ver)}"',
-                      src,
-                  ):
-                      print(f"{path} already at {ver}, no-op")
-                      continue
-                  sys.exit(f"ERROR: rahgozar version line not found in {path}")
-              p.write_text(new)
-              print(f"{path} -> {ver}")
+              original = src
+              for crate in crates:
+                  pat = rf'(name = "{re.escape(crate)}"\nversion = ")[0-9.]+(")'
+                  new = re.sub(pat, rf'\g<1>{ver}\g<2>', src, count=1)
+                  if new == src:
+                      # Either the anchor is missing (real error) or the
+                      # crate is already at the target version (legit
+                      # no-op — happens when an earlier change pre-bumped
+                      # the file).
+                      already = re.search(
+                          rf'name = "{re.escape(crate)}"\nversion = "{re.escape(ver)}"',
+                          src,
+                      )
+                      if already:
+                          print(f"{path} :: {crate} already at {ver}, no-op")
+                          continue
+                      sys.exit(f"ERROR: {crate} version line not found in {path}")
+                  src = new
+                  print(f"{path} :: {crate} -> {ver}")
+              if src != original:
+                  p.write_text(src)
+
+          # ── pass 2: tauri.conf.json ──────────────────────────────────
+          # JSON parse + serialise rather than regex so we don't accidentally
+          # match a `"version"` key inside `plugins.updater.pubkey` (the
+          # pubkey is opaque base64 — no version key inside today, but
+          # treating the file as JSON is the durable choice).
+          tauri_conf = pathlib.Path("desktop/src-tauri/tauri.conf.json")
+          conf = json.loads(tauri_conf.read_text())
+          old = conf.get("version", "<unset>")
+          if old == ver:
+              print(f"{tauri_conf} already at {ver}, no-op")
+          else:
+              conf["version"] = ver
+              # `indent=2` matches the existing file's formatting; the
+              # trailing newline does too (the file is committed with one).
+              tauri_conf.write_text(json.dumps(conf, indent=2) + "\n")
+              print(f"{tauri_conf} -> {ver} (was {old})")
           PY
 
       - name: Bump android versionName + versionCode
@@ -262,7 +315,10 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
-          git add Cargo.toml Cargo.lock android/app/build.gradle.kts \
+          git add Cargo.toml Cargo.lock \
+                  desktop/src-tauri/Cargo.toml \
+                  desktop/src-tauri/tauri.conf.json \
+                  android/app/build.gradle.kts \
                   "docs/changelog/v${NEW_VER}.md"
           git commit -m "release: prepare v${NEW_VER}"
           git push -u origin "$BRANCH"
@@ -281,7 +337,9 @@ jobs:
           Automated version bump for **v${NEW_VER}**.
 
           Bumped in this PR:
-          - \`Cargo.toml\` and \`Cargo.lock\` → ${NEW_VER}
+          - \`Cargo.toml\` and \`Cargo.lock\` → ${NEW_VER} (rahgozar + rahgozar-desktop)
+          - \`desktop/src-tauri/Cargo.toml\` → ${NEW_VER}
+          - \`desktop/src-tauri/tauri.conf.json\` → ${NEW_VER} (drives MSI/DMG/AppImage filenames)
           - \`android/app/build.gradle.kts\` → versionName=${NEW_VER}, versionCode incremented by 1
           - \`docs/changelog/v${NEW_VER}.md\` stubbed; English bullets prefilled from release-drafter's \`next\` draft
 

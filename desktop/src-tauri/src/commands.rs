@@ -112,6 +112,53 @@ pub fn version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// True if the currently-running .exe looks like the Windows portable
+/// build, false otherwise. The JS-side updater (see
+/// `desktop/src/lib/updater.svelte.ts`) uses this to bypass the
+/// auto-install path on portable: `latest.json` maps Windows to MSI, so
+/// `tauri-plugin-updater`'s `downloadAndInstall()` on a portable user
+/// would download the MSI and run the installer alongside the existing
+/// portable .exe — confusing UX. The portable flow instead opens the
+/// release page in the user's browser so they can grab a fresh
+/// `rahgozar-portable-*.exe` manually.
+///
+/// Detection is intentionally narrow — we match on the .exe basename
+/// rather than path heuristics:
+///   - MSI default install path: `%ProgramFiles%\rahgozar\rahgozar.exe`
+///   - NSIS per-user (Tauri default): `%LOCALAPPDATA%\rahgozar\rahgozar.exe`
+///   - MSI per-user: `%LOCALAPPDATA%\Programs\rahgozar\rahgozar.exe`
+///   - Portable: anywhere the user dropped it (Downloads, Desktop, USB)
+///
+/// Path-based detection has too many false positives across those four
+/// install layouts. The portable archive is staged as
+/// `rahgozar-portable-windows-amd64.exe` (see release.yml's "Stage
+/// Windows portable exe" step), so its `file_stem()` reliably contains
+/// the substring `portable`. A user who manually renames the exe to
+/// `rahgozar.exe` is explicitly opting out of portable mode and will
+/// fall through to the auto-update path — at which point they get the
+/// MSI installer; their choice.
+///
+/// On non-Windows platforms there is no portable concept — `.AppImage`
+/// IS portable but Tauri's updater handles AppImage replacement in
+/// place; `.dmg` always installs to /Applications via drag-drop. So
+/// this returns `false` everywhere except Windows.
+#[tauri::command]
+pub fn is_portable_install() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(stem) = exe.file_stem().and_then(|s| s.to_str()) {
+                return stem.to_lowercase().contains("portable");
+            }
+        }
+        false
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        false
+    }
+}
+
 /// Snapshot for the Status tab.
 ///
 /// `uptime_secs` is `None` when stopped; `running` is the source of
