@@ -136,6 +136,19 @@ const H2_OPEN_TIMEOUT_SECS: u64 = 8;
 /// long. Prevents every concurrent caller during an h2 outage from
 /// paying its own full handshake-timeout cost in turn.
 const H2_OPEN_FAILURE_BACKOFF_SECS: u64 = 15;
+/// Cadence for h2 application-level PINGs on the live connection.
+/// Without this, a blackholed TCP socket (RST eaten by middlebox,
+/// common on Iran ISPs for long-lived flows to YouTube / Telegram-web
+/// / x.com) leaves the h2 `Connection` future blocked indefinitely on
+/// a read that never errors. The cell looks "alive" to `ensure_h2`
+/// and every queued request stalls until the app is restarted.
+const H2_PING_INTERVAL: Duration = Duration::from_secs(15);
+/// Budget for the PONG to arrive after a PING is sent. Iran→Google
+/// typical RTT is 200–400 ms; 10 s is ~25× that, generous enough that
+/// transient mobile / WiFi jitter won't false-positive-close a healthy
+/// connection. Combined with `H2_PING_INTERVAL` the worst-case detection
+/// latency for a fully-dead socket is interval + timeout ≈ 25 s.
+const H2_PING_TIMEOUT: Duration = Duration::from_secs(10);
 /// Same idea as `H2_OPEN_TIMEOUT_SECS` but for the legacy h1 socket
 /// path. Without this, a stuck TCP connect or TLS handshake to a
 /// blackholed `connect_host:443` would block `acquire()` (and the
@@ -2139,8 +2152,10 @@ impl DomainFronter {
     /// Open one TLS connection and run the h2 handshake. Returns a
     /// typed `OpenH2Error` so the caller can recognize ALPN refusal
     /// (sticky disable) without string-matching across boundaries.
-    /// The returned `Arc<AtomicBool>` is the death flag the connection
-    /// driver flips when the h2 `Connection` future ends.
+    /// The returned `Arc<AtomicBool>` is the death flag, flipped when
+    /// either the h2 `Connection` future ends (GOAWAY / network error /
+    /// TTL) or the application-level PING loop observes an unanswered
+    /// PONG — see `spawn_h2_driver_with_ping_liveness`.
     async fn open_h2(
         &self,
     ) -> Result<(h2::client::SendRequest<Bytes>, Arc<AtomicBool>, Arc<String>), OpenH2Error> {
@@ -2182,21 +2197,79 @@ impl DomainFronter {
             .handshake(tls)
             .await
             .map_err(|e| OpenH2Error::Handshake(e.to_string()))?;
-        // The connection task drives frame I/O independently of any
-        // SendRequest handle. When it ends (GOAWAY, network error, TTL),
-        // we flip the `dead` flag so `ensure_h2` and `run_pool_refill`
-        // can react within one refill tick instead of waiting for a
-        // request to discover the breakage via `ready()` failure.
+        let dead =
+            Self::spawn_h2_driver_with_ping_liveness(conn, H2_PING_INTERVAL, H2_PING_TIMEOUT);
+        tracing::info!("h2 connection established to relay edge");
+        Ok((send, dead))
+    }
+
+    /// Spawn the h2 connection driver task with application-level PING
+    /// liveness. Returns the `dead` flag that gets flipped when either
+    /// the driver future ends (GOAWAY / network error / TTL) OR the
+    /// pinger observes an unanswered PONG.
+    ///
+    /// The PingPong handle MUST be taken before `conn` is moved into
+    /// the spawn — h2 0.4 only hands one out per connection and the API
+    /// requires `&mut self`.
+    ///
+    /// Generic over the I/O type so tests can wire this up against a
+    /// plain-TCP h2c connection without needing a TLS mock. Production
+    /// callers always pass `PooledStream` (TLS).
+    ///
+    /// `interval` / `timeout` are arguments rather than the constants
+    /// directly so tests can pass millisecond values and assert the
+    /// timing behavior without burning the full 25 s real-clock window.
+    fn spawn_h2_driver_with_ping_liveness<T>(
+        mut conn: h2::client::Connection<T, Bytes>,
+        interval: Duration,
+        timeout: Duration,
+    ) -> Arc<AtomicBool>
+    where
+        T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
+        let ping_pong = conn.ping_pong();
         let dead = Arc::new(AtomicBool::new(false));
         let dead_for_driver = dead.clone();
         tokio::spawn(async move {
-            if let Err(e) = conn.await {
-                tracing::debug!("h2 connection closed: {}", e);
+            let driver = async {
+                if let Err(e) = conn.await {
+                    tracing::debug!("h2 connection closed: {}", e);
+                }
+            };
+            let pinger = async {
+                let Some(mut pp) = ping_pong else {
+                    std::future::pending::<()>().await;
+                    return;
+                };
+                loop {
+                    tokio::time::sleep(interval).await;
+                    let started = Instant::now();
+                    match tokio::time::timeout(timeout, pp.ping(h2::Ping::opaque())).await {
+                        Ok(Ok(_)) => {
+                            tracing::debug!("h2 ping ok ({} ms)", started.elapsed().as_millis());
+                            continue;
+                        }
+                        Ok(Err(e)) => {
+                            tracing::debug!("h2 ping error: {} — closing connection", e);
+                            return;
+                        }
+                        Err(_) => {
+                            tracing::warn!(
+                                "h2 ping unanswered after {:?} — closing stale connection",
+                                timeout
+                            );
+                            return;
+                        }
+                    }
+                }
+            };
+            tokio::select! {
+                _ = driver => {}
+                _ = pinger => {}
             }
             dead_for_driver.store(true, Ordering::Relaxed);
         });
-        tracing::info!("h2 connection established to relay edge");
-        Ok((send, dead))
+        dead
     }
 
     /// React to an h2-fronting-incompatibility HTTP response (status
@@ -10034,6 +10107,103 @@ hello";
             "must return immediately without open attempt; took {:?}",
             t0.elapsed()
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h2_pinger_marks_dead_when_peer_stops_responding_to_pings() {
+        // The whole reason for the pinger: a middlebox can silently
+        // swallow long-lived TCP traffic (no RST, no FIN), leaving the
+        // h2 driver future blocked on a read that never errors. Without
+        // the pinger the cell looks alive forever and `ensure_h2` keeps
+        // handing out a poisoned SendRequest until the user restarts
+        // the app. With the pinger, an unanswered PONG flips `dead`
+        // within `interval + timeout`.
+        //
+        // We use real (sub-second) timings here rather than the
+        // production-tuned 15 s / 10 s — `tokio::time::pause()` would
+        // require real socket I/O to also be virtual, which it isn't.
+        // The helper is parameterized on interval / timeout precisely
+        // to keep this test deterministic and fast.
+        let interval = Duration::from_millis(100);
+        let timeout = Duration::from_millis(200);
+
+        let (addr, server) = spawn_silent_h2c_server().await;
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (_send, conn) = h2::client::handshake(stream).await.unwrap();
+        let dead = DomainFronter::spawn_h2_driver_with_ping_liveness(conn, interval, timeout);
+        assert!(
+            !dead.load(Ordering::Relaxed),
+            "dead must start false on a fresh connection"
+        );
+
+        // Wait past `interval + timeout + slack`. Pinger sends the
+        // first PING after `interval`, then the `timeout` future fires
+        // because the silent server never PONGs. `select!` resolves on
+        // the pinger branch, dead.store(true) runs.
+        tokio::time::sleep(interval + timeout + Duration::from_millis(300)).await;
+
+        assert!(
+            dead.load(Ordering::Relaxed),
+            "pinger must flip `dead` after the silent peer fails to send PONG"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn h2_pinger_stays_quiet_on_responsive_peer() {
+        // Symmetric negative test: against a server that DOES process
+        // frames (the regular h2c server, which auto-PONGs PINGs), the
+        // pinger must never flip `dead`. Guards against tuning the
+        // timeout so tight that healthy connections false-positive
+        // close, and against any future change that breaks the
+        // pinger's `Ok(Ok(_))` continue branch.
+        //
+        // Generous timeout (5 s) on purpose: a stressed CI runner could
+        // delay a local PONG round-trip past a tight cap and false-fail
+        // this test. The interval stays short to keep the test fast.
+        let interval = Duration::from_millis(100);
+        let timeout = Duration::from_secs(5);
+
+        let (addr, server) = spawn_h2c_server(|_req| {
+            let resp = http::Response::builder().status(200).body(()).unwrap();
+            (resp, Vec::new())
+        })
+        .await;
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (_send, conn) = h2::client::handshake(stream).await.unwrap();
+        let dead = DomainFronter::spawn_h2_driver_with_ping_liveness(conn, interval, timeout);
+
+        // Five PING cycles. A responsive server PONGs immediately,
+        // pinger logs `h2 ping ok`, loops. `dead` must stay false.
+        tokio::time::sleep(interval * 5 + Duration::from_millis(100)).await;
+        assert!(
+            !dead.load(Ordering::Relaxed),
+            "responsive peer must not cause the pinger to flip `dead`"
+        );
+
+        server.abort();
+    }
+
+    /// Spawn a TCP listener that completes the h2 server handshake but
+    /// then stops processing frames — holding the connection without
+    /// polling. The TCP socket stays open (we still own the
+    /// `connection`), so client PINGs are written to the wire, but the
+    /// server never reads or responds to them. Simulates the silent-drop
+    /// middlebox behavior we're trying to defend against on Iran ISPs.
+    async fn spawn_silent_h2c_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let (sock, _) = listener.accept().await.unwrap();
+            // `handshake` only completes after the initial SETTINGS
+            // exchange; after that we suspend without polling
+            // `connection` further, which freezes frame processing on
+            // this side while keeping the TCP socket alive.
+            let _connection = h2::server::handshake(sock).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        (addr, handle)
     }
 
     /// Spawn a minimal local h2c server (plaintext h2, no TLS) on a
