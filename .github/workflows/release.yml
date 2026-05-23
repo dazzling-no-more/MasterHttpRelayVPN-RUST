@@ -155,31 +155,45 @@ jobs:
             os: ubuntu-latest
             name: rahgozar-openwrt-mipsel-softfloat
             mipsel_softfloat: true
-          # ── OpenWRT MIPS big-endian (mips-musl soft-float, Rust tier-3) ───
-          # Covers the AR71XX/AR9XXX-era Atheros router platforms still in
-          # active OpenWRT use: TP-Link Archer C7, WDR4300, Ubiquiti
-          # EdgeRouter Lite, etc. Big-endian MIPS32.
+          # ── OpenWRT MIPS big-endian (mips-musl soft-float) — DROPPED ───────
+          # `mips-unknown-linux-musl` (covers Atheros AR71XX/AR9XXX-era
+          # routers: TP-Link Archer C7, WDR4300, Ubiquiti EdgeRouter Lite)
+          # is dropped from the matrix as of v2.7.x. The build was added
+          # in d2376f4 but never produced a successful artifact — the
+          # underlying messense/rust-musl-cross:mips-musl image is broken
+          # for `-nostartfiles -nodefaultlibs` linking (which is what
+          # rustc emits): gcc forwards `crt1.o` / `crti.o` / `crtbegin.o`
+          # to ld as positional relative names, and the bundled ld
+          # doesn't search the gcc-internal `-L` paths for positional
+          # `.o` arguments. crt1.o exists at
+          # /usr/local/musl/mips-unknown-linux-musl/lib/crt1.o but ld
+          # refuses to find it. Confirmed reproducible OUTSIDE Rust with
+          # a plain C hello-world plus the same gcc flags Rust uses.
+          # The mipsel-musl image (kept) doesn't have the bug — Rust's
+          # mipsel link path differs subtly upstream. libunwind is also
+          # missing from the mips-musl image entirely.
           #
-          # `mips-unknown-linux-musl` is Rust tier-3 AND its target spec
-          # bakes in `+soft-float` — see
-          # https://codebrowser.dev/rust/rust/compiler/rustc_target/src/spec/targets/mips_unknown_linux_musl.rs.html
-          # — so the emitted code is soft-float by default; no extra
-          # RUSTFLAGS dance like the mipsel leg needed. Hence the
-          # `-softfloat` suffix on the artifact name, matching reality.
-          # Same tier-3 treatment as mipsel (nightly + `-Z build-std`
-          # inside messense's mips-musl image) and `continue-on-error:
-          # true` so a regression doesn't block desktop/Android.
-          - target: mips-unknown-linux-musl
-            os: ubuntu-latest
-            name: rahgozar-openwrt-mips-softfloat
-            mips_softfloat: true
+          # Fixes attempted before dropping:
+          #   1. Symlinked the missing sysroot dir into place.
+          #   2. Bypassed the gcc wrapper with the bare binary name.
+          #   3. find-based RUSTFLAGS=-B/-L crt-path injection.
+          # None work because the root cause is ld's positional-arg
+          # behavior, not a path issue we can paper over from outside.
+          # The real fix needs either a new docker image (~weeks) or
+          # patching messense/rust-musl-cross upstream.
+          #
+          # AR71XX hardware is 15+ years old; users on that hardware
+          # can build from source on the device or cross-compile with
+          # their own toolchain. The maintenance cost of keeping a
+          # red X on every release outweighs the audience size.
 
     runs-on: ${{ matrix.os }}
-    # Tier-3 musl targets (mipsel-softfloat, mips-softfloat) are best-effort:
-    # nightly Rust occasionally regresses one of them. Letting either fail
-    # keeps the main release going so desktop/Android/CLI users aren't
-    # blocked by router support.
-    continue-on-error: ${{ matrix.mipsel_softfloat == true || matrix.mips_softfloat == true }}
+    # The tier-3 mipsel-softfloat target is best-effort: nightly Rust
+    # occasionally regresses it. Letting it fail keeps the main release
+    # going so desktop/Android/CLI users aren't blocked by router support.
+    # (mips big-endian soft-float was dropped — see the matrix entry
+    # above for why.)
+    continue-on-error: ${{ matrix.mipsel_softfloat == true }}
 
     steps:
       # Heal any root-owned leftovers from a previous mipsel docker
@@ -204,14 +218,14 @@ jobs:
 
       - uses: actions/checkout@v4
 
-      # Skip the host-level rustup install for tier-3 musl targets
-      # (mipsel-softfloat, mips-softfloat) — those are tier-3 in stable
-      # Rust (no prebuilt stdlib via rustup), and the docker images we
-      # use ship their own nightly + std. Trying to pass e.g.
-      # `targets: mipsel-unknown-linux-musl` to dtolnay/rust-toolchain
-      # errors out with "error: component 'rust-std' for target
-      # 'mipsel-unknown-linux-musl' is unavailable for download", which
-      # fails the job before the docker step ever runs.
+      # Skip the host-level rustup install for the tier-3 mipsel-softfloat
+      # target — that's tier-3 in stable Rust (no prebuilt stdlib via
+      # rustup), and the docker image we use ships its own nightly + std.
+      # Trying to pass `targets: mipsel-unknown-linux-musl` to
+      # dtolnay/rust-toolchain errors out with "error: component
+      # 'rust-std' for target 'mipsel-unknown-linux-musl' is unavailable
+      # for download", which fails the job before the docker step ever
+      # runs.
       #
       # On self-hosted this action is mostly a no-op: rustup is already
       # installed and the standard target triples are pre-added. It
@@ -222,7 +236,7 @@ jobs:
       # entry that required 1.77.2), reintroduce a `matrix.rust_toolchain`
       # override and substitute it for the literal `stable` below.
       - uses: dtolnay/rust-toolchain@master
-        if: matrix.mipsel_softfloat != true && matrix.mips_softfloat != true
+        if: matrix.mipsel_softfloat != true
         with:
           toolchain: stable
           targets: ${{ matrix.target }}
@@ -241,7 +255,7 @@ jobs:
       # error from a stale cargo. We want target/ + registry caching, NOT
       # bin pruning. rustup is pre-installed on the runners anyway.
       - uses: Swatinem/rust-cache@v2
-        if: matrix.mipsel_softfloat != true && matrix.mips_softfloat != true
+        if: matrix.mipsel_softfloat != true
         with:
           key: ${{ matrix.target }}-stable
           cache-bin: "false"
@@ -439,27 +453,7 @@ jobs:
       # `mips-unknown-linux-musl` already pins `features: "+soft-float"`,
       # so the emitted code is soft-float regardless. Same root-owned-
       # workspace healing via trap as the mipsel leg.
-      - name: Build CLI (mips-musl via docker)
-        if: matrix.target == 'mips-unknown-linux-musl' && matrix.mips_softfloat == true
-        run: |
-          set +e
-          trap 'sudo chown -R "$(id -u):$(id -g)" target 2>/dev/null || true' EXIT
-          docker run --rm -v "$PWD":/src -w /src \
-            -e RAHGOZAR_UPDATE_PUBKEY \
-            messense/rust-musl-cross:mips-musl \
-            bash -c '
-              set -eux
-              rustup toolchain uninstall nightly 2>/dev/null || true
-              rustup toolchain install nightly --profile minimal
-              rustup component add rust-src --toolchain nightly
-              cargo +nightly build --release \
-                -Z build-std=std,panic_abort \
-                --target mips-unknown-linux-musl \
-                --bin rahgozar
-            '
-          rc=$?
-          exit $rc
-
+      #
       # NB: the egui-based `rahgozar-ui` build was retired in v2.4 — the
       # desktop UI moved to Tauri (see the `desktop-build` job below).
       # CLI-only archives are now what this matrix produces; Tauri
