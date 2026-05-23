@@ -1552,46 +1552,44 @@ jobs:
       - name: List downloaded artifacts
         run: ls -la dist/
 
-      # Compose the GitHub release body from `docs/changelog/v<ver>.md`
-      # so the Releases page tells humans what actually changed —
-      # `generate_release_notes: true` alone produces "Full Changelog:
-      # …compare/v1.x.0...v1.x.1" which is empty when no PRs landed
-      # between tags (e.g. for fix-forward releases like v1.4.1). The
-      # changelog file already exists for every release in our format
-      # (Persian section, then `---`, then English section); we wrap it
-      # with a header and append the auto-generated commit list at the
-      # bottom by NOT setting body_path and instead setting body
-      # directly to changelog_content + (the existing
-      # generate_release_notes flag handles the trailing comparison
-      # link automatically).
+      # Compose the GitHub Release body. Three sections, top to bottom:
+      #   1. ## Install         — quick-pick install lines per platform
+      #   2. (bilingual changelog from docs/changelog/v<ver>.md)
+      #   3. ## Download        — flat table of every binary asset
+      # Signatures + latest.json are uploaded but intentionally NOT listed
+      # in the body (uv-style; they're verification artifacts and add
+      # visual noise without giving users a useful choice).
+      #
+      # The composition itself lives in
+      # `.github/scripts/compose_release_body.py` — kept out of the YAML
+      # so a non-trivial Python script can be edited, linted, and dry-run
+      # locally without round-tripping through CI. See its module docstring
+      # for the asset-categorisation rules.
+      #
+      # `softprops/action-gh-release`'s `generate_release_notes: true`
+      # appends GitHub's auto "What's Changed" + "Full Changelog: …"
+      # block AFTER our composed body. We deliberately do NOT pass
+      # `append_body: true` — that would stack our body on top of the
+      # existing release body on every workflow_dispatch re-publish.
       - name: Compose release body
         id: relbody
+        env:
+          VERSION: ${{ inputs.version && format('{0}', inputs.version) || github.ref_name }}
+          REPO_PATH: ${{ github.repository }}
         run: |
-          VER="${{ inputs.version || github.ref_name }}"
-          VER="${VER#v}"
+          set -euo pipefail
+          VER="${VERSION#v}"
           CHANGELOG="docs/changelog/v${VER}.md"
           if [ ! -f "$CHANGELOG" ]; then
             echo "::warning::no changelog at $CHANGELOG; release body will fall back to generate_release_notes only"
             echo "has_changelog=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          BODY=$(CHANGELOG_PATH="$CHANGELOG" VERSION="$VER" REPO_PATH="$REPO_PATH" \
+                 python3 .github/scripts/compose_release_body.py)
           {
             echo 'body<<__RELEASE_BODY_EOF__'
-            # Strip leading HTML comment blocks (single-line OR multi-line)
-            # so the GitHub Release page sees only the body content, not
-            # the file-format header comment that every changelog has.
-            # Also strips any leading whitespace/blank lines that follow.
-            #
-            # Quoted heredoc (`<<'PY'`) so backticks/$ in the python
-            # snippet aren't shell-interpolated; CHANGELOG is passed in
-            # as an env var on the python invocation rather than via
-            # `$CHANGELOG` interpolation inside the heredoc.
-            CHANGELOG_PATH="$CHANGELOG" python3 - <<'PY'
-          import os, re, pathlib
-          body = pathlib.Path(os.environ["CHANGELOG_PATH"]).read_text(encoding="utf-8")
-          print(re.sub(r"^\s*(?:<!--.*?-->\s*)+", "", body, count=1, flags=re.S), end="")
-          PY
-            echo
+            printf '%s\n' "$BODY"
             echo '__RELEASE_BODY_EOF__'
           } >> "$GITHUB_OUTPUT"
           echo "has_changelog=true" >> "$GITHUB_OUTPUT"
@@ -1614,13 +1612,21 @@ jobs:
           # the CLI / APK files at the top level and silently skip the
           # installers.
           files: dist/**/*
-          # Append auto-generated comparison link AFTER our changelog
-          # body — `append_body: true` puts our body first, then the
-          # auto notes. If no changelog file existed, body is empty and
-          # the auto notes carry the whole release-page content (same
-          # behavior as before this change).
+          # `generate_release_notes: true` with `body:` set produces
+          # `<body><auto-notes>` as the final release body — body is
+          # prepended, GitHub's auto "What's Changed / Full Changelog"
+          # comparison link is appended. We deliberately do NOT pass
+          # `append_body: true` here: it would append the combined
+          # `<body><auto-notes>` to whatever body the release already
+          # has, which for `workflow_dispatch` re-publishes on an
+          # existing release duplicates everything (every dispatch
+          # would balloon the body further). For fresh tag pushes the
+          # existing body is empty, so replace (default) and append
+          # are equivalent — replace is the safer of the two. Found
+          # the hard way when the v2.7.0 release-body redesign was
+          # tested via workflow_dispatch and rendered the old + new
+          # body back-to-back.
           body: ${{ steps.relbody.outputs.body }}
-          append_body: true
           generate_release_notes: true
 
   # Refresh the in-repo `releases/` folder with the latest pre-built
