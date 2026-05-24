@@ -41,7 +41,7 @@ bytes = "1"
 # `reqwest::Client` is part of the `TokenCache` API (it threads the
 # same client through OAuth refresh + Drive REST calls). Matches the
 # version pinned in the root rahgozar crate.
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "gzip", "stream", "query"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "gzip", "stream", "query", "http2"] }
 # `time::OffsetDateTime` is what `DriveFile::modified_time` parses
 # into; the orphan reaper compares against `now()`.
 time = "0.3"

@@ -152,7 +152,7 @@ bech32 = "0.11"
 # returns gzip-compressed responses, `stream` for
 # `Response::bytes_stream()` (forthcoming `files.get` downloads in
 # `drive_api`).
-reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "gzip", "stream", "query"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "gzip", "stream", "query", "http2"] }
 
 # Path-dep on the in-workspace `drive-wire` crate so client (this
 # crate) and relay (forthcoming `drive-relay/`) reuse the same

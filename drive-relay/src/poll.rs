@@ -22,10 +22,13 @@
 //! - **Pipeline mode**: after any non-empty cycle, drop the
 //!   interval to 100 ms for the next cycle. Catches burst traffic
 //!   without paying the baseline latency.
-//! - **Idle backoff**: each consecutive empty cycle adds 200 ms,
-//!   capped at 5 s. An idle session-less relay polls Drive twice
-//!   per 10 s instead of three times per second — saves quota
-//!   for the next active session that lands.
+//! - **Idle backoff**: only applies when the session table is
+//!   empty. Each consecutive empty session-less cycle adds 200 ms,
+//!   capped at 1.5 s — saves Drive quota while still picking up a
+//!   fresh Hello within ~1.5 s of it landing on Drive. With at
+//!   least one active session, every empty cycle stays at baseline
+//!   so c2r traffic doesn't pay multi-second tail latency for the
+//!   first frame after a brief lull.
 //!
 //! ## Ordering
 //!
@@ -40,9 +43,8 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
 use drive_wire::filename::{parse_filename, Direction, DriveFilename, FilenameKind};
-use drive_wire::frame::WireFrame;
+use drive_wire::frame::Batch;
 use rahgozar::drive_api::{DriveApiError, DriveFile, MAX_SEALED_FRAME_BODY_BYTES};
 use rahgozar::drive_crypto::{
     AeadCipher, HelloBody, ReplayWindow, SessionKeys, StrictSeqError, HELLO_BODY_LEN,
@@ -50,15 +52,23 @@ use rahgozar::drive_crypto::{
 use tokio::sync::{mpsc, Mutex, Semaphore};
 use tokio::task::JoinSet;
 
-use crate::state::{frame_to_inbound, RelayState, SessionHandle};
+use crate::state::{frame_to_inbound, InboundFrame, RelayState, SessionHandle};
 
 /// 100 ms after a non-empty cycle — catches bursts without paying
 /// the baseline latency on the next inbound batch.
 const PIPELINE_INTERVAL_MS: u64 = 100;
 /// Each empty cycle adds 200 ms to the next sleep.
 const IDLE_BACKOFF_STEP_MS: u64 = 200;
-/// Max idle sleep — caps the worst-case "no traffic" wake-up cost.
-const MAX_IDLE_INTERVAL_MS: u64 = 5_000;
+/// Cap on the idle sleep. Only reached when the session table is
+/// empty (no in-flight CONNECTs) — see `adapt_interval`. Lowered
+/// from 5 s to 1.5 s now that the cursor-mode list query is cheap
+/// enough that the QPS savings of a 5 s cap aren't worth the
+/// first-Hello wake-up tax it imposed on cold-start sessions.
+const MAX_IDLE_INTERVAL_MS: u64 = 1_500;
+/// Match Skirk's fresh-list lookback so delayed Drive visibility
+/// cannot strand an older missing seq behind an exact modifiedTime
+/// cursor.
+const MODIFIED_CURSOR_LOOKBACK_SECS: i64 = 8;
 
 /// Mailbox depth between the poll worker and a per-session driver
 /// task. Small enough to apply back-pressure if the driver falls
@@ -71,6 +81,14 @@ pub async fn poll_loop(state: Arc<RelayState>) {
     let work_permits = Arc::new(Semaphore::new(state.cfg.max_concurrent_dials as usize));
     let mut interval_ms = baseline_ms;
     let mut empty_streak: u64 = 0;
+    // Sliding modifiedTime cursors, one per listing query — the relay
+    // lists h_* (Hellos) and c2r_* (frames) separately in parallel.
+    // None on the first call (full folder list); subsequent calls
+    // get only the recent delta with an 8s lookback. This keeps list
+    // calls bounded without missing files whose Drive visibility is
+    // delayed behind a newer seq.
+    let mut hello_cursor: Option<String> = None;
+    let mut frame_cursor: Option<String> = None;
 
     tracing::info!(
         "poll loop starting (baseline={}ms, max_concurrent={})",
@@ -80,18 +98,74 @@ pub async fn poll_loop(state: Arc<RelayState>) {
 
     loop {
         tokio::time::sleep(Duration::from_millis(interval_ms)).await;
-        let found_work = run_one_cycle(state.clone(), work_permits.clone()).await;
-        interval_ms = adapt_interval(baseline_ms, found_work, &mut empty_streak);
+        let found_work = run_one_cycle(
+            state.clone(),
+            work_permits.clone(),
+            &mut hello_cursor,
+            &mut frame_cursor,
+        )
+        .await;
+        // While ≥1 session is registered, c2r traffic is expected —
+        // back-off would just add per-frame tail latency. The ramp
+        // only fires when the relay is genuinely idle (no sessions);
+        // a fresh Hello still gets picked up within MAX_IDLE_INTERVAL_MS.
+        let sessions_present = !state.sessions.read().await.is_empty();
+        interval_ms = adapt_interval(baseline_ms, found_work, &mut empty_streak, sessions_present);
+    }
+}
+
+/// Advance a sliding `modifiedTime >= since` cursor.
+///
+/// `now` is the wall-clock timestamp captured BEFORE the list call.
+/// It lets us move the cursor forward even on empty listings, which
+/// is load-bearing: with `since=None` the query path falls back to
+/// Drive's slow `name contains` full-text index (multi-second
+/// visibility lag for newly uploaded mailbox files). Once a cursor
+/// is set, subsequent calls use the much-faster `modifiedTime >= ...`
+/// recently-modified-children query. The 8s lookback preserves
+/// Skirk's safety margin against out-of-order Drive visibility.
+fn advance_modified_cursor(
+    files: &[DriveFile],
+    cursor: &mut Option<String>,
+    now: time::OffsetDateTime,
+) {
+    let file_max = files.iter().filter_map(|f| f.modified_time).max();
+    let basis = match file_max {
+        Some(m) if m > now => m,
+        _ => now,
+    };
+    let proposed = basis - time::Duration::seconds(MODIFIED_CURSOR_LOOKBACK_SECS);
+    let current = cursor.as_deref().and_then(|s| {
+        time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
+    });
+    if current.is_some_and(|c| c >= proposed) {
+        return;
+    }
+    if let Ok(formatted) = proposed.format(&time::format_description::well_known::Rfc3339) {
+        *cursor = Some(formatted);
     }
 }
 
 /// Adaptive-interval computation, factored out for unit testing.
-/// On `found_work`: drop to pipeline interval. On empty: ramp
-/// `baseline + step * empty_streak`, capped.
-pub(crate) fn adapt_interval(baseline_ms: u64, found_work: bool, empty_streak: &mut u64) -> u64 {
+/// - `found_work`: drop to pipeline interval, reset the streak.
+/// - empty cycle with `sessions_present`: stay at baseline. Active
+///   sessions expect c2r traffic; idle backoff would add seconds of
+///   tail latency for nothing.
+/// - empty cycle with no sessions: ramp `baseline + step * streak`,
+///   capped at `MAX_IDLE_INTERVAL_MS`. Fresh Hellos still land in
+///   at most one cap-length poll.
+pub(crate) fn adapt_interval(
+    baseline_ms: u64,
+    found_work: bool,
+    empty_streak: &mut u64,
+    sessions_present: bool,
+) -> u64 {
     if found_work {
         *empty_streak = 0;
         PIPELINE_INTERVAL_MS
+    } else if sessions_present {
+        *empty_streak = 0;
+        baseline_ms
     } else {
         *empty_streak = empty_streak.saturating_add(1);
         baseline_ms
@@ -103,7 +177,12 @@ pub(crate) fn adapt_interval(baseline_ms: u64, found_work: bool, empty_streak: &
 /// Run one poll iteration. Returns true iff at least one Hello or
 /// frame file was processed (used by the caller to drive the
 /// adaptive interval).
-async fn run_one_cycle(state: Arc<RelayState>, permits: Arc<Semaphore>) -> bool {
+async fn run_one_cycle(
+    state: Arc<RelayState>,
+    permits: Arc<Semaphore>,
+    hello_cursor: &mut Option<String>,
+    frame_cursor: &mut Option<String>,
+) -> bool {
     let access_token = match state.token_cache.get().await {
         Ok(t) => t,
         Err(e) => {
@@ -113,14 +192,28 @@ async fn run_one_cycle(state: Arc<RelayState>, permits: Arc<Semaphore>) -> bool 
     };
 
     // Parallel list: Hellos + frames. Each call costs 1 QPS; running
-    // them concurrently halves wall-clock per cycle.
+    // them concurrently halves wall-clock per cycle. Both lists use
+    // their own sliding modifiedTime cursors so we only fetch new
+    // files since the previous successful cycle.
+    //
+    // Capture `now` BEFORE the join so `advance_modified_cursor` can
+    // safely move forward when a listing returns empty — otherwise
+    // the slow `name contains` path (used when cursor is None) never
+    // gets swapped for the fast recently-modified-children query.
+    let call_start = time::OffsetDateTime::now_utc();
     let (hello_result, frame_result) = tokio::join!(
-        state
-            .drive_api
-            .list_files_in_folder(&access_token, &state.cfg.folder_id, "h_"),
-        state
-            .drive_api
-            .list_files_in_folder(&access_token, &state.cfg.folder_id, "c2r_"),
+        state.drive_api.list_files_in_folder_since(
+            &access_token,
+            &state.cfg.folder_id,
+            "h_",
+            hello_cursor.as_deref(),
+        ),
+        state.drive_api.list_files_in_folder_since(
+            &access_token,
+            &state.cfg.folder_id,
+            "c2r_",
+            frame_cursor.as_deref(),
+        ),
     );
 
     // Drive's `name contains 'X'` query uses Google's full-text
@@ -131,35 +224,44 @@ async fn run_one_cycle(state: Arc<RelayState>, permits: Arc<Semaphore>) -> bool 
     // its name. We filter client-side to the exact prefix + kind
     // we asked for, otherwise `process_frame` warns on every
     // mismatched entry and floods the log under load.
-    let hello_files: Vec<DriveFile> = match hello_result {
+    let hello_files_raw: Vec<DriveFile> = match hello_result {
         Ok(f) => f,
         Err(e) => {
             tracing::warn!("list h_* failed: {}", e);
             Vec::new()
         }
-    }
-    .into_iter()
-    .filter(|f| parse_filename(&f.name).is_some_and(|p| matches!(p.kind, FilenameKind::Hello)))
-    .collect();
-    let mut frame_files: Vec<(DriveFile, DriveFilename)> = match frame_result {
+    };
+    let frame_files_raw: Vec<DriveFile> = match frame_result {
         Ok(f) => f,
         Err(e) => {
             tracing::warn!("list c2r_* failed: {}", e);
             Vec::new()
         }
-    }
-    .into_iter()
-    .filter_map(|f| {
-        let parsed = parse_filename(&f.name)?;
-        // Reject anything that isn't a `c2r_*` frame — see the FTS
-        // tokenisation note above. The `process_frame` arm that
-        // catches non-c2r is now defensive only.
-        if !matches!(parsed.kind, FilenameKind::Frame(Direction::ClientToRelay)) {
-            return None;
-        }
-        Some((f, parsed))
-    })
-    .collect();
+    };
+    // Advance the sliding cursors from each raw listing before
+    // name-filtering. The helper keeps Skirk's lookback window, so
+    // subsequent cycles fetch only recent files while still catching
+    // delayed Hello/frame visibility. `call_start` bootstraps the
+    // cursor on empty listings (see `advance_modified_cursor` docs).
+    advance_modified_cursor(&hello_files_raw, hello_cursor, call_start);
+    advance_modified_cursor(&frame_files_raw, frame_cursor, call_start);
+    let hello_files: Vec<DriveFile> = hello_files_raw
+        .into_iter()
+        .filter(|f| parse_filename(&f.name).is_some_and(|p| matches!(p.kind, FilenameKind::Hello)))
+        .collect();
+    let mut frame_files: Vec<(DriveFile, DriveFilename)> = frame_files_raw
+        .into_iter()
+        .filter_map(|f| {
+            let parsed = parse_filename(&f.name)?;
+            // Reject anything that isn't a `c2r_*` frame — see the FTS
+            // tokenisation note above. The `process_frame` arm that
+            // catches non-c2r is now defensive only.
+            if !matches!(parsed.kind, FilenameKind::Frame(Direction::ClientToRelay)) {
+                return None;
+            }
+            Some((f, parsed))
+        })
+        .collect();
     // Re-sort numerically by (sid, seq). Drive's lex order puts
     // ..._10 before ..._2; this fixes it before the workers dispatch.
     frame_files.sort_by_key(|(_, p)| (p.sid, p.seq));
@@ -196,28 +298,10 @@ async fn run_one_cycle(state: Arc<RelayState>, permits: Arc<Semaphore>) -> bool 
     }
     while hello_workers.join_next().await.is_some() {}
 
-    // Group frames by sid + process each sid SERIALLY in its own
-    // worker. Different sids still run in parallel (bounded by the
-    // semaphore).
-    //
-    // Why this matters: `process_frame` does
-    //   1. replay-window check (per-sid lock)
-    //   2. Drive download (await)
-    //   3. AEAD-open (sync)
-    //   4. inbound_tx.send (await — the session driver's mpsc)
-    //   5. Drive delete (await)
-    // The replay-window mutex serialises step 1 across workers for
-    // the same sid, but steps 2-4 run concurrently. Two workers
-    // for c2r_0 + c2r_1 can both pass the window check (each gets
-    // a distinct seq), both finish their downloads, then race
-    // step 4 — delivering c2r_1's Data to the session driver
-    // BEFORE c2r_0's Connect. The driver then exits with "first
-    // inbound was Data, not Connect" and the session is dead.
-    //
-    // Grouping by sid + serial-within-group preserves per-session
-    // ordering on the wire. The seq sort earlier (before the
-    // HashMap collapse) means each sid's worker walks its frames
-    // in numerical order.
+    // Group by sid so per-session delivery stays strictly ordered,
+    // then prefetch each group's Drive bodies concurrently. The
+    // network-bound work can race; replay-window commit and mpsc
+    // delivery are sorted and sequential.
     let mut frames_by_sid: std::collections::HashMap<
         drive_wire::frame::SessionId,
         Vec<(DriveFile, DriveFilename)>,
@@ -229,18 +313,10 @@ async fn run_one_cycle(state: Arc<RelayState>, permits: Arc<Semaphore>) -> bool 
     for (sid, group) in frames_by_sid {
         let state = state.clone();
         let access_token = access_token.clone();
-        let permit = match permits.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => return true,
-        };
+        let permits = permits.clone();
         frame_workers.spawn(async move {
-            let _permit = permit;
-            for (file, parsed) in group {
-                if let Err(e) =
-                    process_frame(state.clone(), access_token.clone(), file, parsed).await
-                {
-                    tracing::warn!("frame processing failed for sid {:?}: {}", sid, e);
-                }
+            if let Err(e) = process_frame_group(state, access_token, permits, group).await {
+                tracing::warn!("frame group processing failed for sid {:?}: {}", sid, e);
             }
         });
     }
@@ -369,31 +445,46 @@ async fn spawn_session(state: Arc<RelayState>, keys: Arc<SessionKeys>) -> bool {
 // Frame processing
 // --------------------------------------------------------------------
 
+struct PreparedFrameBatch {
+    file: DriveFile,
+    parsed: DriveFilename,
+    batch: Batch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryOutcome {
+    Consumed,
+    Duplicate,
+    Blocked,
+}
+
+#[cfg(test)]
 async fn process_frame(
     state: Arc<RelayState>,
     access_token: String,
     file: DriveFile,
     parsed: DriveFilename,
 ) -> Result<(), WorkerError> {
-    let direction = match parsed.kind {
-        FilenameKind::Frame(Direction::ClientToRelay) => Direction::ClientToRelay,
-        // The poll-cycle filter above (run_one_cycle) already drops
-        // non-c2r entries that Drive's FTS-based `name contains`
-        // query returned despite the c2r_ prefix. This arm is
-        // defensive only — debug-level so a future code change
-        // that bypasses the cycle filter doesn't go unnoticed.
-        _ => {
-            tracing::debug!("ignoring non-c2r frame filename: {}", file.name);
-            return Ok(());
-        }
-    };
-    debug_assert_eq!(direction, Direction::ClientToRelay);
+    let permits = Arc::new(Semaphore::new(1));
+    process_frame_group(state, access_token, permits, vec![(file, parsed)]).await
+}
 
-    // Snapshot the session before downloading — drops the read
-    // lock before any await on Drive.
+/// Process one sid's c2r files with parallel Drive-body prefetch,
+/// then ordered commit to the per-session driver.
+async fn process_frame_group(
+    state: Arc<RelayState>,
+    access_token: String,
+    download_permits: Arc<Semaphore>,
+    group: Vec<(DriveFile, DriveFilename)>,
+) -> Result<(), WorkerError> {
+    if group.is_empty() {
+        return Ok(());
+    }
+
+    let sid = group[0].1.sid;
     let session_view = {
         let sessions = state.sessions.read().await;
-        sessions.get(&parsed.sid).map(|h| {
+        sessions.get(&sid).map(|h| {
             (
                 h.keys.clone(),
                 h.replay.clone(),
@@ -405,49 +496,114 @@ async fn process_frame(
     let (keys, replay, inbound_tx, last_seen) = match session_view {
         Some(v) => v,
         None => {
-            // No session for this sid. This can be a genuine stale
-            // leftover, but Drive listings are eventually consistent:
-            // c2r_<sid>_0 can surface one poll before h_<sid>_0 even
-            // though the client uploaded Hello first. Leave it in the
-            // folder so the next cycle can process it after Hello; the
-            // orphan reaper deletes truly stale files by modifiedTime.
-            tracing::debug!(
-                "frame {} has no active session for sid {:?}; leaving for a later poll",
-                file.name,
-                parsed.sid
-            );
+            // No session for this sid. This can be stale, but Drive
+            // can also expose c2r_<sid>_0 before h_<sid>_0 even though
+            // the client uploaded Hello first. Leave these files for a
+            // later poll; the orphan reaper handles truly stale ones.
+            for (file, parsed) in group {
+                tracing::debug!(
+                    "frame {} has no active session for sid {:?}; leaving for a later poll",
+                    file.name,
+                    parsed.sid
+                );
+            }
             return Ok(());
         }
     };
 
-    // Strict replay/ordering check on filename seq BEFORE downloading
-    // the body. Pure *check* — we deliberately do NOT advance the
-    // window here. Advance happens after delivery completes
-    // successfully (`commit` below). A transient download / AEAD /
-    // dispatch failure would otherwise permanently consume the seq
-    // and the redelivered file would be wrongly rejected as a
-    // replay next poll. Future frames are left in Drive until the
-    // missing earlier seq becomes visible.
-    {
+    let next_expected = {
         let window = replay.lock().await;
-        match window.check_next(parsed.seq) {
-            Ok(()) => {}
-            Err(StrictSeqError::Replay(e)) => {
-                tracing::debug!("frame {} rejected by replay window: {}", file.name, e);
-                let _ = state.drive_api.delete_file(&access_token, &file.id).await;
-                return Ok(());
-            }
-            Err(StrictSeqError::Future { expected, .. }) => {
-                tracing::debug!(
-                    "frame {} arrived before seq {}; leaving for a later poll",
-                    file.name,
-                    expected
-                );
-                return Ok(());
-            }
+        match window.last_seen() {
+            None => Some(0),
+            Some(prev) => prev.checked_add(1),
+        }
+    };
+    let Some(next_expected) = next_expected else {
+        for (file, _) in group {
+            let _ = state.drive_api.delete_file(&access_token, &file.id).await;
+        }
+        return Ok(());
+    };
+
+    let mut downloads: JoinSet<Result<Option<PreparedFrameBatch>, WorkerError>> = JoinSet::new();
+    let mut saw_expected_seq = false;
+    for (file, parsed) in group {
+        if !matches!(parsed.kind, FilenameKind::Frame(Direction::ClientToRelay)) {
+            tracing::debug!("ignoring non-c2r frame filename: {}", file.name);
+            continue;
+        }
+        if parsed.seq < next_expected {
+            tracing::debug!(
+                "frame {} rejected by replay window: seq {} < expected {}",
+                file.name,
+                parsed.seq,
+                next_expected
+            );
+            let _ = state.drive_api.delete_file(&access_token, &file.id).await;
+            continue;
+        }
+        if parsed.seq == next_expected {
+            saw_expected_seq = true;
+        } else if !saw_expected_seq {
+            tracing::debug!(
+                "frame {} arrived before seq {}; leaving for a later poll",
+                file.name,
+                next_expected
+            );
+            break;
+        }
+
+        let permit = download_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| WorkerError::WorkerSemaphoreClosed)?;
+        let state = state.clone();
+        let access_token = access_token.clone();
+        let keys = keys.clone();
+        downloads.spawn(async move {
+            let _permit = permit;
+            prepare_frame_batch(state, access_token, keys, file, parsed).await
+        });
+    }
+
+    let mut prepared = Vec::new();
+    while let Some(joined) = downloads.join_next().await {
+        match joined {
+            Ok(Ok(Some(batch))) => prepared.push(batch),
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => tracing::warn!("frame prefetch failed: {}", e),
+            Err(e) => tracing::warn!("frame prefetch task failed: {}", e),
+        }
+    }
+    prepared.sort_by_key(|p| p.parsed.seq);
+
+    for prepared in prepared {
+        match deliver_prepared_frame_batch(
+            &state,
+            &access_token,
+            &replay,
+            &inbound_tx,
+            &last_seen,
+            prepared,
+        )
+        .await?
+        {
+            DeliveryOutcome::Consumed | DeliveryOutcome::Duplicate => {}
+            DeliveryOutcome::Blocked => break,
         }
     }
 
+    Ok(())
+}
+
+async fn prepare_frame_batch(
+    state: Arc<RelayState>,
+    access_token: String,
+    keys: Arc<SessionKeys>,
+    file: DriveFile,
+    parsed: DriveFilename,
+) -> Result<Option<PreparedFrameBatch>, WorkerError> {
     if let Some(size) = file.size {
         if size > MAX_SEALED_FRAME_BODY_BYTES {
             tracing::warn!(
@@ -457,7 +613,7 @@ async fn process_frame(
                 MAX_SEALED_FRAME_BODY_BYTES
             );
             let _ = state.drive_api.delete_file(&access_token, &file.id).await;
-            return Ok(());
+            return Ok(None);
         }
     }
 
@@ -473,7 +629,7 @@ async fn process_frame(
                 file.name
             );
             let _ = state.drive_api.delete_file(&access_token, &file.id).await;
-            return Ok(());
+            return Ok(None);
         }
         Err(e) => return Err(e.into()),
     };
@@ -482,80 +638,161 @@ async fn process_frame(
         Ok(pt) => pt,
         Err(e) => {
             tracing::warn!("frame {} AEAD open failed: {}", file.name, e);
-            // Don't delete — could be a corrupted listing entry the
-            // orphan reaper will catch by modifiedTime. Don't advance
-            // the replay window either; leaves the window open for
-            // the next-poll retry to succeed.
-            return Ok(());
+            return Ok(None);
         }
     };
-    let wire = match WireFrame::decode(&plaintext) {
-        Ok(w) => w,
+    let batch = match Batch::decode(&plaintext) {
+        Ok(b) => b,
         Err(e) => {
-            tracing::warn!("frame {} wire decode failed: {}", file.name, e);
-            return Ok(());
+            tracing::warn!("frame {} batch decode failed: {}", file.name, e);
+            return Ok(None);
         }
     };
-
-    // Defense in depth: filename sid/seq must match WireFrame
-    // sid/seq. The AAD already binds them; this is a belt-and-
-    // suspenders check that fails loudly on a future encoding bug.
-    if wire.sid != parsed.sid || wire.seq != parsed.seq {
+    if batch.frames.is_empty() {
+        tracing::warn!("frame {} decoded to empty batch (no frames)", file.name);
+        return Ok(None);
+    }
+    if batch.frames[0].seq != parsed.seq {
         tracing::warn!(
-            "frame {} sid/seq mismatch: filename ({:?},{}) vs wire ({:?},{})",
+            "frame {} first-frame seq mismatch: filename={} first_frame={}",
             file.name,
-            parsed.sid,
             parsed.seq,
-            wire.sid,
-            wire.seq,
+            batch.frames[0].seq,
         );
-        return Ok(());
+        return Ok(None);
     }
 
-    *last_seen.lock().await = Instant::now();
-
-    let inbound = match frame_to_inbound(wire) {
-        Ok(i) => i,
-        Err(e) => {
-            tracing::warn!("frame {} dispatch error: {}", file.name, e);
-            return Ok(());
-        }
-    };
-
-    // If the driver task already exited, the receiver is dropped
-    // and `send` returns Err — log at debug and move on.
-    if let Err(e) = inbound_tx.send(inbound).await {
-        tracing::debug!(
-            "frame {}: session driver gone, dropping inbound: {}",
-            file.name,
-            e
-        );
-    }
-
-    // Advance the replay window now that the frame has been fully
-    // decoded + dispatched to the per-session driver. Doing this
-    // BEFORE delivery would let a transient failure permanently
-    // consume the seq; see `ReplayWindow::check` for the rationale.
-    {
-        let mut window = replay.lock().await;
-        window.commit(parsed.seq);
-    }
-
-    // Delete the consumed file; the next cycle's listing won't
-    // re-see it.
-    if let Err(e) = state.drive_api.delete_file(&access_token, &file.id).await {
-        tracing::debug!("frame {} delete failed: {}", file.name, e);
-    }
-
-    let _ = body_drop(sealed);
-    Ok(())
+    Ok(Some(PreparedFrameBatch {
+        file,
+        parsed,
+        batch,
+    }))
 }
 
-// Forces the compiler to drop `sealed` AFTER the AEAD open above
-// (rustc already drops at the right point — this is purely a
-// readability marker for the rg-greppable lifecycle).
-#[inline]
-fn body_drop(_: Bytes) {}
+async fn deliver_prepared_frame_batch(
+    state: &RelayState,
+    access_token: &str,
+    replay: &Arc<Mutex<ReplayWindow>>,
+    inbound_tx: &mpsc::Sender<InboundFrame>,
+    last_seen: &Arc<Mutex<Instant>>,
+    prepared: PreparedFrameBatch,
+) -> Result<DeliveryOutcome, WorkerError> {
+    let PreparedFrameBatch {
+        file,
+        parsed,
+        batch,
+    } = prepared;
+    let frame_count = batch.frames.len();
+    let mut committed_through: Option<u64> = None;
+
+    for (idx, wire) in batch.frames.into_iter().enumerate() {
+        if wire.sid != parsed.sid {
+            tracing::warn!(
+                "frame {} batch index {} sid mismatch: filename {:?} vs wire {:?}",
+                file.name,
+                idx,
+                parsed.sid,
+                wire.sid
+            );
+            break;
+        }
+        let replay_check = {
+            let window = replay.lock().await;
+            window.check_next(wire.seq)
+        };
+        match replay_check {
+            Ok(()) => {}
+            Err(StrictSeqError::Replay(e)) => {
+                tracing::debug!(
+                    "frame {} batch index {} seq {} rejected by replay: {}",
+                    file.name,
+                    idx,
+                    wire.seq,
+                    e,
+                );
+                if committed_through.is_none() {
+                    delete_c2r_file_detached(&state.drive_api, access_token, &file);
+                    return Ok(DeliveryOutcome::Duplicate);
+                }
+                break;
+            }
+            Err(StrictSeqError::Future { expected, .. }) => {
+                tracing::debug!(
+                    "frame {} batch index {} arrived before seq {}; leaving for a later poll",
+                    file.name,
+                    idx,
+                    expected
+                );
+                if committed_through.is_none() {
+                    return Ok(DeliveryOutcome::Blocked);
+                }
+                break;
+            }
+        }
+        let frame_seq = wire.seq;
+        let inbound = match frame_to_inbound(wire) {
+            Ok(i) => i,
+            Err(e) => {
+                tracing::warn!(
+                    "frame {} batch index {} dispatch error: {}",
+                    file.name,
+                    idx,
+                    e
+                );
+                break;
+            }
+        };
+        *last_seen.lock().await = Instant::now();
+        if let Err(e) = inbound_tx.send(inbound).await {
+            tracing::debug!(
+                "frame {} batch index {}: session driver gone, dropping inbound: {}",
+                file.name,
+                idx,
+                e
+            );
+            break;
+        }
+        {
+            let mut window = replay.lock().await;
+            window.commit(frame_seq);
+        }
+        committed_through = Some(frame_seq);
+    }
+
+    let Some(committed_through) = committed_through else {
+        return Ok(DeliveryOutcome::Blocked);
+    };
+
+    if frame_count > 1 {
+        tracing::info!(
+            "frame {}: consumed batch first_seq={} through={} ({} frames)",
+            file.name,
+            parsed.seq,
+            committed_through,
+            frame_count
+        );
+    }
+
+    delete_c2r_file_detached(&state.drive_api, access_token, &file);
+
+    Ok(DeliveryOutcome::Consumed)
+}
+
+fn delete_c2r_file_detached(
+    drive_api: &rahgozar::drive_api::DriveApiClient,
+    access_token: &str,
+    file: &DriveFile,
+) {
+    let drive_api = drive_api.clone();
+    let access_token = access_token.to_string();
+    let file_id = file.id.clone();
+    let file_name = file.name.clone();
+    tokio::spawn(async move {
+        if let Err(e) = drive_api.delete_file(&access_token, &file_id).await {
+            tracing::debug!("frame {} delete failed: {}", file_name, e);
+        }
+    });
+}
 
 #[derive(Debug, thiserror::Error)]
 enum WorkerError {
@@ -563,6 +800,8 @@ enum WorkerError {
     Api(#[from] rahgozar::drive_api::DriveApiError),
     #[error("OAuth error: {0}")]
     Oauth(#[from] rahgozar::drive_oauth::OAuthError),
+    #[error("worker semaphore closed")]
+    WorkerSemaphoreClosed,
 }
 
 #[cfg(test)]
@@ -581,7 +820,7 @@ mod tests {
     #[test]
     fn adapt_interval_resets_on_work() {
         let mut streak = 5;
-        let next = adapt_interval(300, true, &mut streak);
+        let next = adapt_interval(300, true, &mut streak, false);
         assert_eq!(next, PIPELINE_INTERVAL_MS);
         assert_eq!(streak, 0);
     }
@@ -589,10 +828,10 @@ mod tests {
     #[test]
     fn adapt_interval_ramps_on_empty() {
         let mut streak = 0;
-        let n1 = adapt_interval(300, false, &mut streak);
+        let n1 = adapt_interval(300, false, &mut streak, false);
         assert_eq!(streak, 1);
         assert_eq!(n1, 300 + IDLE_BACKOFF_STEP_MS);
-        let n2 = adapt_interval(300, false, &mut streak);
+        let n2 = adapt_interval(300, false, &mut streak, false);
         assert_eq!(streak, 2);
         assert_eq!(n2, 300 + 2 * IDLE_BACKOFF_STEP_MS);
     }
@@ -601,14 +840,14 @@ mod tests {
     fn adapt_interval_caps_at_max_idle() {
         let mut streak = 0;
         for _ in 0..100 {
-            let v = adapt_interval(300, false, &mut streak);
+            let v = adapt_interval(300, false, &mut streak, false);
             assert!(v <= MAX_IDLE_INTERVAL_MS, "exceeded cap: {}", v);
         }
         // After many empty cycles we MUST land exactly on the cap,
         // not below — proves the saturating math + min() compose
         // correctly.
         assert_eq!(
-            adapt_interval(300, false, &mut streak),
+            adapt_interval(300, false, &mut streak, false),
             MAX_IDLE_INTERVAL_MS
         );
     }
@@ -619,17 +858,101 @@ mod tests {
         // is rejected by validate(), but if somehow it slipped
         // through, adapt_interval must not panic.
         let mut streak = 0;
-        let v = adapt_interval(0, false, &mut streak);
+        let v = adapt_interval(0, false, &mut streak, false);
         assert_eq!(v, IDLE_BACKOFF_STEP_MS);
-        let v = adapt_interval(0, true, &mut streak);
+        let v = adapt_interval(0, true, &mut streak, false);
         assert_eq!(v, PIPELINE_INTERVAL_MS);
     }
 
     #[test]
     fn adapt_interval_pipeline_does_not_grow_streak() {
         let mut streak = 7;
-        let _ = adapt_interval(300, true, &mut streak);
+        let _ = adapt_interval(300, true, &mut streak, false);
         assert_eq!(streak, 0, "found_work resets the streak");
+    }
+
+    #[test]
+    fn adapt_interval_stays_at_baseline_when_sessions_present() {
+        // With ≥1 session in the table, an empty cycle MUST stay
+        // at baseline. Idle backoff would otherwise delay the next
+        // c2r frame by up to MAX_IDLE_INTERVAL_MS after a brief lull
+        // in client uploads.
+        let mut streak = 7;
+        let next = adapt_interval(300, false, &mut streak, true);
+        assert_eq!(next, 300);
+        assert_eq!(streak, 0);
+    }
+
+    #[test]
+    fn adapt_interval_resumes_ramp_when_sessions_drop() {
+        // Sessions present → no ramp. Sessions then empty → ramp
+        // resumes from a fresh streak. Pins the transition so a
+        // future refactor that forgets to reset streak can't
+        // accidentally re-introduce a long first-Hello latency.
+        let mut streak = 4;
+        let _ = adapt_interval(300, false, &mut streak, true);
+        assert_eq!(streak, 0);
+        let next = adapt_interval(300, false, &mut streak, false);
+        assert_eq!(streak, 1);
+        assert_eq!(next, 300 + IDLE_BACKOFF_STEP_MS);
+    }
+
+    fn parse_rfc3339(s: &str) -> time::OffsetDateTime {
+        time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).unwrap()
+    }
+
+    #[test]
+    fn modified_cursor_advances_with_skirk_lookback() {
+        let mt = parse_rfc3339("2026-05-24T12:00:08Z");
+        let files = vec![DriveFile {
+            id: "id".into(),
+            name: "c2r_x_1".into(),
+            modified_time: Some(mt),
+            size: Some(1),
+        }];
+        let mut cursor = None;
+        advance_modified_cursor(&files, &mut cursor, mt);
+        assert_eq!(cursor.as_deref(), Some("2026-05-24T12:00:00Z"));
+    }
+
+    #[test]
+    fn modified_cursor_never_moves_backward() {
+        let older = parse_rfc3339("2026-05-24T12:00:07Z");
+        let files = vec![DriveFile {
+            id: "id".into(),
+            name: "c2r_x_1".into(),
+            modified_time: Some(older),
+            size: Some(1),
+        }];
+        let mut cursor = Some("2026-05-24T12:00:00Z".to_string());
+        advance_modified_cursor(&files, &mut cursor, older);
+        assert_eq!(cursor.as_deref(), Some("2026-05-24T12:00:00Z"));
+    }
+
+    #[test]
+    fn modified_cursor_advances_on_empty_listing() {
+        // Empty listing must still bootstrap the cursor — otherwise
+        // a folder with no active sessions keeps polling via Drive's
+        // slow full-text `name contains` index forever.
+        let now = parse_rfc3339("2026-05-24T12:00:08Z");
+        let mut cursor: Option<String> = None;
+        advance_modified_cursor(&[], &mut cursor, now);
+        assert_eq!(cursor.as_deref(), Some("2026-05-24T12:00:00Z"));
+    }
+
+    #[test]
+    fn modified_cursor_uses_wall_clock_when_files_older_than_now() {
+        let stale_mt = parse_rfc3339("2026-05-24T11:00:00Z");
+        let now = parse_rfc3339("2026-05-24T12:00:08Z");
+        let files = vec![DriveFile {
+            id: "id".into(),
+            name: "c2r_x_1".into(),
+            modified_time: Some(stale_mt),
+            size: Some(1),
+        }];
+        let mut cursor: Option<String> = None;
+        advance_modified_cursor(&files, &mut cursor, now);
+        assert_eq!(cursor.as_deref(), Some("2026-05-24T12:00:00Z"));
     }
 
     #[tokio::test]

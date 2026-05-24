@@ -39,12 +39,10 @@
 //!
 //! ## Limitations (v1)
 //!
-//! - **Sequential uploads** per session. A burst of small TCP reads
-//!   becomes a chain of one-at-a-time Drive uploads; the next read
-//!   doesn't happen until the previous upload returns. Drive's QPS
-//!   budget is the bottleneck anyway, so the latency cost is
-//!   small in practice. Parallel uploads (with `max_concurrent_uploads`
-//!   as the cap) are a v2 optimisation.
+//! - **Single ordered stream per TCP session.** Each browser CONNECT
+//!   gets its own Drive sid and strictly ordered c2r/r2c sequence.
+//!   Uploads are batched and pipelined, but rahgozar does not yet
+//!   implement Skirk's full mux-v4 four-lane object grammar.
 //! - **No client-side orphan reaper.** Stale `r2c_*` files (relay
 //!   pushed after we closed the local socket) accumulate in the
 //!   shared folder until the relay's own reaper sweeps them. Fine
@@ -56,7 +54,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use drive_wire::filename::{parse_filename, Direction, DriveFilename, FilenameKind};
-use drive_wire::frame::{FrameKind, SessionId, WireFrame, WIRE_VERSION};
+use drive_wire::frame::{Batch, FrameKind, SessionId, WireFrame, WIRE_VERSION};
 use rand::rngs::OsRng;
 use rand::RngCore;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -90,16 +88,66 @@ const SESSION_MAILBOX_DEPTH: usize = 64;
 
 /// After any non-empty poll cycle, drop the next sleep to this
 /// value (pipeline mode). Lets a burst of inbound replies land
-/// without paying the baseline interval again.
-const PIPELINE_INTERVAL_MS: u64 = 100;
+/// without paying the baseline interval again. Matches Skirk's
+/// `BurstPollMS = 75`-ish range — aggressive enough that the
+/// per-RTT wait is dominated by Drive's `files.list` latency
+/// (~150-300 ms from Iran via the google_ip override) rather than
+/// our sleep gap.
+const PIPELINE_INTERVAL_MS: u64 = 25;
 
 /// Each consecutive empty cycle adds this much to the next sleep.
 const IDLE_BACKOFF_STEP_MS: u64 = 200;
 
-/// Cap on the idle sleep — keeps the polling cost low even when
-/// the proxy is unused, but bounds the wake-up latency when a
-/// session finally lands.
-const MAX_IDLE_INTERVAL_MS: u64 = 5_000;
+/// Cap on the idle sleep. Only reached when the session table is
+/// empty (no active CONNECT) — see `adapt_interval`. With cursor-
+/// mode polling each list call costs ~10× less than the old
+/// `name contains` path, so 1.5 s gives us low quota usage while
+/// keeping the cold-start tax bounded when the first CONNECT
+/// after a long idle period lands.
+const MAX_IDLE_INTERVAL_MS: u64 = 1_500;
+
+/// Skirk keeps the fresh-list cursor behind the newest observed
+/// Drive `modifiedTime` so delayed object visibility and same-timestamp
+/// files cannot slip behind the next `modifiedTime >= since` query.
+const MODIFIED_CURSOR_LOOKBACK_SECS: i64 = 8;
+
+// ── c2r batching (Skirk-inspired multi-frame uploads) ────────────────
+//
+// Each Drive file carries 1..=BATCH_MAX_FRAMES frames sealed as one
+// AEAD batch. Coalesce delay is picked based on accumulated payload
+// bytes — small frames (likely interactive traffic, TLS handshake)
+// flush fast; large frames (likely bulk transfer, HTTP body) hold a
+// bit longer to pack more per upload. This is the load-bearing fix
+// for Drive Mode latency: instead of 1 upload per 16 KiB chunk of
+// TCP read (= ~500 ms × N frames for a single HTTPS request), one
+// upload carries every frame produced within the coalesce window.
+
+/// Coalesce wait for accumulated batches up to this byte count.
+/// Interactive tier: TLS handshake records, HTTP request headers,
+/// keystrokes — flush at 5 ms so latency stays tight.
+const COALESCE_INTERACTIVE_BYTES: usize = 8 * 1024;
+const COALESCE_INTERACTIVE_DELAY: Duration = Duration::from_millis(5);
+
+/// Coalesce wait for batches in the 8 KiB..64 KiB range. Medium
+/// tier: full HTTP request bodies, small JSON responses.
+const COALESCE_MEDIUM_BYTES: usize = 64 * 1024;
+const COALESCE_MEDIUM_DELAY: Duration = Duration::from_millis(50);
+
+/// Coalesce wait for batches ≥64 KiB. Bulk tier: download progress,
+/// large response bodies. Hold longer to pack more — the extra
+/// latency is invisible against the bulk transfer wall time.
+const COALESCE_BULK_DELAY: Duration = Duration::from_millis(100);
+
+/// Hard cap on bytes accumulated in one batch before forcing a flush.
+/// Above this we want the upload in flight even if more frames could
+/// pile in — keeps any one Drive upload below the ResponseTooLarge
+/// safety cap on the relay side.
+const BATCH_FLUSH_BYTES: usize = 1024 * 1024;
+
+/// Hard cap on frame count per batch. Matches drive-wire's
+/// `MAX_BATCH_FRAMES` minus a safety margin so we never construct a
+/// batch the codec would refuse.
+const BATCH_MAX_FRAMES: usize = 200;
 
 // --------------------------------------------------------------------
 // Public types
@@ -265,11 +313,10 @@ pub async fn tunnel_connection_with_preface(
     let replay = Arc::new(Mutex::new(ReplayWindow::new()));
 
     // 3. Register BEFORE uploading so any r2c frames that arrive in
-    //    a poll cycle racing our Hello upload land in the
-    //    table-populated state. The relay can't produce an r2c
-    //    before it sees our c2r_<sid>_0 (Connect), and that c2r
-    //    upload happens AFTER the Hello — so this ordering is
-    //    correct, but the defensive shape costs nothing.
+    //    a poll cycle racing our startup uploads land in the
+    //    table-populated state. The relay can't produce r2c until it
+    //    sees c2r_<sid>_0 (Connect); startup uploads are pipelined
+    //    below, so this defensive ordering is load-bearing.
     {
         let mut sessions = inner.sessions.write().await;
         sessions.insert(
@@ -290,57 +337,87 @@ pub async fn tunnel_connection_with_preface(
         sessions: inner.sessions.clone(),
     };
 
-    // 4. Upload Hello (UNSEALED) + initial Connect (sealed at seq=0).
-    if let Err(e) = upload_hello(&inner, sid, &hello).await {
-        tracing::warn!(
-            "drive session {:?}: hello upload failed for {}:{}: {}",
-            sid,
-            host,
-            port,
-            e
-        );
-        return Err(std::io::Error::other(format!("hello upload: {e}")));
-    }
+    // 4. Queue Hello (UNSEALED) + initial Connect (sealed at seq=0).
+    // Do not wait here: the browser's first TLS bytes are already
+    // sitting in the local socket, and serialising Hello -> Connect ->
+    // ClientHello costs multiple Drive upload/list visibility turns on
+    // every new CONNECT. The relay still preserves correctness: it
+    // processes Hellos before frames in a cycle, sorts c2r by seq, and
+    // leaves future seqs in Drive until c2r_<sid>_0 is visible.
     let send_cipher = AeadCipher::new(&keys.k_c2r);
-    if let Err(e) = upload_connect_frame(&inner, sid, &send_cipher, host, port).await {
-        tracing::warn!(
-            "drive session {:?}: connect frame upload failed for {}:{}: {}",
-            sid,
-            host,
-            port,
-            e
-        );
-        return Err(std::io::Error::other(format!("connect upload: {e}")));
+    {
+        let inner = inner.clone();
+        let hello = hello.clone();
+        let dest = format!("{host}:{port}");
+        tokio::spawn(async move {
+            if let Err(e) = upload_hello(&inner, sid, &hello).await {
+                tracing::warn!(
+                    "drive session {:?}: hello upload failed for {}: {}",
+                    sid,
+                    dest,
+                    e
+                );
+            }
+        });
     }
-    tracing::info!("drive session {:?}: opened to {}:{}", sid, host, port);
+    {
+        let inner = inner.clone();
+        let cipher = send_cipher.clone();
+        let host = host.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = upload_connect_frame(&inner, sid, &cipher, &host, port).await {
+                tracing::warn!(
+                    "drive session {:?}: connect frame upload failed for {}:{}: {}",
+                    sid,
+                    host,
+                    port,
+                    e
+                );
+            }
+        });
+    }
+    tracing::info!(
+        "drive session {:?}: opened to {}:{} (startup uploads queued)",
+        sid,
+        host,
+        port
+    );
 
     // 5. Optional initial client payload, used when the HTTP proxy
     //    path has already read bytes from the local socket before
     //    the Drive session existed. Connect was seq=0, so prefaced
     //    Data starts at seq=1 and the live pump continues after it.
+    //    Batched as ONE Drive upload: TLS ClientHello + first HTTP
+    //    bytes typically fit in a single 16 KiB chunk, but pathological
+    //    HTTP CONNECT pipelines can deliver multiple — either way one
+    //    upload carries them all, saving N round trips on session start.
     let mut next_c2r_seq: u64 = 1;
     if !initial_client_bytes.is_empty() {
-        for chunk in initial_client_bytes.chunks(LOCAL_SOCKET_READ_BUFFER) {
-            let seq = next_c2r_seq;
-            next_c2r_seq += 1;
-            if let Err(e) = upload_data_frame(
-                &inner,
-                sid,
-                seq,
-                &send_cipher,
-                Bytes::copy_from_slice(chunk),
-            )
-            .await
-            {
-                tracing::warn!(
-                    "drive session {:?}: initial c2r upload failed at seq={}: {}",
-                    sid,
-                    seq,
-                    e
-                );
-                return Err(std::io::Error::other(format!("initial c2r upload: {e}")));
-            }
-        }
+        let frames: Vec<WireFrame> = initial_client_bytes
+            .chunks(LOCAL_SOCKET_READ_BUFFER)
+            .map(|chunk| {
+                let seq = next_c2r_seq;
+                next_c2r_seq += 1;
+                build_wire_frame(FrameKind::Data, sid, seq, Bytes::copy_from_slice(chunk))
+            })
+            .collect();
+        let first_seq = frames[0].seq;
+        let mut pending_bytes: usize = frames.iter().map(|f| f.payload.len()).sum();
+        let mut pending = frames;
+        let mut flush_deadline = None;
+        tracing::debug!(
+            "drive session {:?}: initial preface queued at first_seq={}",
+            sid,
+            first_seq
+        );
+        flush_c2r_batch(
+            &inner,
+            sid,
+            &send_cipher,
+            &mut pending,
+            &mut pending_bytes,
+            &mut flush_deadline,
+        );
     }
 
     // 6. Steady-state pump until either side closes. `pump_session`
@@ -496,11 +573,141 @@ fn build_wire_frame(kind: FrameKind, sid: SessionId, seq: u64, payload: Bytes) -
     }
 }
 
-/// Seal a wire frame with the given (sid, seq) bound to the AAD
-/// and return the ciphertext ready for upload.
-fn seal_frame(cipher: &AeadCipher, frame: &WireFrame) -> Vec<u8> {
-    let plaintext = frame.encode().freeze();
-    cipher.seal(&frame.sid, frame.seq, &plaintext)
+/// Seal a [`Batch`] of 1..=N frames as a single AEAD-encrypted body
+/// for one Drive upload. The nonce + AAD are derived from the
+/// FIRST frame's seq + sid — same convention the receiver uses to
+/// rebuild them from the filename (`c2r_<sid>_<first_seq>`). Inside
+/// the batch, individual frame seqs are checked against the replay
+/// window per-frame on the receive side.
+fn seal_batch(cipher: &AeadCipher, sid: SessionId, batch: &drive_wire::frame::Batch) -> Vec<u8> {
+    debug_assert!(!batch.frames.is_empty(), "Batch must contain ≥1 frame");
+    let first_seq = batch.frames[0].seq;
+    let plaintext = batch.encode().freeze();
+    cipher.seal(&sid, first_seq, &plaintext)
+}
+
+/// Pick the coalesce wait window based on currently-accumulated batch
+/// payload bytes. Matches Skirk's tiered policy:
+///   <  8 KB → 5 ms  (interactive: TLS records, request headers)
+///   <  64 KB → 50 ms (medium: full request bodies)
+///   ≥ 64 KB → 100 ms (bulk: large response bodies)
+fn pick_coalesce_delay(pending_bytes: usize) -> Duration {
+    if pending_bytes < COALESCE_INTERACTIVE_BYTES {
+        COALESCE_INTERACTIVE_DELAY
+    } else if pending_bytes < COALESCE_MEDIUM_BYTES {
+        COALESCE_MEDIUM_DELAY
+    } else {
+        COALESCE_BULK_DELAY
+    }
+}
+
+/// Seal the accumulated batch synchronously, then SPAWN the HTTP
+/// upload as a detached task — returns Ok(()) without waiting for
+/// the upload to complete. This is the load-bearing optimization
+/// over plain batching: while the previous batch's upload is
+/// in-flight to Drive (200-500 ms of TLS + body transfer), the
+/// pump's select! loop can keep reading from the local socket and
+/// forming the NEXT batch. Concurrency is bounded by the existing
+/// `inner.upload_permits` semaphore (the spawned task acquires a
+/// permit before doing the HTTP work).
+///
+/// Out-of-order completion is safe: the relay's c2r poller sorts
+/// files numerically by sid+seq before dispatching, so if upload of
+/// `c2r_<sid>_8` lands on Drive before `c2r_<sid>_5`, the relay
+/// still processes them in seq order on its next listing cycle.
+///
+/// Upload failures are logged at warn but don't propagate — the
+/// pump session continues, and the missing seq leaves a gap that
+/// the relay's strict-monotonic replay window will block on until
+/// the next batch arrives (which will trip "future seq" and the
+/// orphan reaper eventually evicts the session). This is the same
+/// failure semantics as the pre-pipelining single-frame path.
+fn flush_c2r_batch(
+    inner: &Arc<DriveMuxInner>,
+    sid: SessionId,
+    cipher: &AeadCipher,
+    pending: &mut Vec<WireFrame>,
+    pending_bytes: &mut usize,
+    flush_deadline: &mut Option<tokio::time::Instant>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let first_seq = pending[0].seq;
+    let frame_count = pending.len();
+    let batch = drive_wire::frame::Batch {
+        frames: std::mem::take(pending),
+    };
+    *pending_bytes = 0;
+    *flush_deadline = None;
+    let sealed = seal_batch(cipher, sid, &batch);
+    if frame_count > 1 {
+        // INFO temporarily so we can see batch effectiveness in
+        // default-level journalctl. Drop back to debug once Drive
+        // Mode latency tuning is settled.
+        tracing::info!(
+            "drive session {:?}: flushing batch first_seq={} count={} bytes={}",
+            sid,
+            first_seq,
+            frame_count,
+            sealed.len()
+        );
+    }
+    let inner_for_task = inner.clone();
+    tokio::spawn(async move {
+        if let Err(e) = upload_c2r_frame(&inner_for_task, sid, first_seq, sealed).await {
+            tracing::warn!(
+                "drive session {:?}: pipelined c2r upload failed at first_seq={}: {}",
+                sid,
+                first_seq,
+                e
+            );
+        }
+    });
+}
+
+/// Append a frame to the pending batch and update bookkeeping. If
+/// `flush_now` is true (Eof / Close / Error / Connect — anything but
+/// Data), or the batch crosses a size/count threshold, spawn the
+/// upload immediately. Otherwise updates the coalesce deadline so
+/// the next select! iteration's timer arm fires and flushes.
+///
+/// Synchronous (no .await) since `flush_c2r_batch` is now spawn-
+/// detached — that's the pipelining win, see its doc.
+fn push_c2r_frame(
+    inner: &Arc<DriveMuxInner>,
+    sid: SessionId,
+    cipher: &AeadCipher,
+    pending: &mut Vec<WireFrame>,
+    pending_bytes: &mut usize,
+    flush_deadline: &mut Option<tokio::time::Instant>,
+    frame: WireFrame,
+    flush_now: bool,
+) {
+    *pending_bytes += frame.payload.len();
+    pending.push(frame);
+    // EAGER FLUSH on second+ frame in the batch (Skirk-style — see
+    // their `shouldCorkNormalBatchLocked` at mux.go:1460). The
+    // coalesce delay's only job is to let a 2nd frame ARRIVE; the
+    // moment one does, batch + flush immediately. Waiting longer
+    // just adds latency without packing more frames (subsequent
+    // reads block on TLS/HTTP roundtrips, not on each other).
+    let should_flush = flush_now
+        || pending.len() >= 2
+        || pending.len() >= BATCH_MAX_FRAMES
+        || *pending_bytes >= BATCH_FLUSH_BYTES;
+    if should_flush {
+        flush_c2r_batch(inner, sid, cipher, pending, pending_bytes, flush_deadline);
+        return;
+    }
+    // Only one frame in pending — arm the coalesce timer to flush
+    // if no 2nd frame arrives within the tier window.
+    let delay = pick_coalesce_delay(*pending_bytes);
+    let deadline = tokio::time::Instant::now() + delay;
+    match flush_deadline {
+        Some(existing) if *existing <= deadline => {}
+        _ => *flush_deadline = Some(deadline),
+    }
 }
 
 /// Build the per-direction r2c/c2r filename for a given session.
@@ -521,6 +728,8 @@ async fn upload_c2r_frame(
     sealed: Vec<u8>,
 ) -> Result<(), ClientError> {
     let name = frame_filename(Direction::ClientToRelay, sid, seq);
+    let body_len = sealed.len();
+    let started = Instant::now();
     let token = inner.token_cache.get().await?;
     let _permit = inner
         .upload_permits
@@ -531,6 +740,15 @@ async fn upload_c2r_frame(
         .drive_api
         .upload_file(&token, &inner.cfg.folder_id, &name, Bytes::from(sealed))
         .await?;
+    if seq <= 4 {
+        tracing::info!(
+            "drive session {:?}: uploaded c2r seq={} bytes={} in {}ms",
+            sid,
+            seq,
+            body_len,
+            started.elapsed().as_millis()
+        );
+    }
     Ok(())
 }
 
@@ -548,16 +766,24 @@ async fn upload_hello(
     }
     .format();
     let body = Bytes::from(hello.encode().to_vec());
+    let started = Instant::now();
     let token = inner.token_cache.get().await?;
     let _permit = inner
         .upload_permits
         .acquire()
         .await
         .map_err(|_| ClientError::UploadSemaphoreClosed)?;
+    let body_len = body.len();
     inner
         .drive_api
         .upload_file(&token, &inner.cfg.folder_id, &name, body)
         .await?;
+    tracing::info!(
+        "drive session {:?}: uploaded hello bytes={} in {}ms",
+        sid,
+        body_len,
+        started.elapsed().as_millis()
+    );
     Ok(())
 }
 
@@ -573,46 +799,20 @@ async fn upload_connect_frame(
 ) -> Result<(), ClientError> {
     let payload = Bytes::from(format!("{host}:{port}").into_bytes());
     let frame = build_wire_frame(FrameKind::Connect, sid, 0, payload);
-    let sealed = seal_frame(cipher, &frame);
+    // Sealed as a single-frame batch — the relay's c2r parser
+    // unconditionally expects the batch envelope (RG2B magic +
+    // length-prefixed inner frames). seq=0 is the first frame so
+    // first_seq=0; nonce + AAD bind the same way as before.
+    let batch = drive_wire::frame::Batch::single(frame);
+    let sealed = seal_batch(cipher, sid, &batch);
     upload_c2r_frame(inner, sid, 0, sealed).await
 }
 
-/// Build, seal, and upload one Data frame.
-async fn upload_data_frame(
-    inner: &DriveMuxInner,
-    sid: SessionId,
-    seq: u64,
-    cipher: &AeadCipher,
-    payload: Bytes,
-) -> Result<(), ClientError> {
-    let frame = build_wire_frame(FrameKind::Data, sid, seq, payload);
-    let sealed = seal_frame(cipher, &frame);
-    upload_c2r_frame(inner, sid, seq, sealed).await
-}
-
-/// Build, seal, and upload an Eof frame (writer-side half-close).
-async fn upload_eof_frame(
-    inner: &DriveMuxInner,
-    sid: SessionId,
-    seq: u64,
-    cipher: &AeadCipher,
-) -> Result<(), ClientError> {
-    let frame = build_wire_frame(FrameKind::Eof, sid, seq, Bytes::new());
-    let sealed = seal_frame(cipher, &frame);
-    upload_c2r_frame(inner, sid, seq, sealed).await
-}
-
-/// Build, seal, and upload a Close frame (full close).
-async fn upload_close_frame(
-    inner: &DriveMuxInner,
-    sid: SessionId,
-    cipher: &AeadCipher,
-    seq: u64,
-) -> Result<(), ClientError> {
-    let frame = build_wire_frame(FrameKind::Close, sid, seq, Bytes::new());
-    let sealed = seal_frame(cipher, &frame);
-    upload_c2r_frame(inner, sid, seq, sealed).await
-}
+// The legacy `upload_{data,eof,close}_frame` per-frame helpers were
+// retired when c2r switched to batched uploads — see
+// `push_c2r_frame` / `flush_c2r_batch` above for the new path.
+// `upload_connect_frame` survives unbatched because it's the very
+// first frame and the session can't proceed until the relay sees it.
 
 // --------------------------------------------------------------------
 // Per-session pump
@@ -624,6 +824,7 @@ async fn upload_close_frame(
 ///   - local socket error: uploads Close best-effort, exits Err
 ///   - InboundFrame::Close received: shuts down local socket, exits Ok
 ///   - inbound channel closed (mux dropped): exits Ok
+#[allow(unused_assignments)] // `next_c2r_seq += 1` before some returns is intentional bookkeeping
 async fn pump_session(
     mut sock: TcpStream,
     sid: SessionId,
@@ -637,7 +838,35 @@ async fn pump_session(
     let mut local_writable = true; // false once we receive Eof from the relay
     let mut local_read_closed = false; // true once browser half-closes its write side
 
+    // Outbound batch state. `pending` accumulates frames from local
+    // socket reads (and terminal Eof/Close) until either:
+    //   * the coalesce timer fires (size-tier delay), OR
+    //   * we hit `BATCH_FLUSH_BYTES` / `BATCH_MAX_FRAMES`, OR
+    //   * a non-Data frame (Eof/Close/Error) is pushed (flush now so
+    //     the relay sees the control event without waiting), OR
+    //   * the session is exiting (final flush before return).
+    // `pending_bytes` tracks accumulated payload bytes (not including
+    // wire framing overhead) for the size-tier pick.
+    let mut pending: Vec<WireFrame> = Vec::new();
+    let mut pending_bytes: usize = 0;
+    let mut flush_deadline: Option<tokio::time::Instant> = None;
+
     loop {
+        // Future for the coalesce timer. Resolves only when there's
+        // a pending batch with a deadline set; otherwise blocks
+        // forever. We copy the `Option<Instant>` into the async block
+        // (Instant is Copy) so the block doesn't hold an outstanding
+        // borrow of `flush_deadline` — the push/flush helpers in the
+        // other select! arms need `&mut flush_deadline`.
+        let deadline_snapshot = flush_deadline;
+        let timer_future = async move {
+            if let Some(d) = deadline_snapshot {
+                tokio::time::sleep_until(d).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::pin!(timer_future);
         tokio::select! {
             biased;
             evt = inbound_rx.recv() => {
@@ -654,16 +883,20 @@ async fn pump_session(
                             tracing::warn!(
                                 "drive session {:?}: local write failed: {}", sid, e
                             );
-                            let _ = upload_close_frame(inner, sid, cipher, next_c2r_seq).await;
+                            let close_seq = next_c2r_seq;
+                            next_c2r_seq += 1;
+                            let frame = build_wire_frame(FrameKind::Close, sid, close_seq, Bytes::new());
+                            push_c2r_frame(
+                                inner, sid, cipher,
+                                &mut pending, &mut pending_bytes, &mut flush_deadline,
+                                frame, true,
+                            );
                             return Err(e);
                         }
                     }
                     Some(InboundFrame::Eof) => {
-                        // Relay half-closed its write side (real destination
-                        // closed). Shutdown the local write so the browser
-                        // sees EOF on read. If the browser already half-closed
-                        // its write side, both directions are done and Close is
-                        // now safe as the final teardown signal.
+                        // Relay half-closed its write side. Shutdown local
+                        // write so the browser sees EOF on read.
                         if let Err(e) = sock.shutdown().await {
                             tracing::debug!(
                                 "drive session {:?}: local shutdown failed: {}", sid, e
@@ -672,50 +905,62 @@ async fn pump_session(
                         local_writable = false;
                         if local_read_closed {
                             let close_seq = next_c2r_seq;
-                            if let Err(e) = upload_close_frame(inner, sid, cipher, close_seq).await {
-                                tracing::debug!(
-                                    "drive session {:?}: Close upload failed: {}",
-                                    sid,
-                                    e
-                                );
-                            }
+                            next_c2r_seq += 1;
+                            let frame = build_wire_frame(FrameKind::Close, sid, close_seq, Bytes::new());
+                            push_c2r_frame(
+                                inner, sid, cipher,
+                                &mut pending, &mut pending_bytes, &mut flush_deadline,
+                                frame, true,
+                            );
                             return Ok(());
                         }
                     }
                     Some(InboundFrame::Close) | None => {
-                        // Relay sent Close, OR the mux dropped (channel
-                        // closed). Either way, the session is done.
-                        // Don't upload another Close — relay either sent
-                        // one already (loop case) or no longer cares
-                        // (mux dropped case).
+                        // Relay sent Close, OR mux dropped. Final flush of
+                        // any pending batch then exit. We don't upload
+                        // another Close — the relay already sent one (or
+                        // the mux doesn't care).
+                        flush_c2r_batch(
+                            inner, sid, cipher,
+                            &mut pending, &mut pending_bytes, &mut flush_deadline,
+                        );
                         return Ok(());
                     }
                 }
             }
+            _ = &mut timer_future => {
+                // Coalesce deadline reached — flush whatever accumulated.
+                flush_c2r_batch(
+                    inner, sid, cipher,
+                    &mut pending, &mut pending_bytes, &mut flush_deadline,
+                );
+            }
             read_result = sock.read(&mut read_buf), if !local_read_closed => {
                 match read_result {
                     Ok(0) => {
-                        // Local EOF (browser half-closed write). Upload Eof
-                        // and keep receiving r2c frames; some protocols use
-                        // this to mark end-of-request while still expecting a
-                        // response body.
+                        // Local EOF (browser half-closed write). Push Eof
+                        // and flush. Eof is a control frame: flush_now=true
+                        // so the relay sees it without waiting on coalesce.
                         let eof_seq = next_c2r_seq;
                         next_c2r_seq += 1;
-                        if let Err(e) = upload_eof_frame(inner, sid, eof_seq, cipher).await {
-                            tracing::debug!(
-                                "drive session {:?}: Eof upload failed: {}", sid, e
-                            );
-                        }
+                        let eof_frame = build_wire_frame(FrameKind::Eof, sid, eof_seq, Bytes::new());
+                        push_c2r_frame(
+                            inner, sid, cipher,
+                            &mut pending, &mut pending_bytes, &mut flush_deadline,
+                            eof_frame, true,
+                        );
                         local_read_closed = true;
                         if !local_writable {
                             let close_seq = next_c2r_seq;
-                            if let Err(e) = upload_close_frame(inner, sid, cipher, close_seq).await {
-                                tracing::debug!(
-                                    "drive session {:?}: Close upload failed: {}",
-                                    sid,
-                                    e
-                                );
-                            }
+                            next_c2r_seq += 1;
+                            let close_frame = build_wire_frame(
+                                FrameKind::Close, sid, close_seq, Bytes::new()
+                            );
+                            push_c2r_frame(
+                                inner, sid, cipher,
+                                &mut pending, &mut pending_bytes, &mut flush_deadline,
+                                close_frame, true,
+                            );
                             return Ok(());
                         }
                     }
@@ -723,19 +968,30 @@ async fn pump_session(
                         let payload = Bytes::copy_from_slice(&read_buf[..n]);
                         let seq = next_c2r_seq;
                         next_c2r_seq += 1;
-                        if let Err(e) = upload_data_frame(inner, sid, seq, cipher, payload).await {
-                            tracing::warn!(
-                                "drive session {:?}: c2r upload failed at seq={}: {}",
-                                sid, seq, e
-                            );
-                            return Err(std::io::Error::other(format!("c2r upload: {e}")));
-                        }
+                        let frame = build_wire_frame(FrameKind::Data, sid, seq, payload);
+                        // Data frames are coalesced — flush_now=false. The
+                        // timer arm above fires the spawn-and-forget upload
+                        // once the size-tier delay elapses (or threshold hits).
+                        push_c2r_frame(
+                            inner, sid, cipher,
+                            &mut pending, &mut pending_bytes, &mut flush_deadline,
+                            frame, false,
+                        );
                     }
                     Err(e) => {
                         tracing::warn!(
                             "drive session {:?}: local read failed: {}", sid, e
                         );
-                        let _ = upload_close_frame(inner, sid, cipher, next_c2r_seq).await;
+                        let close_seq = next_c2r_seq;
+                        next_c2r_seq += 1;
+                        let close_frame = build_wire_frame(
+                            FrameKind::Close, sid, close_seq, Bytes::new()
+                        );
+                        push_c2r_frame(
+                            inner, sid, cipher,
+                            &mut pending, &mut pending_bytes, &mut flush_deadline,
+                            close_frame, true,
+                        );
                         return Err(e);
                     }
                 }
@@ -761,6 +1017,12 @@ async fn poll_loop(weak: Weak<DriveMuxInner>) {
     };
     let mut interval_ms = baseline_ms;
     let mut empty_streak: u64 = 0;
+    // Sliding modifiedTime cursor — None on the very first poll
+    // (full folder list); advanced after each cycle to the latest
+    // modifiedTime seen, minus a small safety window so delayed
+    // Drive visibility does not strand an older missing seq behind
+    // the cursor. Mirrors Skirk's `nextListSince` lookback logic.
+    let mut modified_cursor: Option<String> = None;
 
     tracing::info!(
         "drive client poll loop starting (baseline={}ms)",
@@ -776,18 +1038,34 @@ async fn poll_loop(weak: Weak<DriveMuxInner>) {
                 return;
             }
         };
-        let found = run_one_cycle(inner).await;
-        interval_ms = adapt_interval(baseline_ms, found, &mut empty_streak);
+        let found = run_one_cycle(inner.clone(), &mut modified_cursor).await;
+        // While at least one CONNECT is registered, every empty cycle
+        // is still a cycle where r2c traffic is EXPECTED — back-off
+        // would just add per-request tail latency for no quota win.
+        // The ramp only fires when the proxy is genuinely idle.
+        let sessions_present = !inner.sessions.read().await.is_empty();
+        interval_ms = adapt_interval(baseline_ms, found, &mut empty_streak, sessions_present);
     }
 }
 
 /// Adaptive-interval computation, factored out for unit testing.
-/// On `found_work`: drop to pipeline interval. On empty: ramp
-/// `baseline + step * empty_streak`, capped at `MAX_IDLE_INTERVAL_MS`.
-fn adapt_interval(baseline_ms: u64, found_work: bool, empty_streak: &mut u64) -> u64 {
+/// - `found_work`: drop to pipeline interval, reset the streak.
+/// - empty cycle with `sessions_present`: stay at baseline; we
+///   expect r2c shortly and idle backoff would just delay it.
+/// - empty cycle with no sessions: ramp `baseline + step * streak`,
+///   capped at `MAX_IDLE_INTERVAL_MS`.
+fn adapt_interval(
+    baseline_ms: u64,
+    found_work: bool,
+    empty_streak: &mut u64,
+    sessions_present: bool,
+) -> u64 {
     if found_work {
         *empty_streak = 0;
         PIPELINE_INTERVAL_MS
+    } else if sessions_present {
+        *empty_streak = 0;
+        baseline_ms
     } else {
         *empty_streak = empty_streak.saturating_add(1);
         baseline_ms
@@ -796,9 +1074,47 @@ fn adapt_interval(baseline_ms: u64, found_work: bool, empty_streak: &mut u64) ->
     }
 }
 
+/// Advance the sliding `modifiedTime >= since` cursor.
+///
+/// `now` is the wall-clock timestamp captured BEFORE the list call —
+/// it lets us advance the cursor even on empty listings, which is
+/// load-bearing for steady polling: with `since=None` the query path
+/// falls back to Drive's slow `name contains` full-text index
+/// (multi-second visibility lag for newly uploaded mailbox files).
+/// Once we set a cursor, subsequent calls use the much-faster
+/// `modifiedTime >= ...` predicate over the folder's recently-modified
+/// children. The 8s lookback keeps Skirk's safety margin against
+/// out-of-order Drive visibility.
+fn advance_modified_cursor(
+    files: &[DriveFile],
+    cursor: &mut Option<String>,
+    now: time::OffsetDateTime,
+) {
+    let file_max = files.iter().filter_map(|f| f.modified_time).max();
+    let basis = match file_max {
+        Some(m) if m > now => m,
+        _ => now,
+    };
+    let proposed = basis - time::Duration::seconds(MODIFIED_CURSOR_LOOKBACK_SECS);
+    let current = cursor.as_deref().and_then(|s| {
+        time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).ok()
+    });
+    if current.is_some_and(|c| c >= proposed) {
+        return;
+    }
+    if let Ok(formatted) = proposed.format(&time::format_description::well_known::Rfc3339) {
+        *cursor = Some(formatted);
+    }
+}
+
 /// Run one poll iteration. Returns true iff at least one r2c file
 /// was processed (drives the adaptive interval).
-async fn run_one_cycle(inner: Arc<DriveMuxInner>) -> bool {
+///
+/// `modified_cursor` is the sliding `modifiedTime >= since` filter —
+/// `None` on the first call (full folder list), then advanced to the
+/// latest `modifiedTime` observed in each non-empty cycle so
+/// subsequent calls return only the delta.
+async fn run_one_cycle(inner: Arc<DriveMuxInner>, modified_cursor: &mut Option<String>) -> bool {
     let access_token = match inner.token_cache.get().await {
         Ok(t) => t,
         Err(e) => {
@@ -810,9 +1126,22 @@ async fn run_one_cycle(inner: Arc<DriveMuxInner>) -> bool {
         }
     };
 
+    // Capture `now` BEFORE the list call so `advance_modified_cursor`
+    // can safely move forward even when the listing comes back empty.
+    // Without this, the first poll (cursor = None) uses Drive's slow
+    // `name contains` query path; if that listing is empty the cursor
+    // never gets set and every subsequent poll keeps paying the same
+    // slow path. See `advance_modified_cursor` for why `now` is a
+    // safe lower bound here.
+    let call_start = time::OffsetDateTime::now_utc();
     let files = match inner
         .drive_api
-        .list_files_in_folder(&access_token, &inner.cfg.folder_id, "r2c_")
+        .list_files_in_folder_since(
+            &access_token,
+            &inner.cfg.folder_id,
+            "r2c_",
+            modified_cursor.as_deref(),
+        )
         .await
     {
         Ok(f) => f,
@@ -821,6 +1150,12 @@ async fn run_one_cycle(inner: Arc<DriveMuxInner>) -> bool {
             return false;
         }
     };
+    // Advance the cursor before filtering / processing. Skirk's 8s
+    // lookback keeps us robust against out-of-order Drive visibility;
+    // the `now` argument bootstraps the cursor when the listing is
+    // empty so steady polling stops re-hitting the full-text name
+    // index path.
+    advance_modified_cursor(&files, modified_cursor, call_start);
 
     // Snapshot the local session sid-set under a single read lock —
     // we use it to filter out r2c files that belong to OTHER clients
@@ -856,36 +1191,30 @@ async fn run_one_cycle(inner: Arc<DriveMuxInner>) -> bool {
     sorted.sort_by_key(|(_, p)| (p.sid, p.seq));
 
     let permits_cap = std::cmp::max(1, inner.cfg.max_concurrent_uploads as usize);
-    let permits = Arc::new(tokio::sync::Semaphore::new(permits_cap));
+    let download_permits = Arc::new(tokio::sync::Semaphore::new(permits_cap));
 
-    // Group by sid + process each sid serially. Different sids
-    // still run in parallel (bounded by the semaphore). Same
-    // rationale as the relay's poll loop: per-sid serial preserves
-    // wire ordering — concurrent r2c workers for c2r_0+c2r_1 of
-    // the same session race after the replay-window check and
-    // can deliver Data frames out of seq order to the session's
-    // mpsc, which writes them to the local socket in wrong order.
-    // For TLS that's a flow-killer; for plaintext HTTP it's a
-    // silent corruption.
+    // Group by sid so commit stays strictly ordered per TCP stream,
+    // but let each group prefetch Drive bodies concurrently. This
+    // mirrors Skirk's receive workers without the unsafe part: Drive
+    // download/decrypt/decode can race, while replay-window commit
+    // and mpsc delivery happen later in sorted seq order.
     let mut frames_by_sid: std::collections::HashMap<SessionId, Vec<(DriveFile, DriveFilename)>> =
         std::collections::HashMap::new();
     for entry in sorted {
         frames_by_sid.entry(entry.1.sid).or_default().push(entry);
     }
     let mut workers: JoinSet<()> = JoinSet::new();
-    for (_sid, group) in frames_by_sid {
+    for (sid, group) in frames_by_sid {
         let inner = inner.clone();
         let access_token = access_token.clone();
-        let permit = match permits.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => return true,
-        };
+        let download_permits = download_permits.clone();
         workers.spawn(async move {
-            let _permit = permit;
-            for (file, parsed) in group {
-                if let Err(e) = process_r2c_frame(&inner, &access_token, file, parsed).await {
-                    tracing::warn!("drive client: r2c frame processing failed: {}", e);
-                }
+            if let Err(e) = process_r2c_group(inner, access_token, download_permits, group).await {
+                tracing::warn!(
+                    "drive client: r2c group processing failed for sid {:?}: {}",
+                    sid,
+                    e
+                );
             }
         });
     }
@@ -893,71 +1222,145 @@ async fn run_one_cycle(inner: Arc<DriveMuxInner>) -> bool {
     true
 }
 
-/// Download, decrypt, and dispatch one r2c frame to the
-/// per-session driver. Symmetric to the relay's `process_frame`.
-async fn process_r2c_frame(
-    inner: &DriveMuxInner,
-    access_token: &str,
+struct PreparedR2cBatch {
     file: DriveFile,
     parsed: DriveFilename,
+    batch: Batch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryOutcome {
+    Consumed,
+    Duplicate,
+    Blocked,
+}
+
+/// Process one sid's r2c files with parallel Drive-body prefetch,
+/// then ordered commit. This is the client-side receive analogue of
+/// Skirk's workers: network-bound downloads run concurrently, but
+/// replay-window advancement and local socket delivery stay strictly
+/// sequential.
+async fn process_r2c_group(
+    inner: Arc<DriveMuxInner>,
+    access_token: String,
+    download_permits: Arc<Semaphore>,
+    group: Vec<(DriveFile, DriveFilename)>,
 ) -> Result<(), ClientError> {
-    // Snapshot session state under the read lock; drop the lock
-    // before any await on Drive.
+    if group.is_empty() {
+        return Ok(());
+    }
+
+    let sid = group[0].1.sid;
     let session_view = {
         let sessions = inner.sessions.read().await;
         sessions
-            .get(&parsed.sid)
+            .get(&sid)
             .map(|h| (h.keys.clone(), h.replay.clone(), h.inbound_tx.clone()))
     };
     let (keys, replay, inbound_tx) = match session_view {
         Some(v) => v,
         None => {
-            // No session — probably a stale r2c from a session
-            // whose tunnel_connection has already returned (and
-            // whose SessionGuard removed the entry). Best-effort
+            // No session — probably stale r2c from a tunnel whose
+            // SessionGuard already removed the entry. Best-effort
             // delete to keep the listing tidy.
-            let _ = inner.drive_api.delete_file(access_token, &file.id).await;
-            tracing::debug!(
-                "drive client: r2c {} dropped (no session for sid {:?})",
-                file.name,
-                parsed.sid
-            );
+            for (file, parsed) in group {
+                let _ = inner.drive_api.delete_file(&access_token, &file.id).await;
+                tracing::debug!(
+                    "drive client: r2c {} dropped (no session for sid {:?})",
+                    file.name,
+                    parsed.sid
+                );
+            }
             return Ok(());
         }
     };
 
-    // Strict replay/ordering check on filename seq BEFORE download.
-    // Pure *check* — we deliberately do NOT advance the window here.
-    // Advance happens after delivery completes successfully
-    // (`commit` below). A transient download / AEAD / dispatch
-    // failure would otherwise permanently consume the seq and the
-    // redelivered file would be wrongly rejected as a replay next
-    // poll. Future frames are left in Drive until the missing earlier
-    // seq becomes visible.
-    {
+    let next_expected = {
         let window = replay.lock().await;
-        match window.check_next(parsed.seq) {
-            Ok(()) => {}
-            Err(StrictSeqError::Replay(e)) => {
-                tracing::debug!(
-                    "drive client: r2c {} rejected by replay window: {}",
-                    file.name,
-                    e
-                );
-                let _ = inner.drive_api.delete_file(access_token, &file.id).await;
-                return Ok(());
-            }
-            Err(StrictSeqError::Future { expected, .. }) => {
-                tracing::debug!(
-                    "drive client: r2c {} arrived before seq {}; leaving for a later poll",
-                    file.name,
-                    expected
-                );
-                return Ok(());
-            }
+        match window.last_seen() {
+            None => Some(0),
+            Some(prev) => prev.checked_add(1),
+        }
+    };
+    let Some(next_expected) = next_expected else {
+        for (file, _) in group {
+            let _ = inner.drive_api.delete_file(&access_token, &file.id).await;
+        }
+        return Ok(());
+    };
+
+    let mut downloads: JoinSet<Result<Option<PreparedR2cBatch>, ClientError>> = JoinSet::new();
+    let mut saw_expected_seq = false;
+    for (file, parsed) in group {
+        if !matches!(parsed.kind, FilenameKind::Frame(Direction::RelayToClient)) {
+            tracing::debug!("drive client: ignoring non-r2c filename: {}", file.name);
+            continue;
+        }
+        if parsed.seq < next_expected {
+            tracing::debug!(
+                "drive client: r2c {} rejected by replay window: seq {} < expected {}",
+                file.name,
+                parsed.seq,
+                next_expected
+            );
+            let _ = inner.drive_api.delete_file(&access_token, &file.id).await;
+            continue;
+        }
+        if parsed.seq == next_expected {
+            saw_expected_seq = true;
+        } else if !saw_expected_seq {
+            tracing::debug!(
+                "drive client: r2c {} arrived before seq {}; leaving for a later poll",
+                file.name,
+                next_expected
+            );
+            break;
+        }
+
+        let permit = download_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| ClientError::WorkerSemaphoreClosed)?;
+        let inner = inner.clone();
+        let access_token = access_token.clone();
+        let keys = keys.clone();
+        downloads.spawn(async move {
+            let _permit = permit;
+            prepare_r2c_batch(inner, access_token, keys, file, parsed).await
+        });
+    }
+
+    let mut prepared = Vec::new();
+    while let Some(joined) = downloads.join_next().await {
+        match joined {
+            Ok(Ok(Some(batch))) => prepared.push(batch),
+            Ok(Ok(None)) => {}
+            Ok(Err(e)) => tracing::warn!("drive client: r2c prefetch failed: {}", e),
+            Err(e) => tracing::warn!("drive client: r2c prefetch task failed: {}", e),
+        }
+    }
+    prepared.sort_by_key(|p| p.parsed.seq);
+
+    for prepared in prepared {
+        match deliver_prepared_r2c_batch(&inner, &access_token, &replay, &inbound_tx, prepared)
+            .await?
+        {
+            DeliveryOutcome::Consumed | DeliveryOutcome::Duplicate => {}
+            DeliveryOutcome::Blocked => break,
         }
     }
 
+    Ok(())
+}
+
+async fn prepare_r2c_batch(
+    inner: Arc<DriveMuxInner>,
+    access_token: String,
+    keys: Arc<SessionKeys>,
+    file: DriveFile,
+    parsed: DriveFilename,
+) -> Result<Option<PreparedR2cBatch>, ClientError> {
     if let Some(size) = file.size {
         if size > MAX_SEALED_FRAME_BODY_BYTES {
             tracing::warn!(
@@ -966,14 +1369,14 @@ async fn process_r2c_frame(
                 size,
                 MAX_SEALED_FRAME_BODY_BYTES
             );
-            let _ = inner.drive_api.delete_file(access_token, &file.id).await;
-            return Ok(());
+            let _ = inner.drive_api.delete_file(&access_token, &file.id).await;
+            return Ok(None);
         }
     }
 
     let sealed = match inner
         .drive_api
-        .download_file(access_token, &file.id, MAX_SEALED_FRAME_BODY_BYTES)
+        .download_file(&access_token, &file.id, MAX_SEALED_FRAME_BODY_BYTES)
         .await
     {
         Ok(bytes) => bytes,
@@ -982,8 +1385,8 @@ async fn process_r2c_frame(
                 "drive client: r2c {} exceeded the protocol size cap; deleting",
                 file.name
             );
-            let _ = inner.drive_api.delete_file(access_token, &file.id).await;
-            return Ok(());
+            let _ = inner.drive_api.delete_file(&access_token, &file.id).await;
+            return Ok(None);
         }
         Err(e) => return Err(e.into()),
     };
@@ -992,62 +1395,150 @@ async fn process_r2c_frame(
         Ok(pt) => pt,
         Err(e) => {
             tracing::warn!("drive client: r2c {} AEAD open failed: {}", file.name, e);
-            // Don't delete — could be a corrupted listing entry the
-            // relay's orphan reaper will sweep by modifiedTime. Don't
-            // advance the replay window either — leaves the window
-            // open for the next-poll retry to succeed.
-            return Ok(());
+            return Ok(None);
         }
     };
-    let wire = match WireFrame::decode(&plaintext) {
-        Ok(w) => w,
+    let batch = match Batch::decode(&plaintext) {
+        Ok(b) => b,
         Err(e) => {
-            tracing::warn!("drive client: r2c {} wire decode failed: {}", file.name, e);
-            return Ok(());
+            tracing::warn!("drive client: r2c {} batch decode failed: {}", file.name, e);
+            return Ok(None);
         }
     };
-    // Defense in depth: filename (sid, seq) must match wire frame
-    // (sid, seq). Already bound in AAD; this is a belt-and-suspenders
-    // check that would catch a future encoding bug loudly.
-    if wire.sid != parsed.sid || wire.seq != parsed.seq {
+    if batch.frames.is_empty() {
+        tracing::warn!("drive client: r2c {} decoded to empty batch", file.name);
+        return Ok(None);
+    }
+    if batch.frames[0].seq != parsed.seq {
         tracing::warn!(
-            "drive client: r2c {} sid/seq mismatch (filename vs wire frame)",
-            file.name
-        );
-        return Ok(());
-    }
-
-    let inbound = match wire_to_inbound(wire) {
-        Some(i) => i,
-        None => {
-            tracing::warn!(
-                "drive client: r2c {} carried an unexpected frame kind; ignoring",
-                file.name
-            );
-            return Ok(());
-        }
-    };
-    if let Err(e) = inbound_tx.send(inbound).await {
-        tracing::debug!(
-            "drive client: r2c {}: session driver gone, dropping inbound: {}",
+            "drive client: r2c {} first-frame seq mismatch: filename={} first_frame={}",
             file.name,
-            e
+            parsed.seq,
+            batch.frames[0].seq,
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(PreparedR2cBatch {
+        file,
+        parsed,
+        batch,
+    }))
+}
+
+async fn deliver_prepared_r2c_batch(
+    inner: &DriveMuxInner,
+    access_token: &str,
+    replay: &Arc<Mutex<ReplayWindow>>,
+    inbound_tx: &mpsc::Sender<InboundFrame>,
+    prepared: PreparedR2cBatch,
+) -> Result<DeliveryOutcome, ClientError> {
+    let PreparedR2cBatch {
+        file,
+        parsed,
+        batch,
+    } = prepared;
+    let frame_count = batch.frames.len();
+    let mut committed_through: Option<u64> = None;
+
+    for (idx, wire) in batch.frames.into_iter().enumerate() {
+        if wire.sid != parsed.sid {
+            tracing::warn!(
+                "drive client: r2c {} batch index {} sid mismatch",
+                file.name,
+                idx
+            );
+            break;
+        }
+        let replay_check = {
+            let window = replay.lock().await;
+            window.check_next(wire.seq)
+        };
+        match replay_check {
+            Ok(()) => {}
+            Err(StrictSeqError::Replay(e)) => {
+                tracing::debug!(
+                    "drive client: r2c {} batch index {} seq {} rejected by replay: {}",
+                    file.name,
+                    idx,
+                    wire.seq,
+                    e,
+                );
+                if committed_through.is_none() {
+                    delete_r2c_file_detached(&inner.drive_api, access_token, &file);
+                    return Ok(DeliveryOutcome::Duplicate);
+                }
+                break;
+            }
+            Err(StrictSeqError::Future { expected, .. }) => {
+                tracing::debug!(
+                    "drive client: r2c {} batch index {} arrived before seq {}; leaving for a later poll",
+                    file.name,
+                    idx,
+                    expected
+                );
+                if committed_through.is_none() {
+                    return Ok(DeliveryOutcome::Blocked);
+                }
+                break;
+            }
+        }
+        let frame_seq = wire.seq;
+        let inbound = match wire_to_inbound(wire) {
+            Some(i) => i,
+            None => {
+                tracing::warn!(
+                    "drive client: r2c {} batch index {} carried an unexpected frame kind",
+                    file.name,
+                    idx,
+                );
+                break;
+            }
+        };
+        if let Err(e) = inbound_tx.send(inbound).await {
+            tracing::debug!(
+                "drive client: r2c {} batch index {}: session driver gone, dropping inbound: {}",
+                file.name,
+                idx,
+                e
+            );
+            break;
+        }
+        {
+            let mut window = replay.lock().await;
+            window.commit(frame_seq);
+        }
+        committed_through = Some(frame_seq);
+    }
+
+    let Some(committed_through) = committed_through else {
+        return Ok(DeliveryOutcome::Blocked);
+    };
+
+    if frame_count > 1 {
+        tracing::info!(
+            "drive client: r2c {} consumed batch first_seq={} through={} ({} frames)",
+            file.name,
+            parsed.seq,
+            committed_through,
+            frame_count
         );
     }
 
-    // Advance the replay window now that the frame has been fully
-    // decoded + dispatched to the per-session driver. Doing this
-    // BEFORE delivery would let a transient failure permanently
-    // consume the seq; see `ReplayWindow::check` for the rationale.
-    {
-        let mut window = replay.lock().await;
-        window.commit(parsed.seq);
-    }
+    delete_r2c_file_detached(&inner.drive_api, access_token, &file);
+    Ok(DeliveryOutcome::Consumed)
+}
 
-    if let Err(e) = inner.drive_api.delete_file(access_token, &file.id).await {
-        tracing::debug!("drive client: r2c {} delete failed: {}", file.name, e);
-    }
-    Ok(())
+fn delete_r2c_file_detached(drive_api: &DriveApiClient, access_token: &str, file: &DriveFile) {
+    let drive_api = drive_api.clone();
+    let access_token = access_token.to_string();
+    let file_id = file.id.clone();
+    let file_name = file.name.clone();
+    tokio::spawn(async move {
+        if let Err(e) = drive_api.delete_file(&access_token, &file_id).await {
+            tracing::debug!("drive client: r2c {} delete failed: {}", file_name, e);
+        }
+    });
 }
 
 /// Translate a verified r2c [`WireFrame`] into the
@@ -1080,6 +1571,8 @@ enum ClientError {
     Api(#[from] crate::drive_api::DriveApiError),
     #[error("Drive upload semaphore closed")]
     UploadSemaphoreClosed,
+    #[error("Drive worker semaphore closed")]
+    WorkerSemaphoreClosed,
 }
 
 // --------------------------------------------------------------------
@@ -1103,7 +1596,7 @@ mod tests {
     #[test]
     fn adapt_interval_resets_on_work() {
         let mut streak = 5;
-        let next = adapt_interval(300, true, &mut streak);
+        let next = adapt_interval(300, true, &mut streak, false);
         assert_eq!(next, PIPELINE_INTERVAL_MS);
         assert_eq!(streak, 0);
     }
@@ -1111,10 +1604,10 @@ mod tests {
     #[test]
     fn adapt_interval_ramps_on_empty() {
         let mut streak = 0;
-        let n1 = adapt_interval(300, false, &mut streak);
+        let n1 = adapt_interval(300, false, &mut streak, false);
         assert_eq!(streak, 1);
         assert_eq!(n1, 300 + IDLE_BACKOFF_STEP_MS);
-        let n2 = adapt_interval(300, false, &mut streak);
+        let n2 = adapt_interval(300, false, &mut streak, false);
         assert_eq!(streak, 2);
         assert_eq!(n2, 300 + 2 * IDLE_BACKOFF_STEP_MS);
     }
@@ -1123,14 +1616,106 @@ mod tests {
     fn adapt_interval_caps_at_max_idle() {
         let mut streak = 0;
         for _ in 0..100 {
-            let v = adapt_interval(300, false, &mut streak);
+            let v = adapt_interval(300, false, &mut streak, false);
             assert!(v <= MAX_IDLE_INTERVAL_MS, "exceeded cap: {}", v);
         }
         // After many empty cycles we MUST land exactly on the cap.
         assert_eq!(
-            adapt_interval(300, false, &mut streak),
+            adapt_interval(300, false, &mut streak, false),
             MAX_IDLE_INTERVAL_MS
         );
+    }
+
+    #[test]
+    fn adapt_interval_stays_at_baseline_when_sessions_present() {
+        // With at least one CONNECT registered, an empty cycle MUST
+        // stay at baseline — idle backoff would add multi-second
+        // tail latency to every r2c response after a brief lull.
+        let mut streak = 7;
+        let next = adapt_interval(300, false, &mut streak, true);
+        assert_eq!(next, 300);
+        assert_eq!(streak, 0, "session-present resets the empty streak");
+    }
+
+    #[test]
+    fn adapt_interval_resumes_ramp_when_sessions_drop() {
+        // Sessions present → no ramp; sessions then drop to zero →
+        // ramp resumes from a fresh streak. Pins the transition
+        // behaviour so a future refactor that forgets to reset
+        // streak doesn't reintroduce a long first idle sleep.
+        let mut streak = 4;
+        let _ = adapt_interval(300, false, &mut streak, true);
+        assert_eq!(streak, 0);
+        let next = adapt_interval(300, false, &mut streak, false);
+        assert_eq!(streak, 1);
+        assert_eq!(next, 300 + IDLE_BACKOFF_STEP_MS);
+    }
+
+    fn parse_rfc3339(s: &str) -> time::OffsetDateTime {
+        time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339).unwrap()
+    }
+
+    #[test]
+    fn modified_cursor_advances_with_skirk_lookback() {
+        // Files non-empty, file_max >= now → basis is file_max,
+        // cursor advances to file_max - lookback.
+        let mt = parse_rfc3339("2026-05-24T12:00:08Z");
+        let files = vec![DriveFile {
+            id: "id".into(),
+            name: "r2c_x_1".into(),
+            modified_time: Some(mt),
+            size: Some(1),
+        }];
+        let mut cursor = None;
+        advance_modified_cursor(&files, &mut cursor, mt);
+        assert_eq!(cursor.as_deref(), Some("2026-05-24T12:00:00Z"));
+    }
+
+    #[test]
+    fn modified_cursor_never_moves_backward() {
+        let older = parse_rfc3339("2026-05-24T12:00:07Z");
+        let files = vec![DriveFile {
+            id: "id".into(),
+            name: "r2c_x_1".into(),
+            modified_time: Some(older),
+            size: Some(1),
+        }];
+        let mut cursor = Some("2026-05-24T12:00:00Z".to_string());
+        // Pass a `now` that matches file_max so the proposed value
+        // is 11:59:59, strictly before the current cursor — must not move.
+        advance_modified_cursor(&files, &mut cursor, older);
+        assert_eq!(cursor.as_deref(), Some("2026-05-24T12:00:00Z"));
+    }
+
+    #[test]
+    fn modified_cursor_advances_on_empty_listing() {
+        // Empty listing must still advance the cursor — otherwise the
+        // first poll's `name contains` path (used when cursor is None)
+        // never gets swapped for the much-faster `modifiedTime >= ...`
+        // path on subsequent polls.
+        let now = parse_rfc3339("2026-05-24T12:00:08Z");
+        let mut cursor: Option<String> = None;
+        advance_modified_cursor(&[], &mut cursor, now);
+        assert_eq!(cursor.as_deref(), Some("2026-05-24T12:00:00Z"));
+    }
+
+    #[test]
+    fn modified_cursor_uses_wall_clock_when_files_older_than_now() {
+        // file_max is well behind `now` (no recent traffic but the
+        // folder has older leftover files in the listing) → cursor
+        // should still advance based on `now`, not get anchored to
+        // the stale file_max.
+        let stale_mt = parse_rfc3339("2026-05-24T11:00:00Z");
+        let now = parse_rfc3339("2026-05-24T12:00:08Z");
+        let files = vec![DriveFile {
+            id: "id".into(),
+            name: "r2c_x_1".into(),
+            modified_time: Some(stale_mt),
+            size: Some(1),
+        }];
+        let mut cursor: Option<String> = None;
+        advance_modified_cursor(&files, &mut cursor, now);
+        assert_eq!(cursor.as_deref(), Some("2026-05-24T12:00:00Z"));
     }
 
     // ---- wire_to_inbound -------------------------------------------
@@ -1247,15 +1832,17 @@ mod tests {
         let cipher = AeadCipher::new(&client_keys.k_c2r);
         let payload = Bytes::from_static(b"GET / HTTP/1.1\r\n");
         let frame = build_wire_frame(FrameKind::Data, sid, 1, payload.clone());
-        let sealed = seal_frame(&cipher, &frame);
+        let batch = drive_wire::frame::Batch::single(frame);
+        let sealed = seal_batch(&cipher, sid, &batch);
 
         // Simulate the relay's process_frame: open with k_c2r, then
-        // verify the wire bytes decode back to the expected frame.
+        // verify the batch bytes decode back to the expected frame.
         let relay_cipher = AeadCipher::new(&relay_keys.k_c2r);
         let opened = relay_cipher
             .open(&sid, 1, &sealed)
             .expect("relay must open client's Data frame");
-        let opened_frame = WireFrame::decode(&opened).expect("wire decode");
+        let opened_batch = drive_wire::frame::Batch::decode(&opened).expect("batch decode");
+        let opened_frame = &opened_batch.frames[0];
         assert_eq!(opened_frame.kind, FrameKind::Data);
         assert_eq!(opened_frame.sid, sid);
         assert_eq!(opened_frame.seq, 1);
@@ -1276,11 +1863,13 @@ mod tests {
         let port = 443u16;
         let payload = Bytes::from(format!("{host}:{port}").into_bytes());
         let frame = build_wire_frame(FrameKind::Connect, sid, 0, payload.clone());
-        let sealed = seal_frame(&cipher, &frame);
+        let batch = drive_wire::frame::Batch::single(frame);
+        let sealed = seal_batch(&cipher, sid, &batch);
 
         let relay_cipher = AeadCipher::new(&relay_keys.k_c2r);
         let opened = relay_cipher.open(&sid, 0, &sealed).unwrap();
-        let opened_frame = WireFrame::decode(&opened).unwrap();
+        let opened_batch = drive_wire::frame::Batch::decode(&opened).unwrap();
+        let opened_frame = &opened_batch.frames[0];
         assert_eq!(opened_frame.kind, FrameKind::Connect);
 
         // Manually reparse the payload as the relay does. If the
@@ -1325,12 +1914,14 @@ mod tests {
         let relay_cipher = AeadCipher::new(&relay_keys.k_r2c);
         let payload = Bytes::from_static(b"HTTP/1.1 200 OK\r\n");
         let frame = build_wire_frame(FrameKind::Data, sid, 0, payload.clone());
-        let plaintext = frame.encode().freeze();
+        let batch = drive_wire::frame::Batch::single(frame);
+        let plaintext = batch.encode().freeze();
         let sealed = relay_cipher.seal(&sid, 0, &plaintext);
 
         let client_cipher = AeadCipher::new(&client_keys.k_r2c);
         let opened = client_cipher.open(&sid, 0, &sealed).unwrap();
-        let opened_frame = WireFrame::decode(&opened).unwrap();
+        let opened_batch = drive_wire::frame::Batch::decode(&opened).unwrap();
+        let opened_frame = &opened_batch.frames[0];
         assert_eq!(opened_frame.kind, FrameKind::Data);
         assert_eq!(&opened_frame.payload[..], &payload[..]);
     }

@@ -174,7 +174,20 @@ pub fn build_drive_http_client(google_ip: Option<&str>) -> Result<reqwest::Clien
     let mut builder = reqwest::Client::builder()
         .gzip(true)
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(60));
+        .timeout(Duration::from_secs(60))
+        // Aggressive connection reuse. Drive Mode's per-cycle cost is
+        // dominated by per-request TLS handshake + TCP round-trip; one
+        // warm H2 connection multiplexes every upload/download/list
+        // across the same TCP stream and avoids paying the handshake
+        // cost again. The keep-alive ping interval (30 s) is short
+        // enough that Google's edge doesn't drop the H2 connection
+        // during the typical browsing idle window. Skirk's equivalent
+        // is `GoogleHTTPClient` with the same posture — see
+        // `internal/skirk/httpclient.go`.
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .http2_keep_alive_while_idle(true)
+        .tcp_keepalive(Duration::from_secs(60))
+        .pool_idle_timeout(Some(Duration::from_secs(300)));
     if let Some(ip_str) = google_ip {
         if let Ok(ip) = ip_str.parse::<std::net::IpAddr>() {
             let addr = std::net::SocketAddr::new(ip, 443);
@@ -254,9 +267,12 @@ impl DriveApiClient {
     /// List files in `folder_id`, optionally narrowing by names that
     /// contain `name_prefix`.
     /// Google Drive query syntax has `name contains` but no true
-    /// starts-with operator, so callers must treat the response as a
-    /// broad candidate set and ignore names that don't parse as
-    /// rahgozar protocol filenames.
+    /// starts-with operator. For unbounded startup lists we still use
+    /// the marker because it cuts stale folder backlog dramatically.
+    /// For cursor-based hot polling, the query relies on
+    /// `modifiedTime >= since` only and callers filter names locally;
+    /// this avoids Drive's full-text name index becoming the
+    /// freshness bottleneck for newly uploaded mailbox files.
     /// Used by the Drive shared poller to scan one direction's
     /// inbound queue (`c2r_*` on the relay, `r2c_*` on the client)
     /// plus the Hello opener prefix (`h_*` on the relay).
@@ -272,8 +288,31 @@ impl DriveApiClient {
         folder_id: &str,
         name_prefix: &str,
     ) -> Result<Vec<DriveFile>, DriveApiError> {
+        self.list_files_in_folder_since(access_token, folder_id, name_prefix, None)
+            .await
+    }
+
+    /// Like [`Self::list_files_in_folder`] but with an optional
+    /// `modifiedTime >= <since>` predicate (RFC 3339 timestamp string,
+    /// passed verbatim into the Drive query). Caller advances `since`
+    /// after each successful poll cycle so subsequent cycles return
+    /// only files newer than the previous high-water mark — a huge
+    /// per-call latency win once a Drive folder has accumulated even
+    /// a few hundred frames, since the server returns the bounded
+    /// delta instead of the full folder. Skirk-inspired: see
+    /// `ListFreshContainsPageStatus` at `internal/skirk/drive.go:557`.
+    ///
+    /// `since=None` is equivalent to the unbounded list; useful for
+    /// startup or test connection.
+    pub async fn list_files_in_folder_since(
+        &self,
+        access_token: &str,
+        folder_id: &str,
+        name_prefix: &str,
+        since: Option<&str>,
+    ) -> Result<Vec<DriveFile>, DriveApiError> {
         let url = format!("{}/drive/v3/files", self.base_url);
-        let q = build_list_query(folder_id, name_prefix);
+        let q = build_list_query_since(folder_id, name_prefix, since);
         let page_size = DEFAULT_LIST_PAGE_SIZE.to_string();
         // Page through every `nextPageToken` Drive returns. A folder
         // with more than `DEFAULT_LIST_PAGE_SIZE` (100) matching
@@ -297,6 +336,11 @@ impl DriveApiClient {
                 // more pages — silent truncation.
                 ("fields", "nextPageToken,files(id,name,modifiedTime,size)"),
                 ("pageSize", page_size.as_str()),
+                // Runtime pollers use a sliding `modifiedTime >= since`
+                // cursor. Asking Drive for newest-first pages matches
+                // Skirk's fresh-list path and keeps hot objects near
+                // page 1 when a folder has stale backlog.
+                ("orderBy", "modifiedTime desc"),
                 ("spaces", "drive"),
             ];
             if let Some(tok) = page_token.as_deref() {
@@ -488,15 +532,32 @@ impl DriveApiClient {
 /// quotes or backslashes — but the escaping defends against a
 /// future caller passing user input straight in.
 fn build_list_query(folder_id: &str, name_prefix: &str) -> String {
+    build_list_query_since(folder_id, name_prefix, None)
+}
+
+/// Same as `build_list_query` but with an optional `modifiedTime >=
+/// '<since>'` predicate. `since` must already be an RFC 3339 string;
+/// it's wrapped in single quotes and embedded literally in the
+/// query. When `since` is present, omit `name contains`: active
+/// polling wants Drive's recently-modified folder listing, not its
+/// slower full-text name index. Callers already filter by parsed
+/// filename after the list call.
+fn build_list_query_since(folder_id: &str, name_prefix: &str, since: Option<&str>) -> String {
     let folder = escape_query_literal(folder_id);
-    if name_prefix.is_empty() {
+    let mut q = if name_prefix.is_empty() || since.is_some() {
         format!("'{folder}' in parents and trashed = false")
     } else {
         format!(
             "'{folder}' in parents and name contains '{}' and trashed = false",
             escape_query_literal(name_prefix),
         )
+    };
+    if let Some(s) = since {
+        q.push_str(" and modifiedTime >= '");
+        q.push_str(&escape_query_literal(s));
+        q.push('\'');
     }
+    q
 }
 
 fn escape_query_literal(s: &str) -> String {
@@ -771,6 +832,45 @@ mod tests {
     fn build_list_query_omits_name_predicate_for_empty_prefix() {
         let q = build_list_query("0AABBccDD", "");
         assert_eq!(q, "'0AABBccDD' in parents and trashed = false");
+    }
+
+    #[test]
+    fn build_list_query_since_adds_modified_time_lower_bound() {
+        // When `since` is supplied, the query MUST NOT include
+        // `name contains` — that path uses Drive's slow full-text
+        // name index. Active polling instead asks for the folder's
+        // recently-modified children, and callers filter by parsed
+        // filename locally. Pins the optimisation against accidental
+        // regression.
+        let q = build_list_query_since("0AABBccDD", "r2c_", Some("2026-05-24T10:11:12.123Z"));
+        assert_eq!(
+            q,
+            "'0AABBccDD' in parents and trashed = false and modifiedTime >= '2026-05-24T10:11:12.123Z'"
+        );
+    }
+
+    #[test]
+    fn build_list_query_since_without_prefix_matches_with_prefix() {
+        // With a `since` cursor, the prefix is ignored — both calls
+        // must produce the same query, since the prefix predicate is
+        // dropped on the cursor path. Locks in the equivalence so a
+        // future caller that passes "" by mistake doesn't silently
+        // change behaviour.
+        let a = build_list_query_since("F", "r2c_", Some("2026-05-24T10:11:12Z"));
+        let b = build_list_query_since("F", "", Some("2026-05-24T10:11:12Z"));
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn build_list_query_without_since_still_uses_name_contains() {
+        // Startup path (`since = None`) keeps the `name contains`
+        // narrowing — folder bootstrap legitimately needs to filter
+        // out the other direction's frames before paging.
+        let q = build_list_query_since("F", "r2c_", None);
+        assert_eq!(
+            q,
+            "'F' in parents and name contains 'r2c_' and trashed = false"
+        );
     }
 
     #[test]

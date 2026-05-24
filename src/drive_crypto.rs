@@ -448,7 +448,11 @@ fn derive_directional_keys(
 // --------------------------------------------------------------------
 
 /// Per-direction ChaCha20-Poly1305 instance. Cheap to construct; not
-/// shared across directions because the two keys differ.
+/// shared across directions because the two keys differ. `Clone` is
+/// cheap (key schedule is reused under the hood); it's derived so
+/// the spawn-detached upload tasks in the c2r / r2c batchers can own
+/// their own copy of the cipher without contention.
+#[derive(Clone)]
 pub struct AeadCipher {
     inner: ChaCha20Poly1305,
 }

@@ -31,11 +31,11 @@
 //! side relies on this counter being strictly increasing.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use drive_wire::filename::{Direction, DriveFilename, FilenameKind};
-use drive_wire::frame::{FrameKind, SessionId, WireFrame, WIRE_VERSION};
+use drive_wire::frame::{Batch, FrameKind, SessionId, WireFrame, WIRE_VERSION};
 use rahgozar::drive_crypto::{AeadCipher, SessionKeys};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -49,9 +49,23 @@ use crate::state::{InboundFrame, RelayState};
 /// not the buffer size.
 const TCP_READ_BUFFER: usize = 16 * 1024;
 
+// ── r2c batching (mirror of client's c2r batching) ──────────────────
+//
+// Multiple Data frames coalesce into one Drive file upload via a
+// size-tiered wait window, matching the client's policy. The client
+// poller parses each Drive file as a multi-frame Batch.
+const R2C_COALESCE_INTERACTIVE_BYTES: usize = 8 * 1024;
+const R2C_COALESCE_INTERACTIVE_DELAY: Duration = Duration::from_millis(5);
+const R2C_COALESCE_MEDIUM_BYTES: usize = 64 * 1024;
+const R2C_COALESCE_MEDIUM_DELAY: Duration = Duration::from_millis(50);
+const R2C_COALESCE_BULK_DELAY: Duration = Duration::from_millis(100);
+const R2C_BATCH_FLUSH_BYTES: usize = 1024 * 1024;
+const R2C_BATCH_MAX_FRAMES: usize = 200;
+
 /// Run one session to completion. Spawned per-Hello by the poll
 /// worker; the spawned `JoinHandle` lives in
 /// [`crate::state::SessionHandle::task`].
+#[allow(unused_assignments)] // `next_r2c_seq += 1` before some returns is intentional bookkeeping
 pub async fn session_driver(
     sid: SessionId,
     keys: Arc<SessionKeys>,
@@ -140,15 +154,27 @@ pub async fn session_driver(
     let mut read_buf = vec![0u8; TCP_READ_BUFFER];
     let mut peer_writable = true; // false after we receive Eof from client
     let mut tcp_read_closed = false; // false until destination half-closes its write side
+
+    // Outbound r2c batch state. See client pump_session for the
+    // mirror-image accumulator on the c2r side.
+    let mut pending: Vec<WireFrame> = Vec::new();
+    let mut pending_bytes: usize = 0;
+    let mut flush_deadline: Option<tokio::time::Instant> = None;
     loop {
+        let deadline_snapshot = flush_deadline;
+        let timer_future = async move {
+            if let Some(d) = deadline_snapshot {
+                tokio::time::sleep_until(d).await;
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        tokio::pin!(timer_future);
         tokio::select! {
             biased;
             evt = inbound_rx.recv() => {
                 match evt {
                     Some(InboundFrame::Connect { .. }) => {
-                        // Second Connect within an active session is a
-                        // protocol violation. Log and ignore; the
-                        // existing connection stays live.
                         tracing::warn!("session {:?}: redundant Connect frame ignored", sid);
                     }
                     Some(InboundFrame::Data(bytes)) => {
@@ -168,45 +194,69 @@ pub async fn session_driver(
                                 e,
                                 bytes.len()
                             );
+                            flush_r2c_batch(
+                                &state, &sid, &send_cipher,
+                                &mut pending, &mut pending_bytes, &mut flush_deadline,
+                            );
                             return;
                         }
                     }
                     Some(InboundFrame::Eof) => {
                         bump_last_seen(&last_seen).await;
-                        // Half-close the write side. Continue reading
-                        // until the remote also closes so any
-                        // in-flight reply makes it back as r2c. If the
-                        // remote has already half-closed its write side,
-                        // both directions are done and Close is now safe.
                         if let Err(e) = tcp.shutdown().await {
                             tracing::debug!("session {:?}: tcp shutdown failed: {}", sid, e);
                         }
                         peer_writable = false;
                         if tcp_read_closed {
-                            upload_close_frame(&state, &sid, &mut next_r2c_seq, &send_cipher)
-                                .await;
+                            let close_seq = next_r2c_seq;
+                            next_r2c_seq += 1;
+                            push_r2c_frame(
+                                &state, &sid, &send_cipher,
+                                &mut pending, &mut pending_bytes, &mut flush_deadline,
+                                FrameKind::Close, close_seq, Bytes::new(), true,
+                            );
                             return;
                         }
                     }
                     Some(InboundFrame::Close) | None => {
-                        // Client-side close or channel closed: exit.
-                        // The orphan reaper will remove the entry
-                        // from the session table.
+                        // Flush any pending r2c before exiting so the
+                        // client sees the trailing bytes from the
+                        // destination before we vanish.
+                        flush_r2c_batch(
+                            &state, &sid, &send_cipher,
+                            &mut pending, &mut pending_bytes, &mut flush_deadline,
+                        );
                         return;
                     }
                 }
             }
+            _ = &mut timer_future => {
+                flush_r2c_batch(
+                    &state, &sid, &send_cipher,
+                    &mut pending, &mut pending_bytes, &mut flush_deadline,
+                );
+            }
             read_result = tcp.read(&mut read_buf), if !tcp_read_closed => {
                 match read_result {
                     Ok(0) => {
-                        // Remote EOF is a half-close. Tell the client no more
-                        // r2c bytes are coming, but keep accepting c2r bytes
-                        // until the client half-closes or sends Close.
-                        upload_eof_frame(&state, &sid, &mut next_r2c_seq, &send_cipher).await;
+                        // Remote EOF: half-close. Send Eof (flush_now=true).
+                        // If peer already half-closed its write, send Close too.
+                        let eof_seq = next_r2c_seq;
+                        next_r2c_seq += 1;
+                        push_r2c_frame(
+                            &state, &sid, &send_cipher,
+                            &mut pending, &mut pending_bytes, &mut flush_deadline,
+                            FrameKind::Eof, eof_seq, Bytes::new(), true,
+                        );
                         tcp_read_closed = true;
                         if !peer_writable {
-                            upload_close_frame(&state, &sid, &mut next_r2c_seq, &send_cipher)
-                                .await;
+                            let close_seq = next_r2c_seq;
+                            next_r2c_seq += 1;
+                            push_r2c_frame(
+                                &state, &sid, &send_cipher,
+                                &mut pending, &mut pending_bytes, &mut flush_deadline,
+                                FrameKind::Close, close_seq, Bytes::new(), true,
+                            );
                             return;
                         }
                     }
@@ -215,26 +265,18 @@ pub async fn session_driver(
                         let payload = Bytes::copy_from_slice(&read_buf[..n]);
                         let seq = next_r2c_seq;
                         next_r2c_seq += 1;
-                        if let Err(e) = upload_data_frame(
-                            &state,
-                            &sid,
-                            seq,
-                            &send_cipher,
-                            payload,
-                        )
-                        .await
-                        {
-                            tracing::warn!(
-                                "session {:?}: r2c upload failed at seq={}: {}",
-                                sid,
-                                seq,
-                                e
-                            );
-                            return;
-                        }
+                        push_r2c_frame(
+                            &state, &sid, &send_cipher,
+                            &mut pending, &mut pending_bytes, &mut flush_deadline,
+                            FrameKind::Data, seq, payload, false,
+                        );
                     }
                     Err(e) => {
                         tracing::warn!("session {:?}: tcp read failed: {}", sid, e);
+                        flush_r2c_batch(
+                            &state, &sid, &send_cipher,
+                            &mut pending, &mut pending_bytes, &mut flush_deadline,
+                        );
                         return;
                     }
                 }
@@ -296,31 +338,28 @@ async fn bump_last_seen(last_seen: &Arc<Mutex<Instant>>) {
     *last_seen.lock().await = Instant::now();
 }
 
-/// Build, seal, and upload one r2c frame. Caller already
-/// incremented `next_r2c_seq`; we just use the value passed in.
-async fn upload_frame(
+/// Seal a [`Batch`] of N r2c frames into a single Drive upload. The
+/// nonce + AAD bind to the FIRST frame's seq + sid (the filename
+/// the client polls under is `r2c_<sid>_<first_seq>`).
+async fn upload_batch(
     state: &RelayState,
     sid: &SessionId,
-    seq: u64,
     cipher: &AeadCipher,
-    kind: FrameKind,
-    payload: Bytes,
+    batch: Batch,
 ) -> Result<(), UploadError> {
-    let wire = WireFrame {
-        version: WIRE_VERSION,
-        kind,
-        sid: *sid,
-        seq,
-        payload,
-    };
-    let plaintext = wire.encode().freeze();
-    let sealed = cipher.seal(sid, seq, &plaintext);
+    debug_assert!(!batch.frames.is_empty(), "Batch must contain ≥1 frame");
+    let first_seq = batch.frames[0].seq;
+    let frame_count = batch.frames.len();
+    let plaintext = batch.encode().freeze();
+    let sealed = cipher.seal(sid, first_seq, &plaintext);
+    let body_len = sealed.len();
     let name = DriveFilename {
         kind: FilenameKind::Frame(Direction::RelayToClient),
         sid: *sid,
-        seq,
+        seq: first_seq,
     }
     .format();
+    let started = Instant::now();
     let access_token = state.token_cache.get().await?;
     state
         .drive_api
@@ -331,55 +370,139 @@ async fn upload_frame(
             Bytes::from(sealed),
         )
         .await?;
+    if first_seq <= 4 || frame_count > 1 {
+        tracing::info!(
+            "session {:?}: uploaded r2c first_seq={} count={} bytes={} in {}ms",
+            sid,
+            first_seq,
+            frame_count,
+            body_len,
+            started.elapsed().as_millis()
+        );
+    }
     Ok(())
 }
 
-async fn upload_data_frame(
-    state: &RelayState,
-    sid: &SessionId,
-    seq: u64,
-    cipher: &AeadCipher,
-    payload: Bytes,
-) -> Result<(), UploadError> {
-    upload_frame(state, sid, seq, cipher, FrameKind::Data, payload).await
-}
-
-/// Best-effort Eof upload. Errors are logged at debug because the
-/// orphan reaper will eventually evict a session whose peer missed
-/// the signal.
-async fn upload_eof_frame(
-    state: &RelayState,
-    sid: &SessionId,
-    next_seq: &mut u64,
-    cipher: &AeadCipher,
-) {
-    let seq = *next_seq;
-    *next_seq += 1;
-    if let Err(e) = upload_frame(state, sid, seq, cipher, FrameKind::Eof, Bytes::new()).await {
-        tracing::debug!("session {:?}: Eof upload failed at seq={}: {}", sid, seq, e);
+/// Pick the coalesce wait window based on currently-accumulated batch
+/// payload bytes. Mirrors the client side.
+fn pick_r2c_coalesce_delay(pending_bytes: usize) -> Duration {
+    if pending_bytes < R2C_COALESCE_INTERACTIVE_BYTES {
+        R2C_COALESCE_INTERACTIVE_DELAY
+    } else if pending_bytes < R2C_COALESCE_MEDIUM_BYTES {
+        R2C_COALESCE_MEDIUM_DELAY
+    } else {
+        R2C_COALESCE_BULK_DELAY
     }
 }
 
-async fn upload_close_frame(
-    state: &RelayState,
+/// Build, push, and possibly-flush an r2c frame. Synchronous: a flush
+/// here spawns the upload as a detached task and returns immediately,
+/// so the session driver's select! loop keeps reading from the dialed
+/// TCP socket while previous uploads are in flight. Bounded by the
+/// existing `inner.upload_permits` semaphore inside `upload_batch`'s
+/// caller path; failures log at warn but don't propagate.
+fn push_r2c_frame(
+    state: &Arc<RelayState>,
     sid: &SessionId,
-    next_seq: &mut u64,
     cipher: &AeadCipher,
+    pending: &mut Vec<WireFrame>,
+    pending_bytes: &mut usize,
+    flush_deadline: &mut Option<tokio::time::Instant>,
+    kind: FrameKind,
+    seq: u64,
+    payload: Bytes,
+    flush_now: bool,
 ) {
-    let seq = *next_seq;
-    *next_seq += 1;
-    if let Err(e) = upload_frame(state, sid, seq, cipher, FrameKind::Close, Bytes::new()).await {
-        tracing::debug!(
-            "session {:?}: Close upload failed at seq={}: {}",
+    let payload_len = payload.len();
+    let frame = WireFrame {
+        version: WIRE_VERSION,
+        kind,
+        sid: *sid,
+        seq,
+        payload,
+    };
+    *pending_bytes += payload_len;
+    pending.push(frame);
+    // EAGER FLUSH on the first response burst only. Splitting an
+    // entire download into 2-frame Drive files makes Drive visibility
+    // dominate body time; after the first response bytes are in flight,
+    // let the size/timer policy pack bulk data into larger batches.
+    let first_seq = pending.first().map(|f| f.seq).unwrap_or(seq);
+    let eager_second_frame = pending.len() >= 2 && first_seq <= 1;
+    let should_flush = flush_now
+        || eager_second_frame
+        || pending.len() >= R2C_BATCH_MAX_FRAMES
+        || *pending_bytes >= R2C_BATCH_FLUSH_BYTES;
+    if should_flush {
+        flush_r2c_batch(state, sid, cipher, pending, pending_bytes, flush_deadline);
+        return;
+    }
+    let delay = pick_r2c_coalesce_delay(*pending_bytes);
+    let deadline = tokio::time::Instant::now() + delay;
+    match flush_deadline {
+        Some(existing) if *existing <= deadline => {}
+        _ => *flush_deadline = Some(deadline),
+    }
+}
+
+/// Synchronously seal the accumulated batch + spawn the HTTP upload
+/// as a detached task. No-op if pending is empty. Matches the
+/// client's `flush_c2r_batch` shape — see that function's doc for
+/// the pipelining rationale (the load-bearing change vs plain
+/// batching: while the previous upload is in flight to Drive, the
+/// session driver keeps reading from the destination socket).
+fn flush_r2c_batch(
+    state: &Arc<RelayState>,
+    sid: &SessionId,
+    cipher: &AeadCipher,
+    pending: &mut Vec<WireFrame>,
+    pending_bytes: &mut usize,
+    flush_deadline: &mut Option<tokio::time::Instant>,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let frame_count = pending.len();
+    let first_seq = pending[0].seq;
+    let batch = Batch {
+        frames: std::mem::take(pending),
+    };
+    *pending_bytes = 0;
+    *flush_deadline = None;
+    if frame_count > 1 {
+        let eager_second_frame = frame_count == 2 && first_seq <= 1;
+        tracing::info!(
+            "session {:?}: flushing r2c batch first_seq={} count={} eager_second_frame={}",
             sid,
-            seq,
-            e
+            first_seq,
+            frame_count,
+            eager_second_frame
         );
     }
+    let state_for_task = state.clone();
+    let cipher = cipher.clone();
+    let sid_copy = *sid;
+    tokio::spawn(async move {
+        if let Err(e) = upload_batch(&state_for_task, &sid_copy, &cipher, batch).await {
+            tracing::warn!(
+                "session {:?}: pipelined r2c upload failed at first_seq={}: {}",
+                sid_copy,
+                first_seq,
+                e
+            );
+        }
+    });
 }
 
+// The unbatched `upload_eof_frame` / `upload_close_frame` helpers
+// were retired when the r2c side switched to batched uploads.
+// Eof/Close are now pushed via `push_r2c_frame(..., flush_now=true)`
+// so they share the batch envelope with any preceding Data and flush
+// the whole thing in one Drive upload.
+
 /// Best-effort Error frame upload, used on Connect failure / dial
-/// rejection. Same logging discipline as the Eof/Close path.
+/// rejection. Sealed as a single-frame batch so the client's batch
+/// parser handles it the same way as any other r2c file.
 async fn upload_error_frame(
     state: &RelayState,
     sid: &SessionId,
@@ -388,7 +511,15 @@ async fn upload_error_frame(
     reason: &str,
 ) {
     let payload = Bytes::copy_from_slice(reason.as_bytes());
-    if let Err(e) = upload_frame(state, sid, seq, cipher, FrameKind::Error, payload).await {
+    let frame = WireFrame {
+        version: WIRE_VERSION,
+        kind: FrameKind::Error,
+        sid: *sid,
+        seq,
+        payload,
+    };
+    let batch = Batch::single(frame);
+    if let Err(e) = upload_batch(state, sid, cipher, batch).await {
         tracing::debug!(
             "session {:?}: Error upload failed at seq={}: {}",
             sid,
