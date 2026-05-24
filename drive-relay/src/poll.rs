@@ -22,12 +22,15 @@
 //!   so 300 ms baseline keeps us well below the 10 QPS Drive quota
 //!   while staying responsive.
 //! - **Pipeline mode**: after any non-empty cycle, drop the
-//!   interval to 100 ms for the next cycle. Catches burst traffic
-//!   without paying the baseline latency.
+//!   interval to 25 ms for the next cycle (matches the client
+//!   side). The bottleneck during active traffic is Drive's
+//!   `files.list` latency (~200-500 ms) and listing eventual
+//!   consistency (~500 ms-1.5 s), not our sleep gap — so we want
+//!   the relay to re-list as soon as the runtime gets back to it.
 //! - **Idle backoff**: only applies when the session table is
-//!   empty. Each consecutive empty session-less cycle adds 200 ms,
-//!   capped at 1.5 s — saves Drive quota while still picking up a
-//!   fresh Hello within ~1.5 s of it landing on Drive. With at
+//!   empty. Each consecutive empty session-less cycle adds 100 ms,
+//!   capped at 500 ms — saves Drive quota while still picking up a
+//!   fresh Hello within ~500 ms of it landing on Drive. With at
 //!   least one active session, every empty cycle stays at baseline
 //!   so c2r traffic doesn't pay multi-second tail latency for the
 //!   first frame after a brief lull.
@@ -45,6 +48,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use bytes::Bytes;
 use drive_wire::filename::{parse_filename, Direction, DriveFilename, FilenameKind};
 use drive_wire::frame::Batch;
 use rahgozar::drive_api::{DriveApiError, DriveFile, MAX_SEALED_FRAME_BODY_BYTES};
@@ -56,17 +60,21 @@ use tokio::task::JoinSet;
 
 use crate::state::{frame_to_inbound, InboundFrame, RelayState, SessionHandle};
 
-/// 100 ms after a non-empty cycle — catches bursts without paying
-/// the baseline latency on the next inbound batch.
-const PIPELINE_INTERVAL_MS: u64 = 100;
-/// Each empty cycle adds 200 ms to the next sleep.
-const IDLE_BACKOFF_STEP_MS: u64 = 200;
+/// 25 ms after a non-empty cycle — catches bursts without paying
+/// the baseline latency on the next inbound batch. Matches the
+/// client's pipeline interval; the next list call's wire latency
+/// is the real floor, not this sleep.
+const PIPELINE_INTERVAL_MS: u64 = 25;
+/// Each empty cycle adds 100 ms to the next sleep.
+const IDLE_BACKOFF_STEP_MS: u64 = 100;
 /// Cap on the idle sleep. Only reached when the session table is
-/// empty (no in-flight CONNECTs) — see `adapt_interval`. Lowered
-/// from 5 s to 1.5 s now that the cursor-mode list query is cheap
-/// enough that the QPS savings of a 5 s cap aren't worth the
-/// first-Hello wake-up tax it imposed on cold-start sessions.
-const MAX_IDLE_INTERVAL_MS: u64 = 1_500;
+/// empty (no in-flight CONNECTs) — see `adapt_interval`. Was 5 s
+/// originally, then 1.5 s; lowered to 500 ms because the cold-start
+/// tax it imposes on the first Hello after an idle period is
+/// effectively wasted time (the Drive listing call is what we're
+/// waiting on, not the sleep). Idle QPS at 500 ms cap is 2/s,
+/// comfortably under Drive's 10 QPS budget.
+const MAX_IDLE_INTERVAL_MS: u64 = 500;
 /// Match Skirk's fresh-list lookback so delayed Drive visibility
 /// cannot strand an older missing seq behind an exact modifiedTime
 /// cursor.
@@ -271,11 +279,13 @@ async fn run_one_cycle(
 // --------------------------------------------------------------------
 
 /// Sentinel returned from the bootstrap path.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum BootstrapOutcome {
     /// Session is registered in the table (newly inserted, or already
-    /// present because the same c2r_0 hit a previous cycle).
-    Registered,
+    /// present because the same c2r_0 hit a previous cycle). Carries
+    /// the downloaded body so normal frame processing can reuse it
+    /// instead of issuing a second Drive GET for seq=0.
+    Registered(Bytes),
     /// The c2r_0 body was malformed enough that we deleted it; the
     /// caller should drop any related seq>0 frames from this cycle.
     Discarded,
@@ -297,10 +307,9 @@ async fn try_bootstrap_session_from_c2r_0(
     debug_assert!(parsed.seq == 0);
 
     // The combined-upload body is HelloBody(64) || sealed Batch(>=tag).
-    // Reject anything that can't carry at least the Hello prefix; we
-    // don't need a tight upper-bound here — `prepare_frame_batch`
-    // re-validates against `MAX_SEALED_FRAME_BODY_BYTES` when it
-    // actually downloads the sealed remainder.
+    // Validate against the same total cap normal seq=0 processing uses;
+    // we reuse this downloaded body below to avoid a duplicate GET.
+    let max_total = MAX_SEALED_FRAME_BODY_BYTES.saturating_add(HELLO_BODY_LEN as u64);
     if let Some(size) = file.size {
         if size < HELLO_BODY_LEN as u64 {
             tracing::warn!(
@@ -312,11 +321,21 @@ async fn try_bootstrap_session_from_c2r_0(
             let _ = state.drive_api.delete_file(access_token, &file.id).await;
             return Ok(BootstrapOutcome::Discarded);
         }
+        if size > max_total {
+            tracing::warn!(
+                "c2r {} is {} bytes; maximum accepted is {}; deleting",
+                file.name,
+                size,
+                max_total
+            );
+            let _ = state.drive_api.delete_file(access_token, &file.id).await;
+            return Ok(BootstrapOutcome::Discarded);
+        }
     }
 
     let body_bytes = match state
         .drive_api
-        .download_file(access_token, &file.id, MAX_SEALED_FRAME_BODY_BYTES)
+        .download_file(access_token, &file.id, max_total)
         .await
     {
         Ok(bytes) => bytes,
@@ -356,7 +375,7 @@ async fn try_bootstrap_session_from_c2r_0(
         }
     };
     let _inserted = spawn_session(state.clone(), keys).await;
-    Ok(BootstrapOutcome::Registered)
+    Ok(BootstrapOutcome::Registered(body_bytes))
 }
 
 /// Insert a fresh session into the table and spawn its driver task.
@@ -431,11 +450,9 @@ async fn process_frame(
 /// Process one sid's c2r files with parallel Drive-body prefetch,
 /// then ordered commit to the per-session driver. If the session
 /// isn't in the table yet, the seq=0 frame's unsealed Hello prefix
-/// is used to derive the keys + insert the session, then the same
-/// seq=0 file is re-downloaded by `prepare_frame_batch` for normal
-/// AEAD-open processing (two small GETs — one to learn the keys,
-/// one to consume the sealed batch — instead of one large refactor
-/// to share the body across paths).
+/// is used to derive the keys + insert the session; the same
+/// downloaded body is then reused for normal AEAD-open processing so
+/// cold starts do not pay a duplicate Drive GET for c2r_0.
 async fn process_frame_group(
     state: Arc<RelayState>,
     access_token: String,
@@ -455,6 +472,7 @@ async fn process_frame_group(
     // "future seq" guard would catch this later too, but doing it
     // here avoids a wasted download cycle.
     let session_exists_before = state.sessions.read().await.contains_key(&sid);
+    let mut bootstrapped_seq0_body: Option<Bytes> = None;
     if !session_exists_before {
         if group[0].1.seq != 0 {
             for (file, parsed) in group {
@@ -467,7 +485,9 @@ async fn process_frame_group(
         }
         let (file, parsed) = &group[0];
         match try_bootstrap_session_from_c2r_0(&state, &access_token, file, parsed).await? {
-            BootstrapOutcome::Registered => {}
+            BootstrapOutcome::Registered(body) => {
+                bootstrapped_seq0_body = Some(body);
+            }
             BootstrapOutcome::Discarded => {
                 // Hello decode / key-agreement failed for the seq=0
                 // frame. The body was already deleted; the orphan
@@ -556,9 +576,14 @@ async fn process_frame_group(
         let state = state.clone();
         let access_token = access_token.clone();
         let keys = keys.clone();
+        let cached_body = if parsed.seq == 0 {
+            bootstrapped_seq0_body.take()
+        } else {
+            None
+        };
         downloads.spawn(async move {
             let _permit = permit;
-            prepare_frame_batch(state, access_token, keys, file, parsed).await
+            prepare_frame_batch(state, access_token, keys, file, parsed, cached_body).await
         });
     }
 
@@ -598,6 +623,7 @@ async fn prepare_frame_batch(
     keys: Arc<SessionKeys>,
     file: DriveFile,
     parsed: DriveFilename,
+    cached_body: Option<Bytes>,
 ) -> Result<Option<PreparedFrameBatch>, WorkerError> {
     // `seq=0` carries an unsealed 64-byte HelloBody before the sealed
     // batch (see `try_bootstrap_session_from_c2r_0`). Account for that
@@ -618,21 +644,24 @@ async fn prepare_frame_batch(
         }
     }
 
-    let body = match state
-        .drive_api
-        .download_file(&access_token, &file.id, max_total)
-        .await
-    {
-        Ok(bytes) => bytes,
-        Err(DriveApiError::ResponseTooLarge { .. }) => {
-            tracing::warn!(
-                "frame {} exceeded the protocol size cap; deleting",
-                file.name
-            );
-            let _ = state.drive_api.delete_file(&access_token, &file.id).await;
-            return Ok(None);
-        }
-        Err(e) => return Err(e.into()),
+    let body = match cached_body {
+        Some(bytes) => bytes,
+        None => match state
+            .drive_api
+            .download_file(&access_token, &file.id, max_total)
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(DriveApiError::ResponseTooLarge { .. }) => {
+                tracing::warn!(
+                    "frame {} exceeded the protocol size cap; deleting",
+                    file.name
+                );
+                let _ = state.drive_api.delete_file(&access_token, &file.id).await;
+                return Ok(None);
+            }
+            Err(e) => return Err(e.into()),
+        },
     };
     if body.len() < unsealed_prefix_len {
         tracing::warn!(

@@ -85,6 +85,13 @@ use crate::drive_oauth;
 /// symmetric latency.
 const LOCAL_SOCKET_READ_BUFFER: usize = 16 * 1024;
 
+/// Tiny open-cork window for HTTPS CONNECT. After the local proxy has
+/// replied 200, browsers usually send TLS ClientHello immediately.
+/// Waiting a few milliseconds lets us embed that first payload in
+/// `c2r_<sid>_0` with Connect, saving a whole Drive object discovery
+/// hop on cold-start TLS.
+const OPEN_PREFACE_WAIT: Duration = Duration::from_millis(15);
+
 /// Mailbox depth between the r2c poll worker and a per-session
 /// driver. Small enough to apply back-pressure if the local socket
 /// can't keep up; large enough that one poll cycle's burst lands
@@ -101,15 +108,16 @@ const SESSION_MAILBOX_DEPTH: usize = 64;
 const PIPELINE_INTERVAL_MS: u64 = 25;
 
 /// Each consecutive empty cycle adds this much to the next sleep.
-const IDLE_BACKOFF_STEP_MS: u64 = 200;
+const IDLE_BACKOFF_STEP_MS: u64 = 100;
 
 /// Cap on the idle sleep. Only reached when the session table is
-/// empty (no active CONNECT) — see `adapt_interval`. With cursor-
-/// mode polling each list call costs ~10× less than the old
-/// `name contains` path, so 1.5 s gives us low quota usage while
-/// keeping the cold-start tax bounded when the first CONNECT
-/// after a long idle period lands.
-const MAX_IDLE_INTERVAL_MS: u64 = 1_500;
+/// empty (no active CONNECT) — see `adapt_interval`. Was 1.5 s
+/// originally; lowered to 500 ms because the cold-start tax it
+/// imposed on the first r2c after an idle period is effectively
+/// wasted time (Drive's listing latency is what we're waiting on,
+/// not the sleep). Idle QPS at 500 ms cap is 2/s, comfortably
+/// under Drive's 10 QPS budget.
+const MAX_IDLE_INTERVAL_MS: u64 = 500;
 
 /// Skirk keeps the fresh-list cursor behind the newest observed
 /// Drive `modifiedTime` so delayed object visibility and same-timestamp
@@ -323,7 +331,7 @@ pub async fn tunnel_connection(
 /// requests: the proxy has already consumed and rewritten the request
 /// head, so those bytes become the first Data frame after Connect.
 pub async fn tunnel_connection_with_preface(
-    sock: TcpStream,
+    mut sock: TcpStream,
     host: &str,
     port: u16,
     mux: &Arc<DriveMux>,
@@ -369,22 +377,38 @@ pub async fn tunnel_connection_with_preface(
     };
 
     // 4. Queue ONE combined session-open upload: `c2r_<sid>_0` carries
-    //    `[HelloBody: 64 bytes][AEAD-sealed Connect batch]`. The relay
+    //    `[HelloBody: 64 bytes][AEAD-sealed open batch]`. The relay
     //    derives `k_c2r` from the unsealed Hello prefix, then opens the
     //    rest with that key. One file = one Drive upload + one
     //    cold-folder visibility wait on the relay side, instead of the
     //    previous two-file (`h_<sid>_0` + `c2r_<sid>_0`) handshake. The
-    //    browser's first TLS bytes are already sitting in the local
-    //    socket; the live pump in step 6 picks them up.
+    //    first client bytes are embedded in the same batch when they
+    //    are already available, Skirk-style.
     let send_cipher = AeadCipher::new(&keys.k_c2r);
+    let mut next_c2r_seq: u64 = 1;
+    let open_data_frames = if initial_client_bytes.is_empty() {
+        read_open_preface_frames(&mut sock, sid, &mut next_c2r_seq).await?
+    } else {
+        data_frames_from_bytes(sid, &mut next_c2r_seq, initial_client_bytes)
+    };
+    let open_data_frame_count = open_data_frames.len();
+    let open_data_bytes: usize = open_data_frames.iter().map(|f| f.payload.len()).sum();
     {
         let inner = inner.clone();
         let cipher = send_cipher.clone();
         let host = host.to_string();
         let hello = hello.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                upload_session_open_frame(&inner, sid, &cipher, &hello, &host, port).await
+            if let Err(e) = upload_session_open_frame(
+                &inner,
+                sid,
+                &cipher,
+                &hello,
+                &host,
+                port,
+                open_data_frames,
+            )
+            .await
             {
                 tracing::warn!(
                     "drive session {:?}: session-open upload failed for {}:{}: {}",
@@ -397,50 +421,15 @@ pub async fn tunnel_connection_with_preface(
         });
     }
     tracing::info!(
-        "drive session {:?}: opened to {}:{} (session-open upload queued)",
+        "drive session {:?}: opened to {}:{} (session-open upload queued, embedded_frames={}, embedded_bytes={})",
         sid,
         host,
-        port
+        port,
+        open_data_frame_count,
+        open_data_bytes
     );
 
-    // 5. Optional initial client payload, used when the HTTP proxy
-    //    path has already read bytes from the local socket before
-    //    the Drive session existed. Connect was seq=0, so prefaced
-    //    Data starts at seq=1 and the live pump continues after it.
-    //    Batched as ONE Drive upload: TLS ClientHello + first HTTP
-    //    bytes typically fit in a single 16 KiB chunk, but pathological
-    //    HTTP CONNECT pipelines can deliver multiple — either way one
-    //    upload carries them all, saving N round trips on session start.
-    let mut next_c2r_seq: u64 = 1;
-    if !initial_client_bytes.is_empty() {
-        let frames: Vec<WireFrame> = initial_client_bytes
-            .chunks(LOCAL_SOCKET_READ_BUFFER)
-            .map(|chunk| {
-                let seq = next_c2r_seq;
-                next_c2r_seq += 1;
-                build_wire_frame(FrameKind::Data, sid, seq, Bytes::copy_from_slice(chunk))
-            })
-            .collect();
-        let first_seq = frames[0].seq;
-        let mut pending_bytes: usize = frames.iter().map(|f| f.payload.len()).sum();
-        let mut pending = frames;
-        let mut flush_deadline = None;
-        tracing::debug!(
-            "drive session {:?}: initial preface queued at first_seq={}",
-            sid,
-            first_seq
-        );
-        flush_c2r_batch(
-            &inner,
-            sid,
-            &send_cipher,
-            &mut pending,
-            &mut pending_bytes,
-            &mut flush_deadline,
-        );
-    }
-
-    // 6. Steady-state pump until either side closes. `pump_session`
+    // 5. Steady-state pump until either side closes. `pump_session`
     //    is responsible for uploading the right closing frames on
     //    every exit path it controls (local EOF: Eof; both directions
     //    EOF or local read/write error: Close; inbound Close: no upload
@@ -591,6 +580,53 @@ fn build_wire_frame(kind: FrameKind, sid: SessionId, seq: u64, payload: Bytes) -
         seq,
         payload,
     }
+}
+
+fn data_frames_from_bytes(sid: SessionId, next_seq: &mut u64, bytes: Bytes) -> Vec<WireFrame> {
+    bytes
+        .chunks(LOCAL_SOCKET_READ_BUFFER)
+        .map(|chunk| {
+            let seq = *next_seq;
+            *next_seq += 1;
+            build_wire_frame(FrameKind::Data, sid, seq, Bytes::copy_from_slice(chunk))
+        })
+        .collect()
+}
+
+async fn read_open_preface_frames(
+    sock: &mut TcpStream,
+    sid: SessionId,
+    next_seq: &mut u64,
+) -> std::io::Result<Vec<WireFrame>> {
+    let mut read_buf = vec![0u8; LOCAL_SOCKET_READ_BUFFER];
+    match tokio::time::timeout(OPEN_PREFACE_WAIT, sock.read(&mut read_buf)).await {
+        Ok(Ok(0)) | Err(_) => Ok(Vec::new()),
+        Ok(Ok(n)) => {
+            let seq = *next_seq;
+            *next_seq += 1;
+            Ok(vec![build_wire_frame(
+                FrameKind::Data,
+                sid,
+                seq,
+                Bytes::copy_from_slice(&read_buf[..n]),
+            )])
+        }
+        Ok(Err(e)) => Err(e),
+    }
+}
+
+fn build_session_open_batch(
+    sid: SessionId,
+    host: &str,
+    port: u16,
+    mut initial_data_frames: Vec<WireFrame>,
+) -> drive_wire::frame::Batch {
+    let payload = Bytes::from(format!("{host}:{port}").into_bytes());
+    let connect = build_wire_frame(FrameKind::Connect, sid, 0, payload);
+    let mut frames = Vec::with_capacity(1 + initial_data_frames.len());
+    frames.push(connect);
+    frames.append(&mut initial_data_frames);
+    drive_wire::frame::Batch { frames }
 }
 
 /// Seal a [`Batch`] of 1..=N frames as a single AEAD-encrypted body
@@ -775,17 +811,15 @@ async fn upload_c2r_frame(
 /// Build, seal, and upload the combined session-opener at seq=0.
 ///
 /// The file body has the shape
-/// `[HelloBody: 64 bytes][AEAD-sealed Connect batch: N bytes]`. The
+/// `[HelloBody: 64 bytes][AEAD-sealed open batch: N bytes]`. The
 /// relay strips the first 64 bytes as the unsealed key-agreement
 /// input, derives `k_c2r` from it, then opens the rest as a normal
 /// AEAD-sealed Batch (nonce + AAD bound to `(sid, first_seq=0)` the
 /// same way every other c2r frame is). The seq>0 c2r files keep the
 /// old format (just sealed bytes).
 ///
-/// Combining Hello and Connect into ONE Drive upload removes a full
-/// upload round-trip + the relay's cold-folder visibility wait for a
-/// separate `h_<sid>_0` file from the cold-start path. Saves ~1.3-2.5 s
-/// off cold-start TTFB in the Iran→Drive deployment numbers.
+/// Combining Hello, Connect, and first client bytes into ONE Drive
+/// upload removes a full upload + discovery hop from cold-start TLS.
 async fn upload_session_open_frame(
     inner: &DriveMuxInner,
     sid: SessionId,
@@ -793,10 +827,9 @@ async fn upload_session_open_frame(
     hello: &HelloBody,
     host: &str,
     port: u16,
+    initial_data_frames: Vec<WireFrame>,
 ) -> Result<(), ClientError> {
-    let payload = Bytes::from(format!("{host}:{port}").into_bytes());
-    let frame = build_wire_frame(FrameKind::Connect, sid, 0, payload);
-    let batch = drive_wire::frame::Batch::single(frame);
+    let batch = build_session_open_batch(sid, host, port, initial_data_frames);
     let sealed = seal_batch(cipher, sid, &batch);
     let hello_bytes = hello.encode();
     let mut body = Vec::with_capacity(hello_bytes.len() + sealed.len());
@@ -808,9 +841,9 @@ async fn upload_session_open_frame(
 // The legacy `upload_{data,eof,close}_frame` per-frame helpers were
 // retired when c2r switched to batched uploads — see
 // `push_c2r_frame` / `flush_c2r_batch` above for the new path.
-// `upload_session_open_frame` survives unbatched because it's the
-// very first frame and the session can't proceed until the relay
-// sees it.
+// `upload_session_open_frame` survives outside the steady batching
+// path because it carries the unsealed Hello prefix and anchors the
+// AEAD nonce at seq=0.
 
 // --------------------------------------------------------------------
 // Per-session pump
@@ -1877,6 +1910,29 @@ mod tests {
         let (got_host, got_port) = s.rsplit_once(':').unwrap();
         assert_eq!(got_host, host);
         assert_eq!(got_port.parse::<u16>().unwrap(), port);
+    }
+
+    #[test]
+    fn session_open_batch_embeds_first_client_bytes_after_connect() {
+        let (client_keys, relay_keys, sid) = matched_sessions();
+        let cipher = AeadCipher::new(&client_keys.k_c2r);
+        let mut next_seq = 1;
+        let first_payload = Bytes::from_static(b"\x16\x03\x01fake client hello");
+        let initial_frames = data_frames_from_bytes(sid, &mut next_seq, first_payload.clone());
+        let batch = build_session_open_batch(sid, "example.com", 443, initial_frames);
+        let sealed = seal_batch(&cipher, sid, &batch);
+
+        assert_eq!(next_seq, 2, "first embedded Data consumes seq=1");
+
+        let relay_cipher = AeadCipher::new(&relay_keys.k_c2r);
+        let opened = relay_cipher.open(&sid, 0, &sealed).unwrap();
+        let opened_batch = drive_wire::frame::Batch::decode(&opened).unwrap();
+        assert_eq!(opened_batch.frames.len(), 2);
+        assert_eq!(opened_batch.frames[0].kind, FrameKind::Connect);
+        assert_eq!(opened_batch.frames[0].seq, 0);
+        assert_eq!(opened_batch.frames[1].kind, FrameKind::Data);
+        assert_eq!(opened_batch.frames[1].seq, 1);
+        assert_eq!(&opened_batch.frames[1].payload[..], &first_payload[..]);
     }
 
     #[test]

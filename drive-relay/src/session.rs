@@ -160,6 +160,12 @@ pub async fn session_driver(
     let mut pending: Vec<WireFrame> = Vec::new();
     let mut pending_bytes: usize = 0;
     let mut flush_deadline: Option<tokio::time::Instant> = None;
+    // Prioritize the first bytes after each client write burst. TLS
+    // hides HTTP response boundaries from the relay, but inbound c2r
+    // Data is a good signal that the next destination bytes are a
+    // response start. Flush the first couple of r2c frames eagerly so
+    // TTFB is not trapped behind a megabyte-sized bulk object.
+    let mut eager_response_burst = true;
     loop {
         let deadline_snapshot = flush_deadline;
         let timer_future = async move {
@@ -197,9 +203,18 @@ pub async fn session_driver(
                             flush_r2c_batch(
                                 &state, &sid, &send_cipher,
                                 &mut pending, &mut pending_bytes, &mut flush_deadline,
+                                &mut eager_response_burst,
                             );
                             return;
                         }
+                        if !pending.is_empty() {
+                            flush_r2c_batch(
+                                &state, &sid, &send_cipher,
+                                &mut pending, &mut pending_bytes, &mut flush_deadline,
+                                &mut eager_response_burst,
+                            );
+                        }
+                        eager_response_burst = true;
                     }
                     Some(InboundFrame::Eof) => {
                         bump_last_seen(&last_seen).await;
@@ -213,6 +228,7 @@ pub async fn session_driver(
                             push_r2c_frame(
                                 &state, &sid, &send_cipher,
                                 &mut pending, &mut pending_bytes, &mut flush_deadline,
+                                &mut eager_response_burst,
                                 FrameKind::Close, close_seq, Bytes::new(), true,
                             );
                             return;
@@ -225,6 +241,7 @@ pub async fn session_driver(
                         flush_r2c_batch(
                             &state, &sid, &send_cipher,
                             &mut pending, &mut pending_bytes, &mut flush_deadline,
+                            &mut eager_response_burst,
                         );
                         return;
                     }
@@ -234,6 +251,7 @@ pub async fn session_driver(
                 flush_r2c_batch(
                     &state, &sid, &send_cipher,
                     &mut pending, &mut pending_bytes, &mut flush_deadline,
+                    &mut eager_response_burst,
                 );
             }
             read_result = tcp.read(&mut read_buf), if !tcp_read_closed => {
@@ -246,6 +264,7 @@ pub async fn session_driver(
                         push_r2c_frame(
                             &state, &sid, &send_cipher,
                             &mut pending, &mut pending_bytes, &mut flush_deadline,
+                            &mut eager_response_burst,
                             FrameKind::Eof, eof_seq, Bytes::new(), true,
                         );
                         tcp_read_closed = true;
@@ -255,6 +274,7 @@ pub async fn session_driver(
                             push_r2c_frame(
                                 &state, &sid, &send_cipher,
                                 &mut pending, &mut pending_bytes, &mut flush_deadline,
+                                &mut eager_response_burst,
                                 FrameKind::Close, close_seq, Bytes::new(), true,
                             );
                             return;
@@ -268,6 +288,7 @@ pub async fn session_driver(
                         push_r2c_frame(
                             &state, &sid, &send_cipher,
                             &mut pending, &mut pending_bytes, &mut flush_deadline,
+                            &mut eager_response_burst,
                             FrameKind::Data, seq, payload, false,
                         );
                     }
@@ -276,6 +297,7 @@ pub async fn session_driver(
                         flush_r2c_batch(
                             &state, &sid, &send_cipher,
                             &mut pending, &mut pending_bytes, &mut flush_deadline,
+                            &mut eager_response_burst,
                         );
                         return;
                     }
@@ -408,6 +430,7 @@ fn push_r2c_frame(
     pending: &mut Vec<WireFrame>,
     pending_bytes: &mut usize,
     flush_deadline: &mut Option<tokio::time::Instant>,
+    eager_response_burst: &mut bool,
     kind: FrameKind,
     seq: u64,
     payload: Bytes,
@@ -423,18 +446,25 @@ fn push_r2c_frame(
     };
     *pending_bytes += payload_len;
     pending.push(frame);
-    // EAGER FLUSH on the first response burst only. Splitting an
-    // entire download into 2-frame Drive files makes Drive visibility
-    // dominate body time; after the first response bytes are in flight,
-    // let the size/timer policy pack bulk data into larger batches.
-    let first_seq = pending.first().map(|f| f.seq).unwrap_or(seq);
-    let eager_second_frame = pending.len() >= 2 && first_seq <= 1;
+    // EAGER FLUSH on response starts. Splitting an entire download
+    // into 2-frame Drive files makes Drive visibility dominate body
+    // time; after the first response bytes are in flight, let the
+    // size/timer policy pack bulk data into larger batches.
+    let eager_second_frame = pending.len() >= 2 && *eager_response_burst;
     let should_flush = flush_now
         || eager_second_frame
         || pending.len() >= R2C_BATCH_MAX_FRAMES
         || *pending_bytes >= R2C_BATCH_FLUSH_BYTES;
     if should_flush {
-        flush_r2c_batch(state, sid, cipher, pending, pending_bytes, flush_deadline);
+        flush_r2c_batch(
+            state,
+            sid,
+            cipher,
+            pending,
+            pending_bytes,
+            flush_deadline,
+            eager_response_burst,
+        );
         return;
     }
     let delay = pick_r2c_coalesce_delay(*pending_bytes);
@@ -458,25 +488,27 @@ fn flush_r2c_batch(
     pending: &mut Vec<WireFrame>,
     pending_bytes: &mut usize,
     flush_deadline: &mut Option<tokio::time::Instant>,
+    eager_response_burst: &mut bool,
 ) {
     if pending.is_empty() {
         return;
     }
     let frame_count = pending.len();
     let first_seq = pending[0].seq;
+    let was_eager_response_burst = *eager_response_burst;
     let batch = Batch {
         frames: std::mem::take(pending),
     };
     *pending_bytes = 0;
     *flush_deadline = None;
+    *eager_response_burst = false;
     if frame_count > 1 {
-        let eager_second_frame = frame_count == 2 && first_seq <= 1;
         tracing::info!(
-            "session {:?}: flushing r2c batch first_seq={} count={} eager_second_frame={}",
+            "session {:?}: flushing r2c batch first_seq={} count={} eager_response_burst={}",
             sid,
             first_seq,
             frame_count,
-            eager_second_frame
+            was_eager_response_burst
         );
     }
     let state_for_task = state.clone();
