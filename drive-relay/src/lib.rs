@@ -7,8 +7,9 @@
 //!   - Config + key validation (fail-fast on bad credentials).
 //!   - HTTP client + Drive REST + OAuth token cache setup.
 //!   - One [`poll::poll_loop`] task — the adaptive Drive poller
-//!     that lists `h_*` + `c2r_*` and dispatches inbound frames
-//!     to per-session driver tasks.
+//!     that lists `c2r_*` and dispatches inbound frames to per-
+//!     session driver tasks. The seq=0 c2r body carries the
+//!     unsealed Hello prefix used to bootstrap new sessions.
 //!   - One [`orphan_gc::orphan_loop`] task — sweeps stale Drive
 //!     files + finished / idle sessions every 2 minutes.
 //!   - A signal handler that drains both background tasks +
@@ -71,8 +72,29 @@ pub async fn run(cfg: RelayConfig) -> Result<(), Error> {
 
     // Trigger one refresh at startup so a bad `oauth_refresh_token`
     // fails here, not later during the first inbound batch.
-    let _ = token_cache.get().await.map_err(Error::Oauth)?;
+    let access_token = token_cache.get().await.map_err(Error::Oauth)?;
     tracing::info!("OAuth refresh token verified");
+
+    // Pre-warm the TLS pool to `www.googleapis.com`. The OAuth
+    // refresh above hits `oauth2.googleapis.com` (different host),
+    // so without this the first poll cycle pays the full TLS
+    // handshake to a cold Drive host. A no-op cursor-mode list call
+    // (`since = now`, no files match) is the cheapest way to open
+    // the h2 connection + complete TLS so the steady-state polling
+    // loop finds a warm pool. Failure is logged at warn but never
+    // fatal — the poll loop retries every cycle either way.
+    let prewarm_cursor = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .ok();
+    if let Err(e) = drive_api
+        .list_files_in_folder_since(&access_token, &cfg.folder_id, "", prewarm_cursor.as_deref())
+        .await
+    {
+        tracing::warn!(
+            "drive-relay: TLS pre-warm list call failed (non-fatal): {}",
+            e
+        );
+    }
 
     let cfg = Arc::new(cfg);
     let state = Arc::new(RelayState::new(

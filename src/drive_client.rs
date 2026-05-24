@@ -31,11 +31,16 @@
 //!
 //! ## Wire-protocol responsibility split
 //!
-//! | Direction | Client (this module)                | Relay
-//! | --------- | ----------------------------------- | -----
-//! | c2r_*     | Mint, encode, AEAD-seal with k_c2r, upload | Poll, download, AEAD-open with k_c2r
-//! | r2c_*     | Poll, download, AEAD-open with k_r2c | Encode, AEAD-seal with k_r2c, upload
-//! | h_*       | Mint Hello body, upload (unsealed)  | Poll, parse, derive keys via `relay_accept`
+//! | Direction       | Client (this module)                          | Relay
+//! | --------------- | --------------------------------------------- | -----
+//! | c2r_<sid>_0     | Mint Hello + Connect; upload `[Hello][sealed]` | Poll, strip Hello, derive keys, open sealed
+//! | c2r_<sid>_seq>0 | AEAD-seal with k_c2r, upload                  | Poll, download, AEAD-open with k_c2r
+//! | r2c_*           | Poll, download, AEAD-open with k_r2c          | Encode, AEAD-seal with k_r2c, upload
+//!
+//! Pre-v3 the client uploaded the Hello as a separate unsealed
+//! `h_<sid>_0` file and the Connect as `c2r_<sid>_0`. Folding the
+//! Hello into the seq=0 body removes one Drive upload + one cold-
+//! folder visibility wait from every new CONNECT.
 //!
 //! ## Limitations (v1)
 //!
@@ -222,10 +227,36 @@ impl DriveMux {
             config.drive.oauth_client_secret.clone(),
             http,
         );
-        token_cache
+        let access_token = token_cache
             .get()
             .await
             .map_err(|e| std::io::Error::other(format!("drive oauth refresh: {e}")))?;
+
+        // Pre-warm the TLS pool to `www.googleapis.com`. The OAuth
+        // refresh above hits `oauth2.googleapis.com` (different host),
+        // so without this the first session upload pays the full TLS
+        // handshake to a cold Drive host. A no-op cursor-mode list
+        // call (no files match) is the cheapest way to open the h2
+        // connection + complete TLS so subsequent uploads find a warm
+        // pool. Failure is logged at warn but never fatal — the
+        // poller will retry on its first cycle either way.
+        let prewarm_cursor = time::OffsetDateTime::now_utc()
+            .format(&time::format_description::well_known::Rfc3339)
+            .ok();
+        if let Err(e) = drive_api
+            .list_files_in_folder_since(
+                &access_token,
+                &config.drive.folder_id,
+                "",
+                prewarm_cursor.as_deref(),
+            )
+            .await
+        {
+            tracing::warn!(
+                "drive client: TLS pre-warm list call failed (non-fatal): {}",
+                e
+            );
+        }
 
         let cfg = DriveModeRuntimeCfg {
             folder_id: config.drive.folder_id.clone(),
@@ -337,37 +368,26 @@ pub async fn tunnel_connection_with_preface(
         sessions: inner.sessions.clone(),
     };
 
-    // 4. Queue Hello (UNSEALED) + initial Connect (sealed at seq=0).
-    // Do not wait here: the browser's first TLS bytes are already
-    // sitting in the local socket, and serialising Hello -> Connect ->
-    // ClientHello costs multiple Drive upload/list visibility turns on
-    // every new CONNECT. The relay still preserves correctness: it
-    // processes Hellos before frames in a cycle, sorts c2r by seq, and
-    // leaves future seqs in Drive until c2r_<sid>_0 is visible.
+    // 4. Queue ONE combined session-open upload: `c2r_<sid>_0` carries
+    //    `[HelloBody: 64 bytes][AEAD-sealed Connect batch]`. The relay
+    //    derives `k_c2r` from the unsealed Hello prefix, then opens the
+    //    rest with that key. One file = one Drive upload + one
+    //    cold-folder visibility wait on the relay side, instead of the
+    //    previous two-file (`h_<sid>_0` + `c2r_<sid>_0`) handshake. The
+    //    browser's first TLS bytes are already sitting in the local
+    //    socket; the live pump in step 6 picks them up.
     let send_cipher = AeadCipher::new(&keys.k_c2r);
-    {
-        let inner = inner.clone();
-        let hello = hello.clone();
-        let dest = format!("{host}:{port}");
-        tokio::spawn(async move {
-            if let Err(e) = upload_hello(&inner, sid, &hello).await {
-                tracing::warn!(
-                    "drive session {:?}: hello upload failed for {}: {}",
-                    sid,
-                    dest,
-                    e
-                );
-            }
-        });
-    }
     {
         let inner = inner.clone();
         let cipher = send_cipher.clone();
         let host = host.to_string();
+        let hello = hello.clone();
         tokio::spawn(async move {
-            if let Err(e) = upload_connect_frame(&inner, sid, &cipher, &host, port).await {
+            if let Err(e) =
+                upload_session_open_frame(&inner, sid, &cipher, &hello, &host, port).await
+            {
                 tracing::warn!(
-                    "drive session {:?}: connect frame upload failed for {}:{}: {}",
+                    "drive session {:?}: session-open upload failed for {}:{}: {}",
                     sid,
                     host,
                     port,
@@ -377,7 +397,7 @@ pub async fn tunnel_connection_with_preface(
         });
     }
     tracing::info!(
-        "drive session {:?}: opened to {}:{} (startup uploads queued)",
+        "drive session {:?}: opened to {}:{} (session-open upload queued)",
         sid,
         host,
         port
@@ -752,67 +772,45 @@ async fn upload_c2r_frame(
     Ok(())
 }
 
-/// Upload the unsealed Hello body as `h_<sid>_0`. Hello is the
-/// key-agreement input; the rest of the session is AEAD-sealed.
-async fn upload_hello(
-    inner: &DriveMuxInner,
-    sid: SessionId,
-    hello: &HelloBody,
-) -> Result<(), ClientError> {
-    let name = DriveFilename {
-        kind: FilenameKind::Hello,
-        sid,
-        seq: 0,
-    }
-    .format();
-    let body = Bytes::from(hello.encode().to_vec());
-    let started = Instant::now();
-    let token = inner.token_cache.get().await?;
-    let _permit = inner
-        .upload_permits
-        .acquire()
-        .await
-        .map_err(|_| ClientError::UploadSemaphoreClosed)?;
-    let body_len = body.len();
-    inner
-        .drive_api
-        .upload_file(&token, &inner.cfg.folder_id, &name, body)
-        .await?;
-    tracing::info!(
-        "drive session {:?}: uploaded hello bytes={} in {}ms",
-        sid,
-        body_len,
-        started.elapsed().as_millis()
-    );
-    Ok(())
-}
-
-/// Build, seal, and upload the initial Connect frame. Payload is
-/// the destination address as `host:port`; the relay's
-/// `frame_to_inbound` parses it back via `parse_connect_addr`.
-async fn upload_connect_frame(
+/// Build, seal, and upload the combined session-opener at seq=0.
+///
+/// The file body has the shape
+/// `[HelloBody: 64 bytes][AEAD-sealed Connect batch: N bytes]`. The
+/// relay strips the first 64 bytes as the unsealed key-agreement
+/// input, derives `k_c2r` from it, then opens the rest as a normal
+/// AEAD-sealed Batch (nonce + AAD bound to `(sid, first_seq=0)` the
+/// same way every other c2r frame is). The seq>0 c2r files keep the
+/// old format (just sealed bytes).
+///
+/// Combining Hello and Connect into ONE Drive upload removes a full
+/// upload round-trip + the relay's cold-folder visibility wait for a
+/// separate `h_<sid>_0` file from the cold-start path. Saves ~1.3-2.5 s
+/// off cold-start TTFB in the Iran→Drive deployment numbers.
+async fn upload_session_open_frame(
     inner: &DriveMuxInner,
     sid: SessionId,
     cipher: &AeadCipher,
+    hello: &HelloBody,
     host: &str,
     port: u16,
 ) -> Result<(), ClientError> {
     let payload = Bytes::from(format!("{host}:{port}").into_bytes());
     let frame = build_wire_frame(FrameKind::Connect, sid, 0, payload);
-    // Sealed as a single-frame batch — the relay's c2r parser
-    // unconditionally expects the batch envelope (RG2B magic +
-    // length-prefixed inner frames). seq=0 is the first frame so
-    // first_seq=0; nonce + AAD bind the same way as before.
     let batch = drive_wire::frame::Batch::single(frame);
     let sealed = seal_batch(cipher, sid, &batch);
-    upload_c2r_frame(inner, sid, 0, sealed).await
+    let hello_bytes = hello.encode();
+    let mut body = Vec::with_capacity(hello_bytes.len() + sealed.len());
+    body.extend_from_slice(&hello_bytes);
+    body.extend_from_slice(&sealed);
+    upload_c2r_frame(inner, sid, 0, body).await
 }
 
 // The legacy `upload_{data,eof,close}_frame` per-frame helpers were
 // retired when c2r switched to batched uploads — see
 // `push_c2r_frame` / `flush_c2r_batch` above for the new path.
-// `upload_connect_frame` survives unbatched because it's the very
-// first frame and the session can't proceed until the relay sees it.
+// `upload_session_open_frame` survives unbatched because it's the
+// very first frame and the session can't proceed until the relay
+// sees it.
 
 // --------------------------------------------------------------------
 // Per-session pump

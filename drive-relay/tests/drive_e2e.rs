@@ -8,10 +8,11 @@
 //! side and asserts the echo response arrives byte-identical.
 //!
 //! Every wire decision is exercised:
-//!   - Hello body upload + relay decode + key derivation.
+//!   - Combined c2r_<sid>_0 upload: unsealed 64-byte Hello prefix +
+//!     AEAD-sealed Connect batch. Relay strips, decodes, derives keys.
 //!   - c2r AEAD seal (client) + AEAD open (relay).
 //!   - r2c AEAD seal (relay) + AEAD open (client).
-//!   - Filename grammar (`h_<sid>_0`, `c2r_<sid>_<seq>`, `r2c_...`).
+//!   - Filename grammar (`c2r_<sid>_<seq>`, `r2c_<sid>_<seq>`).
 //!   - Numeric sort fix for Drive's lex-ordered list.
 //!   - Replay window monotonicity (every frame's seq is checked).
 //!   - Frame-kind dispatch (Connect → dial; Data → forward; EOF as

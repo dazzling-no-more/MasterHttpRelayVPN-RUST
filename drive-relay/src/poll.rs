@@ -2,10 +2,12 @@
 //!
 //! ## Architecture
 //!
-//! Single task per `RelayState`. Wakes on a tunable interval,
-//! lists `h_*` (new Hellos) + `c2r_*` (in-session frames) in
-//! parallel, hands each file off to a worker, then sleeps until
-//! the next tick.
+//! Single task per `RelayState`. Wakes on a tunable interval, lists
+//! `c2r_*` files, hands each file off to a worker, then sleeps until
+//! the next tick. v3 protocol: the seq=0 c2r body carries the
+//! unsealed 64-byte Hello prefix used to bootstrap the session
+//! (`try_bootstrap_session_from_c2r_0`), so one list call covers both
+//! new-session opens and in-session traffic.
 //!
 //! The worker pool is a `JoinSet` drained at the end of each
 //! poll cycle — so cycles never overlap and a slow worker can't
@@ -81,13 +83,10 @@ pub async fn poll_loop(state: Arc<RelayState>) {
     let work_permits = Arc::new(Semaphore::new(state.cfg.max_concurrent_dials as usize));
     let mut interval_ms = baseline_ms;
     let mut empty_streak: u64 = 0;
-    // Sliding modifiedTime cursors, one per listing query — the relay
-    // lists h_* (Hellos) and c2r_* (frames) separately in parallel.
-    // None on the first call (full folder list); subsequent calls
-    // get only the recent delta with an 8s lookback. This keeps list
-    // calls bounded without missing files whose Drive visibility is
-    // delayed behind a newer seq.
-    let mut hello_cursor: Option<String> = None;
+    // Sliding modifiedTime cursor for the single c2r_* listing query.
+    // Pre-v3 we listed h_* + c2r_* in parallel; v3 folded the Hello
+    // into the c2r_<sid>_0 body, so one list call covers both kinds
+    // of session-relevant input.
     let mut frame_cursor: Option<String> = None;
 
     tracing::info!(
@@ -98,17 +97,13 @@ pub async fn poll_loop(state: Arc<RelayState>) {
 
     loop {
         tokio::time::sleep(Duration::from_millis(interval_ms)).await;
-        let found_work = run_one_cycle(
-            state.clone(),
-            work_permits.clone(),
-            &mut hello_cursor,
-            &mut frame_cursor,
-        )
-        .await;
+        let found_work =
+            run_one_cycle(state.clone(), work_permits.clone(), &mut frame_cursor).await;
         // While ≥1 session is registered, c2r traffic is expected —
         // back-off would just add per-frame tail latency. The ramp
         // only fires when the relay is genuinely idle (no sessions);
-        // a fresh Hello still gets picked up within MAX_IDLE_INTERVAL_MS.
+        // a fresh session-open c2r_0 still gets picked up within
+        // MAX_IDLE_INTERVAL_MS.
         let sessions_present = !state.sessions.read().await.is_empty();
         interval_ms = adapt_interval(baseline_ms, found_work, &mut empty_streak, sessions_present);
     }
@@ -174,13 +169,11 @@ pub(crate) fn adapt_interval(
     }
 }
 
-/// Run one poll iteration. Returns true iff at least one Hello or
-/// frame file was processed (used by the caller to drive the
-/// adaptive interval).
+/// Run one poll iteration. Returns true iff at least one c2r frame
+/// was processed (used by the caller to drive the adaptive interval).
 async fn run_one_cycle(
     state: Arc<RelayState>,
     permits: Arc<Semaphore>,
-    hello_cursor: &mut Option<String>,
     frame_cursor: &mut Option<String>,
 ) -> bool {
     let access_token = match state.token_cache.get().await {
@@ -191,46 +184,23 @@ async fn run_one_cycle(
         }
     };
 
-    // Parallel list: Hellos + frames. Each call costs 1 QPS; running
-    // them concurrently halves wall-clock per cycle. Both lists use
-    // their own sliding modifiedTime cursors so we only fetch new
-    // files since the previous successful cycle.
+    // One list call per cycle: every session-relevant input is a
+    // `c2r_*` file in v3 (the seq=0 entry carries the Hello prefix
+    // inline; seq>0 entries are sealed batches as before).
     //
-    // Capture `now` BEFORE the join so `advance_modified_cursor` can
-    // safely move forward when a listing returns empty — otherwise
-    // the slow `name contains` path (used when cursor is None) never
-    // gets swapped for the fast recently-modified-children query.
+    // Capture `now` BEFORE the call so `advance_modified_cursor` can
+    // safely move forward when the listing returns empty.
     let call_start = time::OffsetDateTime::now_utc();
-    let (hello_result, frame_result) = tokio::join!(
-        state.drive_api.list_files_in_folder_since(
-            &access_token,
-            &state.cfg.folder_id,
-            "h_",
-            hello_cursor.as_deref(),
-        ),
-        state.drive_api.list_files_in_folder_since(
+    let frame_result = state
+        .drive_api
+        .list_files_in_folder_since(
             &access_token,
             &state.cfg.folder_id,
             "c2r_",
             frame_cursor.as_deref(),
-        ),
-    );
+        )
+        .await;
 
-    // Drive's `name contains 'X'` query uses Google's full-text
-    // index, which tokenises on non-alphanumeric chars and indexes
-    // individual letters/digits — NOT strict substring. So a query
-    // for `c2r_` also returns `r2c_*` files (both contain c, 2, r)
-    // and an `h_` query returns hellos plus anything with `h` in
-    // its name. We filter client-side to the exact prefix + kind
-    // we asked for, otherwise `process_frame` warns on every
-    // mismatched entry and floods the log under load.
-    let hello_files_raw: Vec<DriveFile> = match hello_result {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!("list h_* failed: {}", e);
-            Vec::new()
-        }
-    };
     let frame_files_raw: Vec<DriveFile> = match frame_result {
         Ok(f) => f,
         Err(e) => {
@@ -238,24 +208,19 @@ async fn run_one_cycle(
             Vec::new()
         }
     };
-    // Advance the sliding cursors from each raw listing before
-    // name-filtering. The helper keeps Skirk's lookback window, so
-    // subsequent cycles fetch only recent files while still catching
-    // delayed Hello/frame visibility. `call_start` bootstraps the
-    // cursor on empty listings (see `advance_modified_cursor` docs).
-    advance_modified_cursor(&hello_files_raw, hello_cursor, call_start);
+    // Advance the cursor against the raw (pre-filter) listing so
+    // subsequent cycles fetch only recent files via Skirk's lookback.
+    // See `advance_modified_cursor` for the empty-listing rationale.
     advance_modified_cursor(&frame_files_raw, frame_cursor, call_start);
-    let hello_files: Vec<DriveFile> = hello_files_raw
-        .into_iter()
-        .filter(|f| parse_filename(&f.name).is_some_and(|p| matches!(p.kind, FilenameKind::Hello)))
-        .collect();
     let mut frame_files: Vec<(DriveFile, DriveFilename)> = frame_files_raw
         .into_iter()
         .filter_map(|f| {
             let parsed = parse_filename(&f.name)?;
-            // Reject anything that isn't a `c2r_*` frame — see the FTS
-            // tokenisation note above. The `process_frame` arm that
-            // catches non-c2r is now defensive only.
+            // Drive's `name contains 'c2r_'` query (used at cold start
+            // when `frame_cursor` is None) returns `r2c_*` too via
+            // Google's FTS tokenisation. Filter to c2r_ only. The
+            // cursor-mode query already trimmed the cross-direction
+            // noise; this guard handles the bootstrap path.
             if !matches!(parsed.kind, FilenameKind::Frame(Direction::ClientToRelay)) {
                 return None;
             }
@@ -266,42 +231,16 @@ async fn run_one_cycle(
     // ..._10 before ..._2; this fixes it before the workers dispatch.
     frame_files.sort_by_key(|(_, p)| (p.sid, p.seq));
 
-    if hello_files.is_empty() && frame_files.is_empty() {
+    if frame_files.is_empty() {
         return false;
     }
-
-    // Two-phase: process every Hello to completion BEFORE any
-    // frame worker spawns. Frames for a session whose Hello is in
-    // the same cycle would otherwise race the Hello's
-    // `spawn_session` insert into the table; `process_frame` would
-    // see no entry and leave the frame for a later poll. That is
-    // safe, but it adds latency to the first Connect frame.
-    //
-    // Cycles with no Hellos skip phase 1 cleanly. Frames whose
-    // Hello arrived in an EARLIER cycle still race-free here
-    // because the session is already in the table when the frame
-    // worker checks.
-    let mut hello_workers: JoinSet<()> = JoinSet::new();
-    for hello in hello_files {
-        let state = state.clone();
-        let access_token = access_token.clone();
-        let permit = match permits.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => return true, // semaphore closed → shutdown
-        };
-        hello_workers.spawn(async move {
-            let _permit = permit; // released when this task drops
-            if let Err(e) = process_hello(state, access_token, hello).await {
-                tracing::warn!("hello processing failed: {}", e);
-            }
-        });
-    }
-    while hello_workers.join_next().await.is_some() {}
 
     // Group by sid so per-session delivery stays strictly ordered,
     // then prefetch each group's Drive bodies concurrently. The
     // network-bound work can race; replay-window commit and mpsc
-    // delivery are sorted and sequential.
+    // delivery are sorted and sequential. For new sessions, the
+    // seq=0 frame in each group carries the Hello prefix used to
+    // derive keys + spawn the session driver.
     let mut frames_by_sid: std::collections::HashMap<
         drive_wire::frame::SessionId,
         Vec<(DriveFile, DriveFilename)>,
@@ -328,82 +267,102 @@ async fn run_one_cycle(
 }
 
 // --------------------------------------------------------------------
-// Hello processing
+// Session bootstrap (c2r_<sid>_0 carries the Hello prefix)
 // --------------------------------------------------------------------
 
-async fn process_hello(
-    state: Arc<RelayState>,
-    access_token: String,
-    file: DriveFile,
-) -> Result<(), WorkerError> {
-    // Filename SHOULD be `h_<sid_b32>_0`; reject anything else.
-    let parsed = match parse_filename(&file.name) {
-        Some(p) if matches!(p.kind, FilenameKind::Hello) && p.seq == 0 => p,
-        Some(_) | None => {
-            tracing::debug!("ignoring foreign/non-hello Drive filename: {}", file.name);
-            return Ok(());
-        }
-    };
+/// Sentinel returned from the bootstrap path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootstrapOutcome {
+    /// Session is registered in the table (newly inserted, or already
+    /// present because the same c2r_0 hit a previous cycle).
+    Registered,
+    /// The c2r_0 body was malformed enough that we deleted it; the
+    /// caller should drop any related seq>0 frames from this cycle.
+    Discarded,
+}
 
+/// Bootstrap a session from a `c2r_<sid>_0` file. Downloads the body,
+/// parses the unsealed 64-byte Hello prefix, runs the relay-side
+/// X25519 agreement + HKDF, and inserts a fresh session driver into
+/// the table. Returns `Registered` whether the session was just
+/// inserted or already present (a same-cycle duplicate is idempotent).
+/// On Hello-decode / key-agreement failure the c2r_0 file is deleted
+/// and `Discarded` is returned.
+async fn try_bootstrap_session_from_c2r_0(
+    state: &Arc<RelayState>,
+    access_token: &str,
+    file: &DriveFile,
+    parsed: &DriveFilename,
+) -> Result<BootstrapOutcome, WorkerError> {
+    debug_assert!(parsed.seq == 0);
+
+    // The combined-upload body is HelloBody(64) || sealed Batch(>=tag).
+    // Reject anything that can't carry at least the Hello prefix; we
+    // don't need a tight upper-bound here — `prepare_frame_batch`
+    // re-validates against `MAX_SEALED_FRAME_BODY_BYTES` when it
+    // actually downloads the sealed remainder.
     if let Some(size) = file.size {
-        if size > HELLO_BODY_LEN as u64 {
+        if size < HELLO_BODY_LEN as u64 {
             tracing::warn!(
-                "hello {} is {} bytes; expected at most {}; deleting",
+                "c2r {} is {} bytes; expected at least {} for the Hello prefix; deleting",
                 file.name,
                 size,
                 HELLO_BODY_LEN
             );
-            let _ = state.drive_api.delete_file(&access_token, &file.id).await;
-            return Ok(());
+            let _ = state.drive_api.delete_file(access_token, &file.id).await;
+            return Ok(BootstrapOutcome::Discarded);
         }
     }
 
     let body_bytes = match state
         .drive_api
-        .download_file(&access_token, &file.id, HELLO_BODY_LEN as u64)
+        .download_file(access_token, &file.id, MAX_SEALED_FRAME_BODY_BYTES)
         .await
     {
         Ok(bytes) => bytes,
         Err(DriveApiError::ResponseTooLarge { .. }) => {
-            tracing::warn!(
-                "hello {} exceeded the protocol size cap; deleting",
-                file.name
-            );
-            let _ = state.drive_api.delete_file(&access_token, &file.id).await;
-            return Ok(());
+            tracing::warn!("c2r {} exceeded the protocol size cap; deleting", file.name);
+            let _ = state.drive_api.delete_file(access_token, &file.id).await;
+            return Ok(BootstrapOutcome::Discarded);
         }
         Err(e) => return Err(e.into()),
     };
-    let hello = match HelloBody::decode(&body_bytes) {
+    if body_bytes.len() < HELLO_BODY_LEN {
+        tracing::warn!(
+            "c2r {} downloaded body is {} bytes; need at least {} for Hello prefix; deleting",
+            file.name,
+            body_bytes.len(),
+            HELLO_BODY_LEN
+        );
+        let _ = state.drive_api.delete_file(access_token, &file.id).await;
+        return Ok(BootstrapOutcome::Discarded);
+    }
+
+    let hello = match HelloBody::decode(&body_bytes[..HELLO_BODY_LEN]) {
         Ok(h) => h,
         Err(e) => {
-            tracing::warn!("hello {} body decode failed: {}", file.name, e);
-            let _ = state.drive_api.delete_file(&access_token, &file.id).await;
-            return Ok(());
+            tracing::warn!("c2r {} Hello prefix decode failed: {}", file.name, e);
+            let _ = state.drive_api.delete_file(access_token, &file.id).await;
+            return Ok(BootstrapOutcome::Discarded);
         }
     };
 
     let keys = match SessionKeys::relay_accept(&state.relay_secret, parsed.sid, &hello) {
         Ok(k) => Arc::new(k),
         Err(e) => {
-            tracing::warn!("hello {} key agreement failed: {}", file.name, e);
-            let _ = state.drive_api.delete_file(&access_token, &file.id).await;
-            return Ok(());
+            tracing::warn!("c2r {} key agreement failed: {}", file.name, e);
+            let _ = state.drive_api.delete_file(access_token, &file.id).await;
+            return Ok(BootstrapOutcome::Discarded);
         }
     };
     let _inserted = spawn_session(state.clone(), keys).await;
-
-    // Best-effort delete; if it fails, the orphan reaper sweeps later.
-    if let Err(e) = state.drive_api.delete_file(&access_token, &file.id).await {
-        tracing::debug!("hello {} delete failed: {}", file.name, e);
-    }
-    Ok(())
+    Ok(BootstrapOutcome::Registered)
 }
 
 /// Insert a fresh session into the table and spawn its driver task.
-/// If a session with this sid already exists, the Hello is stale
-/// (usually a Drive delete/listing race) and is ignored rather than
-/// resetting the active tunnel.
+/// If a session with this sid already exists, the bootstrap was
+/// redundant (usually a same-cycle race, or the c2r_0 visibility
+/// raced our own delete) and the existing entry is preserved.
 async fn spawn_session(state: Arc<RelayState>, keys: Arc<SessionKeys>) -> bool {
     let sid = keys.sid;
     let mut sessions = state.sessions.write().await;
@@ -470,7 +429,13 @@ async fn process_frame(
 }
 
 /// Process one sid's c2r files with parallel Drive-body prefetch,
-/// then ordered commit to the per-session driver.
+/// then ordered commit to the per-session driver. If the session
+/// isn't in the table yet, the seq=0 frame's unsealed Hello prefix
+/// is used to derive the keys + insert the session, then the same
+/// seq=0 file is re-downloaded by `prepare_frame_batch` for normal
+/// AEAD-open processing (two small GETs — one to learn the keys,
+/// one to consume the sealed batch — instead of one large refactor
+/// to share the body across paths).
 async fn process_frame_group(
     state: Arc<RelayState>,
     access_token: String,
@@ -482,6 +447,36 @@ async fn process_frame_group(
     }
 
     let sid = group[0].1.sid;
+
+    // If the session isn't in the table yet, only the seq=0 frame can
+    // bootstrap it (carries the unsealed Hello prefix). If the lowest
+    // seq we see in this group is >0, the c2r_0 hasn't become visible
+    // yet — leave everything for a later poll. The replay-window
+    // "future seq" guard would catch this later too, but doing it
+    // here avoids a wasted download cycle.
+    let session_exists_before = state.sessions.read().await.contains_key(&sid);
+    if !session_exists_before {
+        if group[0].1.seq != 0 {
+            for (file, parsed) in group {
+                tracing::debug!(
+                    "frame {} has no active session for sid {:?} and seq={}>0; leaving for a later poll",
+                    file.name, parsed.sid, parsed.seq,
+                );
+            }
+            return Ok(());
+        }
+        let (file, parsed) = &group[0];
+        match try_bootstrap_session_from_c2r_0(&state, &access_token, file, parsed).await? {
+            BootstrapOutcome::Registered => {}
+            BootstrapOutcome::Discarded => {
+                // Hello decode / key-agreement failed for the seq=0
+                // frame. The body was already deleted; the orphan
+                // reaper will sweep any seq>0 stragglers.
+                return Ok(());
+            }
+        }
+    }
+
     let session_view = {
         let sessions = state.sessions.read().await;
         sessions.get(&sid).map(|h| {
@@ -496,13 +491,13 @@ async fn process_frame_group(
     let (keys, replay, inbound_tx, last_seen) = match session_view {
         Some(v) => v,
         None => {
-            // No session for this sid. This can be stale, but Drive
-            // can also expose c2r_<sid>_0 before h_<sid>_0 even though
-            // the client uploaded Hello first. Leave these files for a
-            // later poll; the orphan reaper handles truly stale ones.
+            // Defensive: bootstrap claimed Registered but the entry
+            // is gone — must have been evicted by the orphan reaper
+            // between the spawn_session call and this read. Drop the
+            // group; a future c2r_0 retry would re-bootstrap.
             for (file, parsed) in group {
                 tracing::debug!(
-                    "frame {} has no active session for sid {:?}; leaving for a later poll",
+                    "frame {} has no active session for sid {:?} after bootstrap (raced eviction); leaving for a later poll",
                     file.name,
                     parsed.sid
                 );
@@ -604,22 +599,28 @@ async fn prepare_frame_batch(
     file: DriveFile,
     parsed: DriveFilename,
 ) -> Result<Option<PreparedFrameBatch>, WorkerError> {
+    // `seq=0` carries an unsealed 64-byte HelloBody before the sealed
+    // batch (see `try_bootstrap_session_from_c2r_0`). Account for that
+    // in the upper-bound check so a legitimate session-open isn't
+    // rejected for being slightly larger than the per-frame cap.
+    let unsealed_prefix_len = if parsed.seq == 0 { HELLO_BODY_LEN } else { 0 };
+    let max_total = MAX_SEALED_FRAME_BODY_BYTES.saturating_add(unsealed_prefix_len as u64);
     if let Some(size) = file.size {
-        if size > MAX_SEALED_FRAME_BODY_BYTES {
+        if size > max_total {
             tracing::warn!(
                 "frame {} is {} bytes; maximum accepted is {}; deleting",
                 file.name,
                 size,
-                MAX_SEALED_FRAME_BODY_BYTES
+                max_total
             );
             let _ = state.drive_api.delete_file(&access_token, &file.id).await;
             return Ok(None);
         }
     }
 
-    let sealed = match state
+    let body = match state
         .drive_api
-        .download_file(&access_token, &file.id, MAX_SEALED_FRAME_BODY_BYTES)
+        .download_file(&access_token, &file.id, max_total)
         .await
     {
         Ok(bytes) => bytes,
@@ -633,6 +634,16 @@ async fn prepare_frame_batch(
         }
         Err(e) => return Err(e.into()),
     };
+    if body.len() < unsealed_prefix_len {
+        tracing::warn!(
+            "frame {} downloaded body is {} bytes; need at least {} for the seq=0 Hello prefix; dropping",
+            file.name,
+            body.len(),
+            unsealed_prefix_len,
+        );
+        return Ok(None);
+    }
+    let sealed = body.slice(unsealed_prefix_len..);
     let cipher = AeadCipher::new(&keys.k_c2r);
     let plaintext = match cipher.open(&parsed.sid, parsed.seq, &sealed) {
         Ok(pt) => pt,
@@ -956,7 +967,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn process_frame_without_session_leaves_file_for_later_poll() {
+    async fn process_frame_seq_gt_zero_without_session_is_left_for_later_poll() {
+        // v3 protocol: seq=0 carries the unsealed Hello prefix and
+        // bootstraps the session. Only seq>0 frames with no matching
+        // session are deferred to a later cycle — they can't tell us
+        // the keys, so we have to wait for c2r_0 to land. The test
+        // points at an unreachable Drive base URL; if `process_frame`
+        // attempted any Drive RPC for this case it would error out,
+        // so a clean `Ok(())` proves we returned before any I/O.
         let http = build_drive_http_client(None).expect("build client");
         let drive_api = DriveApiClient::new(http.clone(), "http://127.0.0.1:9".into());
         let cfg = Arc::new(RelayConfig {
@@ -981,7 +999,7 @@ mod tests {
         let parsed = DriveFilename {
             kind: FilenameKind::Frame(Direction::ClientToRelay),
             sid,
-            seq: 0,
+            seq: 7,
         };
         let file = DriveFile {
             id: "would-have-been-deleted".into(),
@@ -992,7 +1010,7 @@ mod tests {
 
         process_frame(state, "unused-access-token".into(), file, parsed)
             .await
-            .expect("no-session frame should be left for a later poll");
+            .expect("seq>0 with no session should be left for a later poll");
     }
 
     #[tokio::test]
