@@ -1190,6 +1190,22 @@ fn build_mode_state(config: &Config) -> Result<ModeState, ProxyError> {
     }
 
     let resolved_routing = ResolvedRouting::from_config(config, mode);
+    // Unconditional routing-state dump. The existing logs below only
+    // fire when patterns/skipped/suppressed lists are non-empty, which
+    // leaves users without visibility into the no-op cases that
+    // bug-report logs need to disambiguate (e.g. is force_mitm_hosts
+    // empty because youtube_via_relay_effective is true, or because
+    // patterns themselves are empty?). Diagnostic-only — no behavior
+    // change.
+    tracing::info!(
+        "routing: mode={:?} youtube_via_relay_effective={} exit_node_full_mode_active={} \
+         force_mitm_hosts=[{}] relay_url_patterns=[{}]",
+        mode,
+        resolved_routing.youtube_via_relay_effective,
+        resolved_routing.exit_node_full_mode_active,
+        resolved_routing.force_mitm_hosts.join(", "),
+        resolved_routing.relay_url_patterns.join(", "),
+    );
     if resolved_routing.exit_node_full_mode_active && !config.youtube_via_relay {
         tracing::info!(
             "exit_node.mode=full → routing YouTube through relay (upstream commit 88b2767)"
@@ -4373,14 +4389,45 @@ where
     let method_is_safe_for_forwarder = method.eq_ignore_ascii_case("GET")
         || method.eq_ignore_ascii_case("HEAD")
         || method.eq_ignore_ascii_case("OPTIONS");
-    if scheme == "https"
+    let host_is_force_mitm = host_in_force_mitm_list(host, &rewrite_ctx.force_mitm_hosts);
+    let url_matches_pattern = url_matches_relay_pattern(&url, &rewrite_ctx.relay_url_patterns);
+    let forwarder_eligible = scheme == "https"
         && port == 443
         && method_is_safe_for_forwarder
         && !rewrite_ctx.exit_node_full_mode_active
         && !rewrite_ctx.relay_url_patterns.is_empty()
-        && host_in_force_mitm_list(host, &rewrite_ctx.force_mitm_hosts)
-        && !url_matches_relay_pattern(&url, &rewrite_ctx.relay_url_patterns)
-    {
+        && host_is_force_mitm
+        && !url_matches_pattern;
+
+    // Diagnostic: when a request to a force-MITM host bypasses the
+    // forwarder fast-path, log which condition tripped. Restricted to
+    // force-MITM hosts so non-YT MITM (e.g. inspected sanctioned hosts)
+    // doesn't get spammed. Same `yt_forwarder` target as the rest of
+    // the fast-path lines so users can filter with `RUST_LOG=yt_forwarder=info`.
+    if host_is_force_mitm && !forwarder_eligible {
+        let reason = if scheme != "https" {
+            format!("scheme={}", scheme)
+        } else if port != 443 {
+            format!("port={}", port)
+        } else if !method_is_safe_for_forwarder {
+            format!("method={}", method)
+        } else if rewrite_ctx.exit_node_full_mode_active {
+            "exit_node_full_mode_active".to_string()
+        } else if rewrite_ctx.relay_url_patterns.is_empty() {
+            "relay_url_patterns_empty".to_string()
+        } else if url_matches_pattern {
+            "url_matches_relay_pattern".to_string()
+        } else {
+            "unknown".to_string()
+        };
+        tracing::info!(
+            target: "yt_forwarder",
+            "gate skipped {} {}: {}",
+            method, url, reason,
+        );
+    }
+
+    if forwarder_eligible {
         // All forwarder log lines use `target = "yt_forwarder"` so users
         // diagnosing #977-style reports can `RUST_LOG=yt_forwarder=info`
         // (or =debug) and see exactly which requests took the fast path,
