@@ -1,19 +1,19 @@
 {
-  "version": "2.7.0",
-  "notes": "See https://github.com/dazzling-no-more/rahgozar/releases/tag/v2.7.0",
+  "version": "2.8.0",
+  "notes": "See https://github.com/dazzling-no-more/rahgozar/releases/tag/v2.8.0",
   "pub_date": "",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVnFpL0RBVVg5UnJtY3kvaEhwek0rY3BjSzhrcXdnbzZRcmZkTEtzYkttSklkMEhQQTcrb09LbER3b3BZaXVrWHlMR0NrSDI1NWJjek1qdUVVeGQ4UHBFT3RKODUxdlFjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5NTIyMzI4CWZpbGU6cmFoZ296YXJfMi43LjBfeDY0X2VuLVVTLm1zaQphRjRyRWhEeWpnRUVRVzdLMFc1YjUwbElveDc5ZjAxVW55b1VpYmJEZ011a1JHRWxWMktWdklnUFhBZExqZ28xc3p1KzJFNUVmc0hRK0h0dXpSMlZCdz09Cg==",
-      "url": "https://github.com/dazzling-no-more/rahgozar/releases/download/v2.7.0/rahgozar_2.7.0_x64_en-US.msi"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVnFpL0RBVVg5UmdCRklqaW1ScHUxVElQVDBxK09LT1ArWDhoLzJLZ3owWGNnYU4rdmR0VVh1MGVHMEQza0dtSUp4NkNZQmZLcnRmYTF6cDZOL1ZRVkRsMUNJVFJFZFEwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5NjU0NjA2CWZpbGU6cmFoZ296YXJfMi44LjBfeDY0X2VuLVVTLm1zaQpxay9YdkJVenRBb05KbkNhQjFMdnViNEp2MWFDblJ3aFA3dUx2bGM3Wjh1ajRlZVJlVFZ4Q3lhalFOUWM5c3hTMGdhYTluSld5a2xIWm9sRC9hVU9Edz09Cg==",
+      "url": "https://github.com/dazzling-no-more/rahgozar/releases/download/v2.8.0/rahgozar_2.8.0_x64_en-US.msi"
     },
     "darwin-universal": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVnFpL0RBVVg5UnJJcmxpUXFJbUJkNjJEaGYxdWFCQXR6U1ozdTNtNUFRQjdHUjVhS25jY2JtN1laN1FJQzJmQTU0YWRSSWVnL09VbmZpUUFYVjlCSS9GYU9sWDA4N1FNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5NTIyMTE4CWZpbGU6cmFoZ296YXIuYXBwLnRhci5negovbkplUVRZUEZiNWw0Nm9aRjFsSEpUa2FxQWRFVHZETDI0eWNSdTczUzh4ZktWT2t5VjJyb2FQa2Y2aDhWcU1FcUtKTk1uTzNEL2xTbE05RlpBRFhCQT09Cg==",
-      "url": "https://github.com/dazzling-no-more/rahgozar/releases/download/v2.7.0/rahgozar.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVnFpL0RBVVg5Um5nZVllL2xaM0tpM0tRbDU3a2ZCZ25zZktxWXZ6TnoxSVgxbTVUWkNBd3IyeU9rSkp2Tk9FSFJyaGxaOHpWVDQ5TEpXTEU0b3VwdTRxTlBwSVYyNEF3PQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5NjU0MjI3CWZpbGU6cmFoZ296YXIuYXBwLnRhci5nego1TERqYVhXdjVTMGRWcXV0YVY0V2FMZExTMGtwOW9iOXBtZmFqcVRGZ1Q2cElab3NYMU5hUjNhcEtpSGtTMXpJZmZURXJNN3QrVTkyVm51bm5wMWVCQT09Cg==",
+      "url": "https://github.com/dazzling-no-more/rahgozar/releases/download/v2.8.0/rahgozar.app.tar.gz"
     },
     "linux-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVnFpL0RBVVg5UnFBN01FU0JxYzMrdzNiU1BMOC9YN0xzdmduMlNFbUE1bHVQazV4R0xZbVVwWmgwS292YkIyb21WR2E4NWxrYUZIa2NRUFF4MjBiZmxRN1cyU2I3dVFnPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5NTIyMjE4CWZpbGU6cmFoZ296YXJfMi43LjBfYW1kNjQuQXBwSW1hZ2UKa3Z0MDRPbHY5bURnZ1h1a1ZMeHN6R3dXdHpqWFY5TW5BVlZOY0t3b3ZIVDV1NjZsc3pydWhIa1BYaTB6b1ZUYUlhUEcyOGI3YThFQzBnSmg2SWJVQ2c9PQo=",
-      "url": "https://github.com/dazzling-no-more/rahgozar/releases/download/v2.7.0/rahgozar_2.7.0_amd64.AppImage"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVRVnFpL0RBVVg5UmhwVmdxY0lyVng5ZzUrWVM5eFNtKzkzZytqVXNNTzR1c09OTnZRdTdtNkdyamxwRlZDR1lqZmhXZXQxVGhkY2FiNWpRbyttY0FEeGwyVnh2L0RCNmdVPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzc5NjU0MTkyCWZpbGU6cmFoZ296YXJfMi44LjBfYW1kNjQuQXBwSW1hZ2UKVXMzREVPbzRTc0d1N01nWnVDQkxOSCtmL29XdXMxSFhBYzZsSWJMdzMwVVFIS1hUOEljSERPTXF0VVVYb2tkcGRzYWNBU3E3NWNPOUlvTDc5SjIrQUE9PQo=",
+      "url": "https://github.com/dazzling-no-more/rahgozar/releases/download/v2.8.0/rahgozar_2.8.0_amd64.AppImage"
     }
   }
 }
