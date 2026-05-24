@@ -1,0 +1,15 @@
+[package]
+name = "drive-wire"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Wire format types shared by the rahgozar client and rahgozar-drive-relay binary (Drive-mailbox transport)."
+publish = false
+
+# Kept deliberately tiny. drive-wire is path-depended by both the root
+# rahgozar crate (Android cdylib + mipsel-musl router + desktop) and
+# rahgozar-drive-relay. Every dep here lands in every target — keep it
+# at `bytes` only.
+
+[dependencies]
+bytes = "1"

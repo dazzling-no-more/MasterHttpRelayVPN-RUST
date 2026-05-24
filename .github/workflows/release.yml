@@ -195,6 +195,12 @@ jobs:
     # above for why.)
     continue-on-error: ${{ matrix.mipsel_softfloat == true }}
 
+    # Drive Mode OAuth: BYO — see docs/drive_oauth_setup.md. There are
+    # no compile-time OAuth credentials baked into release binaries;
+    # every end-user registers their own Google Cloud OAuth client and
+    # pastes the values into the Drive setup screen at runtime. CI does
+    # not need to know any client_id / client_secret.
+
     steps:
       # Heal any root-owned leftovers from a previous mipsel docker
       # build that failed before its post-step chown could run. The
@@ -329,7 +335,7 @@ jobs:
       # empty `[workspace]` opt-out so it's a standalone crate with its
       # own target/ — built via `--manifest-path tunnel-node/Cargo.toml`.
       # Sharing the docker container saves ~30 s of cold-start per leg.
-      - name: Build CLI + tunnel-node (musl via docker)
+      - name: Build CLI + tunnel-node + drive-relay (musl via docker)
         if: matrix.target == 'x86_64-unknown-linux-musl'
         run: |
           docker run --rm -v "$PWD":/src -w /src \
@@ -338,13 +344,15 @@ jobs:
             bash -c '
               set -eux
               cargo build --release --target x86_64-unknown-linux-musl --bin rahgozar
+              cargo build --release --target x86_64-unknown-linux-musl \
+                -p rahgozar-drive-relay --bin rahgozar-drive-relay
               cargo build --release \
                 --manifest-path tunnel-node/Cargo.toml \
                 --target x86_64-unknown-linux-musl --bin tunnel-node
             '
           sudo chown -R "$(id -u):$(id -g)" target tunnel-node/target
 
-      - name: Build CLI + tunnel-node (musl via docker, arm64)
+      - name: Build CLI + tunnel-node + drive-relay (musl via docker, arm64)
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: |
           docker run --rm -v "$PWD":/src -w /src \
@@ -353,6 +361,8 @@ jobs:
             bash -c '
               set -eux
               cargo build --release --target aarch64-unknown-linux-musl --bin rahgozar
+              cargo build --release --target aarch64-unknown-linux-musl \
+                -p rahgozar-drive-relay --bin rahgozar-drive-relay
               cargo build --release \
                 --manifest-path tunnel-node/Cargo.toml \
                 --target aarch64-unknown-linux-musl --bin tunnel-node
@@ -487,6 +497,11 @@ jobs:
             x86_64-unknown-linux-musl|aarch64-unknown-linux-musl)
               cp tunnel-node/target/${{ matrix.target }}/release/tunnel-node dist/tunnel-node
               chmod +x dist/tunnel-node
+              # rahgozar-drive-relay static binary — same scope as
+              # tunnel-node (runs on a VPS, not routers).
+              cp target/${{ matrix.target }}/release/rahgozar-drive-relay \
+                 dist/rahgozar-drive-relay
+              chmod +x dist/rahgozar-drive-relay
               ;;
           esac
 
@@ -516,12 +531,24 @@ jobs:
           # exit-node bridge don't have to download the desktop CLI too.
           # The `sign` job globs `dist/*.tar.gz` so these archives get
           # signed automatically alongside the CLI ones.
+          #
+          # Same shape for `rahgozar-drive-relay` (VPS-side relay for
+          # Drive Mode) — we ship the bare binary plus a tarball
+          # containing the binary. The install script + systemd unit
+          # are fetched separately from the repository so the
+          # `curl -fsSLo /tmp/rahgozar-drive-relay-linux-${ARCH}` step in
+          # docs/drive_mode.md works against the release page. Both
+          # forms are signed by the sign job below.
           case "${{ matrix.target }}" in
             x86_64-unknown-linux-musl)
               tar czf "rahgozar-tunnel-node-linux-musl-amd64.tar.gz" tunnel-node
+              cp rahgozar-drive-relay rahgozar-drive-relay-linux-x86_64
+              tar czf "rahgozar-drive-relay-linux-musl-amd64.tar.gz" rahgozar-drive-relay
               ;;
             aarch64-unknown-linux-musl)
               tar czf "rahgozar-tunnel-node-linux-musl-arm64.tar.gz" tunnel-node
+              cp rahgozar-drive-relay rahgozar-drive-relay-linux-aarch64
+              tar czf "rahgozar-drive-relay-linux-musl-arm64.tar.gz" rahgozar-drive-relay
               ;;
           esac
 
@@ -532,6 +559,9 @@ jobs:
             dist/${{ matrix.name }}.tar.gz
             dist/${{ matrix.name }}.zip
             dist/rahgozar-tunnel-node-linux-musl-*.tar.gz
+            dist/rahgozar-drive-relay-linux-musl-*.tar.gz
+            dist/rahgozar-drive-relay-linux-x86_64
+            dist/rahgozar-drive-relay-linux-aarch64
           if-no-files-found: ignore
 
   # Desktop UI (Tauri) build — replaces the egui `rahgozar-ui` binary
@@ -590,6 +620,10 @@ jobs:
               target/release/bundle/nsis/*.exe
               target/release/bundle/portable/*.exe
     runs-on: ${{ matrix.os }}
+
+    # Drive Mode OAuth is BYO at runtime (see docs/drive_oauth_setup.md)
+    # — no compile-time credentials to thread into the Tauri build.
+
     steps:
       - uses: actions/checkout@v4
 
@@ -882,6 +916,10 @@ jobs:
   # vs the self-hosted instant-start, but doesn't need fork infrastructure.
   android:
     runs-on: ubuntu-latest
+
+    # Drive Mode OAuth is BYO at runtime (see docs/drive_oauth_setup.md)
+    # — no compile-time credentials to thread into the Android build.
+
     steps:
       - uses: actions/checkout@v4
 
@@ -932,6 +970,12 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-ndk
+
+      # Unit tests intentionally avoid the cargo/JNI chain for speed.
+      # Keep a cheap Android-target Rust check in CI so cfg(android)
+      # exports in src/android_jni.rs compile before Gradle packaging.
+      - name: Check Android Rust JNI compile
+        run: cargo ndk -t arm64-v8a check -p rahgozar --lib
 
       # Cache Gradle's downloaded distribution + dependency JARs. Gradle
       # itself doesn't ship with the runner image, so a cold run downloads
@@ -1163,6 +1207,8 @@ jobs:
           # the unpackaged binary, not a bundle output), which is why it
           # specifically needs to be picked up here.
           for f in dist/*.tar.gz dist/*.zip dist/*.apk \
+                   dist/rahgozar-drive-relay-linux-x86_64 \
+                   dist/rahgozar-drive-relay-linux-aarch64 \
                    dist/portable/rahgozar-portable-*.exe; do
             [ -f "$f" ] || continue
             echo "::group::sign $(basename "$f")"
@@ -1190,7 +1236,7 @@ jobs:
           done
           echo "signed ${signed} artifacts"
           if [ "${signed}" -eq 0 ]; then
-            echo "::warning::no artifacts matched dist/*.{tar.gz,zip,apk} or dist/portable/rahgozar-portable-*.exe"
+            echo "::warning::no artifacts matched dist/*.{tar.gz,zip,apk}, dist/rahgozar-drive-relay-linux-{x86_64,aarch64}, or dist/portable/rahgozar-portable-*.exe"
           fi
 
           # Hard assertion: every staged portable .exe MUST have a
@@ -1219,6 +1265,20 @@ jobs:
           if [ "${#unsigned_portable[@]}" -gt 0 ]; then
             printf '::error::portable .exe missing minisig: %s\n' \
               "${unsigned_portable[@]}"
+            exit 1
+          fi
+
+          unsigned_drive_relay=()
+          for bin in dist/rahgozar-drive-relay-linux-x86_64 \
+                     dist/rahgozar-drive-relay-linux-aarch64; do
+            [ -f "$bin" ] || continue
+            if [ ! -f "${bin}.minisig" ]; then
+              unsigned_drive_relay+=( "$bin" )
+            fi
+          done
+          if [ "${#unsigned_drive_relay[@]}" -gt 0 ]; then
+            printf '::error::Drive relay binary missing minisig: %s\n' \
+              "${unsigned_drive_relay[@]}"
             exit 1
           fi
 
@@ -1717,12 +1777,20 @@ jobs:
                -o -name '*.minisig' -o -name '*.msi' -o -name '*.dmg' \
                -o -name '*.AppImage' -o -name '*.deb' \
                -o -name '*.exe' \
+               -o -name 'rahgozar-drive-relay-linux-*' \
                -o -name 'latest.json' \) \
             -delete
 
           # Copy CLI archives (rahgozar-linux-amd64.tar.gz, etc.).
           # Version-stable filenames, no rename needed.
           for f in artifacts/*.tar.gz artifacts/*.zip; do
+            [ -f "$f" ] || continue
+            cp "$f" "releases/$(basename "$f")"
+          done
+
+          # Bare Drive relay binaries are used by the VPS install docs.
+          for f in artifacts/rahgozar-drive-relay-linux-x86_64 \
+                   artifacts/rahgozar-drive-relay-linux-aarch64; do
             [ -f "$f" ] || continue
             cp "$f" "releases/$(basename "$f")"
           done

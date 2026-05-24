@@ -41,10 +41,54 @@ export interface ConfigDto {
   front_domain: string;
   google_ip: string;
   log_level: string;
+  // ── Drive-mode (mode === "drive") ────────────────────────────────
+  // The OAuth refresh token isn't exposed in the form — it's managed
+  // by `driveOauthStart` / `driveOauthComplete` and reflected here
+  // only as the boolean `drive_has_refresh_token`. Everything else
+  // is a regular form field bound to its own input.
+  drive_folder_id: string;
+  drive_relay_pubkey: string;
+  drive_poll_interval_ms: number;
+  drive_max_concurrent_uploads: number;
+  /** BYO OAuth client_id from Google Cloud Console — see
+   *  `docs/drive_oauth_setup.md`. Required for Drive mode; no
+   *  embedded default. */
+  drive_oauth_client_id: string;
+  /** BYO OAuth client_secret paired with `drive_oauth_client_id`.
+   *  Per RFC 8252 §8.6 not actually secret for installed apps, but
+   *  Google's token endpoint requires it. */
+  drive_oauth_client_secret: string;
+  /** Read-only: true iff the on-disk `drive.oauth_refresh_token` is
+   *  non-empty. UI uses this to swap "Sign in with Google" for
+   *  "Signed in. Re-link" without round-tripping the secret. */
+  drive_has_refresh_token: boolean;
 }
 
 /** Write side of the Tunnel form — same fields as `ConfigDto`. */
 export type ConfigUpdate = ConfigDto;
+
+// ── Drive-mode setup ─────────────────────────────────────────────────
+
+export interface DriveOauthStartDto {
+  state_token: string;
+  auth_url: string;
+}
+
+export interface DriveOauthCompleteDto {
+  /** True once the refresh token has been persisted server-side.
+   *  The refresh token itself is deliberately NOT returned to the
+   *  renderer — it never has to cross the IPC boundary. */
+  signed_in: boolean;
+  /** Empty under the current `drive.file`-only OAuth scope. The UI
+   *  surfaces "Signed in" without naming the account; the user
+   *  already chose it in the browser. */
+  email: string;
+}
+
+export interface DriveTestDto {
+  folder_id: string;
+  files_count: number;
+}
 
 export interface TestResult {
   pass: boolean;
@@ -173,6 +217,45 @@ export const api = {
   },
   saveRawConfig(text: string): Promise<void> {
     return invoke<void>("save_raw_config", { text });
+  },
+  // ── Drive-mode setup ──────────────────────────────────────────────
+  //
+  // Sequence:
+  //   1. `driveOauthStart` takes the user-pasted OAuth client_id +
+  //      secret + google_ip from the FORM (not disk), returns an
+  //      auth URL + state token. UI shows the URL with Copy + Open
+  //      buttons so the user can paste it into whichever browser
+  //      they're signed into Google with.
+  //   2. User signs in, Google redirects to a 127.0.0.1 loopback URL
+  //      the Rust side bound — the listener task captures the code
+  //      and exchanges it for a refresh token.
+  //   3. JS calls `driveOauthComplete(state_token)` which long-polls
+  //      (up to 120s) for the listener's result and atomically
+  //      persists all three OAuth fields (client_id, client_secret,
+  //      refresh_token) into config.json.
+  //   4. `driveCreateFolder(name)` / `driveTestConnection()` /
+  //      `driveValidateRelayPubkey(s)` are independent setup
+  //      affordances the UI surfaces as buttons.
+  driveOauthStart(args: {
+    oauthClientId: string;
+    oauthClientSecret: string;
+    googleIp: string;
+  }): Promise<DriveOauthStartDto> {
+    return invoke<DriveOauthStartDto>("drive_oauth_start", args);
+  },
+  driveOauthComplete(stateToken: string): Promise<DriveOauthCompleteDto> {
+    return invoke<DriveOauthCompleteDto>("drive_oauth_complete", {
+      stateToken,
+    });
+  },
+  driveCreateFolder(name: string): Promise<string> {
+    return invoke<string>("drive_create_folder", { name });
+  },
+  driveTestConnection(): Promise<DriveTestDto> {
+    return invoke<DriveTestDto>("drive_test_connection");
+  },
+  driveValidateRelayPubkey(s: string): Promise<void> {
+    return invoke<void>("drive_validate_relay_pubkey", { s });
   },
 };
 

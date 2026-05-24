@@ -47,7 +47,7 @@ serde_json = "1"
 # These are scoped to this crate (not the rahgozar core lib) because
 # they're UI-display-only — the lib's `MitmCertManager` already has
 # everything it needs to mint + load the CA for the proxy itself.
-sha2 = "0.10"
+sha2 = "0.11"
 x509-parser = "0.16"
 rustls-pemfile = "2"
 
@@ -58,9 +58,17 @@ rahgozar = { path = "../.." }
 
 # Async runtime — rahgozar's proxy is tokio-based, and we need a
 # multi-thread runtime to spawn it alongside Tauri's event loop.
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+# `net` + `io-util` + `time` added for the Drive-mode OAuth callback
+# listener (`drive_oauth_start` binds a loopback `TcpListener`, reads
+# the redirected HTTP request, parses `?code=`, exchanges via
+# `rahgozar::drive_oauth`).
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "io-util", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Random bytes for the OAuth `state` parameter (CSRF guard) +
+# session-id generation in the future Drive UI flows.
+rand = "0.8"
 
 [features]
 # Default Tauri release feature — embeds the frontend assets into the

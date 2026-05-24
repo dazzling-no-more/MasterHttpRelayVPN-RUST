@@ -187,6 +187,77 @@ const EN: Record<string, string> = {
   "tunnel.mode.local_bypass.label": "Local Bypass (no relay, no cert)",
   "tunnel.mode.local_bypass.help":
     "Local DPI bypass for every TLS host (not just Google). The real ClientHello is split across TCP segments and sent direct to the destination — no Apps Script, no MITM CA. Pick this for full DPI coverage; costs ~300 ms per TLS handshake vs. raw TCP. Cannot bypass IP-level blocks.",
+  "tunnel.mode.drive.label": "Drive (mailbox via Google Drive)",
+  "tunnel.mode.drive.help":
+    "Every TCP session is encrypted and uploaded as files to a shared Google Drive folder; a separate rahgozar-drive-relay process on a VPS you control polls the folder and forwards the traffic. The ISP only sees TLS to *.google.com. Requires a relay binary on a VPS abroad + a Drive folder + the relay's public key. Slower than Apps Script (no long-poll on Drive), but a separate code path under separate Google-account enforcement.",
+
+  // Drive-mode setup section. Visible when `mode === "drive"` in
+  // TunnelTab. The OAuth refresh token is managed by `driveOauthStart`
+  // / `driveOauthComplete` and never surfaced; everything else is a
+  // regular form field.
+  "tunnel.section.drive": "Drive mailbox setup",
+  "tunnel.drive.help":
+    "Connect to Google Drive (one-time), pick a folder for the encrypted mailbox, paste the public key your relay printed at `rahgozar-drive-relay keygen` time. Save when all three are set.",
+  "tunnel.drive.oauth_client_section": "Your Google OAuth client (BYO)",
+  "tunnel.drive.oauth_client_help":
+    "Register your own Desktop app OAuth client in Google Cloud Console — see docs/drive_oauth_setup.md for the step-by-step walkthrough. Required: every user supplies their own client so the 100-user cap on unverified OAuth clients never bites.",
+  "tunnel.drive.oauth_client_id_label": "Client ID",
+  "tunnel.drive.oauth_client_id_placeholder":
+    "123456789-abc...apps.googleusercontent.com",
+  "tunnel.drive.oauth_client_secret_label": "Client secret",
+  "tunnel.drive.oauth_client_secret_placeholder": "GOCSPX-…",
+  "tunnel.drive.oauth_save_before_signin":
+    "Paste your OAuth client_id + client_secret above and save before signing in.",
+  "tunnel.drive.oauth_creds_required":
+    "Paste your OAuth client_id + client_secret above first.",
+  "tunnel.drive.oauth_url_dialog_title": "Open this URL to sign in",
+  "tunnel.drive.oauth_url_dialog_help":
+    "Copy the URL and paste it into the browser where you're signed in with your Google account. Or click Open to use your system default browser. The app catches the redirect automatically.",
+  "tunnel.drive.oauth_url_copy": "Copy URL",
+  "tunnel.drive.oauth_url_open": "Open in default browser",
+  "tunnel.drive.oauth_url_copied": "URL copied to clipboard.",
+  "tunnel.drive.oauth_url_waiting": "Waiting for sign-in…",
+  "tunnel.drive.signed_out": "Not signed in to Google.",
+  "tunnel.drive.signed_in": "Signed in.",
+  "tunnel.drive.sign_in_btn": "Sign in with Google",
+  "tunnel.drive.signing_in": "Signing in…",
+  "tunnel.drive.relink_btn": "Re-link",
+  "tunnel.drive.folder_id_label": "Folder ID",
+  "tunnel.drive.folder_id_help":
+    "Bare Drive folder ID (the random string in the URL after /folders/, not the full URL). Both this client and the relay must use the same folder.",
+  "tunnel.drive.folder_id_placeholder": "0AABBccDDeeFFgg... (or click Create new)",
+  "tunnel.drive.create_folder_btn": "Create new",
+  "tunnel.drive.creating_folder": "Creating folder…",
+  "tunnel.drive.create_folder_name_label": "Folder name",
+  "tunnel.drive.create_folder_name_placeholder": "rahgozar mailbox",
+  "tunnel.drive.create_folder_confirm": "Create",
+  "tunnel.drive.create_folder_cancel": "Cancel",
+  "tunnel.drive.relay_pubkey_label": "Relay public key",
+  "tunnel.drive.relay_pubkey_help":
+    "Bech32m public key your relay printed (starts with `rgdr1`). Pasted as-is; the checksum catches typos.",
+  "tunnel.drive.relay_pubkey_placeholder": "rgdr1...",
+  "tunnel.drive.relay_pubkey_valid": "Valid relay public key.",
+  "tunnel.drive.relay_pubkey_invalid": "Invalid: {error}",
+  "tunnel.drive.test_btn": "Test connection",
+  "tunnel.drive.testing": "Testing…",
+  "tunnel.drive.test_ok": "OK — folder {folder} has {count} file(s).",
+  "tunnel.drive.open_url_manual": "Open this URL in your browser: {url}",
+  "tunnel.drive.signed_in_as": "Signed in as {email}.",
+  "tunnel.drive.oauth_failed": "OAuth failed: {error}",
+  "tunnel.drive.save_before_test":
+    "Save first — Test reads the on-disk config, not the form.",
+  "tunnel.drive.save_before_create_folder":
+    "Save first — folder creation uses the on-disk Google account.",
+  "tunnel.drive.test_failed": "Test failed: {error}",
+  "tunnel.drive.folder_created": "Folder created. ID pasted in. Save when ready.",
+  "tunnel.drive.create_folder_failed": "Create folder failed: {error}",
+  "tunnel.drive.advanced": "Advanced",
+  "tunnel.drive.poll_interval_label": "Poll interval (ms)",
+  "tunnel.drive.poll_interval_help":
+    "Baseline interval the client polls Drive for relay-→client frames. Adapts: faster during active traffic, slower when idle. 300 ms is a good default.",
+  "tunnel.drive.max_concurrent_label": "Max concurrent uploads",
+  "tunnel.drive.max_concurrent_help":
+    "Cap on parallel Drive REST calls in flight from this client. Bounded so a burst doesn't blow past Drive's per-user QPS quota. 8 is a good default.",
   "tunnel.section.fronting_groups": "Fronting groups (CDN edges)",
   "tunnel.fronting.help":
     "Route specific domains through a CDN edge instead of the Apps Script relay. Pick a hostname known to live on the CDN (e.g. python.org → Fastly, react.dev → Vercel) and click Discover — we'll resolve it and pick the best IP.",
@@ -404,6 +475,73 @@ const FA: Record<string, string> = {
   "tunnel.mode.local_bypass.label": "عبور محلی (بدون ریلی، بدون گواهی)",
   "tunnel.mode.local_bypass.help":
     "عبور محلی از DPI برای همهٔ میزبان‌های TLS (نه فقط گوگل). ClientHello واقعی در چند قطعهٔ TCP تکه‌بندی می‌شود و مستقیماً به مقصد ارسال می‌گردد — نه Apps Script، نه گواهی MITM. برای پوشش کامل DPI این گزینه را انتخاب کنید؛ حدوداً ۳۰۰ میلی‌ثانیه به هر TLS handshake اضافه می‌شود. سایت‌هایی که در سطح IP بسته شده‌اند از این مسیر در دسترس نخواهند بود.",
+  "tunnel.mode.drive.label": "درایو (صندوق پستی از طریق گوگل درایو)",
+  "tunnel.mode.drive.help":
+    "هر نشست TCP به‌صورت رمزشده در فایل‌هایی روی یک پوشهٔ مشترک گوگل درایو بارگذاری می‌شود؛ یک سرویس جداگانه (rahgozar-drive-relay) روی VPS شما این پوشه را poll می‌کند و ترافیک را به مقصد اصلی هدایت می‌کند. ISP فقط TLS به *.google.com می‌بیند. نیازمند بایناری ریلی روی VPS خارج، یک پوشهٔ درایو، و کلید عمومی آن ریلی است. کمی کندتر از Apps Script (درایو long-poll ندارد)، اما مسیر کد جداگانه‌ای تحت اعمال محدودیت‌های جداگانه‌ای از طرف گوگل است.",
+
+  "tunnel.section.drive": "راه‌اندازی صندوق پستی درایو",
+  "tunnel.drive.help":
+    "ورود یک‌بار به گوگل، انتخاب یک پوشه برای صندوق پستی رمزشده، چسباندن کلید عمومی‌ای که ریلی شما هنگام `rahgozar-drive-relay keygen` چاپ کرده است. وقتی هر سه تنظیم شد ذخیره کنید.",
+  "tunnel.drive.oauth_client_section": "کلاینت OAuth شخصی شما (BYO)",
+  "tunnel.drive.oauth_client_help":
+    "کلاینت OAuth نوع Desktop app خود را در Google Cloud Console ثبت کنید — راهنمای گام‌به‌گام در docs/drive_oauth_setup.fa.md آمده است. الزامی است: هر کاربر کلاینت خود را می‌سازد تا سقف ۱۰۰ کاربری گوگل برای کلاینت‌های تأیید‌نشده گریبان‌گیرتان نشود.",
+  "tunnel.drive.oauth_client_id_label": "شناسهٔ کلاینت (Client ID)",
+  "tunnel.drive.oauth_client_id_placeholder":
+    "123456789-abc...apps.googleusercontent.com",
+  "tunnel.drive.oauth_client_secret_label": "رمز کلاینت (Client secret)",
+  "tunnel.drive.oauth_client_secret_placeholder": "GOCSPX-…",
+  "tunnel.drive.oauth_save_before_signin":
+    "ابتدا client_id و client_secret را در بالا وارد کنید و ذخیره بزنید، سپس وارد گوگل شوید.",
+  "tunnel.drive.oauth_creds_required":
+    "ابتدا client_id و client_secret خود را در بالا وارد کنید.",
+  "tunnel.drive.oauth_url_dialog_title": "این URL را برای ورود باز کنید",
+  "tunnel.drive.oauth_url_dialog_help":
+    "URL را کپی کنید و در مرورگری که با حساب گوگل خود وارد شده‌اید بچسبانید. یا روی «باز کردن» کلیک کنید تا با مرورگر پیش‌فرض سیستم باز شود. برنامه ادامهٔ مسیر را خودکار می‌گیرد.",
+  "tunnel.drive.oauth_url_copy": "کپی URL",
+  "tunnel.drive.oauth_url_open": "باز کردن در مرورگر پیش‌فرض",
+  "tunnel.drive.oauth_url_copied": "URL در کلیپ‌بورد کپی شد.",
+  "tunnel.drive.oauth_url_waiting": "در انتظار ورود…",
+  "tunnel.drive.signed_out": "وارد گوگل نشده‌اید.",
+  "tunnel.drive.signed_in": "وارد شده‌اید.",
+  "tunnel.drive.sign_in_btn": "ورود با گوگل",
+  "tunnel.drive.signing_in": "در حال ورود…",
+  "tunnel.drive.relink_btn": "اتصال مجدد",
+  "tunnel.drive.folder_id_label": "شناسهٔ پوشه",
+  "tunnel.drive.folder_id_help":
+    "شناسهٔ خالص پوشهٔ درایو (همان رشتهٔ تصادفی در URL بعد از /folders/، نه کل URL). هم کلاینت و هم ریلی باید از یک پوشه استفاده کنند.",
+  "tunnel.drive.folder_id_placeholder": "0AABBccDDeeFFgg... (یا روی «ایجاد پوشه» کلیک کنید)",
+  "tunnel.drive.create_folder_btn": "ایجاد پوشه",
+  "tunnel.drive.creating_folder": "در حال ایجاد پوشه…",
+  "tunnel.drive.create_folder_name_label": "نام پوشه",
+  "tunnel.drive.create_folder_name_placeholder": "rahgozar mailbox",
+  "tunnel.drive.create_folder_confirm": "ایجاد",
+  "tunnel.drive.create_folder_cancel": "انصراف",
+  "tunnel.drive.relay_pubkey_label": "کلید عمومی ریلی",
+  "tunnel.drive.relay_pubkey_help":
+    "کلید عمومی Bech32m که ریلی شما چاپ کرده (با `rgdr1` شروع می‌شود). همان‌طور که هست بچسبانید؛ checksum خطاهای تایپی را می‌گیرد.",
+  "tunnel.drive.relay_pubkey_placeholder": "rgdr1...",
+  "tunnel.drive.relay_pubkey_valid": "کلید عمومی معتبر است.",
+  "tunnel.drive.relay_pubkey_invalid": "نامعتبر: {error}",
+  "tunnel.drive.test_btn": "تست اتصال",
+  "tunnel.drive.testing": "در حال تست…",
+  "tunnel.drive.test_ok": "اوکی — پوشهٔ {folder} شامل {count} فایل است.",
+  "tunnel.drive.open_url_manual": "این URL را در مرورگر باز کنید: {url}",
+  "tunnel.drive.signed_in_as": "با حساب {email} وارد شدید.",
+  "tunnel.drive.oauth_failed": "OAuth ناموفق بود: {error}",
+  "tunnel.drive.save_before_test":
+    "ابتدا ذخیره کنید — تست تنظیمات روی دیسک را می‌خواند، نه فرم را.",
+  "tunnel.drive.save_before_create_folder":
+    "ابتدا ذخیره کنید — ایجاد پوشه از حساب گوگل ذخیره‌شده روی دیسک استفاده می‌کند.",
+  "tunnel.drive.test_failed": "تست ناموفق بود: {error}",
+  "tunnel.drive.folder_created": "پوشه ساخته شد. شناسه در فرم قرار گرفت. در پایان ذخیره کنید.",
+  "tunnel.drive.create_folder_failed": "ایجاد پوشه ناموفق بود: {error}",
+  "tunnel.drive.advanced": "پیشرفته",
+  "tunnel.drive.poll_interval_label": "بازهٔ poll (میلی‌ثانیه)",
+  "tunnel.drive.poll_interval_help":
+    "بازهٔ پایه‌ای که کلاینت برای فریم‌های ریلی→کلاینت درایو را poll می‌کند. وفق‌پذیر است: سریع‌تر در ترافیک فعال، آهسته‌تر در حالت idle. ۳۰۰ میلی‌ثانیه پیش‌فرض مناسبی است.",
+  "tunnel.drive.max_concurrent_label": "حداکثر آپلودهای هم‌زمان",
+  "tunnel.drive.max_concurrent_help":
+    "سقف فراخوانی‌های موازی REST درایو از این کلاینت. محدود می‌شود تا یک burst سهمیهٔ QPS هر کاربر را خراب نکند. ۸ پیش‌فرض خوبی است.",
   "tunnel.section.fronting_groups": "گروه‌های فرانتینگ (لبه‌های CDN)",
   "tunnel.fronting.help":
     "هدایت دامنه‌های مشخص از طریق یک لبه CDN به جای ریلی Apps Script. یک hostname شناخته‌شده روی CDN انتخاب کنید (مثلاً python.org → Fastly، react.dev → Vercel) و روی کشف کلیک کنید — DNS resolve و انتخاب بهترین IP خودکار انجام می‌شود.",

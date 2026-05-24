@@ -95,6 +95,14 @@ pub fn run() {
             commands::clear_logs,
             commands::get_raw_config,
             commands::save_raw_config,
+            // Drive-mode setup: OAuth flow + folder + relay-pubkey
+            // validation. See the "Drive-mode setup" section in
+            // `commands.rs` for the per-command contract.
+            commands::drive_oauth_start,
+            commands::drive_oauth_complete,
+            commands::drive_create_folder,
+            commands::drive_test_connection,
+            commands::drive_validate_relay_pubkey,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

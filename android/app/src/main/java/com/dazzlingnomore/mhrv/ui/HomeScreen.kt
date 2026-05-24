@@ -114,13 +114,15 @@ fun HomeScreen(
     var cfg by remember { mutableStateOf(ConfigStore.load(ctx)) }
 
     fun persist(new: RahgozarConfig) {
-        // In-memory state goes through unconditionally so the form
-        // doesn't snap back to old bytes mid-edit. Disk state is
-        // gated on the write succeeding — if config.json didn't
-        // change, the active profile marker also stays put
-        // (invariant 2: clearing active claims the live config
-        // diverged from the marker, which is only true once the
-        // write lands).
+        // Optimistically reflect the user's edit so the form doesn't
+        // snap back mid-typing if the save fails. On a successful
+        // write we re-read from disk so the in-memory state matches
+        // the persisted bytes exactly — picking up the refresh-token
+        // snapshot that ConfigStore.save preserves internally via
+        // its own prepareForSave pass. Calling prepareForSave here
+        // would read config.json a second time; if another writer
+        // landed between the two reads, the UI state could diverge
+        // from what actually hit disk.
         cfg = new
         val saved = ConfigStore.save(ctx, new)
         if (!saved) {
@@ -135,6 +137,7 @@ fun HomeScreen(
             }
             return
         }
+        cfg = ConfigStore.load(ctx)
         // Only after a successful write do we touch the profile
         // pointer. A failed save would have left config.json with
         // the OLD bytes (which may still match the active profile),
@@ -452,16 +455,11 @@ fun HomeScreen(
                 enabled =
                     (
                         // Connect is enabled when the proxy is already
-                        // running OR the current mode doesn't need
-                        // Apps Script creds OR creds are present.
-                        // [Mode.usesAppsScriptRelay] is the same
-                        // predicate the service-side and ProfileStore
-                        // gates use, so a future cred-free mode
-                        // lights up Connect automatically without
-                        // another edit here.
-                        isVpnRunning ||
-                            !cfg.mode.usesAppsScriptRelay() ||
-                            (cfg.hasDeploymentId && cfg.authKey.isNotBlank())
+                        // running OR the selected mode has its required
+                        // credentials/config. The predicate lives on
+                        // RahgozarConfig so UI and service preflight stay
+                        // in lock-step when new modes land.
+                        isVpnRunning || cfg.canStartCurrentMode
                     ) && !transitioning,
                 colors =
                     ButtonDefaults.buttonColors(
@@ -586,6 +584,19 @@ fun HomeScreen(
                     supportingText = {
                         Text(stringResource(R.string.help_auth_key))
                     },
+                )
+            }
+
+            // Drive-mode setup. Visible only when the user has picked
+            // Drive in the mode dropdown. The OAuth flow lives entirely
+            // inside the JNI bridge; the section just dispatches +
+            // displays status. See `Native.driveOauth*` for the
+            // ~6-call surface.
+            if (cfg.mode == Mode.DRIVE) {
+                Spacer(Modifier.height(4.dp))
+                DriveSetupSection(
+                    cfg = cfg,
+                    onChange = ::persist,
                 )
             }
 
@@ -729,13 +740,9 @@ fun HomeScreen(
             // here because cert install is a one-time setup step; daily
             // users never tap it again.
             //
-            // Hidden in LOCAL_BYPASS / FULL: those modes don't use the
-            // MITM SNI-rewrite path at all (LocalBypass fragments TLS
-            // end-to-end; Full tunnels end-to-end through the relay),
-            // so offering a CA-install button there is misleading. The
-            // file still exists on disk and can be installed by hand if
-            // a user switches modes later.
-            val showsCertInstall = cfg.mode != Mode.LOCAL_BYPASS && cfg.mode != Mode.FULL
+            // Hidden in no-MITM modes so users are never asked to add a
+            // root CA for transports that keep TLS end-to-end.
+            val showsCertInstall = cfg.mode.usesMitmCa()
             if (showsCertInstall) {
                 FilledTonalButton(
                     onClick = { showInstallDialog = true },
@@ -1166,12 +1173,14 @@ private fun ModeDropdown(
     val labelDirect = stringResource(R.string.mode_direct_label)
     val labelFull = stringResource(R.string.mode_full_label)
     val labelLocalBypass = stringResource(R.string.mode_local_bypass_label)
+    val labelDrive = stringResource(R.string.mode_drive_label)
     val currentLabel =
         when (mode) {
             Mode.APPS_SCRIPT -> labelApps
             Mode.DIRECT -> labelDirect
             Mode.FULL -> labelFull
             Mode.LOCAL_BYPASS -> labelLocalBypass
+            Mode.DRIVE -> labelDrive
         }
     var expanded by remember { mutableStateOf(false) }
 
@@ -1220,6 +1229,13 @@ private fun ModeDropdown(
                         expanded = false
                     },
                 )
+                DropdownMenuItem(
+                    text = { Text(labelDrive) },
+                    onClick = {
+                        onChange(Mode.DRIVE)
+                        expanded = false
+                    },
+                )
             }
         }
 
@@ -1229,6 +1245,7 @@ private fun ModeDropdown(
                 Mode.DIRECT -> stringResource(R.string.help_mode_direct)
                 Mode.FULL -> stringResource(R.string.help_mode_full)
                 Mode.LOCAL_BYPASS -> stringResource(R.string.help_mode_local_bypass)
+                Mode.DRIVE -> stringResource(R.string.help_mode_drive)
             }
         Text(
             help,
@@ -2404,7 +2421,7 @@ private fun SectionHeader(text: String) {
  * wrapping the content.
  */
 @Composable
-private fun CollapsibleSection(
+internal fun CollapsibleSection(
     title: String,
     initiallyExpanded: Boolean = false,
     content: @Composable ColumnScope.() -> Unit,

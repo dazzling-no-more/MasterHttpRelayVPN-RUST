@@ -355,6 +355,12 @@ pub(crate) struct ModeBundle {
     /// `Some` only in `full` mode — the tunnel mux is what carries
     /// end-to-end-encrypted traffic to the tunnel node.
     pub(crate) tunnel_mux: Option<Arc<TunnelMux>>,
+    /// `Some` only in `drive` mode — the Drive-mailbox mux runs the
+    /// shared poller against Google Drive's REST API and dispatches
+    /// inbound frames to per-session queues. Mutually exclusive with
+    /// `tunnel_mux` (the two modes can't both be active at once,
+    /// since `Mode` is a single enum value).
+    pub(crate) drive_mux: Option<Arc<crate::drive_client::DriveMux>>,
 }
 
 /// Mode-dependent background tasks tied to the *current* `fronter`/`mux`.
@@ -459,10 +465,16 @@ pub struct RuntimeState {
     /// under `switch_lock`, so plain `Relaxed` ordering suffices.
     coalesce_step_ms: AtomicU64,
     coalesce_max_ms: AtomicU64,
-    /// Serialises `switch_mode` against itself AND against the run-task's
-    /// shutdown path, so a detached switch-task spawned from the UI can't
-    /// race past shutdown and re-spawn fresh fronter tasks after Stop.
+    /// Serialises the short live-state swap/cleanup critical section
+    /// against the run-task's shutdown path, so a detached switch-task
+    /// spawned from the UI can't race past shutdown and re-spawn fresh
+    /// fronter tasks after Stop.
     switch_lock: Mutex<()>,
+    /// Serialises live switch requests across their pre-build phase. A
+    /// Drive switch may refresh OAuth before it is ready to swap state;
+    /// keeping that wait out of `switch_lock` lets shutdown proceed, while
+    /// this mutex preserves "one switch at a time" ordering.
+    switch_serial_lock: Mutex<()>,
     /// Set during the shutdown arm of `run()` (under `switch_lock`). Any
     /// subsequent `switch_mode` checks this immediately after acquiring
     /// `switch_lock` and bails — guaranteeing no new tasks get spawned
@@ -868,6 +880,14 @@ pub(crate) enum EarlyRoute {
     BlockDoh,
     BypassDoh,
     Full,
+    /// Drive-mailbox transport (mode=`drive`). Sits between `BypassDoh`
+    /// and `Full` in the precedence order: the global DoH policy knobs
+    /// still win above us (Drive polling is even slower than Apps
+    /// Script's relay, so routing DoH through it would compound the
+    /// browser-DNS latency hit `bypass_doh` exists to mitigate), but
+    /// for non-DoH traffic Drive mode tunnels everything via the
+    /// Drive mux just like Full mode tunnels via the Apps Script mux.
+    Drive,
     Continue,
 }
 
@@ -903,6 +923,9 @@ pub(crate) fn classify_early_route(
     }
     if bypass_doh && port == 443 && matches_doh_host(host, bypass_doh_hosts) {
         return EarlyRoute::BypassDoh;
+    }
+    if mode == Mode::Drive {
+        return EarlyRoute::Drive;
     }
     if mode == Mode::Full {
         return EarlyRoute::Full;
@@ -1495,8 +1518,13 @@ impl RuntimeState {
             rewrite_ctx,
             fronter,
             // TunnelMux is spawned in `run()` because `TunnelMux::start`
-            // calls `tokio::spawn` internally and needs a runtime.
+            // calls `tokio::spawn` internally and needs a runtime. Same
+            // story for `DriveMux::start` — spawning the shared Drive
+            // poller from `new()` would touch the runtime before the
+            // caller (CLI / Tauri runtime / JNI) has even decided to
+            // start the proxy, so we defer to `run_inner` too.
             tunnel_mux: None,
+            drive_mux: None,
         });
         let (coalesce_step, coalesce_max) = resolve_coalesce(config);
         Ok(Arc::new(Self {
@@ -1509,6 +1537,7 @@ impl RuntimeState {
             coalesce_step_ms: AtomicU64::new(coalesce_step),
             coalesce_max_ms: AtomicU64::new(coalesce_max),
             switch_lock: Mutex::new(()),
+            switch_serial_lock: Mutex::new(()),
             stopped: AtomicBool::new(false),
             config: ArcSwap::from_pointee(config.clone()),
         }))
@@ -1568,11 +1597,19 @@ impl RuntimeState {
             self.stopped.store(true, Ordering::SeqCst);
             self.mode_tasks.lock().await.abort_all();
             let cur = self.bundle.load_full();
-            if cur.tunnel_mux.is_some() {
+            if cur.tunnel_mux.is_some() || cur.drive_mux.is_some() {
+                // Same rationale as the `tunnel_mux` clear above
+                // applies to `drive_mux`: the Drive shared poller
+                // holds its own `Arc<DriveMux>` for as long as the
+                // bundle does, so dropping it here is what lets the
+                // poller task exit naturally on Stop. Both fields
+                // are cleared together in a single store so the
+                // bundle never carries half-stopped state.
                 self.bundle.store(Arc::new(ModeBundle {
                     rewrite_ctx: cur.rewrite_ctx.clone(),
                     fronter: cur.fronter.clone(),
                     tunnel_mux: None,
+                    drive_mux: None,
                 }));
             }
         }
@@ -1603,11 +1640,26 @@ impl RuntimeState {
             socks_addr
         );
 
+        // DriveMux startup can refresh OAuth over the network. Build a
+        // candidate outside `switch_lock` so Stop / switch cleanup isn't
+        // pinned behind that I/O. The short locked block below installs it
+        // only if Drive is still the active mode and no racing switch has
+        // already provided a mux.
+        let mut startup_drive_mux = {
+            let cur = self.bundle.load_full();
+            if cur.rewrite_ctx.mode == Mode::Drive && cur.drive_mux.is_none() {
+                let cfg = self.config.load_full();
+                Some(crate::drive_client::DriveMux::start(&cfg).await)
+            } else {
+                None
+            }
+        };
+
         // Spawn TunnelMux inside the runtime (`TunnelMux::start` calls
         // `tokio::spawn`). If the starting mode is Full and the bundle
         // doesn't already have a mux (a `switch_mode` racing Start may
         // have installed one), install it now so the first connections
-        // see it. Holding `switch_lock` for the whole startup-init block
+        // see it. Holding `switch_lock` for the install/swap block
         // serialises this against switch_mode so we don't overwrite each
         // other's bundle.
         {
@@ -1625,8 +1677,45 @@ impl RuntimeState {
                     rewrite_ctx: cur.rewrite_ctx.clone(),
                     fronter: cur.fronter.clone(),
                     tunnel_mux: Some(mux),
+                    drive_mux: cur.drive_mux.clone(),
                 }));
             }
+
+            // Drive-mode parallel of the Full-mux spawn above. Same
+            // rationale (mux startup needs a tokio runtime; can't
+            // happen in `ProxyServer::new`). A racing `switch_mode`
+            // may have installed the mux already — `is_none()` keeps
+            // this idempotent so a switch-into-Drive immediately
+            // followed by Start doesn't double-spawn the poller.
+            let cur = self.bundle.load_full();
+            if cur.rewrite_ctx.mode == Mode::Drive && cur.drive_mux.is_none() {
+                let dm = match startup_drive_mux.take() {
+                    Some(Ok(dm)) => dm,
+                    Some(Err(e)) => {
+                        return Err(std::io::Error::other(format!("drive mux: {e}")).into());
+                    }
+                    None => {
+                        return Err(
+                            std::io::Error::other("drive mux missing after startup race").into(),
+                        );
+                    }
+                };
+                self.bundle.store(Arc::new(ModeBundle {
+                    rewrite_ctx: cur.rewrite_ctx.clone(),
+                    fronter: cur.fronter.clone(),
+                    tunnel_mux: cur.tunnel_mux.clone(),
+                    drive_mux: Some(dm),
+                }));
+            }
+
+            // Drop any unused candidate. If the recheck above didn't
+            // install it (mode flipped away from Drive via a racing
+            // switch_mode, or a racing switch already populated
+            // drive_mux), the `Some(Ok(dm))` would otherwise stay
+            // pinned in `run_inner`'s frame for the entire proxy
+            // lifetime — the poller (which holds `Weak<DriveMuxInner>`)
+            // would keep upgrading and polling Drive uselessly.
+            let _ = startup_drive_mux.take();
 
             // Mode-dependent background tasks (warm + keepalive + refill +
             // stats) are owned by `mode_tasks` so `switch_mode` can abort
@@ -1684,8 +1773,10 @@ impl RuntimeState {
                 let fronter = bundle.fronter.clone();
                 let rewrite_ctx = bundle.rewrite_ctx.clone();
                 let mux = bundle.tunnel_mux.clone();
+                let drive_mux = bundle.drive_mux.clone();
                 children.spawn(async move {
-                    if let Err(e) = handle_http_client(sock, fronter, mitm, rewrite_ctx, mux).await
+                    if let Err(e) =
+                        handle_http_client(sock, fronter, mitm, rewrite_ctx, mux, drive_mux).await
                     {
                         tracing::debug!("http client {} closed: {}", peer, e);
                     }
@@ -1719,9 +1810,10 @@ impl RuntimeState {
                 let fronter = bundle.fronter.clone();
                 let rewrite_ctx = bundle.rewrite_ctx.clone();
                 let mux = bundle.tunnel_mux.clone();
+                let drive_mux = bundle.drive_mux.clone();
                 children.spawn(async move {
                     if let Err(e) =
-                        handle_socks5_client(sock, fronter, mitm, rewrite_ctx, mux).await
+                        handle_socks5_client(sock, fronter, mitm, rewrite_ctx, mux, drive_mux).await
                     {
                         tracing::debug!("socks client {} closed: {}", peer, e);
                     }
@@ -1816,6 +1908,42 @@ impl RuntimeState {
     /// treat that as a no-op, not a UI-surfaced error — it just means
     /// the user clicked Stop while a SwitchMode was queued.
     pub async fn switch_mode(self: &Arc<Self>, new_config: &Config) -> Result<(), ProxyError> {
+        let _serial = self.switch_serial_lock.lock().await;
+        {
+            let _g = self.switch_lock.lock().await;
+            if self.stopped.load(Ordering::SeqCst) {
+                return Err(ProxyError::ShuttingDown);
+            }
+        }
+
+        // Build the new state BEFORE touching live state — if config parse
+        // or DomainFronter::new fails, the running proxy stays on its
+        // current bundle untouched. Errors propagate to the UI. DriveMux
+        // startup may refresh OAuth over the network, so all pre-build work
+        // happens before the shutdown/swap lock is taken.
+        let (new_fronter, new_ctx, new_mode) = build_mode_state(new_config)?;
+        // Pick up coalesce edits from `new_config` so a Full-mode switch
+        // honours the latest tuning. Stored as the runtime's "current
+        // snapshot" so subsequent switches (and any future `run()`
+        // restarts, although that path doesn't exist today) see them too.
+        let (new_step, new_max) = resolve_coalesce(new_config);
+
+        // Build a fresh `DriveMux` if the post-switch mode is Drive,
+        // else `None`. A switch *away* from Drive lets the previous mux
+        // drop, which causes the shared poller to exit naturally — same
+        // shape as `TunnelMux`'s lifecycle. Errors propagate as
+        // `ProxyError` so the UI surfaces malformed Drive config the same
+        // way it surfaces a missing `script_id` on a switch to AppsScript.
+        let new_drive_mux = if new_mode == Mode::Drive {
+            Some(
+                crate::drive_client::DriveMux::start(new_config)
+                    .await
+                    .map_err(|e| std::io::Error::other(format!("drive mux: {e}")))?,
+            )
+        } else {
+            None
+        };
+
         let _g = self.switch_lock.lock().await;
         // Re-check `stopped` under the lock: the shutdown arm of `run()`
         // sets this also under `switch_lock`, so once we hold the lock
@@ -1826,15 +1954,6 @@ impl RuntimeState {
             return Err(ProxyError::ShuttingDown);
         }
 
-        // Build the new state BEFORE touching live state — if config parse
-        // or DomainFronter::new fails, the running proxy stays on its
-        // current bundle untouched. Errors propagate to the UI.
-        let (new_fronter, new_ctx, new_mode) = build_mode_state(new_config)?;
-        // Pick up coalesce edits from `new_config` so a Full-mode switch
-        // honours the latest tuning. Stored as the runtime's "current
-        // snapshot" so subsequent switches (and any future `run()`
-        // restarts, although that path doesn't exist today) see them too.
-        let (new_step, new_max) = resolve_coalesce(new_config);
         self.coalesce_step_ms.store(new_step, Ordering::Relaxed);
         self.coalesce_max_ms.store(new_max, Ordering::Relaxed);
         let new_mux = if new_mode == Mode::Full {
@@ -1858,6 +1977,7 @@ impl RuntimeState {
             rewrite_ctx: new_ctx,
             fronter: new_fronter.clone(),
             tunnel_mux: new_mux,
+            drive_mux: new_drive_mux,
         }));
 
         // Refresh stored config snapshot before spawning so the new
@@ -1945,6 +2065,7 @@ async fn handle_http_client(
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
     tunnel_mux: Option<Arc<TunnelMux>>,
+    drive_mux: Option<Arc<crate::drive_client::DriveMux>>,
 ) -> std::io::Result<()> {
     let (head, leftover) = match read_http_head(&mut sock).await? {
         HeadReadResult::Got { head, leftover } => (head, leftover),
@@ -1991,7 +2112,17 @@ async fn handle_http_client(
         sock.write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
             .await?;
         sock.flush().await?;
-        dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx, tunnel_mux).await
+        dispatch_tunnel(
+            sock,
+            host,
+            port,
+            fronter,
+            mitm,
+            rewrite_ctx,
+            tunnel_mux,
+            drive_mux,
+        )
+        .await
     } else {
         // Plain HTTP proxy request (e.g. `GET http://…`).
         //
@@ -2006,9 +2137,21 @@ async fn handle_http_client(
         // they finish setting up Apps Script. Issue: typing a bare
         // `http://example.com` URL used to return a 502 here even
         // though `https://example.com` (CONNECT) worked fine.
-        match fronter {
-            Some(f) => do_plain_http(sock, &head, &leftover, f).await,
-            None => do_plain_http_passthrough(sock, &head, &leftover, &rewrite_ctx).await,
+        if rewrite_ctx.mode == Mode::Drive {
+            match drive_mux {
+                Some(mux) => do_plain_http_drive(sock, &head, &leftover, &rewrite_ctx, mux).await,
+                None => {
+                    tracing::error!(
+                        "plain HTTP request in drive mode but no drive mux (should not happen)"
+                    );
+                    Ok(())
+                }
+            }
+        } else {
+            match fronter {
+                Some(f) => do_plain_http(sock, &head, &leftover, f).await,
+                None => do_plain_http_passthrough(sock, &head, &leftover, &rewrite_ctx).await,
+            }
         }
     }
 }
@@ -2021,6 +2164,7 @@ async fn handle_socks5_client(
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
     tunnel_mux: Option<Arc<TunnelMux>>,
+    drive_mux: Option<Arc<crate::drive_client::DriveMux>>,
 ) -> std::io::Result<()> {
     // RFC 1928 handshake: VER=5, NMETHODS, METHODS...
     let mut hdr = [0u8; 2];
@@ -2119,7 +2263,17 @@ async fn handle_socks5_client(
         .await?;
     sock.flush().await?;
 
-    dispatch_tunnel(sock, host, port, fronter, mitm, rewrite_ctx, tunnel_mux).await
+    dispatch_tunnel(
+        sock,
+        host,
+        port,
+        fronter,
+        mitm,
+        rewrite_ctx,
+        tunnel_mux,
+        drive_mux,
+    )
+    .await
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -2813,6 +2967,7 @@ async fn dispatch_tunnel(
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
     tunnel_mux: Option<Arc<TunnelMux>>,
+    drive_mux: Option<Arc<crate::drive_client::DriveMux>>,
 ) -> std::io::Result<()> {
     // Early routing decisions that don't need socket reads live in the
     // pure `classify_early_route` helper so the precedence (especially
@@ -2982,6 +3137,29 @@ async fn dispatch_tunnel(
             };
             tracing::info!("dispatch {}:{} -> full tunnel (via batch mux)", host, port);
             crate::tunnel_client::tunnel_connection(sock, &host, port, &mux).await?;
+            return Ok(());
+        }
+        EarlyRoute::Drive => {
+            // Drive-mailbox transport: every TLS CONNECT becomes a
+            // sequence of encrypted frames uploaded to a shared
+            // Google Drive folder, which a separate
+            // `rahgozar-drive-relay` process polls. No MITM (full
+            // end-to-end tunnel), so the dispatcher hands the raw
+            // socket straight to the Drive client. Same shape as
+            // the `EarlyRoute::Full` arm above.
+            let mux = match drive_mux {
+                Some(m) => m,
+                None => {
+                    tracing::error!(
+                        "dispatch {}:{} -> drive mode but no drive mux (should not happen)",
+                        host,
+                        port
+                    );
+                    return Ok(());
+                }
+            };
+            tracing::info!("dispatch {}:{} -> drive tunnel (via drive mux)", host, port);
+            crate::drive_client::tunnel_connection(sock, &host, port, &mux).await?;
             return Ok(());
         }
         EarlyRoute::Continue => {
@@ -4717,6 +4895,116 @@ async fn do_plain_http(
     Ok(())
 }
 
+/// Drive-mode plain-HTTP proxy request. Drive mode is a TCP tunnel, so
+/// parse the proxy target, rewrite the request line to origin-form, and
+/// send the already-read bytes as the first Data frame after Connect.
+async fn do_plain_http_drive(
+    sock: TcpStream,
+    head: &[u8],
+    leftover: &[u8],
+    rewrite_ctx: &RewriteCtx,
+    mux: Arc<crate::drive_client::DriveMux>,
+) -> std::io::Result<()> {
+    let (method, target, version, headers) = match parse_request_head(head) {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+
+    let (host, port, path) = match resolve_plain_http_target(&target, &headers) {
+        Some(v) => v,
+        None => {
+            tracing::debug!("plain-http drive: cannot parse target {}", target);
+            return Ok(());
+        }
+    };
+
+    match classify_early_route(
+        &host,
+        port,
+        rewrite_ctx.mode,
+        &rewrite_ctx.passthrough_hosts,
+        &rewrite_ctx.bypass_doh_hosts,
+        rewrite_ctx.block_doh,
+        rewrite_ctx.bypass_doh,
+    ) {
+        EarlyRoute::PassthroughHostsMatch => {
+            tracing::info!(
+                "dispatch http {}:{} -> raw-tcp ({}) (passthrough_hosts match)",
+                host,
+                port,
+                rewrite_ctx.upstream_socks5.as_deref().unwrap_or("direct"),
+            );
+            plain_http_passthrough_resolved(
+                sock,
+                &method,
+                &version,
+                &headers,
+                &host,
+                port,
+                &path,
+                leftover,
+                rewrite_ctx,
+            )
+            .await
+        }
+        EarlyRoute::BlockDoh => {
+            tracing::info!("dispatch http {}:{} -> blocked (block_doh)", host, port);
+            Ok(())
+        }
+        EarlyRoute::BypassDoh => {
+            tracing::info!(
+                "dispatch http {}:{} -> raw-tcp ({}) (doh bypass)",
+                host,
+                port,
+                rewrite_ctx.upstream_socks5.as_deref().unwrap_or("direct"),
+            );
+            plain_http_passthrough_resolved(
+                sock,
+                &method,
+                &version,
+                &headers,
+                &host,
+                port,
+                &path,
+                leftover,
+                rewrite_ctx,
+            )
+            .await
+        }
+        EarlyRoute::Drive => {
+            tracing::info!(
+                "dispatch http {}:{} -> drive tunnel (via drive mux)",
+                host,
+                port
+            );
+            let mut initial = rewrite_plain_http_request_head(&method, &version, &headers, &path);
+            initial.extend_from_slice(leftover);
+            crate::drive_client::tunnel_connection_with_preface(
+                sock,
+                host.trim_start_matches('[').trim_end_matches(']'),
+                port,
+                &mux,
+                Bytes::from(initial),
+            )
+            .await
+        }
+        EarlyRoute::LocalBypass | EarlyRoute::Full | EarlyRoute::Continue => {
+            plain_http_passthrough_resolved(
+                sock,
+                &method,
+                &version,
+                &headers,
+                &host,
+                port,
+                &path,
+                leftover,
+                rewrite_ctx,
+            )
+            .await
+        }
+    }
+}
+
 /// `direct` mode plain-HTTP passthrough. The CONNECT path already
 /// falls through to raw TCP for hosts outside the SNI-rewrite set in
 /// `direct`; this is the same idea for the `GET http://…` proxy form
@@ -4728,7 +5016,7 @@ async fn do_plain_http(
 /// to a different host onto our spliced socket, then dial the origin
 /// (honoring `upstream_socks5` if set) and splice both directions.
 async fn do_plain_http_passthrough(
-    mut sock: TcpStream,
+    sock: TcpStream,
     head: &[u8],
     leftover: &[u8],
     rewrite_ctx: &RewriteCtx,
@@ -4753,25 +5041,32 @@ async fn do_plain_http_passthrough(
         rewrite_ctx.upstream_socks5.as_deref().unwrap_or("direct"),
     );
 
-    // Rewrite request line to origin form and drop hop-by-hop headers.
-    let mut rewritten = Vec::with_capacity(head.len());
-    rewritten.extend_from_slice(method.as_bytes());
-    rewritten.push(b' ');
-    rewritten.extend_from_slice(path.as_bytes());
-    rewritten.push(b' ');
-    rewritten.extend_from_slice(version.as_bytes());
-    rewritten.extend_from_slice(b"\r\n");
-    for (k, v) in &headers {
-        let kl = k.to_ascii_lowercase();
-        if kl == "proxy-connection" || kl == "connection" || kl == "keep-alive" {
-            continue;
-        }
-        rewritten.extend_from_slice(k.as_bytes());
-        rewritten.extend_from_slice(b": ");
-        rewritten.extend_from_slice(v.as_bytes());
-        rewritten.extend_from_slice(b"\r\n");
-    }
-    rewritten.extend_from_slice(b"Connection: close\r\n\r\n");
+    plain_http_passthrough_resolved(
+        sock,
+        &method,
+        &version,
+        &headers,
+        &host,
+        port,
+        &path,
+        leftover,
+        rewrite_ctx,
+    )
+    .await
+}
+
+async fn plain_http_passthrough_resolved(
+    mut sock: TcpStream,
+    method: &str,
+    version: &str,
+    headers: &[(String, String)],
+    host: &str,
+    port: u16,
+    path: &str,
+    leftover: &[u8],
+    rewrite_ctx: &RewriteCtx,
+) -> std::io::Result<()> {
+    let rewritten = rewrite_plain_http_request_head(method, version, headers, path);
 
     let target_host = host.trim_start_matches('[').trim_end_matches(']');
     let connect_timeout = if looks_like_ip(target_host) {
@@ -4826,6 +5121,42 @@ async fn do_plain_http_passthrough(
         _ = t2 => {}
     }
     Ok(())
+}
+
+fn rewrite_plain_http_request_head(
+    method: &str,
+    version: &str,
+    headers: &[(String, String)],
+    path: &str,
+) -> Vec<u8> {
+    // Rewrite request line to origin form and drop hop-by-hop headers.
+    let mut rewritten = Vec::new();
+    rewritten.extend_from_slice(method.as_bytes());
+    rewritten.push(b' ');
+    rewritten.extend_from_slice(path.as_bytes());
+    rewritten.push(b' ');
+    rewritten.extend_from_slice(version.as_bytes());
+    rewritten.extend_from_slice(b"\r\n");
+    for (k, v) in headers {
+        let kl = k.to_ascii_lowercase();
+        // Strip hop-by-hop proxy metadata before forwarding to origin.
+        // `proxy-authorization` in particular would otherwise leak the
+        // user's proxy credentials/tokens to destination servers in
+        // direct-passthrough + Drive modes.
+        if kl == "proxy-authorization"
+            || kl == "proxy-connection"
+            || kl == "connection"
+            || kl == "keep-alive"
+        {
+            continue;
+        }
+        rewritten.extend_from_slice(k.as_bytes());
+        rewritten.extend_from_slice(b": ");
+        rewritten.extend_from_slice(v.as_bytes());
+        rewritten.extend_from_slice(b"\r\n");
+    }
+    rewritten.extend_from_slice(b"Connection: close\r\n\r\n");
+    rewritten
 }
 
 /// Parse the target of a plain-HTTP proxy request line into
@@ -7997,5 +8328,79 @@ mod tests {
     fn direct_mode_returns_continue() {
         let d = classify_early_route("example.com", 443, Mode::Direct, &[], &[], false, false);
         assert_eq!(d, EarlyRoute::Continue);
+    }
+
+    /// Drive mode short-circuits every TLS CONNECT to the Drive mux
+    /// (mirror of Full mode's behaviour, just with a different
+    /// transport on the other side of `dispatch_tunnel`).
+    #[test]
+    fn drive_mode_routes_to_drive() {
+        let d = classify_early_route("example.com", 443, Mode::Drive, &[], &[], false, false);
+        assert_eq!(d, EarlyRoute::Drive);
+        // Non-DoH host on a non-443 port still routes to Drive — the
+        // mux is the transport for everything in Drive mode, same as
+        // Full. The classifier's port-gates only apply to the global
+        // DoH knobs.
+        let d = classify_early_route("example.com", 8443, Mode::Drive, &[], &[], false, false);
+        assert_eq!(d, EarlyRoute::Drive);
+    }
+
+    /// `passthrough_hosts` is documented as the top-priority global
+    /// policy — wins over every mode-specific route including Drive.
+    /// Pins the precedence so a future reorder of the classifier
+    /// doesn't silently break the "I added this host to passthrough,
+    /// why does it still go through Drive?" story.
+    #[test]
+    fn passthrough_hosts_wins_over_drive() {
+        let decision = classify_early_route(
+            "intranet.corp",
+            443,
+            Mode::Drive,
+            &["intranet.corp".to_string()],
+            &[],
+            false,
+            false,
+        );
+        assert_eq!(decision, EarlyRoute::PassthroughHostsMatch);
+    }
+
+    /// `block_doh` is documented as a global policy ("immediately
+    /// reject any CONNECT to a known DoH endpoint"). Survives a
+    /// switch to Drive mode for the same reason it survives a switch
+    /// to LocalBypass — a strict-DoH deployment relies on it.
+    #[test]
+    fn block_doh_wins_over_drive() {
+        let d = classify_early_route("dns.google", 443, Mode::Drive, &[], &[], true, false);
+        assert_eq!(d, EarlyRoute::BlockDoh);
+    }
+
+    /// `bypass_doh` sits ABOVE Drive in the precedence: Drive's
+    /// shared poller has its own ~hundreds-of-ms RTT floor, so
+    /// routing browser-DNS lookups through it would compound the
+    /// latency hit `bypass_doh` exists to mitigate. Same precedence
+    /// shape as `bypass_doh > Full` for Apps Script Full mode.
+    #[test]
+    fn bypass_doh_wins_over_drive() {
+        let d = classify_early_route("dns.google", 443, Mode::Drive, &[], &[], false, true);
+        assert_eq!(d, EarlyRoute::BypassDoh);
+        // Non-443 still routes to Drive — bypass_doh is HTTPS-only by
+        // construction (matches the port-gate in `classify_early_route`).
+        let d = classify_early_route("dns.google", 853, Mode::Drive, &[], &[], false, true);
+        assert_eq!(d, EarlyRoute::Drive);
+    }
+
+    /// Pins the `Mode::uses_drive_relay` truth table. Same shape as
+    /// the `mode_uses_apps_script_relay` / `mode_uses_mitm_ca`
+    /// predicate tests elsewhere — adding a new mode should be a
+    /// deliberate edit to BOTH the enum and this matrix, not a
+    /// silent default. (`uses_drive_relay` is the single source of
+    /// truth the config validator and `build_mode_state` defer to.)
+    #[test]
+    fn mode_uses_drive_relay_predicate() {
+        assert!(!Mode::AppsScript.uses_drive_relay());
+        assert!(!Mode::Direct.uses_drive_relay());
+        assert!(!Mode::Full.uses_drive_relay());
+        assert!(!Mode::LocalBypass.uses_drive_relay());
+        assert!(Mode::Drive.uses_drive_relay());
     }
 }

@@ -29,6 +29,9 @@ import java.io.File
  */
 @RunWith(RobolectricTestRunner::class)
 class ProfileStoreTest {
+    private val validRelayPubkey =
+        "rgdr1jxtcw0wklzug0kxfsegwh2cc4kt6y50a5ac7vwmlln0emd30sq4sd7x0sx"
+
     private lateinit var ctx: Context
     private lateinit var profilesFile: File
     private lateinit var configFile: File
@@ -742,6 +745,213 @@ class ProfileStoreTest {
         assertFalse(
             "local_bypass must not require Apps Script creds",
             applied.mode.usesAppsScriptRelay(),
+        )
+    }
+
+    /**
+     * Drive-mode snapshot acceptance gate. Before this slice
+     * `validateRuntimeShape` didn't know about `Mode.DRIVE` and
+     * `applyProfile` would reject a valid Drive profile as
+     * "unknown mode 'drive'", silently losing the user's setup.
+     */
+    @Test
+    fun applyProfile_accepts_well_formed_drive_snapshot() {
+        val ok =
+            """
+            {
+              "active": "",
+              "profiles": [{"name": "d", "config": {
+                "mode": "drive",
+                "drive": {
+                  "oauth_client_id": "CID.apps.googleusercontent.com",
+                  "oauth_client_secret": "SECRET",
+                  "folder_id": "FOLDER_ID",
+                  "relay_pubkey": "$validRelayPubkey",
+                  "oauth_refresh_token": "1//04xxxx"
+                }
+              }}]
+            }
+            """.trimIndent()
+        profilesFile.writeText(ok)
+        val r = ProfileStore.applyProfile(ctx, "d")
+        assertTrue(
+            "well-formed drive snapshot must apply, got ${r::class.simpleName}",
+            r is ProfileStore.ApplyResult.Ok,
+        )
+        val applied = ConfigStore.load(ctx)
+        assertEquals(Mode.DRIVE, applied.mode)
+        assertEquals("FOLDER_ID", applied.driveFolderId)
+        assertEquals("CID.apps.googleusercontent.com", applied.driveOauthClientId)
+    }
+
+    /**
+     * Drive snapshot missing the BYO OAuth credentials must be
+     * rejected up front — Rust's `Config::validate` would fail at
+     * proxy-start with the same message, but applyProfile catches
+     * it first so config.json isn't clobbered by bytes the runtime
+     * will refuse on its next start.
+     */
+    @Test
+    fun applyProfile_refuses_drive_snapshot_missing_oauth_client_id() {
+        val bad =
+            """
+            {
+              "active": "bad",
+              "profiles": [{"name": "bad", "config": {
+                "mode": "drive",
+                "drive": {
+                  "oauth_client_secret": "SECRET",
+                  "folder_id": "FOLDER_ID",
+                  "relay_pubkey": "$validRelayPubkey"
+                }
+              }}]
+            }
+            """.trimIndent()
+        profilesFile.writeText(bad)
+        ConfigStore.save(ctx, RahgozarConfig(authKey = "preserve-me"))
+        val before = configFile.readText()
+
+        val r = ProfileStore.applyProfile(ctx, "bad")
+        assertTrue(
+            "expected Failed for missing oauth_client_id, got ${r::class.simpleName}",
+            r is ProfileStore.ApplyResult.Failed,
+        )
+        assertEquals(before, configFile.readText())
+    }
+
+    @Test
+    fun applyProfile_refuses_drive_snapshot_missing_refresh_token() {
+        val bad =
+            """
+            {
+              "active": "bad",
+              "profiles": [{"name": "bad", "config": {
+                "mode": "drive",
+                "drive": {
+                  "oauth_client_id": "CID.apps.googleusercontent.com",
+                  "oauth_client_secret": "SECRET",
+                  "folder_id": "FOLDER_ID",
+                  "relay_pubkey": "$validRelayPubkey"
+                }
+              }}]
+            }
+            """.trimIndent()
+        profilesFile.writeText(bad)
+        ConfigStore.save(ctx, RahgozarConfig(authKey = "preserve-me"))
+        val before = configFile.readText()
+
+        val r = ProfileStore.applyProfile(ctx, "bad")
+        assertTrue(
+            "expected Failed for missing oauth_refresh_token, got ${r::class.simpleName}",
+            r is ProfileStore.ApplyResult.Failed,
+        )
+        assertEquals(before, configFile.readText())
+    }
+
+    @Test
+    fun applyProfile_refuses_drive_snapshot_with_bad_relay_pubkey() {
+        val bad =
+            """
+            {
+              "active": "bad",
+              "profiles": [{"name": "bad", "config": {
+                "mode": "drive",
+                "drive": {
+                  "oauth_client_id": "CID.apps.googleusercontent.com",
+                  "oauth_client_secret": "SECRET",
+                  "folder_id": "FOLDER_ID",
+                  "relay_pubkey": "rgdr1qqqq",
+                  "oauth_refresh_token": "1//04xxxx"
+                }
+              }}]
+            }
+            """.trimIndent()
+        profilesFile.writeText(bad)
+        ConfigStore.save(ctx, RahgozarConfig(authKey = "preserve-me"))
+        val before = configFile.readText()
+
+        val r = ProfileStore.applyProfile(ctx, "bad")
+        assertTrue(
+            "expected Failed for malformed relay_pubkey, got ${r::class.simpleName}",
+            r is ProfileStore.ApplyResult.Failed,
+        )
+        assertEquals(before, configFile.readText())
+    }
+
+    @Test
+    fun applyProfile_refuses_drive_snapshot_with_invalid_tuning() {
+        val bad =
+            """
+            {
+              "active": "bad",
+              "profiles": [{"name": "bad", "config": {
+                "mode": "drive",
+                "drive": {
+                  "oauth_client_id": "CID.apps.googleusercontent.com",
+                  "oauth_client_secret": "SECRET",
+                  "folder_id": "FOLDER_ID",
+                  "relay_pubkey": "$validRelayPubkey",
+                  "oauth_refresh_token": "1//04xxxx",
+                  "poll_interval_ms": 0
+                }
+              }}]
+            }
+            """.trimIndent()
+        profilesFile.writeText(bad)
+        ConfigStore.save(ctx, RahgozarConfig(authKey = "preserve-me"))
+        val before = configFile.readText()
+
+        val r = ProfileStore.applyProfile(ctx, "bad")
+        assertTrue(
+            "expected Failed for poll_interval_ms=0, got ${r::class.simpleName}",
+            r is ProfileStore.ApplyResult.Failed,
+        )
+        assertEquals(before, configFile.readText())
+    }
+
+    @Test
+    fun configSave_clears_refresh_token_when_oauth_client_changes() {
+        ConfigStore.save(
+            ctx,
+            RahgozarConfig(
+                mode = Mode.DRIVE,
+                driveOauthClientId = "OLD.apps.googleusercontent.com",
+                driveOauthClientSecret = "OLDSECRET",
+                driveFolderId = "FOLDER_ID",
+                driveRelayPubkey = validRelayPubkey,
+                driveOauthRefreshTokenSnapshot = "1//04old-token",
+            ),
+        )
+        val loaded = ConfigStore.load(ctx)
+        assertTrue(loaded.driveHasRefreshToken)
+
+        assertTrue(
+            ConfigStore.save(
+                ctx,
+                loaded.copy(driveOauthClientId = "NEW.apps.googleusercontent.com"),
+            ),
+        )
+
+        val drive = JSONObject(configFile.readText()).getJSONObject("drive")
+        assertTrue(
+            "refresh token must be cleared when OAuth client_id changes",
+            !drive.has("oauth_refresh_token") || drive.optString("oauth_refresh_token").isBlank(),
+        )
+
+        assertTrue(
+            ConfigStore.save(
+                ctx,
+                loaded.copy(
+                    driveOauthClientId = "NEW.apps.googleusercontent.com",
+                    driveFolderId = "FOLDER_ID_2",
+                ),
+            ),
+        )
+        val afterSecondSave = JSONObject(configFile.readText()).getJSONObject("drive")
+        assertTrue(
+            "stale in-memory snapshots must not resurrect a cleared refresh token",
+            !afterSecondSave.has("oauth_refresh_token") ||
+                afterSecondSave.optString("oauth_refresh_token").isBlank(),
         )
     }
 

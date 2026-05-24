@@ -4,6 +4,7 @@ import android.content.Context
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.math.BigInteger
 
 /*
  * Config I/O. The source of truth is a JSON file in the app's files dir —
@@ -88,6 +89,17 @@ enum class Mode {
     DIRECT,
     FULL,
     LOCAL_BYPASS,
+
+    /**
+     * Drive-mailbox transport (Skirk technique). Every TCP session
+     * is sealed and uploaded as files to a shared Google Drive
+     * folder; a separate `rahgozar-drive-relay` binary on a VPS
+     * abroad polls the folder, dials the destination, and writes
+     * response frames back. The ISP only sees TLS to *.google.com.
+     * Requires OAuth refresh token + Drive folder ID + relay
+     * public key in the `drive` sub-object.
+     */
+    DRIVE,
     ;
 
     /**
@@ -101,6 +113,220 @@ enum class Mode {
      * lands.
      */
     fun usesAppsScriptRelay(): Boolean = this == APPS_SCRIPT || this == FULL
+
+    /**
+     * True iff this mode terminates inbound TLS with rahgozar's local
+     * MITM CA. Mirrors Rust-side `Mode::uses_mitm_ca`.
+     */
+    fun usesMitmCa(): Boolean = this == APPS_SCRIPT || this == DIRECT
+
+    /**
+     * True iff this mode uses the Drive-mailbox transport. The UI
+     * shows the Drive setup section only when this is true; the
+     * service-side credential check requires `drive.oauth_refresh_token`
+     * + `drive.folder_id` + `drive.relay_pubkey` before allowing
+     * Start.
+     */
+    fun usesDriveRelay(): Boolean = this == DRIVE
+}
+
+internal fun validateDriveRelayPubkey(value: String): String? {
+    val s = value.trim()
+    if (s.isEmpty()) return "relay pubkey is empty"
+    if (s.any { it.code < 33 || it.code > 126 }) {
+        return "relay pubkey contains invalid bech32 characters"
+    }
+    val lower = s.lowercase()
+    if (s != lower && s != s.uppercase()) {
+        return "relay pubkey mixes uppercase and lowercase"
+    }
+    val sep = lower.lastIndexOf('1')
+    if (sep <= 0 || sep + 7 > lower.length) {
+        return "relay pubkey is not valid bech32m"
+    }
+    val hrp = lower.substring(0, sep)
+    if (hrp != "rgdr") {
+        return "relay pubkey has HRP '$hrp' but expected 'rgdr'"
+    }
+    val dataPart = lower.substring(sep + 1)
+    val values = ArrayList<Int>(dataPart.length)
+    for (ch in dataPart) {
+        val idx = DRIVE_RELAY_BECH32_CHARSET.indexOf(ch)
+        if (idx < 0) return "relay pubkey is not valid bech32m"
+        values.add(idx)
+    }
+    if (!driveRelayBech32mChecksumValid(hrp, values)) {
+        return "relay pubkey checksum is invalid"
+    }
+    val payload =
+        driveRelayConvertBits(values.dropLast(6), fromBits = 5, toBits = 8, pad = false)
+            ?: return "relay pubkey payload has invalid padding"
+    if (payload.size != 32) {
+        return "relay pubkey decodes to ${payload.size} bytes but X25519 keys are exactly 32 bytes"
+    }
+    if (!driveRelayX25519ProbeIsContributory(payload)) {
+        return "relay pubkey is a low-order X25519 point"
+    }
+    return null
+}
+
+private const val DRIVE_RELAY_BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+private val DRIVE_X25519_P = BigInteger.ONE.shiftLeft(255).subtract(BigInteger.valueOf(19))
+private val DRIVE_X25519_A24 = BigInteger.valueOf(121665)
+private val DRIVE_X25519_PROBE_SCALAR = ByteArray(32) { 0x42.toByte() }
+
+private fun driveRelayBech32mChecksumValid(
+    hrp: String,
+    values: List<Int>,
+): Boolean {
+    val expanded = ArrayList<Int>(hrp.length * 2 + values.size + 1)
+    for (ch in hrp) expanded.add(ch.code shr 5)
+    expanded.add(0)
+    for (ch in hrp) expanded.add(ch.code and 31)
+    expanded.addAll(values)
+    val polymod = driveRelayBech32Polymod(expanded)
+    return polymod == 0x2bc830a3
+}
+
+private fun driveRelayBech32Polymod(values: List<Int>): Int {
+    val generators = intArrayOf(0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3)
+    var chk = 1
+    for (v in values) {
+        val top = chk ushr 25
+        chk = (chk and 0x1ffffff) shl 5 xor v
+        for (i in 0 until 5) {
+            if (((top ushr i) and 1) != 0) chk = chk xor generators[i]
+        }
+    }
+    return chk
+}
+
+private fun driveRelayConvertBits(
+    data: List<Int>,
+    fromBits: Int,
+    toBits: Int,
+    pad: Boolean,
+): List<Int>? {
+    var acc = 0
+    var bits = 0
+    val maxv = (1 shl toBits) - 1
+    val maxAcc = (1 shl (fromBits + toBits - 1)) - 1
+    val out = ArrayList<Int>()
+    for (value in data) {
+        if (value < 0 || (value ushr fromBits) != 0) return null
+        acc = ((acc shl fromBits) or value) and maxAcc
+        bits += fromBits
+        while (bits >= toBits) {
+            bits -= toBits
+            out.add((acc ushr bits) and maxv)
+        }
+    }
+    if (pad) {
+        if (bits > 0) out.add((acc shl (toBits - bits)) and maxv)
+    } else if (bits >= fromBits || ((acc shl (toBits - bits)) and maxv) != 0) {
+        return null
+    }
+    return out
+}
+
+private fun driveRelayX25519ProbeIsContributory(payload: List<Int>): Boolean {
+    if (payload.size != 32) return false
+    val publicKey = ByteArray(32) { i -> payload[i].toByte() }
+    val shared = driveRelayX25519(DRIVE_X25519_PROBE_SCALAR, publicKey)
+    return shared.any { it.toInt() != 0 }
+}
+
+private fun driveRelayX25519(
+    scalarInput: ByteArray,
+    publicKeyInput: ByteArray,
+): ByteArray {
+    val scalar = scalarInput.copyOf(32)
+    scalar[0] = (scalar[0].toInt() and 248).toByte()
+    scalar[31] = ((scalar[31].toInt() and 127) or 64).toByte()
+
+    val publicKey = publicKeyInput.copyOf(32)
+    publicKey[31] = (publicKey[31].toInt() and 127).toByte()
+    val x1 = driveRelayLittleEndianToBigInteger(publicKey)
+
+    var x2 = BigInteger.ONE
+    var z2 = BigInteger.ZERO
+    var x3 = x1
+    var z3 = BigInteger.ONE
+    var swap = 0
+
+    for (t in 254 downTo 0) {
+        val kt = driveRelayScalarBit(scalar, t)
+        if ((swap xor kt) != 0) {
+            val tx = x2
+            x2 = x3
+            x3 = tx
+            val tz = z2
+            z2 = z3
+            z3 = tz
+        }
+        swap = kt
+
+        val a = driveRelayMod(x2 + z2)
+        val aa = driveRelaySquare(a)
+        val b = driveRelayMod(x2 - z2)
+        val bb = driveRelaySquare(b)
+        val e = driveRelayMod(aa - bb)
+        val c = driveRelayMod(x3 + z3)
+        val d = driveRelayMod(x3 - z3)
+        val da = driveRelayMod(d * a)
+        val cb = driveRelayMod(c * b)
+        x3 = driveRelaySquare(da + cb)
+        z3 = driveRelayMod(x1 * driveRelaySquare(da - cb))
+        x2 = driveRelayMod(aa * bb)
+        z2 = driveRelayMod(e * driveRelayMod(aa + DRIVE_X25519_A24 * e))
+    }
+
+    if (swap != 0) {
+        val tx = x2
+        x2 = x3
+        x3 = tx
+        val tz = z2
+        z2 = z3
+        z3 = tz
+    }
+
+    val result =
+        if (z2 == BigInteger.ZERO) {
+            BigInteger.ZERO
+        } else {
+            driveRelayMod(x2 * z2.modInverse(DRIVE_X25519_P))
+        }
+    return driveRelayBigIntegerToLittleEndian(result)
+}
+
+private fun driveRelayScalarBit(
+    scalar: ByteArray,
+    bit: Int,
+): Int {
+    val byte = scalar[bit / 8].toInt() and 0xff
+    return (byte ushr (bit % 8)) and 1
+}
+
+private fun driveRelayMod(v: BigInteger): BigInteger = v.mod(DRIVE_X25519_P)
+
+private fun driveRelaySquare(v: BigInteger): BigInteger = driveRelayMod(v * v)
+
+private fun driveRelayLittleEndianToBigInteger(bytes: ByteArray): BigInteger {
+    val be = ByteArray(bytes.size)
+    for (i in bytes.indices) {
+        be[bytes.size - 1 - i] = bytes[i]
+    }
+    return BigInteger(1, be)
+}
+
+private fun driveRelayBigIntegerToLittleEndian(v: BigInteger): ByteArray {
+    val be = v.toByteArray()
+    val out = ByteArray(32)
+    for (i in out.indices) {
+        val src = be.size - 1 - i
+        out[i] = if (src >= 0) be[src] else 0
+    }
+    return out
 }
 
 /**
@@ -242,6 +468,53 @@ data class RahgozarConfig(
     /** UI language toggle. Non-Rust; honoured only by the Android wrapper. */
     val uiLang: UiLang = UiLang.AUTO,
     /**
+     * Drive-mode (mode == DRIVE) — bare Drive folder ID (no URL). Used as
+     * the shared mailbox folder. Below this point until [driveOauthClientSecret]
+     * are the form-visible fields for the Drive transport. `oauth_refresh_token`
+     * is intentionally NOT modelled as an editable field — the JNI device-code
+     * flow writes it after a successful sign-in and the UI sees only
+     * [driveHasRefreshToken] (computed at load time). The other fields are
+     * normal form fields the user enters and Save persists.
+     */
+    val driveFolderId: String = "",
+    /** Bech32m public key the relay printed at `rahgozar-drive-relay keygen` time. */
+    val driveRelayPubkey: String = "",
+    /** Baseline poll interval (ms) for the client-side r2c poller. */
+    val drivePollIntervalMs: Int = 300,
+    /** Max concurrent Drive uploads in flight from this client. */
+    val driveMaxConcurrentUploads: Int = 8,
+    /**
+     * BYO OAuth client_id from the user's own Google Cloud project.
+     * rahgozar ships no embedded OAuth client — every user registers
+     * their own to sidestep the 100-user cap on unverified clients.
+     * Required for Drive mode; the JNI surface refuses
+     * `driveOauthStart` until both this and [driveOauthClientSecret]
+     * are non-empty in `config.json`. See `docs/drive_oauth_setup.md`
+     * for the Google Cloud Console walkthrough.
+     */
+    val driveOauthClientId: String = "",
+    /**
+     * BYO OAuth client_secret paired with [driveOauthClientId]. Per
+     * RFC 8252 §8.6 not actually secret for installed apps, but
+     * Google's token endpoint still requires it.
+     */
+    val driveOauthClientSecret: String = "",
+    /** Read-only: true iff config.drive.oauth_refresh_token is non-empty on disk. */
+    val driveHasRefreshToken: Boolean = false,
+    /**
+     * OAuth refresh-token snapshot captured at load time. The UI must
+     * NEVER surface or echo this string — its only purpose is to
+     * survive a UI Save round-trip so a token written by the JNI
+     * device-code flow isn't wiped when the user subsequently saves
+     * the Drive form. Internally re-emitted in
+     * `toJson`'s `drive` sub-object alongside the user-facing fields.
+     *
+     * `driveHasRefreshToken` is the public read-only flag the UI
+     * uses; this field exists purely for the load → save → write
+     * preservation invariant.
+     */
+    val driveOauthRefreshTokenSnapshot: String = "",
+    /**
      * Multi-edge fronting groups (Vercel, Fastly, AWS CloudFront, …).
      * Until v1.9.x the Android Save path silently dropped this field
      * because it wasn't modelled here; round-tripping fixes that and
@@ -327,6 +600,7 @@ data class RahgozarConfig(
                         Mode.DIRECT -> "direct"
                         Mode.FULL -> "full"
                         Mode.LOCAL_BYPASS -> "local_bypass"
+                        Mode.DRIVE -> "drive"
                     },
                 )
                 put("listen_host", listenHost)
@@ -494,6 +768,37 @@ data class RahgozarConfig(
                 if (splitApps.isNotEmpty()) {
                     put("split_apps", JSONArray().apply { splitApps.forEach { put(it) } })
                 }
+                // Drive-mode sub-object. The OAuth refresh token is
+                // re-emitted from the load-time snapshot so a UI Save
+                // doesn't wipe a token that the JNI device-code flow
+                // wrote out directly. The UI never surfaces the snapshot
+                // and never lets the user edit it — the OAuth flow is
+                // the only legitimate source for that value.
+                val driveObj = JSONObject()
+                if (driveOauthRefreshTokenSnapshot.isNotEmpty()) {
+                    driveObj.put("oauth_refresh_token", driveOauthRefreshTokenSnapshot)
+                }
+                if (driveFolderId.isNotBlank()) {
+                    driveObj.put("folder_id", driveFolderId.trim())
+                }
+                if (driveRelayPubkey.isNotBlank()) {
+                    driveObj.put("relay_pubkey", driveRelayPubkey.trim())
+                }
+                // BYO OAuth credentials — emit only when non-empty so
+                // a fresh-install config doesn't ship a half-empty
+                // `drive` block. The Rust validator only requires them
+                // when mode == drive, so leaving them out for users
+                // running other modes is fine.
+                if (driveOauthClientId.isNotBlank()) {
+                    driveObj.put("oauth_client_id", driveOauthClientId.trim())
+                }
+                if (driveOauthClientSecret.isNotBlank()) {
+                    driveObj.put("oauth_client_secret", driveOauthClientSecret.trim())
+                }
+                driveObj.put("poll_interval_ms", drivePollIntervalMs)
+                driveObj.put("max_concurrent_uploads", driveMaxConcurrentUploads)
+                put("drive", driveObj)
+
                 put(
                     "ui_lang",
                     when (uiLang) {
@@ -535,6 +840,30 @@ data class RahgozarConfig(
      */
     val hasDeploymentId: Boolean get() =
         appsScriptUrls.any { it.enabled && extractId(it.url).isNotEmpty() }
+
+    // Keep this predicate cheap: Compose reads it on every recomposition
+    // (Start button enable state, called per keystroke). Strong pubkey
+    // validation runs (a) live in the Drive-setup section's
+    // `Native.driveValidateRelayPubkey` LaunchedEffect on Dispatchers.IO,
+    // (b) in ProfileStore.applyProfile on import, and (c) in Rust's
+    // Config::validate on proxy start — so weakening this to "field is
+    // filled" doesn't change the overall safety story, it just keeps
+    // the BigInteger Curve25519 ladder off the main thread.
+    val hasDriveRelayConfig: Boolean get() =
+        driveOauthClientId.isNotBlank() &&
+            driveOauthClientSecret.isNotBlank() &&
+            driveHasRefreshToken &&
+            driveFolderId.isNotBlank() &&
+            driveRelayPubkey.isNotBlank() &&
+            drivePollIntervalMs > 0 &&
+            driveMaxConcurrentUploads > 0
+
+    val canStartCurrentMode: Boolean get() =
+        when {
+            mode.usesAppsScriptRelay() -> hasDeploymentId && authKey.isNotBlank()
+            mode.usesDriveRelay() -> hasDriveRelayConfig
+            else -> true
+        }
 }
 
 object ConfigStore {
@@ -548,6 +877,22 @@ object ConfigStore {
         } catch (_: Throwable) {
             RahgozarConfig()
         }
+    }
+
+    /**
+     * Return the exact config shape that should be written for a UI save.
+     *
+     * Refresh tokens are preserved only while the token is still present
+     * on disk and still bound to the same OAuth client credentials. This
+     * keeps a loaded UI snapshot from resurrecting a token that was cleared
+     * by credential rotation or by another writer.
+     */
+    fun prepareForSave(
+        ctx: Context,
+        cfg: RahgozarConfig,
+    ): RahgozarConfig {
+        val f = File(ctx.filesDir, FILE)
+        return prepareForSave(f, cfg)
     }
 
     /**
@@ -565,7 +910,8 @@ object ConfigStore {
         val f = File(ctx.filesDir, FILE)
         val tmp = File(ctx.filesDir, "$FILE.tmp")
         return try {
-            tmp.writeText(cfg.toJson())
+            val cfgToWrite = prepareForSave(f, cfg)
+            tmp.writeText(cfgToWrite.toJson())
             ProfileStore.atomicReplacePublic(tmp, f)
         } catch (_: Throwable) {
             tmp.delete()
@@ -573,12 +919,57 @@ object ConfigStore {
         }
     }
 
+    private fun prepareForSave(
+        existingFile: File,
+        next: RahgozarConfig,
+    ): RahgozarConfig {
+        fun withoutRefreshToken() =
+            next.copy(
+                driveHasRefreshToken = false,
+                driveOauthRefreshTokenSnapshot = "",
+            )
+
+        if (!existingFile.exists()) {
+            return next.copy(
+                driveHasRefreshToken = next.driveOauthRefreshTokenSnapshot.isNotBlank(),
+            )
+        }
+        return try {
+            val root = JSONObject(existingFile.readText())
+            val drive = root.optJSONObject("drive") ?: return withoutRefreshToken()
+            val refreshToken = drive.optString("oauth_refresh_token", "").trim()
+            if (refreshToken.isEmpty()) return withoutRefreshToken()
+            val oldClientId = drive.optString("oauth_client_id", "").trim()
+            val oldClientSecret = drive.optString("oauth_client_secret", "").trim()
+            if (
+                oldClientId != next.driveOauthClientId.trim() ||
+                oldClientSecret != next.driveOauthClientSecret.trim()
+            ) {
+                withoutRefreshToken()
+            } else {
+                next.copy(
+                    driveHasRefreshToken = true,
+                    driveOauthRefreshTokenSnapshot =
+                        next.driveOauthRefreshTokenSnapshot.ifBlank { refreshToken },
+                )
+            }
+        } catch (_: Throwable) {
+            // If the existing file is malformed, let the normal save
+            // path decide whether it can replace it; don't preserve a
+            // token whose credential binding we cannot verify.
+            withoutRefreshToken()
+        }
+    }
+
     /** Prefix for encoded config strings so we can detect them in clipboard. */
     private const val HASH_PREFIX = "rahgozar://"
 
-    /** Encode config as a shareable base64 string with prefix.
-     *  Only includes non-default fields to keep the hash short. */
-    fun encode(cfg: RahgozarConfig): String {
+    /**
+     * JSON payload used by QR/clipboard export. Deliberately omits
+     * Drive OAuth bearer material; persistence uses [RahgozarConfig.toJson]
+     * instead so Save still preserves the refresh token on disk.
+     */
+    internal fun toShareJson(cfg: RahgozarConfig): JSONObject {
         val defaults = RahgozarConfig()
         val obj = JSONObject()
 
@@ -590,6 +981,7 @@ object ConfigStore {
                 Mode.DIRECT -> "direct"
                 Mode.FULL -> "full"
                 Mode.LOCAL_BYPASS -> "local_bypass"
+                Mode.DRIVE -> "drive"
             },
         )
         // Normalise each entry to a bare ID and keep its enabled flag —
@@ -703,7 +1095,32 @@ object ConfigStore {
                 },
             )
         }
+        // Drive-mode sub-object. Only emit fields the user has
+        // populated — a QR share of a non-Drive config shouldn't
+        // include an empty `drive` block. Never export
+        // oauth_refresh_token or oauth_client_secret: sharing should
+        // not silently grant Drive access or leak a BYO OAuth client
+        // secret. Recipients can paste their own secret and sign in.
+        val driveObj = JSONObject()
+        if (cfg.driveFolderId.isNotBlank()) driveObj.put("folder_id", cfg.driveFolderId.trim())
+        if (cfg.driveRelayPubkey.isNotBlank()) driveObj.put("relay_pubkey", cfg.driveRelayPubkey.trim())
+        if (cfg.driveOauthClientId.isNotBlank()) driveObj.put("oauth_client_id", cfg.driveOauthClientId.trim())
+        if (cfg.drivePollIntervalMs != defaults.drivePollIntervalMs) {
+            driveObj.put("poll_interval_ms", cfg.drivePollIntervalMs)
+        }
+        if (cfg.driveMaxConcurrentUploads != defaults.driveMaxConcurrentUploads) {
+            driveObj.put("max_concurrent_uploads", cfg.driveMaxConcurrentUploads)
+        }
+        if (driveObj.length() > 0) {
+            obj.put("drive", driveObj)
+        }
+        return obj
+    }
 
+    /** Encode config as a shareable base64 string with prefix.
+     *  Only includes non-default fields to keep the hash short. */
+    fun encode(cfg: RahgozarConfig): String {
+        val obj = toShareJson(cfg)
         // Compress with DEFLATE then base64.
         val jsonBytes = obj.toString().toByteArray(Charsets.UTF_8)
         val compressed =
@@ -844,6 +1261,14 @@ object ConfigStore {
             // explicit puts.
             "fetch_ips_from_api",
             "max_ips_to_scan",
+            // Drive-mode setup. The whole `drive` sub-object is modelled
+            // (broken out into 5 fields in RahgozarConfig — folder_id,
+            // relay_pubkey, poll_interval_ms, max_concurrent_uploads, and
+            // the oauth_refresh_token snapshot for round-trip
+            // preservation). Keeping `drive` here prevents the unmodelled
+            // extras-passthrough from re-emitting the same sub-object
+            // and colliding with toJson's explicit `put("drive", ...)`.
+            "drive",
         )
 
     /**
@@ -898,6 +1323,20 @@ object ConfigStore {
         }
         val extrasStr = if (extras.length() > 0) extras.toString() else ""
 
+        // Drive-mode sub-object. Parsed once so the modelled fields +
+        // the snapshot of the OAuth refresh token (for round-trip
+        // preservation) both flow into the returned RahgozarConfig.
+        val driveObj = obj.optJSONObject("drive")
+        val driveFolderId = driveObj?.optString("folder_id", "")?.trim().orEmpty()
+        val driveRelayPubkey = driveObj?.optString("relay_pubkey", "")?.trim().orEmpty()
+        val drivePollIntervalMs = driveObj?.optInt("poll_interval_ms", 300) ?: 300
+        val driveMaxConcurrentUploads = driveObj?.optInt("max_concurrent_uploads", 8) ?: 8
+        val driveOauthClientId = driveObj?.optString("oauth_client_id", "")?.trim().orEmpty()
+        val driveOauthClientSecret = driveObj?.optString("oauth_client_secret", "")?.trim().orEmpty()
+        val driveOauthRefreshTokenSnapshot =
+            driveObj?.optString("oauth_refresh_token", "")?.trim().orEmpty()
+        val driveHasRefreshToken = driveOauthRefreshTokenSnapshot.isNotEmpty()
+
         return RahgozarConfig(
             mode =
                 when (obj.optString("mode", "apps_script")) {
@@ -910,6 +1349,8 @@ object ConfigStore {
                     "full" -> Mode.FULL
 
                     "local_bypass" -> Mode.LOCAL_BYPASS
+
+                    "drive" -> Mode.DRIVE
 
                     else -> Mode.APPS_SCRIPT
                 },
@@ -1008,6 +1449,14 @@ object ConfigStore {
                             }
                         }
                     }.orEmpty(),
+            driveFolderId = driveFolderId,
+            driveRelayPubkey = driveRelayPubkey,
+            drivePollIntervalMs = drivePollIntervalMs,
+            driveMaxConcurrentUploads = driveMaxConcurrentUploads,
+            driveOauthClientId = driveOauthClientId,
+            driveOauthClientSecret = driveOauthClientSecret,
+            driveHasRefreshToken = driveHasRefreshToken,
+            driveOauthRefreshTokenSnapshot = driveOauthRefreshTokenSnapshot,
             extrasJson = extrasStr,
         )
     }

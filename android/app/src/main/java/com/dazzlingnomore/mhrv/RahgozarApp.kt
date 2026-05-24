@@ -23,6 +23,15 @@ class RahgozarApp : Application() {
     override fun onCreate() {
         super.onCreate()
 
+        // Initialise rustls-platform-verifier with the Android Context
+        // BEFORE anything that might touch TLS. The very first HTTPS
+        // call out of the app (Drive OAuth device-code POST, update
+        // check, etc.) panics-and-aborts with "Expect
+        // rustls-platform-verifier to be initialized" without this.
+        // Safe to call from onCreate: System.loadLibrary("rahgozar")
+        // already ran via the Native.init block at first reference.
+        Native.initAndroidTls(this)
+
         // Apply the saved UI-language preference before any UI class
         // loads. AppCompatDelegate propagates locale changes to the whole
         // process, including Compose text rendering and

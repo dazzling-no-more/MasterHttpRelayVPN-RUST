@@ -100,7 +100,13 @@ class MainActivity : AppCompatActivity() {
 
     /** Stash decoded config from deep link for the UI to confirm — never
      *  auto-import. The composable reads this and shows a confirmation
-     *  dialog with the deployment IDs and a trust warning. */
+     *  dialog with the deployment IDs and a trust warning.
+     *
+     *  Today the rahgozar:// scheme is QR-share only. Drive-mode OAuth
+     *  used to share this scheme too, but custom-scheme redirects are
+     *  not supported by Google for Desktop-app OAuth clients — Android
+     *  now uses the device-code flow (RFC 8628) instead, which needs
+     *  no inbound URI handling. */
     private fun handleDeepLink(intent: Intent?) {
         val data = intent?.data ?: return
         if (data.scheme != "rahgozar") return

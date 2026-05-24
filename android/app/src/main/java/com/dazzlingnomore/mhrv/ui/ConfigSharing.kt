@@ -282,6 +282,7 @@ private fun ImportConfirmDialog(
             com.dazzlingnomore.mhrv.Mode.DIRECT -> "direct"
             com.dazzlingnomore.mhrv.Mode.FULL -> "full"
             com.dazzlingnomore.mhrv.Mode.LOCAL_BYPASS -> "local_bypass"
+            com.dazzlingnomore.mhrv.Mode.DRIVE -> "drive"
         }
 
     AlertDialog(

@@ -1,0 +1,48 @@
+[Unit]
+Description=rahgozar Drive-mode relay
+Documentation=https://github.com/dazzling-no-more/rahgozar
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/rahgozar-drive-relay run --config /etc/rahgozar-drive-relay/config.json
+Restart=on-failure
+RestartSec=5
+
+# Run as an unprivileged dedicated user; the install script creates
+# this user with no shell and no home directory.
+User=rahgozar-relay
+Group=rahgozar-relay
+
+# `ConfigurationDirectoryMode=0700` keeps the config + relay.key
+# readable only by the service user. The install script chowns the
+# directory to match.
+ConfigurationDirectory=rahgozar-drive-relay
+ConfigurationDirectoryMode=0700
+StateDirectory=rahgozar-drive-relay
+StateDirectoryMode=0700
+
+# File-descriptor headroom for the per-session TCP forwarders that
+# the next slice spins up. The default soft limit on most distros
+# is 1024 which is too low for a busy relay.
+LimitNOFILE=65536
+
+# Hardening — the relay only ever needs network access + read/write
+# to its config directory. Lock everything else down.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/etc/rahgozar-drive-relay /var/lib/rahgozar-drive-relay
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=multi-user.target

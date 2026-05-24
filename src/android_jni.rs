@@ -19,6 +19,7 @@ use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use jni::objects::{JClass, JString};
 use jni::sys::{jboolean, jlong, jstring, JNI_FALSE, JNI_TRUE};
@@ -164,12 +165,79 @@ fn safe<F: FnOnce() -> R + std::panic::UnwindSafe, R>(default: R, f: F) -> R {
 }
 
 /// Build a throwaway tokio runtime for one-shot blocking calls from JNI.
-/// Small, single-worker — sufficient for probes and cert ops.
+/// One worker thread (not current_thread), with an explicitly bumped
+/// 4 MiB stack — the default ~2 MiB worker stack is fine for most
+/// reqwest calls, but the Drive OAuth device-code flow does a full
+/// rustls TLS 1.3 handshake which is stack-hungry, and the JNI
+/// caller's thread (Kotlin's Dispatchers.IO worker) has a tighter
+/// stack budget than desktop processes. Running on `new_current_thread`
+/// would borrow that same tight stack and crash mid-handshake with
+/// SIGSEGV — observed pre-fix on driveOauthDeviceCodeStart against
+/// oauth2.googleapis.com. Bumping the worker stack here costs ~2 MiB
+/// of address space per JNI call, which is negligible.
 fn one_shot_runtime() -> Option<Runtime> {
-    tokio::runtime::Builder::new_current_thread()
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_stack_size(4 * 1024 * 1024)
         .enable_all()
         .build()
         .ok()
+}
+
+/// `Native.initAndroidTls(Context)` — call ONCE per process, before
+/// any TLS-touching code runs. Reqwest 0.13 with rustls delegates
+/// cert-chain verification to `rustls-platform-verifier`; on Linux/
+/// macOS/Windows that crate auto-bootstraps off the system cert store,
+/// but on Android it needs an explicit JNIEnv + Application context
+/// handed to it (the verifier reaches into Android's KeyStore via JNI
+/// to walk the device trust anchors). Without this init, the very
+/// first TLS handshake — typically the Drive OAuth device-code POST
+/// to `oauth2.googleapis.com` — panics with "Expect
+/// rustls-platform-verifier to be initialized" and aborts the
+/// process. Kotlin calls this from `RahgozarApp.onCreate`.
+///
+/// Idempotent: `rustls_platform_verifier::android::init_with_env`
+/// uses a `OnceCell` internally, so a second call is a no-op.
+#[no_mangle]
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_initAndroidTls(
+    env: JNIEnv,
+    _class: JClass,
+    context: jni::objects::JObject,
+) {
+    let _ = safe(
+        (),
+        AssertUnwindSafe(|| {
+            install_logging_once();
+            // Bridge jni 0.21 (our main dep) → jni 0.22 (what
+            // rustls-platform-verifier 0.7's public API takes) via the
+            // FFI-stable JNI ABI types (`sys::JNIEnv` / `sys::jobject`).
+            // Both crates' `sys` modules just re-export the canonical
+            // JNI struct definitions from libnativehelper, so the raw
+            // pointers are interchangeable. Wrapping costs nothing at
+            // runtime — `EnvUnowned`/`JObject` are zero-sized wrappers
+            // around the same raw pointer.
+            let raw_env = env.get_raw() as *mut jni_v22::sys::JNIEnv;
+            let raw_ctx = context.as_raw() as jni_v22::sys::jobject;
+            let mut env_v22 = unsafe { jni_v22::EnvUnowned::from_raw(raw_env) };
+            // `with_env` returns `EnvOutcome<T, E>` not a plain Result;
+            // resolve via the built-in `LogErrorAndDefault` policy so
+            // any JNIError gets logged via tracing and the closure's
+            // T = () falls through. `init_with_env` is OnceCell-backed
+            // upstream — a successful first call latches; a failure
+            // here means subsequent TLS calls will abort with the
+            // same "Expect rustls-platform-verifier to be initialized"
+            // message. `JObject::from_raw` in jni 0.22 ties the
+            // wrapper's lifetime to an `&Env`, so construct it inside
+            // the closure where the Env is in scope.
+            env_v22
+                .with_env(|env| {
+                    let context_v22 = unsafe { jni_v22::objects::JObject::from_raw(env, raw_ctx) };
+                    rustls_platform_verifier::android::init_with_env(env, context_v22)
+                })
+                .resolve::<jni_v22::errors::LogErrorAndDefault>();
+            tracing::info!("rustls-platform-verifier init attempted for Android");
+        }),
+    );
 }
 
 /// `Native.setDataDir(String)` — must be called once, before `startProxy`.
@@ -823,4 +891,744 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_runTun2proxy<'a>(
             }
         }),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Drive-mode OAuth + helpers.
+//
+// Drive Mode setup on Android uses the **device-code flow (RFC 8628)**.
+// Pair it with a Google OAuth client whose application type is
+// "TVs and Limited Input devices". Desktop loopback PKCE uses a
+// Desktop app client instead.
+//
+// User taps "Sign in"; Android calls `driveOauthDeviceCodeStart`,
+// which POSTs `/device/code` and returns `user_code` +
+// `verification_url`. The UI shows both; the user opens the URL on
+// any device (often the same phone, in another browser tab), enters
+// the code, signs in. Android polls `driveOauthPollFlow` at the
+// returned `interval_secs` until Google reports success / denial /
+// expiry — same shape the relay's CLI uses.
+//
+// Per-flow state (device_code + OAuth credentials snapshot) lives in
+// a process-wide `Mutex<HashMap<flow_token, PendingDeviceFlow>>` so
+// the polling JNI export can look it up by handle.
+//
+// Five JNI exports:
+//   - `driveOauthDeviceCodeStart` — mint a flow, POST /device/code,
+//                                   return user_code + URL + handle
+//   - `driveOauthPollFlow`        — one /token poll; persists
+//                                   refresh_token on success
+//   - `driveOauthCancelFlow`      — drop the in-flight flow handle
+//   - `driveCreateFolder`         — files.create with the folder MIME
+//   - `driveTestConnection`       — list the configured folder
+//   - `driveValidateRelayPubkey`  — pure bech32m parse echo
+// ---------------------------------------------------------------------------
+
+/// Per-flow state for an RFC 8628 device-code OAuth flow. Held in the
+/// `pending_device_flows` registry until either the polling resolves
+/// (`status` flips to a terminal variant) or the UI explicitly
+/// cancels.
+struct PendingDeviceFlow {
+    /// Opaque device_code Google returned at start. Goes into every
+    /// poll request body.
+    device_code: String,
+    /// User-supplied OAuth client_id snapshotted at flow-start.
+    /// Captured here rather than re-read on every poll so a config
+    /// edit mid-flow can't cause `invalid_client` mid-handshake.
+    oauth_client_id: String,
+    /// Same rationale as [`Self::oauth_client_id`].
+    oauth_client_secret: String,
+    /// Local deadline after which the in-memory registry entry is
+    /// useless even if Compose never calls cancel.
+    expires_at: Instant,
+}
+
+const MAX_PENDING_DEVICE_FLOWS: usize = 8;
+const DEVICE_FLOW_EXPIRY_GRACE_SECS: u64 = 60;
+
+fn pending_device_flows() -> &'static Mutex<std::collections::HashMap<String, PendingDeviceFlow>> {
+    static FLOWS: OnceLock<Mutex<std::collections::HashMap<String, PendingDeviceFlow>>> =
+        OnceLock::new();
+    FLOWS.get_or_init(|| Mutex::new(std::collections::HashMap::new()))
+}
+
+fn prune_expired_device_flows(flows: &mut std::collections::HashMap<String, PendingDeviceFlow>) {
+    let now = Instant::now();
+    flows.retain(|_, flow| flow.expires_at > now);
+}
+
+/// Start an RFC 8628 device-code OAuth flow. POSTs `/device/code`
+/// with the user-supplied OAuth client_id, stashes the device_code +
+/// BYO credentials in the in-memory registry, and returns the
+/// `user_code` + `verification_url` for the UI to display. JSON
+/// shape:
+///
+/// ```json
+/// {"ok":true, "flow_token":"...", "user_code":"ABCD-EFGH",
+///  "verification_url":"https://www.google.com/device",
+///  "expires_in_secs":1800, "interval_secs":5}
+/// {"ok":false, "error":"..."}
+/// ```
+///
+/// `flow_token` is a 32-hex random string the UI passes back to
+/// `driveOauthPollFlow` on each polling tick. Distinct from
+/// `device_code` (which never leaves the Rust side — leaking it
+/// to JS wouldn't be useful, the call to `/token` requires
+/// client_secret too).
+#[no_mangle]
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveOauthDeviceCodeStart<'a>(
+    env: JNIEnv<'a>,
+    _class: JClass,
+) -> jstring {
+    let out = safe(
+        r#"{"ok":false,"error":"panic"}"#.to_string(),
+        AssertUnwindSafe(|| {
+            install_logging_once();
+            // Fail fast on missing BYO credentials so the user gets
+            // a clear "set OAuth client first" error instead of a
+            // generic Google-side `invalid_client` after the round-trip.
+            let fields = match load_drive_config_fields() {
+                Ok(f) => f,
+                Err(e) => return drive_error_json(&e),
+            };
+            if fields.oauth_client_id.is_empty() || fields.oauth_client_secret.is_empty() {
+                return drive_error_json(
+                    "OAuth client credentials missing — paste your client_id + client_secret \
+                     from Google Cloud Console first (see docs/drive_oauth_setup.md)",
+                );
+            }
+            let google_ip_opt = if fields.google_ip.is_empty() {
+                None
+            } else {
+                Some(fields.google_ip.as_str())
+            };
+            let http = match crate::drive_api::build_drive_http_client(google_ip_opt) {
+                Ok(c) => c,
+                Err(e) => return drive_error_json(&format!("build http client: {e}")),
+            };
+            let oauth_client_id = fields.oauth_client_id;
+            let oauth_client_secret = fields.oauth_client_secret;
+            let Some(rt) = one_shot_runtime() else {
+                return drive_error_json("tokio init failed");
+            };
+            let flow = match rt.block_on(crate::drive_oauth::device_code_start(
+                &http,
+                &oauth_client_id,
+            )) {
+                Ok(f) => f,
+                Err(e) => {
+                    // Log via tracing so the error surfaces in `adb
+                    // logcat -s rahgozar:V` and the in-app Logs ring,
+                    // not just in the toast (which truncates after
+                    // ~80 chars and loses the OAuth response body).
+                    tracing::warn!("device_code_start failed: {}", e);
+                    return drive_error_json(&format!("device_code_start: {e}"));
+                }
+            };
+
+            // 32-hex random flow_token. The actual device_code is
+            // an opaque Google value; we mint our own handle so the
+            // JS / Kotlin side has a stable identifier even if the
+            // device_code shape ever changes.
+            use rand::RngCore;
+            let mut tok_bytes = [0u8; 16];
+            rand::rngs::OsRng.fill_bytes(&mut tok_bytes);
+            let flow_token: String =
+                tok_bytes
+                    .iter()
+                    .fold(String::with_capacity(32), |mut acc, b| {
+                        use std::fmt::Write;
+                        let _ = write!(acc, "{:02x}", b);
+                        acc
+                    });
+
+            let expires_at = Instant::now()
+                .checked_add(flow.expires_in + Duration::from_secs(DEVICE_FLOW_EXPIRY_GRACE_SECS))
+                .unwrap_or_else(Instant::now);
+            {
+                let mut flows = pending_device_flows().lock().unwrap();
+                prune_expired_device_flows(&mut flows);
+                if flows.len() >= MAX_PENDING_DEVICE_FLOWS {
+                    return drive_error_json(
+                        "too many pending OAuth device-code flows — cancel or wait for one to expire",
+                    );
+                }
+                flows.insert(
+                    flow_token.clone(),
+                    PendingDeviceFlow {
+                        device_code: flow.device_code.clone(),
+                        oauth_client_id,
+                        oauth_client_secret,
+                        expires_at,
+                    },
+                );
+            }
+
+            format!(
+                r#"{{"ok":true,"flow_token":"{}","user_code":"{}","verification_url":"{}","expires_in_secs":{},"interval_secs":{}}}"#,
+                json_escape(&flow_token),
+                json_escape(&flow.user_code),
+                json_escape(&flow.verification_url),
+                flow.expires_in.as_secs(),
+                flow.interval.as_secs().max(1),
+            )
+        }),
+    );
+    env.new_string(out)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Poll one iteration of an in-flight device-code flow. Status
+/// shape mirrors the device-code outcomes the relay's CLI handles
+/// (RFC 8628 §3.5). On `ok`, the refresh token has already been
+/// persisted into `config.json::drive::oauth_refresh_token`; the
+/// UI just re-reads the config to flip its indicator.
+///
+/// ```json
+/// {"status":"pending"}
+/// {"status":"slow_down","interval_secs":N}
+/// {"status":"ok"}
+/// {"status":"denied"}
+/// {"status":"expired"}
+/// {"status":"error","error":"..."}
+/// {"status":"unknown"}
+/// ```
+#[no_mangle]
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveOauthPollFlow<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass,
+    flow_token: JString,
+) -> jstring {
+    let out = safe(
+        r#"{"status":"unknown"}"#.to_string(),
+        AssertUnwindSafe(|| {
+            install_logging_once();
+            let tok = jstring_to_string(&mut env, &flow_token);
+            if tok.is_empty() {
+                return r#"{"status":"unknown"}"#.to_string();
+            }
+            // Snapshot the flow's state without removing it — a
+            // `pending` / `slow_down` outcome means the UI is going
+            // to poll again, so we leave the entry alive.
+            let (device_code, oauth_client_id, oauth_client_secret) = {
+                let mut guard = pending_device_flows().lock().unwrap();
+                prune_expired_device_flows(&mut guard);
+                match guard.get(&tok) {
+                    Some(p) => (
+                        p.device_code.clone(),
+                        p.oauth_client_id.clone(),
+                        p.oauth_client_secret.clone(),
+                    ),
+                    None => return r#"{"status":"unknown"}"#.to_string(),
+                }
+            };
+
+            let fields = match load_drive_config_fields() {
+                Ok(f) => f,
+                Err(e) => {
+                    return format!(
+                        r#"{{"status":"transient_error","error":"{}"}}"#,
+                        json_escape(&e),
+                    );
+                }
+            };
+            let google_ip_opt = if fields.google_ip.is_empty() {
+                None
+            } else {
+                Some(fields.google_ip.as_str())
+            };
+            let http = match crate::drive_api::build_drive_http_client(google_ip_opt) {
+                Ok(c) => c,
+                Err(e) => {
+                    return format!(
+                        r#"{{"status":"transient_error","error":"{}"}}"#,
+                        json_escape(&format!("build http client: {e}")),
+                    );
+                }
+            };
+            let Some(rt) = one_shot_runtime() else {
+                return r#"{"status":"error","error":"tokio init failed"}"#.to_string();
+            };
+            match rt.block_on(crate::drive_oauth::device_code_poll(
+                &http,
+                &device_code,
+                &oauth_client_id,
+                &oauth_client_secret,
+            )) {
+                Ok(crate::drive_oauth::DevicePollOutcome::Pending) => {
+                    r#"{"status":"pending"}"#.to_string()
+                }
+                Ok(crate::drive_oauth::DevicePollOutcome::SlowDown) => {
+                    // Per RFC 8628 §3.5 the next poll interval MUST
+                    // increase by at least 5 s. The Android-side
+                    // poller is responsible for honouring this — we
+                    // report it as a hint here.
+                    r#"{"status":"slow_down","interval_secs":5}"#.to_string()
+                }
+                Ok(crate::drive_oauth::DevicePollOutcome::AccessDenied) => {
+                    pending_device_flows().lock().unwrap().remove(&tok);
+                    r#"{"status":"denied"}"#.to_string()
+                }
+                Ok(crate::drive_oauth::DevicePollOutcome::ExpiredToken) => {
+                    pending_device_flows().lock().unwrap().remove(&tok);
+                    r#"{"status":"expired"}"#.to_string()
+                }
+                Ok(crate::drive_oauth::DevicePollOutcome::Tokens(tokens)) => {
+                    let refresh = match tokens.refresh_token {
+                        Some(t) if !t.is_empty() => t,
+                        _ => {
+                            pending_device_flows().lock().unwrap().remove(&tok);
+                            return r#"{"status":"error","error":"OAuth response did not include a refresh_token"}"#.to_string();
+                        }
+                    };
+                    if let Err(e) = persist_drive_refresh_token(
+                        &refresh,
+                        &oauth_client_id,
+                        &oauth_client_secret,
+                    ) {
+                        pending_device_flows().lock().unwrap().remove(&tok);
+                        return format!(
+                            r#"{{"status":"error","error":"{}"}}"#,
+                            json_escape(&format!("save refresh token: {e}")),
+                        );
+                    }
+                    pending_device_flows().lock().unwrap().remove(&tok);
+                    r#"{"status":"ok"}"#.to_string()
+                }
+                Err(e) => {
+                    let transient = matches!(
+                        &e,
+                        crate::drive_oauth::OAuthError::Transport(_)
+                            | crate::drive_oauth::OAuthError::BadResponse(_)
+                    );
+                    if !transient {
+                        pending_device_flows().lock().unwrap().remove(&tok);
+                    }
+                    // Network / parse errors leave the flow alive so
+                    // the next poll can retry. OAuth endpoint errors
+                    // such as invalid_client are terminal.
+                    format!(
+                        r#"{{"status":"{}","error":"{}"}}"#,
+                        if transient {
+                            "transient_error"
+                        } else {
+                            "error"
+                        },
+                        json_escape(&format!("device_code_poll: {e}")),
+                    )
+                }
+            }
+        }),
+    );
+    env.new_string(out)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Drop an in-flight device-code flow. Called when the user taps
+/// Cancel in the Compose dialog. Idempotent: returns `{"ok":true}`
+/// whether the flow existed or not. The OAuth-side device_code is
+/// left to expire naturally on Google's side (Google's
+/// `/device/code/cancel` endpoint exists but isn't worth the extra
+/// round-trip — the user has already abandoned the flow).
+#[no_mangle]
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveOauthCancelFlow<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass,
+    flow_token: JString,
+) -> jstring {
+    let out = safe(
+        r#"{"ok":true}"#.to_string(),
+        AssertUnwindSafe(|| {
+            let tok = jstring_to_string(&mut env, &flow_token);
+            pending_device_flows().lock().unwrap().remove(&tok);
+            r#"{"ok":true}"#.to_string()
+        }),
+    );
+    env.new_string(out)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// `files.create` with the folder MIME type. Returns the new
+/// folder's Drive ID — the UI pastes it into the Drive form's
+/// folder_id field. JSON shape:
+///
+/// ```json
+/// {"ok": true,  "folder_id": "..."}
+/// {"ok": false, "error": "..."}
+/// ```
+#[no_mangle]
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveCreateFolder<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass,
+    name: JString,
+) -> jstring {
+    let out = safe(
+        r#"{"ok":false,"error":"panic"}"#.to_string(),
+        AssertUnwindSafe(|| {
+            install_logging_once();
+            let n = jstring_to_string(&mut env, &name);
+            let n = n.trim();
+            if n.is_empty() {
+                return drive_error_json("folder name is empty");
+            }
+            let fields = match load_drive_config_fields() {
+                Ok(t) => t,
+                Err(e) => return drive_error_json(&e),
+            };
+            if fields.refresh_token.is_empty() {
+                return drive_error_json("not signed in to Google — sign in first, then try again");
+            }
+            if fields.oauth_client_id.is_empty() || fields.oauth_client_secret.is_empty() {
+                return drive_error_json(
+                    "OAuth client credentials missing — paste your client_id + client_secret \
+                     from Google Cloud Console first (see docs/drive_oauth_setup.md)",
+                );
+            }
+            let Some(rt) = one_shot_runtime() else {
+                return drive_error_json("tokio init failed");
+            };
+            let google_ip_opt = if fields.google_ip.is_empty() {
+                None
+            } else {
+                Some(fields.google_ip.as_str())
+            };
+            let http = match crate::drive_api::build_drive_http_client(google_ip_opt) {
+                Ok(c) => c,
+                Err(e) => return drive_error_json(&format!("build http: {e}")),
+            };
+            let api = crate::drive_api::DriveApiClient::with_default_base_url(http.clone());
+            let access = match rt.block_on(crate::drive_oauth::refresh_access_token(
+                &http,
+                &fields.refresh_token,
+                &fields.oauth_client_id,
+                &fields.oauth_client_secret,
+            )) {
+                Ok(t) => t.access_token,
+                Err(e) if e.is_refresh_token_revoked() => {
+                    let _ = clear_drive_refresh_token();
+                    return drive_reauth_required_json(&format!(
+                        "Your Google access has been revoked or the session expired \
+                         (Google returned: {e}). Sign in with Google again."
+                    ));
+                }
+                Err(e) => return drive_error_json(&format!("refresh failed: {e}")),
+            };
+            let folder_id = match rt.block_on(api.create_folder(&access, n)) {
+                Ok(id) => id,
+                Err(e) => return drive_error_json(&format!("create folder: {e}")),
+            };
+            format!(r#"{{"ok":true,"folder_id":"{}"}}"#, json_escape(&folder_id))
+        }),
+    );
+    env.new_string(out)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Refresh + `files.list` against the configured folder. Confirms
+/// both that the saved OAuth refresh token still works and that the
+/// saved folder ID is reachable. JSON shape:
+///
+/// ```json
+/// {"ok": true,  "folder_id": "...", "files_count": 42}
+/// {"ok": false, "error": "..."}
+/// ```
+#[no_mangle]
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveTestConnection<'a>(
+    env: JNIEnv<'a>,
+    _class: JClass,
+) -> jstring {
+    let out = safe(
+        r#"{"ok":false,"error":"panic"}"#.to_string(),
+        AssertUnwindSafe(|| {
+            install_logging_once();
+            let fields = match load_drive_config_fields() {
+                Ok(t) => t,
+                Err(e) => return drive_error_json(&e),
+            };
+            if fields.refresh_token.is_empty() {
+                return drive_error_json("not signed in to Google — sign in first, then try again");
+            }
+            if fields.folder_id.is_empty() {
+                return drive_error_json(
+                    "no folder ID set — create or paste the shared folder ID first",
+                );
+            }
+            if fields.oauth_client_id.is_empty() || fields.oauth_client_secret.is_empty() {
+                return drive_error_json(
+                    "OAuth client credentials missing — paste your client_id + client_secret \
+                     from Google Cloud Console first (see docs/drive_oauth_setup.md)",
+                );
+            }
+            let Some(rt) = one_shot_runtime() else {
+                return drive_error_json("tokio init failed");
+            };
+            let google_ip_opt = if fields.google_ip.is_empty() {
+                None
+            } else {
+                Some(fields.google_ip.as_str())
+            };
+            let http = match crate::drive_api::build_drive_http_client(google_ip_opt) {
+                Ok(c) => c,
+                Err(e) => return drive_error_json(&format!("build http: {e}")),
+            };
+            let api = crate::drive_api::DriveApiClient::with_default_base_url(http.clone());
+            let access = match rt.block_on(crate::drive_oauth::refresh_access_token(
+                &http,
+                &fields.refresh_token,
+                &fields.oauth_client_id,
+                &fields.oauth_client_secret,
+            )) {
+                Ok(t) => t.access_token,
+                Err(e) if e.is_refresh_token_revoked() => {
+                    let _ = clear_drive_refresh_token();
+                    return drive_reauth_required_json(&format!(
+                        "Your Google access has been revoked or the session expired \
+                         (Google returned: {e}). Sign in with Google again."
+                    ));
+                }
+                Err(e) => return drive_error_json(&format!("refresh failed: {e}")),
+            };
+            let files = match rt.block_on(api.list_files_in_folder(&access, &fields.folder_id, ""))
+            {
+                Ok(f) => f,
+                Err(e) => return drive_error_json(&format!("list folder: {e}")),
+            };
+            format!(
+                r#"{{"ok":true,"folder_id":"{}","files_count":{}}}"#,
+                json_escape(&fields.folder_id),
+                files.len()
+            )
+        }),
+    );
+    env.new_string(out)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+/// Pure bech32m parse echo — live-validate the relay public key
+/// from the Drive setup form. Returns an empty string on OK, the
+/// human-readable error otherwise. (No JSON wrapper because the UI
+/// just needs a yes/no + reason.)
+#[no_mangle]
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveValidateRelayPubkey<'a>(
+    mut env: JNIEnv<'a>,
+    _class: JClass,
+    relay_pubkey: JString,
+) -> jstring {
+    let out = safe(
+        "panic".to_string(),
+        AssertUnwindSafe(|| {
+            let s = jstring_to_string(&mut env, &relay_pubkey);
+            match crate::drive_crypto::RelayPubkey::from_bech32m(&s) {
+                Ok(_) => String::new(),
+                Err(e) => e.to_string(),
+            }
+        }),
+    );
+    env.new_string(out)
+        .map(|s| s.into_raw())
+        .unwrap_or(std::ptr::null_mut())
+}
+
+// ---------------------------------------------------------------------------
+// Drive helpers — config IO + JSON escaping
+// ---------------------------------------------------------------------------
+
+/// Drive-related fields rahgozar's `Config` exposes to the JNI
+/// surface: the OAuth refresh token + folder ID + the existing
+/// `google_ip` + the user-supplied BYO OAuth client_id/secret.
+/// Returns empty strings when fields are absent (a fresh config
+/// with no Drive setup yet) rather than erroring — the caller
+/// decides which fields are preconditions for its specific
+/// operation. Individual JNI exports decide which fields are required
+/// and return user-facing setup errors for missing prerequisites.
+struct DriveJniConfigFields {
+    refresh_token: String,
+    folder_id: String,
+    google_ip: String,
+    oauth_client_id: String,
+    oauth_client_secret: String,
+}
+
+fn load_drive_config_fields() -> Result<DriveJniConfigFields, String> {
+    let path = crate::data_dir::config_path();
+    if !path.exists() {
+        return Ok(DriveJniConfigFields {
+            refresh_token: String::new(),
+            folder_id: String::new(),
+            google_ip: String::new(),
+            oauth_client_id: String::new(),
+            oauth_client_secret: String::new(),
+        });
+    }
+    let raw =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    let drive = json
+        .get("drive")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let refresh_token = drive
+        .get("oauth_refresh_token")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let folder_id = drive
+        .get("folder_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let oauth_client_id = drive
+        .get("oauth_client_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let oauth_client_secret = drive
+        .get("oauth_client_secret")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let google_ip = json
+        .get("google_ip")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    Ok(DriveJniConfigFields {
+        refresh_token,
+        folder_id,
+        google_ip,
+        oauth_client_id,
+        oauth_client_secret,
+    })
+}
+
+/// Write `refresh_token` into `config.json::drive::oauth_refresh_token`,
+/// preserving every other field. Refuses to save if the OAuth client
+/// credentials on disk changed after the device-code flow started.
+fn persist_drive_refresh_token(
+    refresh_token: &str,
+    expected_client_id: &str,
+    expected_client_secret: &str,
+) -> Result<(), String> {
+    let path = crate::data_dir::config_path();
+    let mut json: serde_json::Value = if path.exists() {
+        let raw = std::fs::read_to_string(&path)
+            .map_err(|e| format!("read {}: {}", path.display(), e))?;
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {}", path.display(), e))?
+    } else {
+        return Err(
+            "config.json no longer exists — save your OAuth client credentials and sign in again"
+                .to_string(),
+        );
+    };
+    let obj = json
+        .as_object_mut()
+        .ok_or_else(|| "config.json is not a JSON object".to_string())?;
+    let drive_obj = obj
+        .get_mut("drive")
+        .ok_or_else(|| "config.json::drive is missing".to_string())?
+        .as_object_mut()
+        .ok_or_else(|| "config.json::drive is not an object".to_string())?;
+    let current_client_id = drive_obj
+        .get("oauth_client_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    let current_client_secret = drive_obj
+        .get("oauth_client_secret")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if current_client_id != expected_client_id.trim()
+        || current_client_secret != expected_client_secret.trim()
+    {
+        return Err(
+            "OAuth credentials changed during sign-in — save the intended credentials and sign in \
+             again"
+                .to_string(),
+        );
+    }
+    drive_obj.insert(
+        "oauth_refresh_token".to_string(),
+        serde_json::Value::String(refresh_token.to_string()),
+    );
+    crate::profiles::write_config_json_to(&path, &json)
+        .map_err(|e| format!("write {}: {}", path.display(), e))
+}
+
+/// Atomically clear `drive.oauth_refresh_token` in `config.json`. Used
+/// by the Drive JNI surface when Google returns `invalid_grant` (token
+/// revoked / user signed out / sanctions hit) — per RFC 6749 §5.2 the
+/// client MUST stop using the dead token and force re-auth. Repeatedly
+/// re-sending an invalid_grant can trip Google's fraud heuristics and
+/// lock the account.
+///
+/// No-op if config.json doesn't exist or already has an empty token.
+/// Errors only on JSON parse / disk write failure.
+fn clear_drive_refresh_token() -> Result<(), String> {
+    let path = crate::data_dir::config_path();
+    if !path.exists() {
+        return Ok(());
+    }
+    let raw =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {}", path.display(), e))?;
+    let mut json: serde_json::Value =
+        serde_json::from_str(&raw).map_err(|e| format!("parse {}: {}", path.display(), e))?;
+    let Some(obj) = json.as_object_mut() else {
+        return Ok(());
+    };
+    let Some(drive_obj) = obj.get_mut("drive").and_then(|v| v.as_object_mut()) else {
+        return Ok(());
+    };
+    drive_obj.insert(
+        "oauth_refresh_token".to_string(),
+        serde_json::Value::String(String::new()),
+    );
+    crate::profiles::write_config_json_to(&path, &json)
+        .map_err(|e| format!("write {}: {}", path.display(), e))
+}
+
+/// Format a small error JSON for the Drive JNI surface.
+fn drive_error_json(reason: &str) -> String {
+    format!(r#"{{"ok":false,"error":"{}"}}"#, json_escape(reason))
+}
+
+/// Format an error JSON the UI can recognize as "the saved refresh
+/// token is dead, prompt re-auth". Carries the `reauth_required` flag
+/// so DriveSetupSection.kt can switch the indicator back to "Not
+/// signed in" and disable Create Folder / Test Connection.
+fn drive_reauth_required_json(reason: &str) -> String {
+    format!(
+        r#"{{"ok":false,"reauth_required":true,"error":"{}"}}"#,
+        json_escape(reason)
+    )
+}
+
+/// Minimal JSON string-escape — only the characters that must be
+/// escaped per RFC 8259 §7. Sufficient for the short strings the
+/// Drive JNI surface emits (OAuth URLs, folder IDs, error messages).
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }

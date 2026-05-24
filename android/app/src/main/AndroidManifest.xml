@@ -115,8 +115,13 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
             </intent-filter>
-            <!-- Deep link: tapping rahgozar://... in any app opens MainActivity
-                 and auto-imports the encoded config. -->
+            <!-- Deep link: tapping rahgozar://... in any app opens MainActivity.
+                 Currently used only for QR-code-shared config payloads —
+                 ConfigStore.decode parses the URI and the Activity surfaces a
+                 confirm dialog before import. (Drive-mode OAuth used to share
+                 this scheme too but moved to the device-code flow because
+                 Google's Desktop-app OAuth clients don't support custom-scheme
+                 redirects on Android.) -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />

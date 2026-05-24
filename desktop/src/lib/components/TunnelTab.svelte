@@ -15,7 +15,13 @@
   // moving between platforms doesn't have to relearn it.
 
   import { onMount } from "svelte";
-  import { api, type ConfigDto, type SniHostDto } from "../api";
+  import { openUrl } from "@tauri-apps/plugin-opener";
+  import {
+    api,
+    type ConfigDto,
+    type DriveOauthCompleteDto,
+    type SniHostDto,
+  } from "../api";
   import { t, tn } from "../i18n.svelte";
   import { toast } from "../toast.svelte";
   import FrontingGroupsSection from "./FrontingGroupsSection.svelte";
@@ -68,27 +74,31 @@
   // than at module-eval time so the label / help text re-render when
   // the user toggles language. The wire `value` is always English —
   // it's the on-disk Config field.
-  const MODES = ["apps_script", "full", "direct", "local_bypass"] as const;
+  const MODES = [
+    "apps_script",
+    "full",
+    "direct",
+    "local_bypass",
+    "drive",
+  ] as const;
 
-  // direct / google_only (legacy alias) / local_bypass all skip the
-  // Apps Script relay, so the deployment-IDs + auth-key form is
-  // disabled under any of them. local_bypass goes a step further
-  // (no SNI rewrite, no MITM CA), but from this form's perspective
-  // both modes share the "Apps Script settings are inert" state.
+  // direct / google_only (legacy alias) / local_bypass / drive all
+  // skip the Apps Script relay, so the deployment-IDs + auth-key
+  // form is disabled under any of them.
   const noRelay = $derived(
     config?.mode === "direct" ||
       config?.mode === "google_only" ||
-      config?.mode === "local_bypass",
+      config?.mode === "local_bypass" ||
+      config?.mode === "drive",
   );
 
   // LocalBypass goes a step further than "noRelay": it ignores
-  // front_domain, google_ip, the SNI pool, and fronting_groups. The
-  // dialer connects directly to the real destination and fragments
-  // its ClientHello — none of those knobs feed any code path. Hide
-  // the editors so users don't think changing the values matters in
-  // this mode. (Direct mode still needs them for the Google direct
-  // fragmentation pool and the SNI-rewrite fallback path.)
+  // front_domain, google_ip, the SNI pool, and fronting_groups.
+  // Drive also skips the Apps Script relay knobs, but it still uses
+  // google_ip for Drive/OAuth endpoint resolution, so the network
+  // editor keeps that field visible in Drive mode.
   const isLocalBypass = $derived(config?.mode === "local_bypass");
+  const isDrive = $derived(config?.mode === "drive");
 
   const dirty = $derived(
     config != null &&
@@ -152,6 +162,179 @@
     if (!pristine) return;
     config = structuredClone(pristine);
   }
+
+  // ── Drive-mode setup ─────────────────────────────────────────────
+  //
+  // OAuth flow: clicking "Sign in" calls `driveOauthStart` which
+  // returns a state token + auth URL. We open the URL in the system
+  // browser (via tauri-plugin-opener), then long-poll
+  // `driveOauthComplete` — the Rust side blocks up to 120s waiting
+  // on the loopback listener task. Success persists the refresh
+  // token into config.json server-side; we re-read the config so
+  // `drive_has_refresh_token` flips to true in the form.
+
+  let signingIn = $state(false);
+  // The auth URL is surfaced in a dialog with Copy + Open buttons
+  // so the user can paste it into whichever browser they're signed
+  // into Google with — auto-opening the system-default browser
+  // forces a sign-in in the wrong account if their default isn't
+  // their Google-signed-in one. `null` means no flow is in
+  // progress.
+  let pendingAuthUrl = $state<string | null>(null);
+  // `drive_oauth_start` now takes the OAuth client_id/secret +
+  // google_ip directly from the form (no Save first). So the only
+  // gate is "the three required fields have content".
+  let signInReady = $derived(
+    !!config &&
+      !!config.drive_oauth_client_id.trim() &&
+      !!config.drive_oauth_client_secret.trim(),
+  );
+  async function onSignInDrive() {
+    if (!config) return;
+    if (!signInReady) return;
+    signingIn = true;
+    pendingAuthUrl = null;
+    try {
+      const start = await api.driveOauthStart({
+        oauthClientId: config.drive_oauth_client_id,
+        oauthClientSecret: config.drive_oauth_client_secret,
+        googleIp: config.google_ip,
+      });
+      // Show the URL — the user decides which browser to use.
+      pendingAuthUrl = start.auth_url;
+      // Long-poll. The Rust command waits up to 120s per call, while
+      // the loopback listener stays alive for 5 minutes; keep calling
+      // on timeout so a slow browser approval still persists.
+      let complete: DriveOauthCompleteDto | null = null;
+      const oauthDeadline = Date.now() + 5 * 60 * 1000;
+      while (!complete) {
+        try {
+          complete = await api.driveOauthComplete(start.state_token);
+        } catch (e) {
+          const message = String(e);
+          if (
+            message.includes("OAuth flow timed out") &&
+            Date.now() < oauthDeadline
+          ) {
+            continue;
+          }
+          throw e;
+        }
+      }
+      // Refresh the form state so `drive_has_refresh_token`
+      // reflects the just-saved token. The server-side
+      // `drive_oauth_complete` already wrote all three OAuth
+      // fields (client_id, client_secret, refresh_token) to disk.
+      const fresh = await api.getConfig();
+      config = fresh;
+      pristine = structuredClone(fresh);
+      toast.success(
+        complete.email
+          ? tn("tunnel.drive.signed_in_as", { email: complete.email })
+          : t("tunnel.drive.signed_in"),
+      );
+    } catch (e) {
+      toast.error(tn("tunnel.drive.oauth_failed", { error: String(e) }));
+    } finally {
+      signingIn = false;
+      pendingAuthUrl = null;
+    }
+  }
+
+  async function onOpenAuthUrl() {
+    if (!pendingAuthUrl) return;
+    try {
+      await openUrl(pendingAuthUrl);
+    } catch (e) {
+      toast.error(`Couldn't open browser: ${String(e)}. Copy the URL manually.`);
+    }
+  }
+
+  async function onCopyAuthUrl() {
+    if (!pendingAuthUrl) return;
+    try {
+      await navigator.clipboard.writeText(pendingAuthUrl);
+      toast.success(t("tunnel.drive.oauth_url_copied"));
+    } catch (e) {
+      toast.error(`Copy failed: ${String(e)}`);
+    }
+  }
+
+  // Create-folder modal state. Stays local to this component because
+  // it's a one-shot interaction — once we have a folder ID we paste
+  // it into the regular folder_id field and the form's normal
+  // dirty-tracking kicks in.
+  let showCreateFolderModal = $state(false);
+  let newFolderName = $state("rahgozar mailbox");
+  let creatingFolder = $state(false);
+  async function onCreateFolder() {
+    if (!config) return;
+    if (dirty) {
+      toast.error(t("tunnel.drive.save_before_create_folder"));
+      return;
+    }
+    if (signingIn) return;
+    creatingFolder = true;
+    try {
+      const folderId = await api.driveCreateFolder(newFolderName);
+      config.drive_folder_id = folderId;
+      showCreateFolderModal = false;
+      toast.success(t("tunnel.drive.folder_created"));
+    } catch (e) {
+      toast.error(tn("tunnel.drive.create_folder_failed", { error: String(e) }));
+    } finally {
+      creatingFolder = false;
+    }
+  }
+
+  // Relay-pubkey live validation. Fires on input change; cached so
+  // an unchanged value doesn't re-call the Rust side every keystroke.
+  // The validator is pure (bech32m parse) so latency is negligible,
+  // but caching keeps the IPC volume sane.
+  let pubkeyValidation = $state<
+    { ok: true } | { ok: false; error: string } | null
+  >(null);
+  let pubkeyLastValidated = $state("");
+  async function validateRelayPubkey() {
+    if (!config) return;
+    const s = config.drive_relay_pubkey.trim();
+    if (s === "") {
+      pubkeyValidation = null;
+      pubkeyLastValidated = "";
+      return;
+    }
+    if (s === pubkeyLastValidated) return;
+    pubkeyLastValidated = s;
+    try {
+      await api.driveValidateRelayPubkey(s);
+      pubkeyValidation = { ok: true };
+    } catch (e) {
+      pubkeyValidation = { ok: false, error: String(e) };
+    }
+  }
+
+  // Test-connection. Reads from on-disk config (not the in-memory
+  // form), so the user must Save before clicking — surface that as
+  // a guard rather than silently testing stale settings.
+  let testingConnection = $state(false);
+  let lastTestResult = $state<{ folder: string; count: number } | null>(null);
+  async function onTestDriveConnection() {
+    if (!config) return;
+    if (dirty) {
+      toast.error(t("tunnel.drive.save_before_test"));
+      return;
+    }
+    testingConnection = true;
+    lastTestResult = null;
+    try {
+      const r = await api.driveTestConnection();
+      lastTestResult = { folder: r.folder_id, count: r.files_count };
+    } catch (e) {
+      toast.error(tn("tunnel.drive.test_failed", { error: String(e) }));
+    } finally {
+      testingConnection = false;
+    }
+  }
 </script>
 
 {#if !config}
@@ -195,11 +378,10 @@
     <!-- ── Fronting groups ────────────────────────────────────────
          Owns its own data lifecycle (loads / saves independent of
          this form's Save button) — see `FrontingGroupsSection.svelte`
-         for the reasoning. Inert in LocalBypass (the dispatch never
-         consults `fronting_groups` there — `EarlyRoute::LocalBypass`
-         runs above the fronting-groups dispatch branch), so the
-         editor is hidden in that mode. -->
-    {#if !isLocalBypass}
+         for the reasoning. Inert in LocalBypass and Drive (neither
+         dispatch path consults `fronting_groups`), so the editor is
+         hidden in those modes. -->
+    {#if !isLocalBypass && !isDrive}
       <FrontingGroupsSection />
     {/if}
 
@@ -323,6 +505,325 @@
       </div>
     </section>
 
+    <!-- ── Drive setup ──────────────────────────────────────────────
+         Mode-gated: only renders when `mode === "drive"`. The Save
+         button at the bottom of the form persists every field
+         (including these) via `save_config`'s overlay. The OAuth
+         refresh token is NOT a form field — `Sign in with Google`
+         triggers the loopback-listener flow which writes the token
+         server-side and we re-read the config to flip the
+         `drive_has_refresh_token` indicator. -->
+    {#if isDrive}
+      <section class="bg-surface border-border-subtle rounded-lg border p-5">
+        <h2 class="text-secondary mb-3 text-xs font-semibold tracking-wider uppercase">
+          {t("tunnel.section.drive")}
+        </h2>
+        <p class="text-secondary mb-4 text-xs">{t("tunnel.drive.help")}</p>
+
+        <!-- 0. BYO OAuth client credentials. rahgozar ships no
+             default OAuth client — every user registers their own
+             in Google Cloud Console (see docs/drive_oauth_setup.md
+             for the walkthrough) and pastes the values here. This
+             section comes BEFORE Sign in so users see the
+             prerequisite first; the Sign-in button is disabled
+             until both fields are non-empty AND saved. -->
+        <div class="border-border-subtle mb-5 rounded-md border p-3">
+          <h3 class="text-primary mb-1 text-sm font-semibold">
+            {t("tunnel.drive.oauth_client_section")}
+          </h3>
+          <p class="text-muted mb-3 text-xs">{t("tunnel.drive.oauth_client_help")}</p>
+          <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+            <div>
+              <label
+                class="text-secondary text-xs font-semibold"
+                for="drive-oauth-client-id"
+              >
+                {t("tunnel.drive.oauth_client_id_label")}
+              </label>
+              <input
+                id="drive-oauth-client-id"
+                type="text"
+                bind:value={config.drive_oauth_client_id}
+                disabled={signingIn}
+                placeholder={t("tunnel.drive.oauth_client_id_placeholder")}
+                class="bg-input border-border-subtle focus:border-accent placeholder:text-muted mt-1 w-full rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+              />
+            </div>
+            <div>
+              <label
+                class="text-secondary text-xs font-semibold"
+                for="drive-oauth-client-secret"
+              >
+                {t("tunnel.drive.oauth_client_secret_label")}
+              </label>
+              <input
+                id="drive-oauth-client-secret"
+                type="password"
+                bind:value={config.drive_oauth_client_secret}
+                disabled={signingIn}
+                placeholder={t("tunnel.drive.oauth_client_secret_placeholder")}
+                class="bg-input border-border-subtle focus:border-accent placeholder:text-muted mt-1 w-full rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors disabled:cursor-not-allowed disabled:opacity-60"
+              />
+            </div>
+          </div>
+        </div>
+
+        <!-- 1. OAuth sign-in. The "Signed in" indicator reads from
+             `drive_has_refresh_token` which is set by `get_config`
+             based on whether `config.drive.oauth_refresh_token` is
+             non-empty on disk — i.e. the OAuth flow already
+             persisted a token.
+
+             Sign-in needs the BYO OAuth credentials present on
+             disk (the Rust side reads them from config.json at
+             flow start). Disable the button when the form values
+             are missing or dirty: `dirty` means in-memory form
+             differs from on-disk → save first. -->
+        <div class="mb-5 flex flex-wrap items-center gap-3">
+          {#if config.drive_has_refresh_token}
+            <span class="text-success text-sm">
+              ✓ {t("tunnel.drive.signed_in")}
+            </span>
+            <button
+              type="button"
+              onclick={onSignInDrive}
+              disabled={signingIn || !signInReady}
+              class="border-border-subtle text-secondary hover:text-primary hover:border-border-strong rounded-md border px-3 py-1 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {signingIn ? t("tunnel.drive.signing_in") : t("tunnel.drive.relink_btn")}
+            </button>
+          {:else}
+            <span class="text-warn text-sm">
+              {t("tunnel.drive.signed_out")}
+            </span>
+            <button
+              type="button"
+              onclick={onSignInDrive}
+              disabled={signingIn || !signInReady}
+              class="bg-accent hover:bg-accent-hover rounded-md px-4 py-1.5 text-sm font-semibold text-black transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {signingIn ? t("tunnel.drive.signing_in") : t("tunnel.drive.sign_in_btn")}
+            </button>
+          {/if}
+          {#if !signInReady}
+            <span class="text-warn text-xs">
+              {t("tunnel.drive.oauth_creds_required")}
+            </span>
+          {/if}
+        </div>
+
+        <!-- Auth-URL dialog. Visible only while a Sign-in flow is in
+             flight (pendingAuthUrl != null). The user picks which
+             browser to use: Copy → paste anywhere; Open → system
+             default. Either way the loopback listener catches the
+             redirect when the user finishes sign-in. -->
+        {#if pendingAuthUrl}
+          <div
+            class="border-border-subtle bg-surface-2 mb-5 rounded-md border p-3 text-sm"
+          >
+            <div class="text-primary mb-2 font-semibold">
+              {t("tunnel.drive.oauth_url_dialog_title")}
+            </div>
+            <p class="text-secondary mb-2 text-xs">
+              {t("tunnel.drive.oauth_url_dialog_help")}
+            </p>
+            <input
+              type="text"
+              readonly
+              value={pendingAuthUrl}
+              class="border-border-subtle bg-surface-1 text-primary mb-2 w-full rounded-md border px-2 py-1 font-mono text-xs"
+            />
+            <div class="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onclick={onCopyAuthUrl}
+                class="border-border-subtle text-secondary hover:text-primary hover:border-border-strong rounded-md border px-3 py-1 text-xs transition-colors"
+              >
+                {t("tunnel.drive.oauth_url_copy")}
+              </button>
+              <button
+                type="button"
+                onclick={onOpenAuthUrl}
+                class="border-border-subtle text-secondary hover:text-primary hover:border-border-strong rounded-md border px-3 py-1 text-xs transition-colors"
+              >
+                {t("tunnel.drive.oauth_url_open")}
+              </button>
+              <span class="text-muted ml-auto text-xs">
+                {t("tunnel.drive.oauth_url_waiting")}
+              </span>
+            </div>
+          </div>
+        {/if}
+
+        <!-- 2. Folder ID. Set manually OR via Create-new modal. -->
+        <div class="mb-5">
+          <label class="text-primary text-sm font-semibold" for="drive-folder-id">
+            {t("tunnel.drive.folder_id_label")}
+          </label>
+          <p class="text-muted text-xs">{t("tunnel.drive.folder_id_help")}</p>
+          <div class="mt-1.5 flex items-stretch gap-2">
+            <input
+              id="drive-folder-id"
+              type="text"
+              bind:value={config.drive_folder_id}
+              placeholder={t("tunnel.drive.folder_id_placeholder")}
+              class="bg-input border-border-subtle focus:border-accent placeholder:text-muted flex-1 rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors"
+            />
+            <button
+              type="button"
+              onclick={() => (showCreateFolderModal = true)}
+              disabled={!config.drive_has_refresh_token || dirty || signingIn}
+              class="border-border-subtle text-secondary hover:text-primary hover:border-border-strong rounded-md border px-3 text-xs transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {t("tunnel.drive.create_folder_btn")}
+            </button>
+          </div>
+        </div>
+
+        <!-- 3. Relay pubkey. Live-validated via the
+             `drive_validate_relay_pubkey` Tauri command — pure
+             bech32m parse, so the IPC cost is negligible. The
+             cached-last-validated value in the script block prevents
+             re-calling for an unchanged input. -->
+        <div class="mb-5">
+          <label class="text-primary text-sm font-semibold" for="drive-relay-pubkey">
+            {t("tunnel.drive.relay_pubkey_label")}
+          </label>
+          <p class="text-muted text-xs">{t("tunnel.drive.relay_pubkey_help")}</p>
+          <input
+            id="drive-relay-pubkey"
+            type="text"
+            bind:value={config.drive_relay_pubkey}
+            oninput={validateRelayPubkey}
+            placeholder={t("tunnel.drive.relay_pubkey_placeholder")}
+            class="bg-input border-border-subtle focus:border-accent placeholder:text-muted mt-1.5 w-full rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors"
+          />
+          {#if pubkeyValidation && pubkeyValidation.ok}
+            <p class="text-success mt-1 text-xs">✓ {t("tunnel.drive.relay_pubkey_valid")}</p>
+          {:else if pubkeyValidation && !pubkeyValidation.ok}
+            <p class="text-error mt-1 text-xs">
+              {tn("tunnel.drive.relay_pubkey_invalid", {
+                error: pubkeyValidation.error,
+              })}
+            </p>
+          {/if}
+        </div>
+
+        <!-- 4. Test connection. Guarded by `dirty` so the user
+             saves their changes before testing (the test reads
+             from on-disk config). -->
+        <div class="mb-5 flex items-center gap-3">
+            <button
+              type="button"
+              onclick={onTestDriveConnection}
+              disabled={testingConnection || !config.drive_has_refresh_token || dirty}
+              class="border-border-subtle text-secondary hover:text-primary hover:border-border-strong rounded-md border px-4 py-1.5 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+            >
+            {testingConnection ? t("tunnel.drive.testing") : t("tunnel.drive.test_btn")}
+          </button>
+          {#if lastTestResult}
+            <span class="text-success text-xs">
+              ✓ {tn("tunnel.drive.test_ok", {
+                folder: lastTestResult.folder,
+                count: lastTestResult.count,
+              })}
+            </span>
+          {/if}
+        </div>
+
+        <!-- 5. Advanced: poll interval + max concurrent uploads. -->
+        <details class="border-border-subtle border-t pt-3">
+          <summary class="text-secondary cursor-pointer text-xs">
+            {t("tunnel.drive.advanced")}
+          </summary>
+          <div class="mt-3 grid grid-cols-2 gap-4">
+            <div>
+              <label class="text-primary text-sm font-semibold" for="drive-poll-interval">
+                {t("tunnel.drive.poll_interval_label")}
+              </label>
+              <p class="text-muted text-xs">{t("tunnel.drive.poll_interval_help")}</p>
+              <input
+                id="drive-poll-interval"
+                type="number"
+                min="50"
+                max="60000"
+                bind:value={config.drive_poll_interval_ms}
+                class="bg-input border-border-subtle focus:border-accent mt-1.5 w-full rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors"
+              />
+            </div>
+            <div>
+              <label class="text-primary text-sm font-semibold" for="drive-max-concurrent">
+                {t("tunnel.drive.max_concurrent_label")}
+              </label>
+              <p class="text-muted text-xs">{t("tunnel.drive.max_concurrent_help")}</p>
+              <input
+                id="drive-max-concurrent"
+                type="number"
+                min="1"
+                max="64"
+                bind:value={config.drive_max_concurrent_uploads}
+                class="bg-input border-border-subtle focus:border-accent mt-1.5 w-full rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors"
+              />
+            </div>
+          </div>
+        </details>
+      </section>
+
+      <!-- Create-folder mini-modal. Inline rather than a separate
+           component because it has zero shared state with anything
+           else — name input + create + cancel. -->
+      {#if showCreateFolderModal}
+        <div
+          class="fixed inset-0 z-50 grid place-items-center bg-black/50 backdrop-blur-sm"
+          onclick={(e) => {
+            if (e.target === e.currentTarget) showCreateFolderModal = false;
+          }}
+          role="presentation"
+        >
+          <div
+            class="bg-surface border-border-subtle w-[24rem] rounded-lg border p-5 shadow-xl"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="create-folder-title"
+          >
+            <h3 id="create-folder-title" class="mb-3 text-base font-semibold">
+              {t("tunnel.drive.create_folder_btn")}
+            </h3>
+            <label class="text-primary text-sm font-semibold" for="new-folder-name">
+              {t("tunnel.drive.create_folder_name_label")}
+            </label>
+            <input
+              id="new-folder-name"
+              type="text"
+              bind:value={newFolderName}
+              placeholder={t("tunnel.drive.create_folder_name_placeholder")}
+              class="bg-input border-border-subtle focus:border-accent mt-1.5 w-full rounded-md border px-3 py-1.5 text-sm outline-none transition-colors"
+            />
+            <div class="mt-4 flex justify-end gap-2">
+              <button
+                type="button"
+                onclick={() => (showCreateFolderModal = false)}
+                disabled={creatingFolder}
+                class="border-border-subtle text-secondary hover:text-primary hover:border-border-strong rounded-md border px-4 py-1.5 text-sm transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {t("tunnel.drive.create_folder_cancel")}
+              </button>
+              <button
+                type="button"
+                onclick={onCreateFolder}
+                disabled={creatingFolder || newFolderName.trim() === ""}
+                class="bg-accent hover:bg-accent-hover rounded-md px-4 py-1.5 text-sm font-semibold text-black transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {creatingFolder
+                  ? t("tunnel.drive.creating_folder")
+                  : t("tunnel.drive.create_folder_confirm")}
+              </button>
+            </div>
+          </div>
+        </div>
+      {/if}
+    {/if}
+
     <!-- ── Network ───────────────────────────────────────────────── -->
     <section class="bg-surface border-border-subtle rounded-lg border p-5">
       <h2 class="text-secondary mb-3 text-xs font-semibold tracking-wider uppercase">
@@ -387,13 +888,11 @@
             class="bg-input border-border-subtle focus:border-accent mt-1.5 w-full rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors"
           />
         </div>
-        <!-- front_domain / google_ip / SNI pool all feed the
-             SNI-rewrite tunnel and the Google direct path. LocalBypass
-             ignores all three (it dials the real destination
-             directly and fragments the ClientHello), so the editors
-             are hidden in that mode to avoid implying the values
-             matter. -->
-        {#if !isLocalBypass}
+        <!-- front_domain / SNI pool feed the Apps Script relay path.
+             google_ip also feeds Drive/OAuth endpoint resolution, so
+             keep it visible in Drive mode while hiding the relay-only
+             knobs. LocalBypass ignores all three. -->
+        {#if !isLocalBypass && !isDrive}
           <div class="col-span-2">
             <label class="text-primary text-sm font-semibold" for="front-domain">
               {t("tunnel.network.front_domain")}
@@ -405,6 +904,8 @@
               class="bg-input border-border-subtle focus:border-accent mt-1.5 w-full rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors"
             />
           </div>
+        {/if}
+        {#if !isLocalBypass}
           <div class="col-span-2">
             <label class="text-primary text-sm font-semibold" for="google-ip">
               {t("tunnel.network.google_ip")}
@@ -420,16 +921,18 @@
                  enabled" so a misconfiguration (everything disabled,
                  proxy can't handshake) is visible at a glance even
                  before opening the modal. -->
-            <button
-              type="button"
-              onclick={() => (sniModalOpen = true)}
-              class="border-border-subtle text-secondary hover:text-primary hover:border-border-strong mt-2 rounded-md border px-3 py-1 text-xs transition-colors"
-            >
-              {tn("tunnel.network.sni_pool_btn", {
-                active: sniSummary.active,
-                total: sniSummary.total,
-              })}
-            </button>
+            {#if !isDrive}
+              <button
+                type="button"
+                onclick={() => (sniModalOpen = true)}
+                class="border-border-subtle text-secondary hover:text-primary hover:border-border-strong mt-2 rounded-md border px-3 py-1 text-xs transition-colors"
+              >
+                {tn("tunnel.network.sni_pool_btn", {
+                  active: sniSummary.active,
+                  total: sniSummary.total,
+                })}
+              </button>
+            {/if}
           </div>
         {/if}
       </div>

@@ -589,14 +589,18 @@ object ProfileStore {
      *
      * Rules:
      *   - `mode` must be present and one of "apps_script" | "direct"
-     *     | "full" | "local_bypass" (the legacy "google_only" alias
-     *     is accepted as direct, mirroring `Config::mode_kind`).
+     *     | "full" | "local_bypass" | "drive" (the legacy
+     *     "google_only" alias is accepted as direct, mirroring
+     *     `Config::mode_kind`).
      *   - Modes that use the Apps Script relay (gated by
      *     [Mode.usesAppsScriptRelay]) require at least one non-empty
      *     deployment ID (under either `script_id` or `script_ids`)
      *     AND a non-empty, non-placeholder `auth_key`. Everything
-     *     else (direct, google_only alias, local_bypass) saves
-     *     without creds.
+     *   - Drive mode requires the same Drive sub-object fields Rust
+     *     requires, including a refresh token and a valid bech32m
+     *     relay public key.
+     *     Everything else (direct, google_only alias, local_bypass)
+     *     saves without creds.
      */
     private fun validateRuntimeShape(
         raw: JSONObject,
@@ -615,6 +619,7 @@ object ProfileStore {
                 "direct", "google_only" -> Mode.DIRECT
                 "full" -> Mode.FULL
                 "local_bypass" -> Mode.LOCAL_BYPASS
+                "drive" -> Mode.DRIVE
                 else -> return "unknown mode '$modeStr'"
             }
         if (mode.usesAppsScriptRelay()) {
@@ -624,6 +629,30 @@ object ProfileStore {
             val auth = decoded.authKey.trim()
             if (auth.isEmpty() || auth == "CHANGE_ME_TO_A_STRONG_SECRET") {
                 return "$modeStr mode requires a non-placeholder auth_key"
+            }
+        }
+        if (mode.usesDriveRelay()) {
+            if (decoded.driveOauthClientId.isBlank()) {
+                return "$modeStr mode requires drive.oauth_client_id (BYO OAuth — see docs/drive_oauth_setup.md)"
+            }
+            if (decoded.driveOauthClientSecret.isBlank()) {
+                return "$modeStr mode requires drive.oauth_client_secret"
+            }
+            if (decoded.driveOauthRefreshTokenSnapshot.isBlank()) {
+                return "$modeStr mode requires drive.oauth_refresh_token"
+            }
+            if (decoded.driveFolderId.isBlank()) {
+                return "$modeStr mode requires drive.folder_id"
+            }
+            if (decoded.driveRelayPubkey.isBlank()) {
+                return "$modeStr mode requires drive.relay_pubkey"
+            }
+            validateDriveRelayPubkey(decoded.driveRelayPubkey)?.let { return "drive.relay_pubkey: $it" }
+            if (decoded.drivePollIntervalMs <= 0) {
+                return "$modeStr mode requires drive.poll_interval_ms > 0"
+            }
+            if (decoded.driveMaxConcurrentUploads <= 0) {
+                return "$modeStr mode requires drive.max_concurrent_uploads > 0"
             }
         }
         return null

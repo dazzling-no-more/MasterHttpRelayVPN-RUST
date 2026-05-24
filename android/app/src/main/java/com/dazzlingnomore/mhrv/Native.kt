@@ -17,6 +17,19 @@ object Native {
     }
 
     /**
+     * Initialise rustls-platform-verifier with an Android Context.
+     * MUST be called once per process before any TLS-touching code runs
+     * — reqwest 0.13's cert verifier reaches into Android's KeyStore
+     * via JNI to walk the device's trust anchors, and without this
+     * init the very first TLS handshake aborts the process with
+     * "Expect rustls-platform-verifier to be initialized".
+     * Invoked from RahgozarApp.onCreate so all subsequent code paths
+     * (Drive OAuth, proxy start, update check, etc.) are covered.
+     * Idempotent: subsequent calls are no-ops.
+     */
+    external fun initAndroidTls(context: android.content.Context)
+
+    /**
      * Tell the Rust side where to put config + CA + cache. Must be called
      * once before any other call. The path we hand over is our app's
      * private filesDir — guaranteed writable, auto-cleaned on uninstall.
@@ -191,4 +204,104 @@ object Native {
         cliArgs: String,
         tunMtu: Int,
     ): Int
+
+    // ── Drive-mode setup ──────────────────────────────────────────────
+    //
+    // Six entries that the Drive setup UI in HomeScreen.kt drives.
+    // OAuth uses the device-code flow (RFC 8628) on Android because
+    // Google's Desktop-app OAuth client type — which is what users
+    // register per docs/drive_oauth_setup.md — does NOT permit custom
+    // scheme redirects (`rahgozar://oauth/cb` would 400 with
+    // `redirect_uri_mismatch`). The device-code flow has no inbound
+    // URI to handle: the user opens the verification URL on any device,
+    // enters the user_code, and Android polls until Google reports
+    // approval.
+
+    /**
+     * Start an RFC 8628 device-code OAuth flow. Reads
+     * `oauth_client_id` from `config.json::drive` (the BYO credential
+     * the user pasted in the Drive setup screen) and POSTs
+     * `oauth2.googleapis.com/device/code`. Returns:
+     *
+     *   `{"ok":true, "flow_token":"...", "user_code":"ABCD-EFGH",`
+     *    `"verification_url":"https://www.google.com/device",`
+     *    `"expires_in_secs":1800, "interval_secs":5}`
+     *   `{"ok":false, "error":"..."}`
+     *
+     * The UI displays `user_code` + `verification_url` to the user
+     * (with Open / Copy buttons), then polls `driveOauthPollFlow` at
+     * `interval_secs` until completion. `flow_token` is the opaque
+     * handle that identifies this in-flight flow on subsequent calls.
+     *
+     * BLOCKS for the device/code HTTP round-trip (~500 ms typical).
+     * Call from a background dispatcher.
+     */
+    external fun driveOauthDeviceCodeStart(): String
+
+    /**
+     * Poll one iteration of the device-code flow. Hits Google's
+     * `/token` endpoint with the device_code stashed against
+     * `flowToken`. Outcomes:
+     *
+     *   `{"status":"pending"}`        — user hasn't entered code yet
+     *   `{"status":"slow_down","interval_secs":N}` — back off & retry
+     *   `{"status":"ok"}`             — refresh token persisted to config
+     *   `{"status":"denied"}`         — user clicked Cancel on consent
+     *   `{"status":"expired"}`        — device_code TTL exhausted
+     *   `{"status":"transient_error","error":"..."}` — retry next tick
+     *   `{"status":"error","error":"..."}`
+     *   `{"status":"unknown"}`        — flow_token not in registry
+     *
+     * On `ok` the refresh token has already been written into
+     * `config.json::drive::oauth_refresh_token`; the UI just needs to
+     * re-read the config to flip its "Signed in" indicator.
+     *
+     * BLOCKS for one /token round-trip (~200 ms typical). Call from a
+     * background dispatcher on the timer interval the previous response
+     * returned.
+     */
+    external fun driveOauthPollFlow(flowToken: String): String
+
+    /**
+     * Drop an in-flight device-code flow. Called when the user taps
+     * Cancel in the device-code dialog. No-op if the flow is already
+     * complete or unknown. Returns `{"ok":true}` either way.
+     *
+     * NON-BLOCKING — just removes the entry from the in-memory registry.
+     */
+    external fun driveOauthCancelFlow(flowToken: String): String
+
+    /**
+     * `files.create` with the Drive folder MIME type, against the
+     * OAuth account currently persisted in config.json. The UI
+     * surfaces the returned folder ID by pasting it into the Drive
+     * form's folder_id field. Result shape:
+     *
+     *   `{"ok": true,  "folder_id": "..."}`
+     *   `{"ok": false, "error": "..."}`
+     *
+     * BLOCKS for the duration of the OAuth refresh + files.create
+     * HTTP round-trips (~1 s typical). Call from a background thread.
+     */
+    external fun driveCreateFolder(name: String): String
+
+    /**
+     * OAuth refresh + `files.list` against the configured folder.
+     * Confirms both that the saved refresh token still works AND
+     * that the saved folder ID is reachable. Result shape:
+     *
+     *   `{"ok": true,  "folder_id": "...", "files_count": 42}`
+     *   `{"ok": false, "error": "..."}`
+     *
+     * BLOCKS (~1 s typical). Call from a background thread.
+     */
+    external fun driveTestConnection(): String
+
+    /**
+     * Pure bech32m parse of the relay public key. Empty string on
+     * success; human-readable error message on failure. The Drive
+     * form calls this on every keystroke for live validation — the
+     * IPC cost is negligible (pure compute, no I/O).
+     */
+    external fun driveValidateRelayPubkey(relayPubkey: String): String
 }

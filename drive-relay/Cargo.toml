@@ -1,0 +1,56 @@
+[package]
+name = "rahgozar-drive-relay"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Drive-mailbox relay server for rahgozar — runs on a VPS, polls a shared Google Drive folder, dials real destinations, forwards bytes."
+publish = false
+
+[[bin]]
+name = "rahgozar-drive-relay"
+path = "src/main.rs"
+
+[lib]
+name = "rahgozar_drive_relay"
+path = "src/lib.rs"
+
+[dependencies]
+# Path-dep on the root rahgozar crate gives us drive_crypto +
+# drive_oauth + drive_api without code duplication. Heavy at compile
+# time (rahgozar pulls in tokio-rustls, h2, rcgen, etc. — all
+# strippable by LTO in the release profile defined at the workspace
+# root) but the alternative is duplicating ~2000 lines of crypto +
+# OAuth + REST that already have full test coverage in `rahgozar`.
+# If sharing becomes painful we can extract those three modules to
+# a new `drive-shared` workspace member later.
+rahgozar = { path = ".." }
+
+# Wire format shared with the rahgozar client.
+drive-wire = { path = "../drive-wire" }
+
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "signal", "sync", "fs"] }
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+thiserror = "2"
+rand = "0.8"
+bytes = "1"
+
+# `reqwest::Client` is part of the `TokenCache` API (it threads the
+# same client through OAuth refresh + Drive REST calls). Matches the
+# version pinned in the root rahgozar crate.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "gzip", "stream", "query"] }
+# `time::OffsetDateTime` is what `DriveFile::modified_time` parses
+# into; the orphan reaper compares against `now()`.
+time = "0.3"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
+# Mock HTTP server for the Drive REST + OAuth endpoints in
+# `tests/drive_e2e.rs`. 0.6 has the `Respond` trait we use for the
+# stateful upload/list/get/delete handlers (a Drive file added by
+# one request must be visible to later list/get/delete calls).
+wiremock = "0.6"

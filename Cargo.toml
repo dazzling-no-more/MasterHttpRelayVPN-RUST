@@ -2,10 +2,23 @@
 # Multi-crate workspace so the new Tauri desktop app at `desktop/src-tauri`
 # can path-depend on the rahgozar core via `rahgozar = { path = "../.." }`.
 # The root crate (rahgozar core + CLI + legacy egui UI bin) is still the
-# primary package; `desktop/src-tauri` is the only additional member.
+# primary package; the additional members exist so dependent crates
+# share the root target dir and dep-graph unification.
+#   - desktop/src-tauri — Tauri 2 desktop UI (Rust + Svelte/Tailwind).
+#   - drive-wire        — wire-format types shared between the Drive-mode
+#                         client (this crate) and `rahgozar-drive-relay`.
+#                         Kept dep-light so it cross-compiles to every
+#                         release target without dep churn.
+#   - drive-relay       — `rahgozar-drive-relay` VPS-side server binary.
+#                         Path-deps back on `rahgozar` so it reuses the
+#                         in-crate `drive_crypto` / `drive_oauth` /
+#                         `drive_api` modules without duplication.
+#                         Compile-time bloat is real (rahgozar's full
+#                         dep tree gets pulled in); LTO strips the
+#                         proxy/tunnel code that drive-relay never calls.
 # `resolver = "2"` is required for the dep-feature unification Tauri 2
 # expects across the workspace.
-members = ["desktop/src-tauri"]
+members = ["desktop/src-tauri", "drive-wire", "drive-relay"]
 resolver = "2"
 
 [package]
@@ -101,6 +114,51 @@ portable-atomic = { version = "1", features = ["fallback"] }
 # snapshot of all three pointers with one atomic op.
 arc-swap = "1"
 
+# Drive-mode crypto stack (Skirk technique — `src/drive_crypto.rs`).
+# All pure-Rust RustCrypto crates so the Android cdylib + mipsel-musl
+# router cross-compile inherits zero new C toolchain pain. Trade-off
+# vs ring (~10% slower on x86_64): irrelevant in a transport bounded
+# by Drive's ~hundreds-of-ms RTT floor. libsodium (Skirk's upstream
+# choice) would mean a C dep per target — declined.
+#
+#   chacha20poly1305 — IETF AEAD, RFC 8439. 12-byte nonce per the spec.
+#   x25519-dalek     — ECDH for the session-keys derivation. `static_secrets`
+#                      feature exposes `StaticSecret` (the relay's long-lived
+#                      keypair); `EphemeralSecret` is in the default surface.
+#   hkdf + sha2      — directional-key derivation off the shared X25519 secret.
+#   bech32           — typo-resistant pubkey encoding (`rgdr1...`) for the
+#                      relay's published public key. Bech32m variant.
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc"] }
+x25519-dalek = { version = "2", default-features = false, features = ["static_secrets", "zeroize"] }
+hkdf = "0.13"
+sha2 = "0.11"
+bech32 = "0.11"
+
+# HTTP client for the Drive REST + OAuth endpoints. Matches the
+# `reqwest` 0.13 that tauri 2 already pulls so the workspace resolver
+# unifies on one version. The `rustls-no-provider` feature (vs the
+# plain `rustls` feature) is the critical pick:
+#   - `rustls` in reqwest 0.13 enables `__rustls-aws-lc-rs` which
+#     pulls `aws-lc-sys` (cmake + C build). That breaks the
+#     `mipsel-unknown-linux-musl` OpenWRT cross-compile we ship
+#     binaries for — same constraint that motivated the
+#     `default-features = false` + `features = ["ring", ...]` setup
+#     on `rustls` / `tokio-rustls` at the top of this file.
+#   - `rustls-no-provider` leaves the choice of crypto provider to
+#     the binary. `drive_oauth::install_default_crypto_provider()`
+#     wires up the same `ring` provider the rest of the codebase
+#     already uses, on first call.
+# `json` for `Response::json()`, `gzip` because Google occasionally
+# returns gzip-compressed responses, `stream` for
+# `Response::bytes_stream()` (forthcoming `files.get` downloads in
+# `drive_api`).
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json", "gzip", "stream", "query"] }
+
+# Path-dep on the in-workspace `drive-wire` crate so client (this
+# crate) and relay (forthcoming `drive-relay/`) reuse the same
+# wire-format types. Cheap: `drive-wire` only pulls `bytes`.
+drive-wire = { path = "drive-wire" }
+
 # eframe / egui were dropped in v2.4 — the desktop UI moved to Tauri at
 # `desktop/` (Rust backend + Svelte/Tailwind frontend) so Persian text
 # shaping, light/dark theming, and modern web-style layout all work
@@ -139,7 +197,28 @@ tempfile = "3"
 # traffic black-holes (symptom: Chrome shows DNS_PROBE_STARTED).
 [target.'cfg(target_os = "android")'.dependencies]
 jni = { version = "0.21", default-features = false }
+# Renamed second jni version, kept ALONGSIDE `jni = 0.21` above.
+# rustls-platform-verifier 0.7's public API takes jni 0.22 types
+# (`Env`, `JObject`, etc.) and bumping our main jni dep to 0.22 would
+# cascade through every JNI extern in `android_jni.rs` (the 0.21 → 0.22
+# upgrade is a significant API rework, not a drop-in). So we keep
+# 0.21 as the primary, pull 0.22 in under a `jni_v22` alias just for
+# the `initAndroidTls` shim, and bridge via FFI-stable raw `*mut sys::JNIEnv`
+# / `sys::jobject` pointers. The two jni crates link as separate
+# compilation units; ~150 KB of duplicated code in the cdylib.
+jni_v22 = { package = "jni", version = "0.22", default-features = false }
 tun2proxy = { version = "0.7", default-features = false, features = ["udpgw"] }
+# Android-only: rustls-platform-verifier is what reqwest 0.13 + rustls
+# delegates cert chain verification to. On Linux/macOS/Windows it
+# auto-bootstraps off the system cert store; on Android it needs an
+# explicit init with a JavaVM + Application context BEFORE any TLS
+# work, otherwise it panics with "Expect rustls-platform-verifier to
+# be initialized" and the process aborts. Called from
+# `Java_com_dazzlingnomore_mhrv_Native_initAndroidTls` which
+# `RahgozarApp.onCreate` invokes once per process. Pulled in as a
+# direct dep so we can name it in Rust; it was already transitively
+# present via reqwest's default features.
+rustls-platform-verifier = "0.7"
 
 [dev-dependencies]
 # Used in mitm tests to sanity-check the cert extensions we emit.

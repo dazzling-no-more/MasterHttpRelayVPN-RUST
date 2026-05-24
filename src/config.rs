@@ -37,6 +37,15 @@ pub enum Mode {
     /// against IP-level blocks (the destination must still be
     /// reachable from the user's network).
     LocalBypass,
+    /// Drive-mailbox transport (Skirk technique): every TLS CONNECT
+    /// is multiplexed into encrypted frames uploaded as files to a
+    /// shared Google Drive folder. A separate `rahgozar-drive-relay`
+    /// binary on a VPS the user controls polls the folder, dials the
+    /// real destination, and writes response frames back. The Iranian
+    /// ISP only sees TLS to `*.google.com` (the same cover Apps Script
+    /// mode relies on). Requires `drive.oauth_refresh_token`,
+    /// `drive.folder_id`, and `drive.relay_pubkey`. No MITM CA install.
+    Drive,
 }
 
 impl Mode {
@@ -46,6 +55,7 @@ impl Mode {
             Mode::Direct => "direct",
             Mode::Full => "full",
             Mode::LocalBypass => "local_bypass",
+            Mode::Drive => "drive",
         }
     }
 
@@ -81,6 +91,22 @@ impl Mode {
     pub fn uses_mitm_ca(self) -> bool {
         matches!(self, Mode::AppsScript | Mode::Direct)
     }
+
+    /// True iff this mode tunnels through the Google Drive mailbox
+    /// (Skirk technique) and therefore requires a non-empty
+    /// `drive.oauth_refresh_token`, `drive.folder_id`, and
+    /// `drive.relay_pubkey`. Single source of truth — same pattern as
+    /// [`uses_apps_script_relay`] above; adding a future "Drive +
+    /// MITM" hybrid would be a deliberate edit here, and the test
+    /// `mode_uses_drive_relay_predicate` pins the truth table.
+    ///
+    /// Used by the config validator (rejecting Drive mode without
+    /// OAuth credentials at load time, not first connect) and by
+    /// `proxy_server::build_mode_state` (deciding whether to spawn
+    /// the [`crate::drive_client::DriveMux`] background poller).
+    pub fn uses_drive_relay(self) -> bool {
+        matches!(self, Mode::Drive)
+    }
 }
 
 impl std::str::FromStr for Mode {
@@ -94,8 +120,9 @@ impl std::str::FromStr for Mode {
             "google_only" => Ok(Mode::Direct),
             "full" => Ok(Mode::Full),
             "local_bypass" => Ok(Mode::LocalBypass),
+            "drive" => Ok(Mode::Drive),
             other => Err(ConfigError::Invalid(format!(
-                "unknown mode '{}' (expected 'apps_script', 'direct', 'full', or 'local_bypass')",
+                "unknown mode '{}' (expected 'apps_script', 'direct', 'full', 'local_bypass', or 'drive')",
                 other
             ))),
         }
@@ -710,6 +737,15 @@ pub struct Config {
     /// Setup walkthrough at `assets/exit_node/README.md`. Default off.
     #[serde(default)]
     pub exit_node: ExitNodeConfig,
+
+    /// Configuration for Drive-mailbox transport (mode=`drive`). Only
+    /// the three credential fields (`oauth_refresh_token`, `folder_id`,
+    /// `relay_pubkey`) are required; the poll/concurrency knobs have
+    /// sensible defaults. See [`DriveConfig`] for the per-field rules.
+    /// Setup walkthrough lands at `docs/drive_mode.md` once the
+    /// transport ships.
+    #[serde(default)]
+    pub drive: DriveConfig,
 }
 
 /// Configuration for the optional second-hop exit node.
@@ -770,6 +806,126 @@ pub struct ExitNodeConfig {
 
 fn default_exit_node_mode() -> String {
     "selective".into()
+}
+
+/// Configuration for the Drive-mailbox transport (`mode = "drive"`).
+///
+/// Architecture: every TLS CONNECT is multiplexed into encrypted
+/// frames uploaded as files to the shared `folder_id`; a separate
+/// `rahgozar-drive-relay` binary on a VPS abroad polls the folder,
+/// dials the real destination, and writes response frames back.
+/// Both ends authenticate to the same Google account via OAuth
+/// (`drive.file` scope only — the app sees only files it creates,
+/// not the user's whole Drive). The relay's long-lived X25519 public
+/// key (`relay_pubkey`) is published out-of-band by
+/// `rahgozar-drive-relay keygen`.
+///
+/// `#[non_exhaustive]` rationale matches `ExitNodeConfig` — the
+/// transport is still maturing and cross-crate consumers should
+/// round-trip via serde rather than struct literals.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[non_exhaustive]
+pub struct DriveConfig {
+    /// OAuth 2.0 client_id from the user's own Google Cloud project.
+    /// rahgozar is **BYO ("bring your own") OAuth**: every user
+    /// registers their own installed-app OAuth client in Google Cloud
+    /// Console (see `docs/drive_oauth_setup.md` for the walkthrough)
+    /// and pastes the credentials here. Rationale: an unverified
+    /// OAuth client has a 100-user cap on the `drive.file` scope —
+    /// BYO sidesteps it entirely because every user gets their own
+    /// 100 they never hit. Required for `mode=drive`; `validate()`
+    /// rejects an empty value with a pointer to the setup guide.
+    #[serde(default)]
+    pub oauth_client_id: String,
+
+    /// OAuth 2.0 client_secret paired with [`Self::oauth_client_id`].
+    /// Per RFC 8252 §8.6 this is not actually secret for installed
+    /// apps (anyone with the binary can extract it), but Google's
+    /// token endpoint still requires it. Treated as a credential at
+    /// rest — stored plaintext alongside `oauth_refresh_token` and
+    /// `exit_node.psk`. Required for `mode=drive`.
+    #[serde(default)]
+    pub oauth_client_secret: String,
+
+    /// OAuth 2.0 refresh token for the Drive API. Obtained via the
+    /// PKCE installed-app flow (desktop / Android Tauri command) or
+    /// the RFC 8628 device-code flow (OpenWRT / headless), running
+    /// against the user-supplied [`Self::oauth_client_id`] +
+    /// [`Self::oauth_client_secret`]. Stored plaintext alongside
+    /// `auth_key` and `exit_node.psk` — the `drive.file` scope
+    /// limits exposure to files this OAuth client itself created.
+    /// Documented trade-off in `docs/drive_mode.md`.
+    #[serde(default)]
+    pub oauth_refresh_token: String,
+
+    /// Drive folder ID (the bare ID, not a URL — what
+    /// `files.create(mimeType=application/vnd.google-apps.folder)`
+    /// returns). Both client and relay must use the same folder ID;
+    /// session-isolation happens via the per-frame `sid` prefix in
+    /// the filename grammar, not via per-session folders.
+    #[serde(default)]
+    pub folder_id: String,
+
+    /// Relay's long-lived X25519 public key, bech32m-encoded (HRP
+    /// `rgdr1...`, ~63 chars). Printed by `rahgozar-drive-relay
+    /// keygen` on the VPS; user pastes into the client UI. Bech32m
+    /// has a checksum so a one-character typo fails the parser
+    /// cleanly instead of silently producing a Diffie-Hellman with
+    /// the wrong peer.
+    #[serde(default)]
+    pub relay_pubkey: String,
+
+    /// Baseline poll interval (milliseconds) for the shared Drive
+    /// `files.list` poller. The poller adapts: drops to a faster
+    /// floor after a non-empty batch (pipelining), ramps up after
+    /// consecutive empty polls (idle), so this is the *floor*
+    /// during active traffic plus the starting tick for an idle
+    /// session. Default 300 — keeps the poller well under Drive's
+    /// 10 QPS sustained budget while leaving headroom for upload /
+    /// download / delete calls on the same account.
+    #[serde(default = "default_drive_poll_interval_ms")]
+    pub poll_interval_ms: u32,
+
+    /// Maximum concurrent file uploads / downloads kept in flight by
+    /// the shared poller's worker pool. Bounded so a burst of inbound
+    /// files can't blow past Drive's per-user QPS quota — at the
+    /// default 8 plus the poll cost, the steady-state ceiling is
+    /// ~9 QPS, comfortably below 10. Bump only if you understand
+    /// how it interacts with `poll_interval_ms`.
+    #[serde(default = "default_drive_max_concurrent_uploads")]
+    pub max_concurrent_uploads: u8,
+}
+
+fn default_drive_poll_interval_ms() -> u32 {
+    300
+}
+
+fn default_drive_max_concurrent_uploads() -> u8 {
+    8
+}
+
+impl Default for DriveConfig {
+    /// Match the deserialize-from-`{}` shape. A `#[derive(Default)]`
+    /// would emit `u32::default() = 0` for the tuning knobs, which is
+    /// then rejected by `Config::validate` ("poll_interval_ms must be
+    /// > 0") with a confusing error message the moment the user tries
+    /// to switch into Drive mode — the parent's `#[serde(default)]`
+    /// on the `drive` field calls THIS impl, not the per-field
+    /// `#[serde(default = "...")]` annotations (those only fire on
+    /// missing-field deserialization). Same defaults as the per-field
+    /// annotations so a missing-section JSON and an empty-section
+    /// `{"drive":{}}` JSON produce identical configs.
+    fn default() -> Self {
+        Self {
+            oauth_client_id: String::new(),
+            oauth_client_secret: String::new(),
+            oauth_refresh_token: String::new(),
+            folder_id: String::new(),
+            relay_pubkey: String::new(),
+            poll_interval_ms: default_drive_poll_interval_ms(),
+            max_concurrent_uploads: default_drive_max_concurrent_uploads(),
+        }
+    }
 }
 
 /// Configuration for the TLS-fragmentation Direct Mode (port of zyrln's
@@ -1232,6 +1388,94 @@ impl Config {
                 }
             }
         }
+        if mode.uses_drive_relay() {
+            if self.drive.oauth_client_id.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "drive.oauth_client_id is required for mode=drive — rahgozar is BYO OAuth: \
+                     register your own installed-app client in Google Cloud Console and paste \
+                     the client_id here. See docs/drive_oauth_setup.md for the walkthrough."
+                        .into(),
+                ));
+            }
+            if self.drive.oauth_client_secret.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "drive.oauth_client_secret is required for mode=drive — paste it next to \
+                     drive.oauth_client_id. See docs/drive_oauth_setup.md for the walkthrough."
+                        .into(),
+                ));
+            }
+            if self.drive.oauth_refresh_token.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "drive.oauth_refresh_token is required for mode=drive — run the OAuth flow first \
+                     (Sign in with Google in the desktop UI, or `rahgozar-drive-relay oauth device-code` \
+                     on a headless host)"
+                        .into(),
+                ));
+            }
+            if self.drive.folder_id.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "drive.folder_id is required for mode=drive — create the shared mailbox folder \
+                     in the same Google account, paste the bare folder ID (not the URL)"
+                        .into(),
+                ));
+            }
+            if self.drive.relay_pubkey.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "drive.relay_pubkey is required for mode=drive — run `rahgozar-drive-relay keygen` \
+                     on your VPS and paste the bech32m-encoded public key it prints (HRP `rgdr1`)"
+                        .into(),
+                ));
+            }
+            // Parse the bech32m pubkey eagerly so a typo / wrong-HRP
+            // / wrong-length fails the SAME load path the UI + CLI
+            // both use, rather than landing as a runtime error on
+            // first connect. Single source of truth: `drive_crypto`.
+            // Same fail-fast contract as the `fronting_groups[*].sni`
+            // ServerName parse at line ~1272 below.
+            crate::drive_crypto::RelayPubkey::from_bech32m(&self.drive.relay_pubkey)
+                .map_err(|e| ConfigError::Invalid(format!("drive.relay_pubkey: {}", e)))?;
+            // Tuning knobs must be > 0 to be usable. 0 would either
+            // busy-loop the poller (poll_interval_ms) or stall every
+            // upload (max_concurrent_uploads). Mirrors the relay-side
+            // guard in `RelayConfig::validate`.
+            if self.drive.poll_interval_ms == 0 {
+                return Err(ConfigError::Invalid(
+                    "drive.poll_interval_ms must be > 0 (would otherwise busy-loop the poller)"
+                        .into(),
+                ));
+            }
+            if self.drive.max_concurrent_uploads == 0 {
+                return Err(ConfigError::Invalid(
+                    "drive.max_concurrent_uploads must be > 0 (would otherwise stall every upload)"
+                        .into(),
+                ));
+            }
+            // Drive endpoints (googleapis.com / oauth2.googleapis.com /
+            // accounts.google.com) MUST resolve via the `google_ip`
+            // override on the Iran client side — system DNS is the
+            // poisoned/blocked ISP DNS we exist to bypass. Without a
+            // valid IP here, `build_drive_http_client` falls back to
+            // system DNS with only a tracing warning; the user's
+            // entire Drive transport leaks to the ISP. Reject up
+            // front. Note: Apps Script mode tolerates an empty
+            // google_ip (operator may rely on system DNS for
+            // bootstrapping); Drive mode does not.
+            let gip = self.google_ip.trim();
+            if gip.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "google_ip is required for mode=drive — Drive endpoints must resolve via this \
+                     pinned IP, not system DNS (the ISP DNS Drive Mode exists to bypass). Set a \
+                     known-working Google edge IP (e.g. one discovered via `cdn_discover`)."
+                        .into(),
+                ));
+            }
+            if gip.parse::<std::net::IpAddr>().is_err() {
+                return Err(ConfigError::Invalid(format!(
+                    "google_ip {gip:?} is not a valid IP address — would silently fall back to \
+                     system DNS for Drive endpoints, leaking the transport to the ISP"
+                )));
+            }
+        }
         if self.scan_batch_size == 0 {
             return Err(ConfigError::Invalid(
                 "scan_batch_size must be greater than 0".into(),
@@ -1629,6 +1873,10 @@ mod tests {
             !Mode::LocalBypass.uses_mitm_ca(),
             "local_bypass passes the real ClientHello through (no MITM)"
         );
+        assert!(
+            !Mode::Drive.uses_mitm_ca(),
+            "drive transports encrypted frames through Google Drive, no MITM CA"
+        );
     }
 
     #[test]
@@ -1643,6 +1891,7 @@ mod tests {
             Mode::Direct,
             Mode::Full,
             Mode::LocalBypass,
+            Mode::Drive,
         ] {
             let parsed: Mode = m
                 .as_str()
@@ -2120,6 +2369,165 @@ mod tests {
         }"#;
         let cfg: Config = serde_json::from_str(s).unwrap();
         cfg.validate().expect("well-formed patterns must validate");
+    }
+
+    // ── Drive-mode validation ───────────────────────────────────────
+    //
+    // Each test starts from a complete Drive config and mutates ONE
+    // field to the invalid value, so a failure trivially points at
+    // which guard fired. Mirrors the existing
+    // `validate_config_rejects_bad_direct_mode_entries` shape.
+
+    /// Build a known-good Drive-mode config, using a freshly minted
+    /// relay keypair so the bech32m pubkey is real.
+    fn well_formed_drive_config() -> Config {
+        let pk = crate::drive_crypto::RelaySecret::generate(rand::rngs::OsRng).public_key();
+        let s = format!(
+            r#"{{
+                "mode": "drive",
+                "drive": {{
+                    "oauth_client_id": "1234567890-test.apps.googleusercontent.com",
+                    "oauth_client_secret": "GOCSPX-test-client-secret",
+                    "oauth_refresh_token": "1//xxxxxxxxxxxxxxxxxxxx",
+                    "folder_id": "0AABBccDDeeFFggHHiiJJkkLL",
+                    "relay_pubkey": "{}"
+                }}
+            }}"#,
+            pk.to_bech32m()
+        );
+        serde_json::from_str(&s).unwrap()
+    }
+
+    #[test]
+    fn validate_accepts_well_formed_drive_config() {
+        let cfg = well_formed_drive_config();
+        cfg.validate()
+            .expect("well-formed Drive config must validate");
+    }
+
+    #[test]
+    fn validate_rejects_drive_without_oauth_client_id() {
+        let mut cfg = well_formed_drive_config();
+        cfg.drive.oauth_client_id.clear();
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("oauth_client_id"),
+            "error must name the missing field; got {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_drive_without_oauth_client_secret() {
+        let mut cfg = well_formed_drive_config();
+        cfg.drive.oauth_client_secret.clear();
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("oauth_client_secret"),
+            "error must name the missing field; got {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_drive_without_oauth_refresh_token() {
+        let mut cfg = well_formed_drive_config();
+        cfg.drive.oauth_refresh_token.clear();
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("oauth_refresh_token"),
+            "error must name the missing field; got {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_drive_without_folder_id() {
+        let mut cfg = well_formed_drive_config();
+        cfg.drive.folder_id.clear();
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("folder_id"),
+            "error must name the missing field; got {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_drive_without_relay_pubkey() {
+        let mut cfg = well_formed_drive_config();
+        cfg.drive.relay_pubkey.clear();
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("relay_pubkey"),
+            "error must name the missing field; got {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_drive_with_garbage_relay_pubkey() {
+        let mut cfg = well_formed_drive_config();
+        cfg.drive.relay_pubkey = "not bech32m at all".to_string();
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("relay_pubkey") && msg.to_lowercase().contains("bech32m"),
+            "error must surface the bech32m parse failure; got {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_drive_with_wrong_hrp_relay_pubkey() {
+        let mut cfg = well_formed_drive_config();
+        // Mint a 32-byte payload with the wrong HRP. The shape is
+        // valid bech32m but the HRP doesn't match `rgdr`, so the
+        // validator must refuse — that's what catches "user pasted
+        // a bitcoin address / lightning invoice / etc.".
+        let hrp = bech32::Hrp::parse_unchecked("ln");
+        let bytes = [0u8; 32];
+        cfg.drive.relay_pubkey = bech32::encode::<bech32::Bech32m>(hrp, &bytes).unwrap();
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("relay_pubkey") && msg.contains("HRP"),
+            "error must call out the wrong HRP; got {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_drive_with_empty_google_ip() {
+        let mut cfg = well_formed_drive_config();
+        cfg.google_ip.clear();
+        let err = cfg.validate().unwrap_err();
+        assert!(
+            format!("{err}").contains("google_ip"),
+            "error must name the missing google_ip; got {err}"
+        );
+    }
+
+    #[test]
+    fn validate_rejects_drive_with_malformed_google_ip() {
+        let mut cfg = well_formed_drive_config();
+        cfg.google_ip = "not-an-ip".into();
+        let err = cfg.validate().unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("google_ip") && msg.contains("not a valid IP"),
+            "error must call out the malformed IP; got {err}"
+        );
+    }
+
+    #[test]
+    fn validate_skips_drive_checks_in_other_modes() {
+        // Same incomplete drive config, but mode=direct. The drive
+        // checks must NOT fire — `mode.uses_drive_relay()` gates them.
+        let s = r#"{
+            "mode": "direct",
+            "drive": {
+                "oauth_refresh_token": "",
+                "folder_id": "",
+                "relay_pubkey": ""
+            }
+        }"#;
+        let cfg: Config = serde_json::from_str(s).unwrap();
+        cfg.validate()
+            .expect("drive checks must be skipped when mode != drive");
     }
 }
 

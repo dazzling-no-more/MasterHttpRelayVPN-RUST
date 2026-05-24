@@ -151,6 +151,20 @@ dependencies {
     implementation("com.google.zxing:core:3.5.3")
     implementation("com.journeyapps:zxing-android-embedded:4.3.0")
 
+    // rustls-platform-verifier Android companion (Kotlin helper class
+    // that bridges TLS cert chain validation to Android's KeyStore).
+    // The Rust crate ships the prebuilt AAR inside its `maven/`
+    // subdirectory, but we copy it into the project's `libs/` to
+    // avoid depending on the cargo registry's extraction layout at
+    // build time. Bumped together with the Rust crate version —
+    // re-copy the AAR from `~/.cargo/registry/src/.../rustls-platform-verifier-android-X.Y.Z/maven/...`
+    // when bumping `rustls-platform-verifier` in the root Cargo.toml.
+    // Without this AAR on the classpath, every TLS handshake logs
+    // `failed to call native verifier: Error` (the JNI lookup of the
+    // Kotlin helper class fails) and reqwest surfaces it as
+    // `HTTP Transport`.
+    implementation(files("libs/rustls-platform-verifier-0.1.1.aar"))
+
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 

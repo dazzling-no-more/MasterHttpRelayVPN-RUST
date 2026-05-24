@@ -33,7 +33,7 @@ enum Command {
 
 fn print_help() {
     println!(
-        "rahgozar {} — Rust port of MasterHttpRelayVPN (apps_script mode only)
+        "rahgozar {} — Rust port of MasterHttpRelayVPN (multi-mode DPI bypass)
 
 USAGE:
     rahgozar [OPTIONS]                  Start the proxy server (default)
@@ -329,6 +329,22 @@ async fn main() -> ExitCode {
                  segments (no Apps Script, no SNI-rewrite, no MITM CA). \
                  Defeats DPI only — IP-blocked destinations remain \
                  unreachable. Non-TLS traffic passes through raw."
+            );
+        }
+        rahgozar::config::Mode::Drive => {
+            tracing::warn!(
+                "drive mode: every TLS CONNECT is multiplexed into encrypted \
+                 frames uploaded to Google Drive folder {} and dispatched by \
+                 a separate `rahgozar-drive-relay` binary running on a VPS \
+                 you control. No MITM CA install. Requires the BYO OAuth \
+                 client_id + client_secret + refresh token + bech32m relay \
+                 public key configured under `drive` in config.json. \
+                 See docs/drive_mode.md + docs/drive_oauth_setup.md.",
+                if config.drive.folder_id.is_empty() {
+                    "<unset>"
+                } else {
+                    config.drive.folder_id.as_str()
+                }
             );
         }
     }

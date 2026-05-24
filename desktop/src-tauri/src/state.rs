@@ -16,7 +16,7 @@
 //     would otherwise be plain sync functions, which keeps the
 //     `#[tauri::command]` signatures readable.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -42,6 +42,44 @@ pub struct AppState {
     /// (frontend's initial scroll-back fetch) and tailed via
     /// `rahgozar:log` events for the live stream.
     pub log: Mutex<VecDeque<String>>,
+    /// In-flight Drive-mode OAuth flows, keyed by the `state` token
+    /// returned by `drive_oauth_start`. Each entry holds the
+    /// `oneshot::Receiver` half of the channel the loopback listener
+    /// task will fire when the user completes (or aborts) the
+    /// browser flow.
+    ///
+    /// `drive_oauth_start` inserts; `drive_oauth_complete` removes
+    /// (takes ownership of the Receiver) and awaits it with a
+    /// timeout. Held in a separate `Mutex` from `inner` because
+    /// OAuth flow lifecycle is orthogonal to proxy lifecycle —
+    /// signing in / out doesn't affect a running proxy and vice
+    /// versa.
+    pub oauth_pending: Mutex<HashMap<String, oneshot::Receiver<Result<OAuthCompletion, String>>>>,
+}
+
+/// Successful outcome of a Drive-mode OAuth flow. Returned by
+/// `drive_oauth_complete` to the frontend.
+///
+/// `email` is intentionally empty under the current `drive.file`
+/// scope — Google's `/userinfo` endpoint requires the `email` /
+/// `openid` scope to populate it. Adding those scopes just for a
+/// display string would broaden the OAuth grant beyond what the
+/// transport actually needs, so v1 leaves the field unpopulated.
+/// The frontend can surface "Signed in" without naming the
+/// account; the user already saw which Google account they picked
+/// during the browser flow.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OAuthCompletion {
+    pub refresh_token: String,
+    /// OAuth client_id used to mint `refresh_token`. Kept server-side so
+    /// completion can refuse to save a token under a different saved client.
+    #[serde(skip_serializing)]
+    pub oauth_client_id: String,
+    /// OAuth client_secret paired with [`Self::oauth_client_id`].
+    #[serde(skip_serializing)]
+    pub oauth_client_secret: String,
+    #[serde(default)]
+    pub email: String,
 }
 
 /// Mutable bits, all under one mutex so reading `running` + `started_at`
@@ -89,6 +127,7 @@ impl AppState {
                 running_state: None,
             }),
             log: Mutex::new(VecDeque::with_capacity(LOG_MAX)),
+            oauth_pending: Mutex::new(HashMap::new()),
         }
     }
 

@@ -427,17 +427,11 @@ class RahgozarVpnService : VpnService() {
             // the notification keeps showing the ports line.
             startForeground(NOTIF_ID, buildNotif(NotifState.RUNNING, statsJson = ""))
 
-            // Deployment ID + auth key are required for apps_script and full
-            // modes — both talk to Apps Script. Other modes (direct,
-            // local_bypass) run without them. Defers to
-            // [Mode.usesAppsScriptRelay] rather than open-coding the
-            // mode list so a future cred-free mode picks the right
-            // side without another allowlist edit here. Closes #73
-            // regression where direct-mode users hit this branch and
-            // crashed on startForeground timeout.
-            val needsCreds = cfg.mode.usesAppsScriptRelay()
-            if (needsCreds && (!cfg.hasDeploymentId || cfg.authKey.isBlank())) {
-                Log.e(TAG, "Config is incomplete — deployment ID + auth key required for ${cfg.mode}")
+            // Preflight the mode-specific requirements before handing
+            // control to Rust. This mirrors the Connect button gate and
+            // keeps foreground-service startup failures explicit.
+            if (!cfg.canStartCurrentMode) {
+                Log.e(TAG, "Config is incomplete for ${cfg.mode}")
                 try {
                     stopForeground(STOP_FOREGROUND_REMOVE)
                 } catch (_: Throwable) {
@@ -1060,7 +1054,8 @@ class RahgozarVpnService : VpnService() {
      * we show today's call count / bytes / countdown to the Pacific-time
      * quota reset — the trio the user actually cares about for daily
      * Google quota tracking. For modes that don't use the Apps
-     * Script relay (direct / local_bypass — see [Mode.usesAppsScriptRelay])
+     * Script relay (direct / local_bypass / drive — see
+     * [Mode.usesAppsScriptRelay])
      * statsJson is "" and we fall back to the local-listener port info
      * that's been in the notification historically.
      */
