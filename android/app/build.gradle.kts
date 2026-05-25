@@ -8,12 +8,12 @@ plugins {
 
 android {
     namespace = "com.dazzlingnomore.mhrv"
-    compileSdk = 34
+    compileSdk = 35
 
     defaultConfig {
         applicationId = "com.dazzlingnomore.mhrv"
         minSdk = 24 // Android 7.0 — covers 99%+ of live devices.
-        targetSdk = 34
+        targetSdk = 35
         versionCode = 211
         versionName = "2.8.0"
 
@@ -127,14 +127,14 @@ android {
 }
 
 dependencies {
-    val composeBom = platform("androidx.compose:compose-bom:2024.06.00")
+    val composeBom = platform("androidx.compose:compose-bom:2025.04.01")
     implementation(composeBom)
     androidTestImplementation(composeBom)
 
-    implementation("androidx.core:core-ktx:1.13.1")
-    implementation("androidx.activity:activity-compose:1.9.0")
-    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.2")
-    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.2")
+    implementation("androidx.core:core-ktx:1.15.0")
+    implementation("androidx.activity:activity-compose:1.10.1")
+    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.8.7")
+    implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
     // AppCompatDelegate.setApplicationLocales is the only thing we need
     // out of AppCompat — lets us flip the whole app locale at runtime
     // from RahgozarApp.onCreate without touching every composable.
@@ -179,7 +179,7 @@ dependencies {
     //     storage invariants documented in ProfileStore.kt. (#1057)
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")
-    testImplementation("org.robolectric:robolectric:4.13")
+    testImplementation("org.robolectric:robolectric:4.14.1")
     testImplementation("androidx.test:core:1.6.1")
 }
 

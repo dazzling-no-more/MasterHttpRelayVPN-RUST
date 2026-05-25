@@ -61,7 +61,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "2"
 webpki-roots = "0.26"
-rcgen = { version = "0.13", features = ["x509-parser"] }
+rcgen = { version = "0.14", features = ["x509-parser"] }
 rustls-pki-types = "1"
 time = "0.3"
 serde = { version = "1", features = ["derive"] }
@@ -72,6 +72,13 @@ thiserror = "2"
 base64 = "0.22"
 bytes = "1"
 httparse = "1"
+# rand is pinned to 0.8 because x25519-dalek 2 and curve25519-dalek 4 (and
+# chacha20poly1305 0.10) all depend on `rand_core = 0.6`, and `rand_core`
+# traits are major-versioned: a rand 0.10 ThreadRng implements rand_core
+# 0.10's CryptoRng but NOT rand_core 0.6's CryptoRngCore — they're separate
+# trait types. So `StaticSecret::random_from_rng(&mut rand::rng())` would
+# fail to satisfy the trait bound. Bump rand once x25519-dalek 3.x and
+# chacha20poly1305 0.11.x leave pre-release.
 rand = "0.8"
 h2 = "0.4"
 http = "1"
@@ -88,7 +95,15 @@ flate2 = "1"
 # origin-controlled bytes reach the decoder). The 0.8.x line is a
 # separate audit (frame-header API moved) and is deliberately not bumped
 # in the same commit as the security pin.
-brotli = { version = "7", default-features = false, features = ["std"] }
+brotli = { version = "8", default-features = false, features = ["std"] }
+# ruzstd pinned to 0.7.3 (NOT bumped to 0.8). 0.7.3 carries the
+# RUSTSEC-2024-0400 fix AND still exposes `ruzstd::frame::read_frame_header`
+# publicly — we use that for a pre-decode `window_size` cap in
+# `decode_zstd()` (domain_fronter.rs), which catches zstd-bomb frames that
+# declare huge windows BEFORE the decoder pre-allocates the buffer. 0.8
+# moved `decoding::frame` to `pub(crate)`, so the bomb guard would be lost
+# without manually parsing the frame header. Revisit if upstream re-exposes
+# header inspection or after a manual frame-header parser is in place.
 ruzstd = "0.7.3"
 # C-backed encoder + decoder for tunnel-internal batch compression
 # (`zops` / `zr`). Trusted-counterparty path (both sides hold
@@ -97,7 +112,7 @@ ruzstd = "0.7.3"
 # zstd-sys uses cc + pkg-config; messense cross-compile images and CI
 # apt toolchains cover it for all release matrix targets.
 zstd = "0.13"
-directories = "5"
+directories = "6"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 minisign-verify = "0.2"
 # 64-bit atomics on 32-bit MIPS/ARMv5 targets. Rust's std AtomicU64 is
@@ -182,7 +197,7 @@ libc = "0.2"
 #   tar                 → unpack linux/macos *.tar.gz release assets
 #   tempfile            → scratch dir for download/extract before staging
 [target.'cfg(not(target_os = "android"))'.dependencies]
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "4", default-features = false, features = ["deflate"] }
 tar = "0.4.45"
 tempfile = "3"
 
@@ -196,18 +211,8 @@ tempfile = "3"
 # this, VpnService establishes a TUN device nothing reads from and all
 # traffic black-holes (symptom: Chrome shows DNS_PROBE_STARTED).
 [target.'cfg(target_os = "android")'.dependencies]
-jni = { version = "0.21", default-features = false }
-# Renamed second jni version, kept ALONGSIDE `jni = 0.21` above.
-# rustls-platform-verifier 0.7's public API takes jni 0.22 types
-# (`Env`, `JObject`, etc.) and bumping our main jni dep to 0.22 would
-# cascade through every JNI extern in `android_jni.rs` (the 0.21 → 0.22
-# upgrade is a significant API rework, not a drop-in). So we keep
-# 0.21 as the primary, pull 0.22 in under a `jni_v22` alias just for
-# the `initAndroidTls` shim, and bridge via FFI-stable raw `*mut sys::JNIEnv`
-# / `sys::jobject` pointers. The two jni crates link as separate
-# compilation units; ~150 KB of duplicated code in the cdylib.
-jni_v22 = { package = "jni", version = "0.22", default-features = false }
-tun2proxy = { version = "0.7", default-features = false, features = ["udpgw"] }
+jni = { version = "0.22", default-features = false }
+tun2proxy = { version = "0.8", default-features = false, features = ["udpgw"] }
 # Android-only: rustls-platform-verifier is what reqwest 0.13 + rustls
 # delegates cert chain verification to. On Linux/macOS/Windows it
 # auto-bootstraps off the system cert store; on Android it needs an

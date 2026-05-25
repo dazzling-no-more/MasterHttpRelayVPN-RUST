@@ -14,16 +14,14 @@
 
 #![cfg(target_os = "android")]
 
+use jni::objects::{JClass, JObject, JString};
+use jni::sys::{jboolean, jlong, jstring, JNI_FALSE, JNI_TRUE};
+use jni::{Env, EnvUnowned};
 use std::collections::VecDeque;
-use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-
-use jni::objects::{JClass, JString};
-use jni::sys::{jboolean, jlong, jstring, JNI_FALSE, JNI_TRUE};
-use jni::JNIEnv;
 use tokio::runtime::Runtime;
 use tokio::sync::{oneshot, Mutex as AsyncMutex};
 
@@ -154,14 +152,33 @@ fn install_logging_once() {
 }
 
 /// Helper: JString -> String, defaulting to "" on any failure.
-fn jstring_to_string(env: &mut JNIEnv, s: &JString) -> String {
-    env.get_string(s)
-        .map(|j| j.into())
+fn jstring_to_string(env: &Env, s: &JString) -> String {
+    // Use `mutf8_chars(env)` directly: `JString::to_string(env)` would
+    // resolve to `std::string::ToString::to_string` first (JString
+    // implements Display) and call the std method with an arg, which is
+    // an arity mismatch. mutf8_chars yields a `MUTF8Chars` whose `Into<String>`
+    // impl does the MUTF-8 → UTF-8 conversion.
+    s.mutf8_chars(env)
+        .map(|c| c.into())
         .unwrap_or_else(|_| String::new())
 }
 
-fn safe<F: FnOnce() -> R + std::panic::UnwindSafe, R>(default: R, f: F) -> R {
-    std::panic::catch_unwind(f).unwrap_or(default)
+/// Helper: collapse the jni 0.22 entry-point boilerplate for `jstring`-
+/// returning native methods. The closure receives the owned `Env`,
+/// computes a `String`, and we materialise it as a `JString` and surface
+/// the raw `jstring` pointer the JVM expects. Errors during conversion
+/// are logged via `LogErrorAndDefault` and the JVM gets a null jstring
+/// back (the `Default` for `jstring`), which is what the equivalent
+/// jni 0.21 paths returned before.
+fn jstring_return<'local, F>(env: &mut EnvUnowned<'local>, f: F) -> jstring
+where
+    F: FnOnce(&mut Env<'local>) -> String,
+{
+    env.with_env(|env| -> jni::errors::Result<jstring> {
+        let s = f(env);
+        Ok(env.new_string(s)?.into_raw())
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
 /// Build a throwaway tokio runtime for one-shot blocking calls from JNI.
@@ -199,147 +216,116 @@ fn one_shot_runtime() -> Option<Runtime> {
 /// Idempotent: `rustls_platform_verifier::android::init_with_env`
 /// uses a `OnceCell` internally, so a second call is a no-op.
 #[no_mangle]
-pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_initAndroidTls(
-    env: JNIEnv,
-    _class: JClass,
-    context: jni::objects::JObject,
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_initAndroidTls<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    context: JObject<'local>,
 ) {
-    let _ = safe(
-        (),
-        AssertUnwindSafe(|| {
-            install_logging_once();
-            // Bridge jni 0.21 (our main dep) → jni 0.22 (what
-            // rustls-platform-verifier 0.7's public API takes) via the
-            // FFI-stable JNI ABI types (`sys::JNIEnv` / `sys::jobject`).
-            // Both crates' `sys` modules just re-export the canonical
-            // JNI struct definitions from libnativehelper, so the raw
-            // pointers are interchangeable. Wrapping costs nothing at
-            // runtime — `EnvUnowned`/`JObject` are zero-sized wrappers
-            // around the same raw pointer.
-            let raw_env = env.get_raw() as *mut jni_v22::sys::JNIEnv;
-            let raw_ctx = context.as_raw() as jni_v22::sys::jobject;
-            let mut env_v22 = unsafe { jni_v22::EnvUnowned::from_raw(raw_env) };
-            // `with_env` returns `EnvOutcome<T, E>` not a plain Result;
-            // resolve via the built-in `LogErrorAndDefault` policy so
-            // any JNIError gets logged via tracing and the closure's
-            // T = () falls through. `init_with_env` is OnceCell-backed
-            // upstream — a successful first call latches; a failure
-            // here means subsequent TLS calls will abort with the
-            // same "Expect rustls-platform-verifier to be initialized"
-            // message. `JObject::from_raw` in jni 0.22 ties the
-            // wrapper's lifetime to an `&Env`, so construct it inside
-            // the closure where the Env is in scope.
-            env_v22
-                .with_env(|env| {
-                    let context_v22 = unsafe { jni_v22::objects::JObject::from_raw(env, raw_ctx) };
-                    rustls_platform_verifier::android::init_with_env(env, context_v22)
-                })
-                .resolve::<jni_v22::errors::LogErrorAndDefault>();
-            tracing::info!("rustls-platform-verifier init attempted for Android");
-        }),
-    );
+    env.with_env(|env| {
+        install_logging_once();
+        rustls_platform_verifier::android::init_with_env(env, context)
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>();
+    tracing::info!("rustls-platform-verifier init attempted for Android");
 }
 
 /// `Native.setDataDir(String)` — must be called once, before `startProxy`.
 /// The Kotlin side passes `context.filesDir.absolutePath`.
 #[no_mangle]
-pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_setDataDir(
-    mut env: JNIEnv,
-    _class: JClass,
-    path: JString,
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_setDataDir<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    path: JString<'local>,
 ) {
-    let _ = safe(
-        (),
-        AssertUnwindSafe(|| {
-            install_logging_once();
-            let p = jstring_to_string(&mut env, &path);
-            if !p.is_empty() {
-                crate::data_dir::set_data_dir(PathBuf::from(p));
-            }
-        }),
-    );
+    env.with_env(|env| -> jni::errors::Result<()> {
+        install_logging_once();
+        let p = jstring_to_string(env, &path);
+        if !p.is_empty() {
+            crate::data_dir::set_data_dir(PathBuf::from(p));
+        }
+        Ok(())
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>();
 }
 
 /// `Native.startProxy(String configJson)` -> `long` handle (0 on failure).
 /// The config is parsed and validated; on success the proxy server is
 /// spawned on its own tokio runtime and a non-zero handle returned.
 #[no_mangle]
-pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_startProxy(
-    mut env: JNIEnv,
-    _class: JClass,
-    config_json: JString,
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_startProxy<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    config_json: JString<'local>,
 ) -> jlong {
-    safe(
-        0i64,
-        AssertUnwindSafe(|| {
-            install_logging_once();
+    env.with_env(|env| -> jni::errors::Result<jlong> {
+        install_logging_once();
 
-            let json = jstring_to_string(&mut env, &config_json);
-            let config: Config = match serde_json::from_str(&json) {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!("android: invalid config json: {}", e);
-                    return 0i64;
-                }
-            };
+        let json = jstring_to_string(env, &config_json);
+        let config: Config = match serde_json::from_str(&json) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!("android: invalid config json: {}", e);
+                return Ok(0i64);
+            }
+        };
 
-            // Try to build the runtime first — if allocation fails we want to
-            // know before spinning up anything stateful.
-            let rt = match tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(4)
-                .enable_all()
-                .thread_name("rahgozar-worker")
-                .build()
-            {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::error!("android: tokio runtime build failed: {}", e);
-                    return 0i64;
-                }
-            };
+        // Try to build the runtime first — if allocation fails we want to
+        // know before spinning up anything stateful.
+        let rt = match tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(4)
+            .enable_all()
+            .thread_name("rahgozar-worker")
+            .build()
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!("android: tokio runtime build failed: {}", e);
+                return Ok(0i64);
+            }
+        };
 
-            let base = crate::data_dir::data_dir();
-            let mitm = match MitmCertManager::new_in(&base) {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::error!("android: MITM CA init failed: {}", e);
-                    return 0i64;
-                }
-            };
-            let mitm = Arc::new(AsyncMutex::new(mitm));
+        let base = crate::data_dir::data_dir();
+        let mitm = match MitmCertManager::new_in(&base) {
+            Ok(m) => m,
+            Err(e) => {
+                tracing::error!("android: MITM CA init failed: {}", e);
+                return Ok(0i64);
+            }
+        };
+        let mitm = Arc::new(AsyncMutex::new(mitm));
 
-            let server = match ProxyServer::new(&config, mitm) {
-                Ok(s) => s,
-                Err(e) => {
-                    tracing::error!("android: ProxyServer::new failed: {}", e);
-                    return 0i64;
-                }
-            };
+        let server = match ProxyServer::new(&config, mitm) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("android: ProxyServer::new failed: {}", e);
+                return Ok(0i64);
+            }
+        };
 
-            // Grab the fronter Arc BEFORE we move `server` into the async task —
-            // so `statsJson(handle)` can read counters without cross-task plumbing.
-            let fronter = server.fronter();
+        // Grab the fronter Arc BEFORE we move `server` into the async task —
+        // so `statsJson(handle)` can read counters without cross-task plumbing.
+        let fronter = server.fronter();
 
-            let (tx, rx) = oneshot::channel::<()>();
+        let (tx, rx) = oneshot::channel::<()>();
 
-            rt.spawn(async move {
-                if let Err(e) = server.run(rx).await {
-                    tracing::error!("android: proxy server exited: {}", e);
-                }
-            });
+        rt.spawn(async move {
+            if let Err(e) = server.run(rx).await {
+                tracing::error!("android: proxy server exited: {}", e);
+            }
+        });
 
-            let handle = HANDLE_COUNTER.fetch_add(1, Ordering::Relaxed);
-            slot_map().lock().unwrap().insert(
-                handle,
-                Running {
-                    shutdown: Some(tx),
-                    rt: Some(rt),
-                    fronter,
-                },
-            );
-            handle as jlong
-        }),
-    )
+        let handle = HANDLE_COUNTER.fetch_add(1, Ordering::Relaxed);
+        slot_map().lock().unwrap().insert(
+            handle,
+            Running {
+                shutdown: Some(tx),
+                rt: Some(rt),
+                fronter,
+            },
+        );
+        Ok(handle as jlong)
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
 /// `Native.stopProxy(long handle)` -> boolean. Idempotent: calling on an
@@ -354,83 +340,76 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_startProxy(
 /// unwind; anything slower, we force-kill (the listener socket is released
 /// as part of the forced shutdown).
 #[no_mangle]
-pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_stopProxy(
-    _env: JNIEnv,
-    _class: JClass,
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_stopProxy<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
     handle: jlong,
 ) -> jboolean {
-    safe(
-        JNI_FALSE,
-        AssertUnwindSafe(|| {
-            let mut map = slot_map().lock().unwrap();
-            let Some(mut running) = map.remove(&(handle as u64)) else {
-                return JNI_FALSE;
-            };
-            if let Some(tx) = running.shutdown.take() {
-                let _ = tx.send(());
-            }
-            // Release the map lock BEFORE shutting the runtime down so concurrent
-            // JNI callers (stats queries, etc.) don't stall behind us.
-            drop(map);
-            if let Some(rt) = running.rt.take() {
-                tracing::info!(
-                    "android: stopProxy handle={} — shutting runtime down",
-                    handle
-                );
-                rt.shutdown_timeout(std::time::Duration::from_secs(5));
-                tracing::info!(
-                    "android: stopProxy handle={} — runtime shutdown complete",
-                    handle
-                );
-            }
-            JNI_TRUE
-        }),
-    )
+    env.with_env(|_env| -> jni::errors::Result<jboolean> {
+        let mut map = slot_map().lock().unwrap();
+        let Some(mut running) = map.remove(&(handle as u64)) else {
+            return Ok(JNI_FALSE);
+        };
+        if let Some(tx) = running.shutdown.take() {
+            let _ = tx.send(());
+        }
+        // Release the map lock BEFORE shutting the runtime down so concurrent
+        // JNI callers (stats queries, etc.) don't stall behind us.
+        drop(map);
+        if let Some(rt) = running.rt.take() {
+            tracing::info!(
+                "android: stopProxy handle={} — shutting runtime down",
+                handle
+            );
+            rt.shutdown_timeout(std::time::Duration::from_secs(5));
+            tracing::info!(
+                "android: stopProxy handle={} — runtime shutdown complete",
+                handle
+            );
+        }
+        Ok(JNI_TRUE)
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
 /// `Native.exportCa(String destPath)` -> boolean. Writes the MITM CA's
 /// public cert to the given path. Init-safe: creates the CA on first call
 /// if it doesn't exist yet.
 #[no_mangle]
-pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_exportCa(
-    mut env: JNIEnv,
-    _class: JClass,
-    dest: JString,
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_exportCa<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    dest: JString<'local>,
 ) -> jboolean {
-    safe(
-        JNI_FALSE,
-        AssertUnwindSafe(|| {
-            install_logging_once();
-            let dest_path = jstring_to_string(&mut env, &dest);
-            if dest_path.is_empty() {
-                return JNI_FALSE;
+    env.with_env(|env| -> jni::errors::Result<jboolean> {
+        install_logging_once();
+        let dest_path = jstring_to_string(env, &dest);
+        if dest_path.is_empty() {
+            return Ok(JNI_FALSE);
+        }
+        let base = crate::data_dir::data_dir();
+        if MitmCertManager::new_in(&base).is_err() {
+            return Ok(JNI_FALSE);
+        }
+        let src = base.join(CA_CERT_FILE);
+        Ok(match std::fs::copy(&src, &dest_path) {
+            Ok(_) => JNI_TRUE,
+            Err(e) => {
+                tracing::error!("android: CA export to {} failed: {}", dest_path, e);
+                JNI_FALSE
             }
-            let base = crate::data_dir::data_dir();
-            if MitmCertManager::new_in(&base).is_err() {
-                return JNI_FALSE;
-            }
-            let src = base.join(CA_CERT_FILE);
-            match std::fs::copy(&src, &dest_path) {
-                Ok(_) => JNI_TRUE,
-                Err(e) => {
-                    tracing::error!("android: CA export to {} failed: {}", dest_path, e);
-                    JNI_FALSE
-                }
-            }
-        }),
-    )
+        })
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
 /// `Native.version()` -> String. Trivial smoke test for the JNI linkage.
 #[no_mangle]
-pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_version<'a>(
-    env: JNIEnv<'a>,
-    _class: JClass,
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_version<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
 ) -> jstring {
-    let v = env!("CARGO_PKG_VERSION");
-    env.new_string(v)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    jstring_return(&mut env, |_env| env!("CARGO_PKG_VERSION").to_string())
 }
 
 /// `Native.drainLogs()` -> String. Returns the full ring buffer as a single
@@ -438,24 +417,17 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_version<'a>(
 /// array because it's one JNI call vs. N — the Kotlin side splits on `\n`
 /// for display. Empty string when there's nothing to read.
 #[no_mangle]
-pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_drainLogs<'a>(
-    env: JNIEnv<'a>,
-    _class: JClass,
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_drainLogs<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
 ) -> jstring {
-    let out = safe(
-        String::new(),
-        AssertUnwindSafe(|| {
-            let mut g = match log_ring().lock() {
-                Ok(g) => g,
-                Err(_) => return String::new(),
-            };
-            let lines: Vec<String> = g.drain(..).collect();
-            lines.join("\n")
-        }),
-    );
-    env.new_string(out)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    jstring_return(&mut env, |_env| {
+        let Ok(mut g) = log_ring().lock() else {
+            return String::new();
+        };
+        let lines: Vec<String> = g.drain(..).collect();
+        lines.join("\n")
+    })
 }
 
 /// `Native.checkUpdate()` -> String. Runs the same `update_check::check`
@@ -476,26 +448,20 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_drainLogs<'a>(
 ///
 /// Blocking — hit from a background dispatcher.
 #[no_mangle]
-pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_checkUpdate<'a>(
-    env: JNIEnv<'a>,
-    _class: JClass,
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_checkUpdate<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
 ) -> jstring {
-    let result_json = safe(
-        r#"{"kind":"error","reason":"panic"}"#.to_string(),
-        AssertUnwindSafe(|| {
-            install_logging_once();
-            let Some(rt) = one_shot_runtime() else {
-                return r#"{"kind":"error","reason":"tokio init failed"}"#.to_string();
-            };
-            let outcome = rt.block_on(crate::update_check::check(
-                crate::update_check::Route::Direct,
-            ));
-            update_check_to_json(&outcome)
-        }),
-    );
-    env.new_string(result_json)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    jstring_return(&mut env, |_env| {
+        install_logging_once();
+        let Some(rt) = one_shot_runtime() else {
+            return r#"{"kind":"error","reason":"tokio init failed"}"#.to_string();
+        };
+        let outcome = rt.block_on(crate::update_check::check(
+            crate::update_check::Route::Direct,
+        ));
+        update_check_to_json(&outcome)
+    })
 }
 
 fn update_check_to_json(u: &crate::update_check::UpdateCheck) -> String {
@@ -561,135 +527,118 @@ fn update_check_to_json(u: &crate::update_check::UpdateCheck) -> String {
 /// `objects.githubusercontent.com` redirects to). Can be revisited if
 /// users on Iranian networks report the asset host blocked.
 #[no_mangle]
-pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_downloadAsset<'a>(
-    mut env: JNIEnv<'a>,
-    _class: JClass,
-    url: JString,
-    dest: JString,
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_downloadAsset<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    url: JString<'local>,
+    dest: JString<'local>,
 ) -> jstring {
-    let result_json = safe(
-        r#"{"ok":false,"error":"panic"}"#.to_string(),
-        AssertUnwindSafe(|| {
-            install_logging_once();
-            let url_s = jstring_to_string(&mut env, &url);
-            let dest_s = jstring_to_string(&mut env, &dest);
-            if url_s.is_empty() || dest_s.is_empty() {
-                return r#"{"ok":false,"error":"empty url or dest"}"#.to_string();
-            }
-            let Some(rt) = one_shot_runtime() else {
-                return r#"{"ok":false,"error":"tokio init failed"}"#.to_string();
-            };
-            let dest_path = std::path::PathBuf::from(&dest_s);
-            let res = rt.block_on(async {
-                let bytes = crate::update_check::download_asset(
-                    crate::update_check::Route::Direct,
-                    &url_s,
-                    &dest_path,
-                )
-                .await?;
+    jstring_return(&mut env, |env| {
+        install_logging_once();
+        let url_s = jstring_to_string(env, &url);
+        let dest_s = jstring_to_string(env, &dest);
+        if url_s.is_empty() || dest_s.is_empty() {
+            return r#"{"ok":false,"error":"empty url or dest"}"#.to_string();
+        }
+        let Some(rt) = one_shot_runtime() else {
+            return r#"{"ok":false,"error":"tokio init failed"}"#.to_string();
+        };
+        let dest_path = std::path::PathBuf::from(&dest_s);
+        let res = rt.block_on(async {
+            let bytes = crate::update_check::download_asset(
+                crate::update_check::Route::Direct,
+                &url_s,
+                &dest_path,
+            )
+            .await?;
 
-                if let Some(pubkey) = crate::update_apply::embedded_update_pubkey() {
-                    let sig_url = crate::update_apply::signature_url_for_asset(&url_s);
-                    let sig_path = {
-                        let Some(file_name) = dest_path.file_name() else {
-                            return Err("dest path has no filename".to_string());
-                        };
-                        let mut sig_name = file_name.to_os_string();
-                        sig_name.push(".minisig");
-                        dest_path.with_file_name(sig_name)
+            if let Some(pubkey) = crate::update_apply::embedded_update_pubkey() {
+                let sig_url = crate::update_apply::signature_url_for_asset(&url_s);
+                let sig_path = {
+                    let Some(file_name) = dest_path.file_name() else {
+                        return Err("dest path has no filename".to_string());
                     };
-                    crate::update_check::download_asset(
-                        crate::update_check::Route::Direct,
-                        &sig_url,
-                        &sig_path,
-                    )
+                    let mut sig_name = file_name.to_os_string();
+                    sig_name.push(".minisig");
+                    dest_path.with_file_name(sig_name)
+                };
+                crate::update_check::download_asset(
+                    crate::update_check::Route::Direct,
+                    &sig_url,
+                    &sig_path,
+                )
+                .await
+                .map_err(|e| format!("signature missing: {}", e))?;
+                let sig_text = tokio::fs::read_to_string(&sig_path)
                     .await
-                    .map_err(|e| format!("signature missing: {}", e))?;
-                    let sig_text = tokio::fs::read_to_string(&sig_path)
-                        .await
-                        .map_err(|e| format!("read signature: {}", e))?;
-                    crate::update_apply::verify_minisign_signature(pubkey, &dest_path, &sig_text)
-                        .map_err(|e| format!("signature invalid: {}", e))?;
-                    let _ = tokio::fs::remove_file(&sig_path).await;
-                    tracing::info!("android: minisign signature verified for {}", dest_s);
-                } else {
-                    tracing::warn!(
-                        "android: RAHGOZAR_UPDATE_PUBKEY was not set at build time — \
+                    .map_err(|e| format!("read signature: {}", e))?;
+                crate::update_apply::verify_minisign_signature(pubkey, &dest_path, &sig_text)
+                    .map_err(|e| format!("signature invalid: {}", e))?;
+                let _ = tokio::fs::remove_file(&sig_path).await;
+                tracing::info!("android: minisign signature verified for {}", dest_s);
+            } else {
+                tracing::warn!(
+                    "android: RAHGOZAR_UPDATE_PUBKEY was not set at build time — \
                          installing update without minisign check (rollout mode)."
-                    );
-                }
-
-                Ok::<u64, String>(bytes)
-            });
-            match res {
-                Ok(bytes) => {
-                    tracing::info!(
-                        "android: downloadAsset {} -> {} ({} bytes)",
-                        url_s,
-                        dest_s,
-                        bytes
-                    );
-                    format!(r#"{{"ok":true,"bytes":{}}}"#, bytes)
-                }
-                Err(e) => {
-                    let _ = std::fs::remove_file(&dest_path);
-                    tracing::warn!("android: downloadAsset failed: {}", e);
-                    let cleaned = e.replace('\\', "\\\\").replace('"', "\\\"");
-                    format!(r#"{{"ok":false,"error":"{}"}}"#, cleaned)
-                }
+                );
             }
-        }),
-    );
-    env.new_string(result_json)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+
+            Ok::<u64, String>(bytes)
+        });
+        match res {
+            Ok(bytes) => {
+                tracing::info!(
+                    "android: downloadAsset {} -> {} ({} bytes)",
+                    url_s,
+                    dest_s,
+                    bytes
+                );
+                format!(r#"{{"ok":true,"bytes":{}}}"#, bytes)
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&dest_path);
+                tracing::warn!("android: downloadAsset failed: {}", e);
+                let cleaned = e.replace('\\', "\\\\").replace('"', "\\\"");
+                format!(r#"{{"ok":false,"error":"{}"}}"#, cleaned)
+            }
+        }
+    })
 }
 
 /// `Native.testSni(googleIp, sni)` -> String. Returns a small JSON blob
 /// like `{"ok":true,"latencyMs":123}` or `{"ok":false,"error":"..."}`.
 /// Blocking call — Kotlin side should invoke on a background coroutine.
 #[no_mangle]
-pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_testSni<'a>(
-    mut env: JNIEnv<'a>,
-    _class: JClass,
-    google_ip: JString,
-    sni: JString,
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_testSni<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    google_ip: JString<'local>,
+    sni: JString<'local>,
 ) -> jstring {
-    let result_json = safe(
-        r#"{"ok":false,"error":"panic"}"#.to_string(),
-        AssertUnwindSafe(|| {
-            install_logging_once();
-            let ip = jstring_to_string(&mut env, &google_ip);
-            let s = jstring_to_string(&mut env, &sni);
-            if ip.is_empty() || s.is_empty() {
-                return r#"{"ok":false,"error":"empty google_ip or sni"}"#.to_string();
+    jstring_return(&mut env, |env| {
+        install_logging_once();
+        let ip = jstring_to_string(env, &google_ip);
+        let s = jstring_to_string(env, &sni);
+        if ip.is_empty() || s.is_empty() {
+            return r#"{"ok":false,"error":"empty google_ip or sni"}"#.to_string();
+        }
+        let Some(rt) = one_shot_runtime() else {
+            return r#"{"ok":false,"error":"tokio init failed"}"#.to_string();
+        };
+        let probe = rt.block_on(crate::scan_sni::probe_one(&ip, &s));
+        match (probe.latency_ms, probe.error) {
+            (Some(ms), _) => {
+                tracing::info!("sni_probe: {} via {} ok in {}ms", s, ip, ms);
+                format!(r#"{{"ok":true,"latencyMs":{}}}"#, ms)
             }
-            let Some(rt) = one_shot_runtime() else {
-                return r#"{"ok":false,"error":"tokio init failed"}"#.to_string();
-            };
-            let probe = rt.block_on(crate::scan_sni::probe_one(&ip, &s));
-            match (probe.latency_ms, probe.error) {
-                (Some(ms), _) => {
-                    tracing::info!("sni_probe: {} via {} ok in {}ms", s, ip, ms);
-                    format!(r#"{{"ok":true,"latencyMs":{}}}"#, ms)
-                }
-                (None, Some(e)) => {
-                    // Surface the reason in logcat too — otherwise users see a
-                    // red dot in the UI with no path to diagnose. Common causes:
-                    //   - "dns: ..."   -> system resolver can't reach DNS
-                    //   - "connect: ..." -> TCP to google_ip:443 blocked
-                    //   - "handshake: ..." -> TLS fail (cert, ALPN, etc.)
-                    tracing::warn!("sni_probe: {} via {} FAIL: {}", s, ip, e);
-                    let cleaned = e.replace('\\', "\\\\").replace('"', "\\\"");
-                    format!(r#"{{"ok":false,"error":"{}"}}"#, cleaned)
-                }
-                _ => r#"{"ok":false,"error":"unknown"}"#.to_string(),
+            (None, Some(e)) => {
+                tracing::warn!("sni_probe: {} via {} FAIL: {}", s, ip, e);
+                let cleaned = e.replace('\\', "\\\\").replace('"', "\\\"");
+                format!(r#"{{"ok":false,"error":"{}"}}"#, cleaned)
             }
-        }),
-    );
-    env.new_string(result_json)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+            _ => r#"{"ok":false,"error":"unknown"}"#.to_string(),
+        }
+    })
 }
 
 /// `Native.statsJson(long handle)` -> String. Returns a JSON blob with the
@@ -699,30 +648,23 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_testSni<'a>(
 /// Cheap — just reads a handful of atomics. The Kotlin UI polls this on a
 /// timer to render the "Usage today (estimated)" card.
 #[no_mangle]
-pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_statsJson<'a>(
-    env: JNIEnv<'a>,
-    _class: JClass,
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_statsJson<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
     handle: jlong,
 ) -> jstring {
-    let out = safe(
-        String::new(),
-        AssertUnwindSafe(|| {
-            let map = match slot_map().lock() {
-                Ok(g) => g,
-                Err(_) => return String::new(),
-            };
-            let Some(running) = map.get(&(handle as u64)) else {
-                return String::new();
-            };
-            let Some(f) = running.fronter.as_ref() else {
-                return String::new();
-            };
-            f.snapshot_stats().to_json()
-        }),
-    );
-    env.new_string(out)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    jstring_return(&mut env, |_env| {
+        let Ok(map) = slot_map().lock() else {
+            return String::new();
+        };
+        let Some(running) = map.get(&(handle as u64)) else {
+            return String::new();
+        };
+        let Some(f) = running.fronter.as_ref() else {
+            return String::new();
+        };
+        f.snapshot_stats().to_json()
+    })
 }
 
 /// `Native.pipelineDebugJson()` -> String. Snapshot of pipeline debug
@@ -735,17 +677,13 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_statsJson<'a>(
 /// the library cleanly regardless of which variant the Rust side was
 /// built with.
 #[no_mangle]
-pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_pipelineDebugJson<'a>(
-    env: JNIEnv<'a>,
-    _class: JClass,
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_pipelineDebugJson<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
 ) -> jstring {
-    let out = safe(
-        String::new(),
-        AssertUnwindSafe(|| crate::tunnel_client::pipeline_debug::to_json()),
-    );
-    env.new_string(out)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    jstring_return(&mut env, |_env| {
+        crate::tunnel_client::pipeline_debug::to_json()
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -770,78 +708,72 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_pipelineDebugJson<'a>
 /// TLS handshakes bounded). Typical case for a healthy CDN is well
 /// under 1s. Always call from a background dispatcher.
 #[no_mangle]
-pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_discoverFront<'a>(
-    mut env: JNIEnv<'a>,
-    _class: JClass,
-    hostname: JString,
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_discoverFront<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    hostname: JString<'local>,
 ) -> jstring {
-    let result_json = safe(
-        r#"{"hostname":"","error":"panic"}"#.to_string(),
-        AssertUnwindSafe(|| {
-            install_logging_once();
-            let host = jstring_to_string(&mut env, &hostname);
-            if host.trim().is_empty() {
-                return r#"{"hostname":"","error":"hostname is empty"}"#.to_string();
-            }
-            let Some(rt) = one_shot_runtime() else {
-                return r#"{"hostname":"","error":"tokio init failed"}"#.to_string();
-            };
-            // Use serde_json::json! here (unlike `update_check_to_json`
-            // above, which is fixed-shape and ASCII-only). Probe `error`
-            // strings come from OS / TLS / DNS layers and routinely
-            // contain non-ASCII bytes, control chars, or both — the
-            // hand-rolled `replace('"').replace('\\')` pattern would
-            // miss `\n` / `\t` / `\x00` and produce malformed JSON the
-            // Kotlin side rejects.
-            match rt.block_on(crate::cdn_discover::discover_front(&host)) {
-                Ok(df) => {
-                    let ips: Vec<serde_json::Value> = df
-                        .ips
-                        .iter()
-                        .map(|r| match (&r.latency_ms, &r.error) {
-                            (Some(ms), _) => serde_json::json!({
-                                "ip": r.ip,
-                                "ok": true,
-                                "latencyMs": ms,
-                            }),
-                            (None, Some(e)) => serde_json::json!({
-                                "ip": r.ip,
-                                "ok": false,
-                                "error": e,
-                            }),
-                            (None, None) => serde_json::json!({
-                                "ip": r.ip,
-                                "ok": false,
-                                "error": "unknown",
-                            }),
-                        })
-                        .collect();
-                    tracing::info!(
-                        "discover_front: {} -> {} ips, {} ok",
-                        df.hostname,
-                        df.ips.len(),
-                        df.ips.iter().filter(|r| r.is_ok()).count(),
-                    );
-                    serde_json::json!({
-                        "hostname": df.hostname,
-                        "ips": ips,
+    jstring_return(&mut env, |env| {
+        install_logging_once();
+        let host = jstring_to_string(env, &hostname);
+        if host.trim().is_empty() {
+            return r#"{"hostname":"","error":"hostname is empty"}"#.to_string();
+        }
+        let Some(rt) = one_shot_runtime() else {
+            return r#"{"hostname":"","error":"tokio init failed"}"#.to_string();
+        };
+        // Use serde_json::json! here (unlike `update_check_to_json`
+        // above, which is fixed-shape and ASCII-only). Probe `error`
+        // strings come from OS / TLS / DNS layers and routinely
+        // contain non-ASCII bytes, control chars, or both — the
+        // hand-rolled `replace('"').replace('\\')` pattern would
+        // miss `\n` / `\t` / `\x00` and produce malformed JSON the
+        // Kotlin side rejects.
+        match rt.block_on(crate::cdn_discover::discover_front(&host)) {
+            Ok(df) => {
+                let ips: Vec<serde_json::Value> = df
+                    .ips
+                    .iter()
+                    .map(|r| match (&r.latency_ms, &r.error) {
+                        (Some(ms), _) => serde_json::json!({
+                            "ip": r.ip,
+                            "ok": true,
+                            "latencyMs": ms,
+                        }),
+                        (None, Some(e)) => serde_json::json!({
+                            "ip": r.ip,
+                            "ok": false,
+                            "error": e,
+                        }),
+                        (None, None) => serde_json::json!({
+                            "ip": r.ip,
+                            "ok": false,
+                            "error": "unknown",
+                        }),
                     })
-                    .to_string()
-                }
-                Err(e) => {
-                    tracing::warn!("discover_front: {} FAIL: {}", host, e);
-                    serde_json::json!({
-                        "hostname": host,
-                        "error": e,
-                    })
-                    .to_string()
-                }
+                    .collect();
+                tracing::info!(
+                    "discover_front: {} -> {} ips, {} ok",
+                    df.hostname,
+                    df.ips.len(),
+                    df.ips.iter().filter(|r| r.is_ok()).count(),
+                );
+                serde_json::json!({
+                    "hostname": df.hostname,
+                    "ips": ips,
+                })
+                .to_string()
             }
-        }),
-    );
-    env.new_string(result_json)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+            Err(e) => {
+                tracing::warn!("discover_front: {} FAIL: {}", host, e);
+                serde_json::json!({
+                    "hostname": host,
+                    "error": e,
+                })
+                .to_string()
+            }
+        }
+    })
 }
 
 /// `Native.runTun2proxy(cliArgs, tunMtu)` -> int
@@ -850,47 +782,46 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_discoverFront<'a>(
 /// This is the C API the tun2proxy maintainer recommends for callers that
 /// need full CLI flexibility (e.g. --udpgw-server). BLOCKS until shutdown.
 #[no_mangle]
-pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_runTun2proxy<'a>(
-    mut env: JNIEnv<'a>,
-    _class: JClass,
-    cli_args: JString,
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_runTun2proxy<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    cli_args: JString<'local>,
     tun_mtu: jni::sys::jint,
 ) -> jni::sys::jint {
-    safe(
-        -1,
-        AssertUnwindSafe(|| {
-            let args_str = jstring_to_string(&mut env, &cli_args);
-            tracing::info!("runTun2proxy: cli={}", args_str);
+    env.with_env(|env| -> jni::errors::Result<jni::sys::jint> {
+        let args_str = jstring_to_string(env, &cli_args);
+        tracing::info!("runTun2proxy: cli={}", args_str);
 
-            unsafe {
-                use std::ffi::{CStr, CString};
+        let rc = unsafe {
+            use std::ffi::{CStr, CString};
 
-                let lib = CString::new("libtun2proxy.so").unwrap();
-                let handle = libc::dlopen(lib.as_ptr(), libc::RTLD_NOW);
-                if handle.is_null() {
-                    let err = CStr::from_ptr(libc::dlerror());
-                    tracing::error!("dlopen libtun2proxy.so failed: {:?}", err);
-                    return -10;
-                }
-
-                let sym = CString::new("tun2proxy_run_with_cli_args").unwrap();
-                let func = libc::dlsym(handle, sym.as_ptr());
-                if func.is_null() {
-                    let err = CStr::from_ptr(libc::dlerror());
-                    tracing::error!("dlsym tun2proxy_run_with_cli_args: {:?}", err);
-                    libc::dlclose(handle);
-                    return -11;
-                }
-
-                type RunFn = unsafe extern "C" fn(*const std::ffi::c_char, u16, bool) -> i32;
-                let run: RunFn = std::mem::transmute(func);
-                let c_args = CString::new(args_str).unwrap();
-                let rc = run(c_args.as_ptr(), tun_mtu as u16, false);
-                libc::dlclose(handle);
-                rc
+            let lib = CString::new("libtun2proxy.so").unwrap();
+            let handle = libc::dlopen(lib.as_ptr(), libc::RTLD_NOW);
+            if handle.is_null() {
+                let err = CStr::from_ptr(libc::dlerror());
+                tracing::error!("dlopen libtun2proxy.so failed: {:?}", err);
+                return Ok(-10);
             }
-        }),
-    )
+
+            let sym = CString::new("tun2proxy_run_with_cli_args").unwrap();
+            let func = libc::dlsym(handle, sym.as_ptr());
+            if func.is_null() {
+                let err = CStr::from_ptr(libc::dlerror());
+                tracing::error!("dlsym tun2proxy_run_with_cli_args: {:?}", err);
+                libc::dlclose(handle);
+                return Ok(-11);
+            }
+
+            type RunFn = unsafe extern "C" fn(*const std::ffi::c_char, u16, bool) -> i32;
+            let run: RunFn = std::mem::transmute(func);
+            let c_args = CString::new(args_str).unwrap();
+            let rc = run(c_args.as_ptr(), tun_mtu as u16, false);
+            libc::dlclose(handle);
+            rc
+        };
+        Ok(rc)
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
 // ---------------------------------------------------------------------------
@@ -976,107 +907,100 @@ fn prune_expired_device_flows(flows: &mut std::collections::HashMap<String, Pend
 /// to JS wouldn't be useful, the call to `/token` requires
 /// client_secret too).
 #[no_mangle]
-pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveOauthDeviceCodeStart<'a>(
-    env: JNIEnv<'a>,
-    _class: JClass,
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveOauthDeviceCodeStart<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
 ) -> jstring {
-    let out = safe(
-        r#"{"ok":false,"error":"panic"}"#.to_string(),
-        AssertUnwindSafe(|| {
-            install_logging_once();
-            // Fail fast on missing BYO credentials so the user gets
-            // a clear "set OAuth client first" error instead of a
-            // generic Google-side `invalid_client` after the round-trip.
-            let fields = match load_drive_config_fields() {
-                Ok(f) => f,
-                Err(e) => return drive_error_json(&e),
-            };
-            if fields.oauth_client_id.is_empty() || fields.oauth_client_secret.is_empty() {
-                return drive_error_json(
-                    "OAuth client credentials missing — paste your client_id + client_secret \
+    jstring_return(&mut env, |_env| {
+        install_logging_once();
+        // Fail fast on missing BYO credentials so the user gets
+        // a clear "set OAuth client first" error instead of a
+        // generic Google-side `invalid_client` after the round-trip.
+        let fields = match load_drive_config_fields() {
+            Ok(f) => f,
+            Err(e) => return drive_error_json(&e),
+        };
+        if fields.oauth_client_id.is_empty() || fields.oauth_client_secret.is_empty() {
+            return drive_error_json(
+                "OAuth client credentials missing — paste your client_id + client_secret \
                      from Google Cloud Console first (see docs/drive_oauth_setup.md)",
+            );
+        }
+        let google_ip_opt = if fields.google_ip.is_empty() {
+            None
+        } else {
+            Some(fields.google_ip.as_str())
+        };
+        let http = match crate::drive_api::build_drive_http_client(google_ip_opt) {
+            Ok(c) => c,
+            Err(e) => return drive_error_json(&format!("build http client: {e}")),
+        };
+        let oauth_client_id = fields.oauth_client_id;
+        let oauth_client_secret = fields.oauth_client_secret;
+        let Some(rt) = one_shot_runtime() else {
+            return drive_error_json("tokio init failed");
+        };
+        let flow = match rt.block_on(crate::drive_oauth::device_code_start(
+            &http,
+            &oauth_client_id,
+        )) {
+            Ok(f) => f,
+            Err(e) => {
+                // Log via tracing so the error surfaces in `adb
+                // logcat -s rahgozar:V` and the in-app Logs ring,
+                // not just in the toast (which truncates after
+                // ~80 chars and loses the OAuth response body).
+                tracing::warn!("device_code_start failed: {}", e);
+                return drive_error_json(&format!("device_code_start: {e}"));
+            }
+        };
+
+        // 32-hex random flow_token. The actual device_code is
+        // an opaque Google value; we mint our own handle so the
+        // JS / Kotlin side has a stable identifier even if the
+        // device_code shape ever changes.
+        use rand::RngCore;
+        let mut tok_bytes = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut tok_bytes);
+        let flow_token: String = tok_bytes
+            .iter()
+            .fold(String::with_capacity(32), |mut acc, b| {
+                use std::fmt::Write;
+                let _ = write!(acc, "{:02x}", b);
+                acc
+            });
+
+        let expires_at = Instant::now()
+            .checked_add(flow.expires_in + Duration::from_secs(DEVICE_FLOW_EXPIRY_GRACE_SECS))
+            .unwrap_or_else(Instant::now);
+        {
+            let mut flows = pending_device_flows().lock().unwrap();
+            prune_expired_device_flows(&mut flows);
+            if flows.len() >= MAX_PENDING_DEVICE_FLOWS {
+                return drive_error_json(
+                    "too many pending OAuth device-code flows — cancel or wait for one to expire",
                 );
             }
-            let google_ip_opt = if fields.google_ip.is_empty() {
-                None
-            } else {
-                Some(fields.google_ip.as_str())
-            };
-            let http = match crate::drive_api::build_drive_http_client(google_ip_opt) {
-                Ok(c) => c,
-                Err(e) => return drive_error_json(&format!("build http client: {e}")),
-            };
-            let oauth_client_id = fields.oauth_client_id;
-            let oauth_client_secret = fields.oauth_client_secret;
-            let Some(rt) = one_shot_runtime() else {
-                return drive_error_json("tokio init failed");
-            };
-            let flow = match rt.block_on(crate::drive_oauth::device_code_start(
-                &http,
-                &oauth_client_id,
-            )) {
-                Ok(f) => f,
-                Err(e) => {
-                    // Log via tracing so the error surfaces in `adb
-                    // logcat -s rahgozar:V` and the in-app Logs ring,
-                    // not just in the toast (which truncates after
-                    // ~80 chars and loses the OAuth response body).
-                    tracing::warn!("device_code_start failed: {}", e);
-                    return drive_error_json(&format!("device_code_start: {e}"));
-                }
-            };
+            flows.insert(
+                flow_token.clone(),
+                PendingDeviceFlow {
+                    device_code: flow.device_code.clone(),
+                    oauth_client_id,
+                    oauth_client_secret,
+                    expires_at,
+                },
+            );
+        }
 
-            // 32-hex random flow_token. The actual device_code is
-            // an opaque Google value; we mint our own handle so the
-            // JS / Kotlin side has a stable identifier even if the
-            // device_code shape ever changes.
-            use rand::RngCore;
-            let mut tok_bytes = [0u8; 16];
-            rand::rngs::OsRng.fill_bytes(&mut tok_bytes);
-            let flow_token: String =
-                tok_bytes
-                    .iter()
-                    .fold(String::with_capacity(32), |mut acc, b| {
-                        use std::fmt::Write;
-                        let _ = write!(acc, "{:02x}", b);
-                        acc
-                    });
-
-            let expires_at = Instant::now()
-                .checked_add(flow.expires_in + Duration::from_secs(DEVICE_FLOW_EXPIRY_GRACE_SECS))
-                .unwrap_or_else(Instant::now);
-            {
-                let mut flows = pending_device_flows().lock().unwrap();
-                prune_expired_device_flows(&mut flows);
-                if flows.len() >= MAX_PENDING_DEVICE_FLOWS {
-                    return drive_error_json(
-                        "too many pending OAuth device-code flows — cancel or wait for one to expire",
-                    );
-                }
-                flows.insert(
-                    flow_token.clone(),
-                    PendingDeviceFlow {
-                        device_code: flow.device_code.clone(),
-                        oauth_client_id,
-                        oauth_client_secret,
-                        expires_at,
-                    },
-                );
-            }
-
-            format!(
-                r#"{{"ok":true,"flow_token":"{}","user_code":"{}","verification_url":"{}","expires_in_secs":{},"interval_secs":{}}}"#,
-                json_escape(&flow_token),
-                json_escape(&flow.user_code),
-                json_escape(&flow.verification_url),
-                flow.expires_in.as_secs(),
-                flow.interval.as_secs().max(1),
-            )
-        }),
-    );
-    env.new_string(out)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+        format!(
+            r#"{{"ok":true,"flow_token":"{}","user_code":"{}","verification_url":"{}","expires_in_secs":{},"interval_secs":{}}}"#,
+            json_escape(&flow_token),
+            json_escape(&flow.user_code),
+            json_escape(&flow.verification_url),
+            flow.expires_in.as_secs(),
+            flow.interval.as_secs().max(1),
+        )
+    })
 }
 
 /// Poll one iteration of an in-flight device-code flow. Status
@@ -1095,135 +1019,127 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveOauthDeviceCodeS
 /// {"status":"unknown"}
 /// ```
 #[no_mangle]
-pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveOauthPollFlow<'a>(
-    mut env: JNIEnv<'a>,
-    _class: JClass,
-    flow_token: JString,
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveOauthPollFlow<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    flow_token: JString<'local>,
 ) -> jstring {
-    let out = safe(
-        r#"{"status":"unknown"}"#.to_string(),
-        AssertUnwindSafe(|| {
-            install_logging_once();
-            let tok = jstring_to_string(&mut env, &flow_token);
-            if tok.is_empty() {
-                return r#"{"status":"unknown"}"#.to_string();
+    jstring_return(&mut env, |env| {
+        install_logging_once();
+        let tok = jstring_to_string(env, &flow_token);
+        if tok.is_empty() {
+            return r#"{"status":"unknown"}"#.to_string();
+        }
+        // Snapshot the flow's state without removing it — a
+        // `pending` / `slow_down` outcome means the UI is going
+        // to poll again, so we leave the entry alive.
+        let (device_code, oauth_client_id, oauth_client_secret) = {
+            let mut guard = pending_device_flows().lock().unwrap();
+            prune_expired_device_flows(&mut guard);
+            match guard.get(&tok) {
+                Some(p) => (
+                    p.device_code.clone(),
+                    p.oauth_client_id.clone(),
+                    p.oauth_client_secret.clone(),
+                ),
+                None => return r#"{"status":"unknown"}"#.to_string(),
             }
-            // Snapshot the flow's state without removing it — a
-            // `pending` / `slow_down` outcome means the UI is going
-            // to poll again, so we leave the entry alive.
-            let (device_code, oauth_client_id, oauth_client_secret) = {
-                let mut guard = pending_device_flows().lock().unwrap();
-                prune_expired_device_flows(&mut guard);
-                match guard.get(&tok) {
-                    Some(p) => (
-                        p.device_code.clone(),
-                        p.oauth_client_id.clone(),
-                        p.oauth_client_secret.clone(),
-                    ),
-                    None => return r#"{"status":"unknown"}"#.to_string(),
-                }
-            };
+        };
 
-            let fields = match load_drive_config_fields() {
-                Ok(f) => f,
-                Err(e) => {
-                    return format!(
-                        r#"{{"status":"transient_error","error":"{}"}}"#,
-                        json_escape(&e),
-                    );
-                }
-            };
-            let google_ip_opt = if fields.google_ip.is_empty() {
-                None
-            } else {
-                Some(fields.google_ip.as_str())
-            };
-            let http = match crate::drive_api::build_drive_http_client(google_ip_opt) {
-                Ok(c) => c,
-                Err(e) => {
-                    return format!(
-                        r#"{{"status":"transient_error","error":"{}"}}"#,
-                        json_escape(&format!("build http client: {e}")),
-                    );
-                }
-            };
-            let Some(rt) = one_shot_runtime() else {
-                return r#"{"status":"error","error":"tokio init failed"}"#.to_string();
-            };
-            match rt.block_on(crate::drive_oauth::device_code_poll(
-                &http,
-                &device_code,
-                &oauth_client_id,
-                &oauth_client_secret,
-            )) {
-                Ok(crate::drive_oauth::DevicePollOutcome::Pending) => {
-                    r#"{"status":"pending"}"#.to_string()
-                }
-                Ok(crate::drive_oauth::DevicePollOutcome::SlowDown) => {
-                    // Per RFC 8628 §3.5 the next poll interval MUST
-                    // increase by at least 5 s. The Android-side
-                    // poller is responsible for honouring this — we
-                    // report it as a hint here.
-                    r#"{"status":"slow_down","interval_secs":5}"#.to_string()
-                }
-                Ok(crate::drive_oauth::DevicePollOutcome::AccessDenied) => {
-                    pending_device_flows().lock().unwrap().remove(&tok);
-                    r#"{"status":"denied"}"#.to_string()
-                }
-                Ok(crate::drive_oauth::DevicePollOutcome::ExpiredToken) => {
-                    pending_device_flows().lock().unwrap().remove(&tok);
-                    r#"{"status":"expired"}"#.to_string()
-                }
-                Ok(crate::drive_oauth::DevicePollOutcome::Tokens(tokens)) => {
-                    let refresh = match tokens.refresh_token {
-                        Some(t) if !t.is_empty() => t,
-                        _ => {
-                            pending_device_flows().lock().unwrap().remove(&tok);
-                            return r#"{"status":"error","error":"OAuth response did not include a refresh_token"}"#.to_string();
-                        }
-                    };
-                    if let Err(e) = persist_drive_refresh_token(
-                        &refresh,
-                        &oauth_client_id,
-                        &oauth_client_secret,
-                    ) {
-                        pending_device_flows().lock().unwrap().remove(&tok);
-                        return format!(
-                            r#"{{"status":"error","error":"{}"}}"#,
-                            json_escape(&format!("save refresh token: {e}")),
-                        );
-                    }
-                    pending_device_flows().lock().unwrap().remove(&tok);
-                    r#"{"status":"ok"}"#.to_string()
-                }
-                Err(e) => {
-                    let transient = matches!(
-                        &e,
-                        crate::drive_oauth::OAuthError::Transport(_)
-                            | crate::drive_oauth::OAuthError::BadResponse(_)
-                    );
-                    if !transient {
-                        pending_device_flows().lock().unwrap().remove(&tok);
-                    }
-                    // Network / parse errors leave the flow alive so
-                    // the next poll can retry. OAuth endpoint errors
-                    // such as invalid_client are terminal.
-                    format!(
-                        r#"{{"status":"{}","error":"{}"}}"#,
-                        if transient {
-                            "transient_error"
-                        } else {
-                            "error"
-                        },
-                        json_escape(&format!("device_code_poll: {e}")),
-                    )
-                }
+        let fields = match load_drive_config_fields() {
+            Ok(f) => f,
+            Err(e) => {
+                return format!(
+                    r#"{{"status":"transient_error","error":"{}"}}"#,
+                    json_escape(&e),
+                );
             }
-        }),
-    );
-    env.new_string(out)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+        };
+        let google_ip_opt = if fields.google_ip.is_empty() {
+            None
+        } else {
+            Some(fields.google_ip.as_str())
+        };
+        let http = match crate::drive_api::build_drive_http_client(google_ip_opt) {
+            Ok(c) => c,
+            Err(e) => {
+                return format!(
+                    r#"{{"status":"transient_error","error":"{}"}}"#,
+                    json_escape(&format!("build http client: {e}")),
+                );
+            }
+        };
+        let Some(rt) = one_shot_runtime() else {
+            return r#"{"status":"error","error":"tokio init failed"}"#.to_string();
+        };
+        match rt.block_on(crate::drive_oauth::device_code_poll(
+            &http,
+            &device_code,
+            &oauth_client_id,
+            &oauth_client_secret,
+        )) {
+            Ok(crate::drive_oauth::DevicePollOutcome::Pending) => {
+                r#"{"status":"pending"}"#.to_string()
+            }
+            Ok(crate::drive_oauth::DevicePollOutcome::SlowDown) => {
+                // Per RFC 8628 §3.5 the next poll interval MUST
+                // increase by at least 5 s. The Android-side
+                // poller is responsible for honouring this — we
+                // report it as a hint here.
+                r#"{"status":"slow_down","interval_secs":5}"#.to_string()
+            }
+            Ok(crate::drive_oauth::DevicePollOutcome::AccessDenied) => {
+                pending_device_flows().lock().unwrap().remove(&tok);
+                r#"{"status":"denied"}"#.to_string()
+            }
+            Ok(crate::drive_oauth::DevicePollOutcome::ExpiredToken) => {
+                pending_device_flows().lock().unwrap().remove(&tok);
+                r#"{"status":"expired"}"#.to_string()
+            }
+            Ok(crate::drive_oauth::DevicePollOutcome::Tokens(tokens)) => {
+                let refresh = match tokens.refresh_token {
+                    Some(t) if !t.is_empty() => t,
+                    _ => {
+                        pending_device_flows().lock().unwrap().remove(&tok);
+                        return r#"{"status":"error","error":"OAuth response did not include a refresh_token"}"#.to_string();
+                    }
+                };
+                if let Err(e) =
+                    persist_drive_refresh_token(&refresh, &oauth_client_id, &oauth_client_secret)
+                {
+                    pending_device_flows().lock().unwrap().remove(&tok);
+                    return format!(
+                        r#"{{"status":"error","error":"{}"}}"#,
+                        json_escape(&format!("save refresh token: {e}")),
+                    );
+                }
+                pending_device_flows().lock().unwrap().remove(&tok);
+                r#"{"status":"ok"}"#.to_string()
+            }
+            Err(e) => {
+                let transient = matches!(
+                    &e,
+                    crate::drive_oauth::OAuthError::Transport(_)
+                        | crate::drive_oauth::OAuthError::BadResponse(_)
+                );
+                if !transient {
+                    pending_device_flows().lock().unwrap().remove(&tok);
+                }
+                // Network / parse errors leave the flow alive so
+                // the next poll can retry. OAuth endpoint errors
+                // such as invalid_client are terminal.
+                format!(
+                    r#"{{"status":"{}","error":"{}"}}"#,
+                    if transient {
+                        "transient_error"
+                    } else {
+                        "error"
+                    },
+                    json_escape(&format!("device_code_poll: {e}")),
+                )
+            }
+        }
+    })
 }
 
 /// Drop an in-flight device-code flow. Called when the user taps
@@ -1233,22 +1149,16 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveOauthPollFlow<'a
 /// `/device/code/cancel` endpoint exists but isn't worth the extra
 /// round-trip — the user has already abandoned the flow).
 #[no_mangle]
-pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveOauthCancelFlow<'a>(
-    mut env: JNIEnv<'a>,
-    _class: JClass,
-    flow_token: JString,
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveOauthCancelFlow<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    flow_token: JString<'local>,
 ) -> jstring {
-    let out = safe(
-        r#"{"ok":true}"#.to_string(),
-        AssertUnwindSafe(|| {
-            let tok = jstring_to_string(&mut env, &flow_token);
-            pending_device_flows().lock().unwrap().remove(&tok);
-            r#"{"ok":true}"#.to_string()
-        }),
-    );
-    env.new_string(out)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    jstring_return(&mut env, |env| {
+        let tok = jstring_to_string(env, &flow_token);
+        pending_device_flows().lock().unwrap().remove(&tok);
+        r#"{"ok":true}"#.to_string()
+    })
 }
 
 /// `files.create` with the folder MIME type. Returns the new
@@ -1260,72 +1170,66 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveOauthCancelFlow<
 /// {"ok": false, "error": "..."}
 /// ```
 #[no_mangle]
-pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveCreateFolder<'a>(
-    mut env: JNIEnv<'a>,
-    _class: JClass,
-    name: JString,
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveCreateFolder<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    name: JString<'local>,
 ) -> jstring {
-    let out = safe(
-        r#"{"ok":false,"error":"panic"}"#.to_string(),
-        AssertUnwindSafe(|| {
-            install_logging_once();
-            let n = jstring_to_string(&mut env, &name);
-            let n = n.trim();
-            if n.is_empty() {
-                return drive_error_json("folder name is empty");
-            }
-            let fields = match load_drive_config_fields() {
-                Ok(t) => t,
-                Err(e) => return drive_error_json(&e),
-            };
-            if fields.refresh_token.is_empty() {
-                return drive_error_json("not signed in to Google — sign in first, then try again");
-            }
-            if fields.oauth_client_id.is_empty() || fields.oauth_client_secret.is_empty() {
-                return drive_error_json(
-                    "OAuth client credentials missing — paste your client_id + client_secret \
+    jstring_return(&mut env, |env| {
+        install_logging_once();
+        let n = jstring_to_string(env, &name);
+        let n = n.trim();
+        if n.is_empty() {
+            return drive_error_json("folder name is empty");
+        }
+        let fields = match load_drive_config_fields() {
+            Ok(t) => t,
+            Err(e) => return drive_error_json(&e),
+        };
+        if fields.refresh_token.is_empty() {
+            return drive_error_json("not signed in to Google — sign in first, then try again");
+        }
+        if fields.oauth_client_id.is_empty() || fields.oauth_client_secret.is_empty() {
+            return drive_error_json(
+                "OAuth client credentials missing — paste your client_id + client_secret \
                      from Google Cloud Console first (see docs/drive_oauth_setup.md)",
-                );
-            }
-            let Some(rt) = one_shot_runtime() else {
-                return drive_error_json("tokio init failed");
-            };
-            let google_ip_opt = if fields.google_ip.is_empty() {
-                None
-            } else {
-                Some(fields.google_ip.as_str())
-            };
-            let http = match crate::drive_api::build_drive_http_client(google_ip_opt) {
-                Ok(c) => c,
-                Err(e) => return drive_error_json(&format!("build http: {e}")),
-            };
-            let api = crate::drive_api::DriveApiClient::with_default_base_url(http.clone());
-            let access = match rt.block_on(crate::drive_oauth::refresh_access_token(
-                &http,
-                &fields.refresh_token,
-                &fields.oauth_client_id,
-                &fields.oauth_client_secret,
-            )) {
-                Ok(t) => t.access_token,
-                Err(e) if e.is_refresh_token_revoked() => {
-                    let _ = clear_drive_refresh_token();
-                    return drive_reauth_required_json(&format!(
-                        "Your Google access has been revoked or the session expired \
+            );
+        }
+        let Some(rt) = one_shot_runtime() else {
+            return drive_error_json("tokio init failed");
+        };
+        let google_ip_opt = if fields.google_ip.is_empty() {
+            None
+        } else {
+            Some(fields.google_ip.as_str())
+        };
+        let http = match crate::drive_api::build_drive_http_client(google_ip_opt) {
+            Ok(c) => c,
+            Err(e) => return drive_error_json(&format!("build http: {e}")),
+        };
+        let api = crate::drive_api::DriveApiClient::with_default_base_url(http.clone());
+        let access = match rt.block_on(crate::drive_oauth::refresh_access_token(
+            &http,
+            &fields.refresh_token,
+            &fields.oauth_client_id,
+            &fields.oauth_client_secret,
+        )) {
+            Ok(t) => t.access_token,
+            Err(e) if e.is_refresh_token_revoked() => {
+                let _ = clear_drive_refresh_token();
+                return drive_reauth_required_json(&format!(
+                    "Your Google access has been revoked or the session expired \
                          (Google returned: {e}). Sign in with Google again."
-                    ));
-                }
-                Err(e) => return drive_error_json(&format!("refresh failed: {e}")),
-            };
-            let folder_id = match rt.block_on(api.create_folder(&access, n)) {
-                Ok(id) => id,
-                Err(e) => return drive_error_json(&format!("create folder: {e}")),
-            };
-            format!(r#"{{"ok":true,"folder_id":"{}"}}"#, json_escape(&folder_id))
-        }),
-    );
-    env.new_string(out)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+                ));
+            }
+            Err(e) => return drive_error_json(&format!("refresh failed: {e}")),
+        };
+        let folder_id = match rt.block_on(api.create_folder(&access, n)) {
+            Ok(id) => id,
+            Err(e) => return drive_error_json(&format!("create folder: {e}")),
+        };
+        format!(r#"{{"ok":true,"folder_id":"{}"}}"#, json_escape(&folder_id))
+    })
 }
 
 /// Refresh + `files.list` against the configured folder. Confirms
@@ -1337,76 +1241,69 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveCreateFolder<'a>
 /// {"ok": false, "error": "..."}
 /// ```
 #[no_mangle]
-pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveTestConnection<'a>(
-    env: JNIEnv<'a>,
-    _class: JClass,
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveTestConnection<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
 ) -> jstring {
-    let out = safe(
-        r#"{"ok":false,"error":"panic"}"#.to_string(),
-        AssertUnwindSafe(|| {
-            install_logging_once();
-            let fields = match load_drive_config_fields() {
-                Ok(t) => t,
-                Err(e) => return drive_error_json(&e),
-            };
-            if fields.refresh_token.is_empty() {
-                return drive_error_json("not signed in to Google — sign in first, then try again");
-            }
-            if fields.folder_id.is_empty() {
-                return drive_error_json(
-                    "no folder ID set — create or paste the shared folder ID first",
-                );
-            }
-            if fields.oauth_client_id.is_empty() || fields.oauth_client_secret.is_empty() {
-                return drive_error_json(
-                    "OAuth client credentials missing — paste your client_id + client_secret \
+    jstring_return(&mut env, |_env| {
+        install_logging_once();
+        let fields = match load_drive_config_fields() {
+            Ok(t) => t,
+            Err(e) => return drive_error_json(&e),
+        };
+        if fields.refresh_token.is_empty() {
+            return drive_error_json("not signed in to Google — sign in first, then try again");
+        }
+        if fields.folder_id.is_empty() {
+            return drive_error_json(
+                "no folder ID set — create or paste the shared folder ID first",
+            );
+        }
+        if fields.oauth_client_id.is_empty() || fields.oauth_client_secret.is_empty() {
+            return drive_error_json(
+                "OAuth client credentials missing — paste your client_id + client_secret \
                      from Google Cloud Console first (see docs/drive_oauth_setup.md)",
-                );
-            }
-            let Some(rt) = one_shot_runtime() else {
-                return drive_error_json("tokio init failed");
-            };
-            let google_ip_opt = if fields.google_ip.is_empty() {
-                None
-            } else {
-                Some(fields.google_ip.as_str())
-            };
-            let http = match crate::drive_api::build_drive_http_client(google_ip_opt) {
-                Ok(c) => c,
-                Err(e) => return drive_error_json(&format!("build http: {e}")),
-            };
-            let api = crate::drive_api::DriveApiClient::with_default_base_url(http.clone());
-            let access = match rt.block_on(crate::drive_oauth::refresh_access_token(
-                &http,
-                &fields.refresh_token,
-                &fields.oauth_client_id,
-                &fields.oauth_client_secret,
-            )) {
-                Ok(t) => t.access_token,
-                Err(e) if e.is_refresh_token_revoked() => {
-                    let _ = clear_drive_refresh_token();
-                    return drive_reauth_required_json(&format!(
-                        "Your Google access has been revoked or the session expired \
+            );
+        }
+        let Some(rt) = one_shot_runtime() else {
+            return drive_error_json("tokio init failed");
+        };
+        let google_ip_opt = if fields.google_ip.is_empty() {
+            None
+        } else {
+            Some(fields.google_ip.as_str())
+        };
+        let http = match crate::drive_api::build_drive_http_client(google_ip_opt) {
+            Ok(c) => c,
+            Err(e) => return drive_error_json(&format!("build http: {e}")),
+        };
+        let api = crate::drive_api::DriveApiClient::with_default_base_url(http.clone());
+        let access = match rt.block_on(crate::drive_oauth::refresh_access_token(
+            &http,
+            &fields.refresh_token,
+            &fields.oauth_client_id,
+            &fields.oauth_client_secret,
+        )) {
+            Ok(t) => t.access_token,
+            Err(e) if e.is_refresh_token_revoked() => {
+                let _ = clear_drive_refresh_token();
+                return drive_reauth_required_json(&format!(
+                    "Your Google access has been revoked or the session expired \
                          (Google returned: {e}). Sign in with Google again."
-                    ));
-                }
-                Err(e) => return drive_error_json(&format!("refresh failed: {e}")),
-            };
-            let files = match rt.block_on(api.list_files_in_folder(&access, &fields.folder_id, ""))
-            {
-                Ok(f) => f,
-                Err(e) => return drive_error_json(&format!("list folder: {e}")),
-            };
-            format!(
-                r#"{{"ok":true,"folder_id":"{}","files_count":{}}}"#,
-                json_escape(&fields.folder_id),
-                files.len()
-            )
-        }),
-    );
-    env.new_string(out)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+                ));
+            }
+            Err(e) => return drive_error_json(&format!("refresh failed: {e}")),
+        };
+        let files = match rt.block_on(api.list_files_in_folder(&access, &fields.folder_id, "")) {
+            Ok(f) => f,
+            Err(e) => return drive_error_json(&format!("list folder: {e}")),
+        };
+        format!(
+            r#"{{"ok":true,"folder_id":"{}","files_count":{}}}"#,
+            json_escape(&fields.folder_id),
+            files.len()
+        )
+    })
 }
 
 /// Pure bech32m parse echo — live-validate the relay public key
@@ -1414,24 +1311,18 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveTestConnection<'
 /// human-readable error otherwise. (No JSON wrapper because the UI
 /// just needs a yes/no + reason.)
 #[no_mangle]
-pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveValidateRelayPubkey<'a>(
-    mut env: JNIEnv<'a>,
-    _class: JClass,
-    relay_pubkey: JString,
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_driveValidateRelayPubkey<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+    relay_pubkey: JString<'local>,
 ) -> jstring {
-    let out = safe(
-        "panic".to_string(),
-        AssertUnwindSafe(|| {
-            let s = jstring_to_string(&mut env, &relay_pubkey);
-            match crate::drive_crypto::RelayPubkey::from_bech32m(&s) {
-                Ok(_) => String::new(),
-                Err(e) => e.to_string(),
-            }
-        }),
-    );
-    env.new_string(out)
-        .map(|s| s.into_raw())
-        .unwrap_or(std::ptr::null_mut())
+    jstring_return(&mut env, |env| {
+        let s = jstring_to_string(env, &relay_pubkey);
+        match crate::drive_crypto::RelayPubkey::from_bech32m(&s) {
+            Ok(_) => String::new(),
+            Err(e) => e.to_string(),
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------

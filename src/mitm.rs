@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use rcgen::{
-    BasicConstraints, Certificate, CertificateParams, DistinguishedName, DnType,
-    ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
@@ -55,13 +55,7 @@ pub struct MitmCertManager {
     /// This is what we chain onto leaves so browsers validate against
     /// the exact cert they've trusted.
     ca_cert_der: CertificateDer<'static>,
-    /// The CA key pair used to sign leaves.
-    ca_key_pair: KeyPair,
-    /// An in-memory `Certificate` (the rcgen type) whose params match the
-    /// on-disk CA. Used as the `issuer` argument when signing leaves. Its
-    /// DER may differ from `ca_cert_der` (different serial, signature
-    /// re-made), but that's fine — we never send this cert to browsers.
-    ca_cert: Certificate,
+    ca_issuer: Issuer<'static, KeyPair>,
     cache: HashMap<String, Arc<ServerConfig>>,
 }
 
@@ -96,19 +90,13 @@ impl MitmCertManager {
             return Err(MitmError::Pem("no certificate in ca.crt".into()));
         }
         let ca_cert_der = certs.remove(0);
-
-        // Rebuild params from the DER, then self-sign an in-memory Certificate
-        // for use as the signing-issuer. Its DER signature will differ from
-        // the on-disk one, but DN, SAN, and key identifier match.
-        let params = CertificateParams::from_ca_cert_der(&ca_cert_der)?;
-        let ca_cert = params.self_signed(&key_pair)?;
+        let ca_issuer = Issuer::from_ca_cert_pem(&cert_pem, key_pair)?;
 
         tracing::info!("Loaded MITM CA from {}", cert_path.display());
 
         Ok(Self {
             ca_cert_der,
-            ca_key_pair: key_pair,
-            ca_cert,
+            ca_issuer,
             cache: HashMap::new(),
         })
     }
@@ -143,11 +131,11 @@ impl MitmCertManager {
         );
 
         let ca_cert_der = ca_cert.der().clone();
+        let ca_issuer = Issuer::new(params, key_pair);
 
         Ok(Self {
             ca_cert_der,
-            ca_key_pair: key_pair,
-            ca_cert,
+            ca_issuer,
             cache: HashMap::new(),
         })
     }
@@ -206,7 +194,7 @@ impl MitmCertManager {
         params.not_after = now + time::Duration::days(365);
 
         let leaf_key = KeyPair::generate()?;
-        let leaf = params.signed_by(&leaf_key, &self.ca_cert, &self.ca_key_pair)?;
+        let leaf = params.signed_by(&leaf_key, &self.ca_issuer)?;
         let leaf_der = leaf.der().clone();
         let leaf_key_der = leaf_key.serialize_der();
         Ok((leaf_der, leaf_key_der))

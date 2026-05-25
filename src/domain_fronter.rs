@@ -10702,7 +10702,7 @@ hello";
         let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
         let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
         let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
-            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()),
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()),
         );
 
         let mut server_cfg = rustls::ServerConfig::builder()
