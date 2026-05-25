@@ -853,28 +853,28 @@ class RahgozarVpnService : VpnService() {
                 }
             }
 
-            // 2. Cooperative stop signal — mostly redundant now that step 1
-            //    has yanked the socket out from under the worker, but cheap
-            //    and covers any future code path where the worker might be
-            //    blocked on something other than its upstream socket read.
-            //    Bounded so a hung JNI call can't stall teardown.
-            if (tun2proxyRunning.get()) {
-                val stopper =
-                    Thread({
-                        try {
-                            Tun2proxy.stop()
-                        } catch (t: Throwable) {
-                            Log.w(TAG, "Tun2proxy.stop: ${t.message}")
-                        }
-                    }, "rahgozar-tun2proxy-stop").apply { start() }
-                try {
-                    stopper.join(2_000)
-                } catch (_: InterruptedException) {
-                }
-                if (stopper.isAlive) {
-                    Log.w(TAG, "Tun2proxy.stop did not return within 2s — proceeding")
-                }
-            }
+            // 2. Cooperative stop signal — DELIBERATELY SKIPPED to test a
+            //    libhwui FORTIFY abort that fires ~1.8s after teardown on
+            //    Samsung Android 16 (and possibly other vendor builds).
+            //    The crash bionic reports is
+            //      `pthread_mutex_lock called on a destroyed mutex` on
+            //    `hwuiTask0`, with the mutex address consistently inside
+            //    libhwui.so's .bss segment. We confirmed via /proc/self/maps
+            //    that the mutex is owned by Android's libhwui, not by us.
+            //    The original kdoc note above already characterised step 2
+            //    as "mostly redundant" because step 1 closes the SOCKS5
+            //    listener that the tun2proxy worker is blocked reading
+            //    from — the worker exits cleanly on EOF without needing the
+            //    cooperative `Tun2proxy.stop()` signal. Empirically that's
+            //    been holding (we see `tun2proxy exited rc=0` in logcat
+            //    consistently). Calling `Tun2proxy.stop()` is the only
+            //    teardown step that crosses into libtun2proxy.so via JNI,
+            //    so it's the most likely Rust-side trigger for the libhwui
+            //    cascade. Confirm in a future hardening pass: if disconnect
+            //    is stable without this call, leave the skip in; if some
+            //    edge case turns up where the worker hangs without the
+            //    explicit signal, reinstate with a narrower gate.
+            Log.i(TAG, "teardown: skipping Tun2proxy.stop() (libhwui crash workaround)")
 
             // 3. Drop our PFD reference. detachFd at startup means this
             //    close() is a no-op for the underlying fd — tun2proxy owns
