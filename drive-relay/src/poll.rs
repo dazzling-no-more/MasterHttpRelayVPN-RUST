@@ -75,9 +75,8 @@ const IDLE_BACKOFF_STEP_MS: u64 = 100;
 /// waiting on, not the sleep). Idle QPS at 500 ms cap is 2/s,
 /// comfortably under Drive's 10 QPS budget.
 const MAX_IDLE_INTERVAL_MS: u64 = 500;
-/// Match Skirk's fresh-list lookback so delayed Drive visibility
-/// cannot strand an older missing seq behind an exact modifiedTime
-/// cursor.
+/// fresh-list lookback so delayed Drive visibility cannot strand
+/// an older missing seq behind an exact modifiedTime cursor.
 const MODIFIED_CURSOR_LOOKBACK_SECS: i64 = 8;
 
 /// Mailbox depth between the poll worker and a per-session driver
@@ -126,7 +125,7 @@ pub async fn poll_loop(state: Arc<RelayState>) {
 /// visibility lag for newly uploaded mailbox files). Once a cursor
 /// is set, subsequent calls use the much-faster `modifiedTime >= ...`
 /// recently-modified-children query. The 8s lookback preserves
-/// Skirk's safety margin against out-of-order Drive visibility.
+/// safety margin against out-of-order Drive visibility.
 fn advance_modified_cursor(
     files: &[DriveFile],
     cursor: &mut Option<String>,
@@ -217,7 +216,7 @@ async fn run_one_cycle(
         }
     };
     // Advance the cursor against the raw (pre-filter) listing so
-    // subsequent cycles fetch only recent files via Skirk's lookback.
+    // subsequent cycles fetch only recent files via lookback.
     // See `advance_modified_cursor` for the empty-listing rationale.
     advance_modified_cursor(&frame_files_raw, frame_cursor, call_start);
     let mut frame_files: Vec<(DriveFile, DriveFilename)> = frame_files_raw
@@ -942,7 +941,7 @@ mod tests {
     }
 
     #[test]
-    fn modified_cursor_advances_with_skirk_lookback() {
+    fn modified_cursor_advances_with_lookback() {
         let mt = parse_rfc3339("2026-05-24T12:00:08Z");
         let files = vec![DriveFile {
             id: "id".into(),

@@ -219,8 +219,7 @@ pub const BATCH_MAGIC: &[u8; 4] = b"RG2B";
 /// per-batch worst-case memory pressure bounded (256 × MAX_PAYLOAD =
 /// 1 GiB theoretical, but in practice each frame is ≤16 KiB — the
 /// LOCAL_SOCKET_READ_BUFFER cap — so realistic batch bodies are
-/// ≤4 MiB). Matches Skirk's `muxMaxFrames = 512` (we err lower since
-/// our per-frame ceiling is 4 MiB vs Skirk's smaller per-frame size).
+/// ≤4 MiB).
 pub const MAX_BATCH_FRAMES: u8 = 255;
 
 /// 4 (magic) + 1 (count) = 5 bytes of fixed batch overhead, plus

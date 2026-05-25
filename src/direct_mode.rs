@@ -1350,10 +1350,49 @@ const LOCAL_BYPASS_BREAKER_THRESHOLD: u32 = 3;
 const LOCAL_BYPASS_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
 const LOCAL_BYPASS_BREAKER_MAX_ENTRIES: usize = 256;
 
-#[derive(Debug, Clone, Copy)]
+/// Per-host, per-profile strike threshold. After this many consecutive
+/// race failures involving a given (host, profile) pair, that profile
+/// drops out of rotation for that host. Ported from SNI-Spoofing-Go's
+/// `policy.DefaultStrikeThreshold` (`internal/policy/factory.go`); the
+/// `3` value is verbatim from there.
+const LOCAL_BYPASS_PROFILE_STRIKE_THRESHOLD: u32 = 3;
+
+/// Floor on how many fragmenting profiles must remain available for any
+/// single host. If strike-blacklisting would drop us below this number,
+/// the picker forgives every profile for that host and re-includes the
+/// full pool. Mirrors `policy.DefaultMinDecoys`'s role: prevents the
+/// adaptive filter from starving the pool to nothing on a host that
+/// just plain doesn't work, where the right behaviour is "stop trying"
+/// (the host-level breaker handles that) rather than "lock in one
+/// arbitrary profile forever."
+const LOCAL_BYPASS_PROFILE_FLOOR: usize = 2;
+
+#[derive(Debug, Clone)]
 struct LocalBypassBreakerEntry {
     consecutive_failures: u32,
     until: Option<Instant>,
+    /// Per-profile consecutive failure counts for this host. Keyed by
+    /// `Profile.id` (a `&'static str`, no allocation). All mutations
+    /// go through [`local_bypass_note_dial_outcome`]: a profile that
+    /// definitively failed for this host gets `+1`, the winning
+    /// profile of a successful dial gets cleared, and other profiles
+    /// — whose state is unknown (e.g. cancelled mid-race) — are left
+    /// alone. This selective attribution is what makes the
+    /// blacklist actually adapt under the race + partial-success
+    /// shape; an earlier port cleared the whole entry on any success
+    /// and the strike counts never accumulated. Ported from
+    /// SNI-Spoofing-Go's `Factory.strategyFails` (`internal/policy/factory.go`).
+    profile_fails: std::collections::HashMap<&'static str, u32>,
+}
+
+impl LocalBypassBreakerEntry {
+    fn new() -> Self {
+        Self {
+            consecutive_failures: 0,
+            until: None,
+            profile_fails: std::collections::HashMap::new(),
+        }
+    }
 }
 
 static LOCAL_BYPASS_BREAKER_MAP: std::sync::OnceLock<
@@ -1399,62 +1438,183 @@ fn local_bypass_breaker_tripped(host: &str) -> bool {
     Instant::now() < until
 }
 
-fn local_bypass_note_success(host: &str) {
-    let key = breaker_key(host);
-    let mut map = match local_bypass_breaker_map().lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    // Successful dial → the breaker for this host is no longer
-    // useful. Removing (instead of resetting to zero) keeps the
-    // map small under normal browsing patterns: every successful
-    // first-time host gets one transient entry that immediately
-    // disappears.
-    map.remove(&key);
-}
-
-fn local_bypass_note_failure(host: &str) {
-    let key = breaker_key(host);
-    let mut map = match local_bypass_breaker_map().lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    // Prune + bounded-cap. Done inside the same critical section
-    // as the upsert below so the cap is honoured exactly. The
-    // cleanup is conditional on being at-or-past cap, so warm
-    // paths (a single bad host) don't pay the O(N) sweep at all.
-    if map.len() >= LOCAL_BYPASS_BREAKER_MAX_ENTRIES && !map.contains_key(&key) {
-        let now = Instant::now();
-        map.retain(|_, e| e.until.map_or(false, |t| now < t));
-        if map.len() >= LOCAL_BYPASS_BREAKER_MAX_ENTRIES {
-            // Still at cap → evict the entry expiring soonest.
-            // `min_by_key` on the `until` value; entries without an
-            // `until` (consecutive_failures < threshold) get
-            // dropped first via `None`-sorts-first ordering.
-            if let Some(oldest) = map
-                .iter()
-                .min_by_key(|(_, e)| e.until)
-                .map(|(k, _)| k.clone())
-            {
-                map.remove(&oldest);
-            }
+/// Evict expired or oldest entries when the breaker map is at capacity
+/// AND we're about to insert a new key. Called by `note_dial_outcome`
+/// with the lock held so the cap is honoured exactly across writers.
+/// The cleanup is conditional on being at-or-past cap, so warm paths
+/// (a single bad host) don't pay the O(N) sweep at all.
+fn evict_if_at_cap(
+    map: &mut std::collections::HashMap<String, LocalBypassBreakerEntry>,
+    incoming_key: &str,
+) {
+    if map.len() < LOCAL_BYPASS_BREAKER_MAX_ENTRIES || map.contains_key(incoming_key) {
+        return;
+    }
+    let now = Instant::now();
+    map.retain(|_, e| e.until.map_or(false, |t| now < t));
+    if map.len() >= LOCAL_BYPASS_BREAKER_MAX_ENTRIES {
+        // Still at cap → evict the entry expiring soonest.
+        // `min_by_key` on the `until` value; entries without an
+        // `until` (consecutive_failures < threshold) get
+        // dropped first via `None`-sorts-first ordering.
+        if let Some(oldest) = map
+            .iter()
+            .min_by_key(|(_, e)| e.until)
+            .map(|(k, _)| k.clone())
+        {
+            map.remove(&oldest);
         }
     }
-    let entry = map.entry(key.clone()).or_insert(LocalBypassBreakerEntry {
-        consecutive_failures: 0,
-        until: None,
-    });
-    entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
-    if entry.consecutive_failures >= LOCAL_BYPASS_BREAKER_THRESHOLD {
-        entry.until = Some(Instant::now() + LOCAL_BYPASS_BREAKER_COOLDOWN);
-        tracing::warn!(
-            "local-bypass circuit breaker tripped for '{}' after {} consecutive failures; \
-             skipping fragmentation for {:?}",
-            key,
-            entry.consecutive_failures,
-            LOCAL_BYPASS_BREAKER_COOLDOWN
-        );
+}
+
+/// Record a dial outcome for `host`. Single entry point for every
+/// success / failure path in `try_local_bypass_tunnel` so per-profile
+/// attribution stays correct under the race + partial-success shape
+/// unique to rahgozar.
+///
+/// - Each `pid` in `failed_profiles` gets `+1` strike for this host
+///   (saturating to avoid overflow).
+/// - If `winner` is `Some(pid)`, that profile's strike count is
+///   cleared AND the host-level breaker resets (`consecutive_failures
+///   = 0`, `until = None`). This is the success branch.
+/// - If `winner` is `None` and `failed_profiles` is non-empty, the
+///   host-level breaker increments and may trip per the existing
+///   `LOCAL_BYPASS_BREAKER_*` thresholds. This is the total-failure
+///   branch.
+///
+/// Why a single function: the partial-success case (fast-path
+/// failed, race produced a winner) needs to BOTH strike the failed
+/// fast-path profile AND clear the winner / reset the breaker.
+/// Splitting into independent success / failure helpers hid that
+/// case earlier — the success helper removed the whole entry, the
+/// failed fast-path profile never accumulated a strike, and the
+/// adaptive blacklist became a no-op for the most realistic failure
+/// mode. Concentrating outcome attribution in one function keeps
+/// the partial-success branch impossible to forget.
+///
+/// Ported from SNI-Spoofing-Go's `Factory.ReportResult`
+/// (`internal/policy/factory.go`), generalized to support our
+/// race-of-N-profiles per connection.
+///
+/// Compaction: when the entry has no remaining state
+/// (`consecutive_failures == 0`, no `until`, no profile fails) the
+/// entry is removed so the map stays small for first-time-success
+/// hosts.
+fn local_bypass_note_dial_outcome(
+    host: &str,
+    failed_profiles: &[&'static str],
+    winner: Option<&'static str>,
+) {
+    if failed_profiles.is_empty() && winner.is_none() {
+        return;
     }
+    let key = breaker_key(host);
+    let mut map = match local_bypass_breaker_map().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    evict_if_at_cap(&mut map, &key);
+    let entry = map
+        .entry(key.clone())
+        .or_insert_with(LocalBypassBreakerEntry::new);
+
+    for pid in failed_profiles {
+        // Skip striking a profile that's also being reported as the
+        // winner — defensive against a future caller passing the
+        // same id in both lists. The dial flow never does this
+        // today (fast-path failure id is distinct from race winner),
+        // but the symmetry is cheap to enforce.
+        if winner == Some(*pid) {
+            continue;
+        }
+        let c = entry.profile_fails.entry(*pid).or_insert(0);
+        *c = c.saturating_add(1);
+    }
+
+    if let Some(pid) = winner {
+        entry.profile_fails.remove(pid);
+        entry.consecutive_failures = 0;
+        entry.until = None;
+    } else if !failed_profiles.is_empty() {
+        entry.consecutive_failures = entry.consecutive_failures.saturating_add(1);
+        if entry.consecutive_failures >= LOCAL_BYPASS_BREAKER_THRESHOLD {
+            entry.until = Some(Instant::now() + LOCAL_BYPASS_BREAKER_COOLDOWN);
+            tracing::warn!(
+                "local-bypass circuit breaker tripped for '{}' after {} consecutive failures; \
+                 skipping fragmentation for {:?}",
+                key,
+                entry.consecutive_failures,
+                LOCAL_BYPASS_BREAKER_COOLDOWN
+            );
+        }
+    }
+
+    // Compact: if the entry is fully empty after this update,
+    // remove it so first-time-success hosts don't leave a transient
+    // entry behind. Matches the old `note_success` "map stays
+    // small" optimization without losing the profile-strike state
+    // when there IS state worth keeping.
+    if entry.consecutive_failures == 0 && entry.until.is_none() && entry.profile_fails.is_empty() {
+        map.remove(&key);
+    }
+}
+
+/// Pure-function picker: given a strike-count map, return the profile
+/// ids still in rotation. Mirrors `Factory.availableStrategiesLocked`
+/// from SNI-Spoofing-Go (`internal/policy/factory.go`).
+///
+/// - Always operates over the fragmenting profile pool (p00 / Passthrough
+///   is filtered out at the source) so passthrough cannot accidentally
+///   slip back into rotation via this path either.
+/// - Excludes ids whose strike count has reached `threshold`.
+/// - If exclusion would drop the available set below `floor`, returns
+///   the full fragmenting pool — i.e. "forgive everyone" rather than
+///   starve to one arbitrary profile. The host-level breaker is the
+///   right tool for "stop trying this host"; this picker is only for
+///   "rotate away from profiles that have already proven useless here."
+fn available_profile_ids(
+    profile_fails: &std::collections::HashMap<&'static str, u32>,
+    threshold: u32,
+    floor: usize,
+) -> Vec<&'static str> {
+    let pool: Vec<&'static str> = PROFILES
+        .iter()
+        .filter(|p| is_fragmenting_profile(p))
+        .map(|p| p.id)
+        .collect();
+    let filtered: Vec<&'static str> = pool
+        .iter()
+        .copied()
+        .filter(|id| profile_fails.get(id).copied().unwrap_or(0) < threshold)
+        .collect();
+    if filtered.len() < floor {
+        pool
+    } else {
+        filtered
+    }
+}
+
+/// Loader: snapshot the per-host strike map and resolve to a set of
+/// allowed profile ids. Pulls the lock briefly so callers can use the
+/// returned set without holding the breaker mutex across the race.
+fn local_bypass_available_profile_ids(host: &str) -> std::collections::HashSet<&'static str> {
+    let key = breaker_key(host);
+    let pf = {
+        let map = match local_bypass_breaker_map().lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        map.get(&key)
+            .map(|e| e.profile_fails.clone())
+            .unwrap_or_default()
+    };
+    available_profile_ids(
+        &pf,
+        LOCAL_BYPASS_PROFILE_STRIKE_THRESHOLD,
+        LOCAL_BYPASS_PROFILE_FLOOR,
+    )
+    .into_iter()
+    .collect()
 }
 
 /// True when the profile actually fragments the ClientHello — i.e. its
@@ -1597,8 +1757,53 @@ pub async fn try_local_bypass_tunnel(
     // app-level pinning continue to work.
     let connect_target = dial_target.unwrap_or(host).to_string();
 
-    // 3. Fast path with the cached/default profile.
-    let preferred = local_bypass_preferred_profile();
+    // 3. Resolve the set of profiles still in rotation for THIS host.
+    //    Profiles that have hit `LOCAL_BYPASS_PROFILE_STRIKE_THRESHOLD`
+    //    consecutive failures for this host drop out of the picker
+    //    until a future success on this host clears the entry. The
+    //    floor in `available_profile_ids` guarantees at least
+    //    `LOCAL_BYPASS_PROFILE_FLOOR` profiles remain in rotation
+    //    even if every fragmenting profile has been struck out — at
+    //    that point the host-level breaker is the right escape
+    //    hatch, not zero-profile starvation. Snapshot here so the
+    //    breaker lock isn't held across the race.
+    let allowed_ids = local_bypass_available_profile_ids(host);
+
+    // Fast path with the cached/default profile. If the global
+    // preferred isn't currently in rotation for this host, fall back
+    // to the documented first-dial default (also gated on the
+    // per-host allow-set); if THAT'S also blacklisted here, take the
+    // first allowed profile in declaration order. The floor in
+    // `available_profile_ids` guarantees this last fallback finds
+    // something — empty `allowed_ids` is unreachable.
+    let preferred: &'static Profile = {
+        let global = local_bypass_preferred_profile();
+        if allowed_ids.contains(global.id) {
+            global
+        } else {
+            let dp = default_profile();
+            if allowed_ids.contains(dp.id) {
+                dp
+            } else {
+                // Floor in `available_profile_ids` guarantees this
+                // last fallback finds at least one profile; `dp`
+                // here is the rescue if a future PROFILES reorder
+                // ever desyncs.
+                PROFILES
+                    .iter()
+                    .find(|p| allowed_ids.contains(p.id))
+                    .unwrap_or(dp)
+            }
+        }
+    };
+
+    // Track every profile attempted (fast-path + race participants)
+    // so the failure-attribution branch can strike them all when no
+    // ServerHello arrives anywhere, AND so the partial-success
+    // branch (race won after fast-path failed) can strike the
+    // failed fast-path profile while clearing the winner's count.
+    let mut attempted: Vec<&'static str> = vec![preferred.id];
+
     if let Some(w) = tokio::time::timeout(
         FAST_PATH_TIMEOUT,
         dial_one(
@@ -1614,7 +1819,9 @@ pub async fn try_local_bypass_tunnel(
     .flatten()
     {
         local_bypass_remember(w.profile);
-        local_bypass_note_success(host);
+        // Fast-path win: no failed profile to attribute, just clear
+        // the winner's count and reset the host breaker.
+        local_bypass_note_dial_outcome(host, &[], Some(w.profile.id));
         tracing::info!(
             "local-bypass {}:{} (profile={}, ServerHello in {}ms)",
             host,
@@ -1638,14 +1845,17 @@ pub async fn try_local_bypass_tunnel(
     //    would let a non-DPI'd host accidentally crown it the global
     //    winner and silently turn LocalBypass into raw passthrough
     //    for every subsequent connection. See the doc comment on
-    //    `is_fragmenting_profile`.
+    //    `is_fragmenting_profile`. Adaptive blacklist: profiles
+    //    struck out for THIS host (see `allowed_ids` above) are also
+    //    skipped.
     let mut tasks = tokio::task::JoinSet::new();
     let hello_owned = client_hello.clone();
     let connect_target_owned = connect_target.clone();
     for p in PROFILES.iter() {
-        if p.id == preferred.id || !is_fragmenting_profile(p) {
+        if p.id == preferred.id || !is_fragmenting_profile(p) || !allowed_ids.contains(p.id) {
             continue;
         }
+        attempted.push(p.id);
         let target = connect_target_owned.clone();
         let hello = hello_owned.clone();
         tasks.spawn(async move { dial_one(port, target, p, &hello, SERVER_HELLO_TIMEOUT).await });
@@ -1676,7 +1886,20 @@ pub async fn try_local_bypass_tunnel(
             // unfragmented SNI). That's the best a no-VPS mode can
             // do — the alternative is silently dropping the
             // connection.
-            local_bypass_note_failure(host);
+            //
+            // Adaptive blacklist update: every profile that ran to
+            // completion in this connection gets +1 strike for this
+            // host AND the host-level breaker increments (may trip).
+            // Future connections to the same host skip those
+            // profiles until a success on this host clears their
+            // counts. Caveat: when EVERY allowed profile fails
+            // simultaneously they all hit threshold together and
+            // the picker's floor resets the pool — that's
+            // intentional, because the host-level breaker is the
+            // right tool for "stop trying this host," not
+            // per-profile starvation. The blacklist's actual value
+            // is in the partial-success branch below.
+            local_bypass_note_dial_outcome(host, &attempted, None);
             tracing::info!(
                 "local-bypass {}:{} -> raw fallback (all profiles failed)",
                 host,
@@ -1688,7 +1911,27 @@ pub async fn try_local_bypass_tunnel(
     };
 
     local_bypass_remember(win.profile);
-    local_bypass_note_success(host);
+    // Partial-success branch: the fast-path `preferred` profile
+    // definitively failed (no ServerHello within `FAST_PATH_TIMEOUT`),
+    // but a different profile won the race. Strike the failed
+    // fast-path profile so the next connection to this host
+    // de-prioritises it, clear the winner's count, and reset the
+    // host breaker. Other race participants that didn't complete
+    // (cancelled when the winner returned) are deliberately NOT
+    // struck — their state is unknown, and counting cancellations
+    // as failures would unfairly penalize good profiles that just
+    // happened to be slightly slower than the winner this time.
+    //
+    // This is the case the earlier port silently no-op'd: a
+    // host-level success used to remove the entry entirely, so the
+    // failed fast-path profile never accumulated a strike across
+    // repeated partial successes. The blacklist's whole adaptive
+    // value lives in this branch.
+    if preferred.id == win.profile.id {
+        local_bypass_note_dial_outcome(host, &[], Some(win.profile.id));
+    } else {
+        local_bypass_note_dial_outcome(host, &[preferred.id], Some(win.profile.id));
+    }
     tracing::info!(
         "local-bypass {}:{} (race winner profile={}, ServerHello in {}ms)",
         host,
@@ -2698,6 +2941,22 @@ mod tests {
         );
     }
 
+    /// Serialize tests that read or mutate the process-global
+    /// `LOCAL_BYPASS_BREAKER_MAP`. Cargo runs tests in parallel by
+    /// default; without this guard, a test asserting on map state
+    /// can observe writes made by an unrelated test running on
+    /// another worker thread. Every test that touches the map
+    /// directly (not via `try_local_bypass_tunnel` against a unique
+    /// fake server) must hold this guard for its duration. The
+    /// targeted per-key removes at test entry / exit are still
+    /// belt-and-suspenders for the case where a test crashes mid-run
+    /// and skips its cleanup block.
+    static BREAKER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_breaker_for_test() -> std::sync::MutexGuard<'static, ()> {
+        BREAKER_TEST_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     /// Per-host breaker scope: failures on host A must NOT trip the
     /// breaker for host B. The previous shape used a single
     /// process-global counter, so three failures on a single
@@ -2709,24 +2968,29 @@ mod tests {
     /// counter for simplicity" refactor fails loudly.
     #[test]
     fn breaker_failures_on_one_host_do_not_trip_other_hosts() {
-        // Clean the shared state so prior tests don't poison the
-        // assertion. The breaker map is process-global by necessity
-        // (it caches across CONNECTs in production); test isolation
-        // happens here via the lock-and-clear at entry.
+        let _guard = lock_breaker_for_test();
+        // Remove only the keys this test uses; whole-map clears
+        // would race with tokio tests that exercise
+        // `try_local_bypass_tunnel` against unrelated host keys.
+        let blocked = "blocked.example.test";
+        let unrelated = "unrelated.example.test";
         {
             let mut map = local_bypass_breaker_map().lock().unwrap();
-            map.clear();
+            map.remove(&breaker_key(blocked));
+            map.remove(&breaker_key(unrelated));
         }
         for _ in 0..LOCAL_BYPASS_BREAKER_THRESHOLD {
-            local_bypass_note_failure("blocked.example.test");
+            // Total-failure shape: at least one failed profile, no
+            // winner → host-level breaker increments.
+            local_bypass_note_dial_outcome(blocked, &["p05"], None);
         }
         assert!(
-            local_bypass_breaker_tripped("blocked.example.test"),
+            local_bypass_breaker_tripped(blocked),
             "breaker should trip after {} failures on the SAME host",
             LOCAL_BYPASS_BREAKER_THRESHOLD,
         );
         assert!(
-            !local_bypass_breaker_tripped("unrelated.example.test"),
+            !local_bypass_breaker_tripped(unrelated),
             "breaker for OTHER host must stay closed — global-scope \
              contamination would silently turn LocalBypass into raw \
              passthrough for unrelated hosts",
@@ -2737,19 +3001,275 @@ mod tests {
             local_bypass_breaker_tripped("BLOCKED.example.test:443"),
             "breaker_key should normalise case + port",
         );
-        // A successful dial clears the entry so it doesn't linger
-        // beyond the cooldown. Belt-and-suspenders: future code that
-        // accidentally retains-after-success would see stale "still
-        // tripped" reads on the next connect.
-        local_bypass_note_success("blocked.example.test");
+        // A successful dial resets the host-level breaker so it
+        // doesn't linger beyond the cooldown. Belt-and-suspenders:
+        // future code that accidentally retains-after-success would
+        // see stale "still tripped" reads on the next connect.
+        local_bypass_note_dial_outcome(blocked, &[], Some("p05"));
         assert!(
-            !local_bypass_breaker_tripped("blocked.example.test"),
+            !local_bypass_breaker_tripped(blocked),
             "successful dial must clear the breaker for that host",
         );
         // Cleanup so we don't leak state to sibling tests.
         {
             let mut map = local_bypass_breaker_map().lock().unwrap();
-            map.clear();
+            map.remove(&breaker_key(blocked));
+            map.remove(&breaker_key(unrelated));
+        }
+    }
+
+    /// Pure-function picker behaviour: no strikes → full fragmenting
+    /// pool. p00 (passthrough) must never appear — it's filtered at
+    /// the source so a passthrough win can't slip in via this path
+    /// either.
+    #[test]
+    fn available_profile_ids_empty_map_returns_full_fragmenting_pool() {
+        let empty: std::collections::HashMap<&'static str, u32> = std::collections::HashMap::new();
+        let got = available_profile_ids(
+            &empty,
+            LOCAL_BYPASS_PROFILE_STRIKE_THRESHOLD,
+            LOCAL_BYPASS_PROFILE_FLOOR,
+        );
+        let expected: Vec<&'static str> = PROFILES
+            .iter()
+            .filter(|p| is_fragmenting_profile(p))
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(got, expected);
+        assert!(!got.contains(&"p00"), "passthrough must never appear");
+    }
+
+    /// One profile at the strike threshold drops out; the rest stay
+    /// in rotation. Below-threshold strikes (e.g. count = threshold-1)
+    /// must NOT exclude — exclusion only kicks in when the count
+    /// reaches the threshold, matching SNI-Spoofing-Go's `< threshold`
+    /// semantics in `availableStrategiesLocked`.
+    #[test]
+    fn available_profile_ids_excludes_struck_out_profiles() {
+        let mut map: std::collections::HashMap<&'static str, u32> =
+            std::collections::HashMap::new();
+        map.insert("p05", LOCAL_BYPASS_PROFILE_STRIKE_THRESHOLD);
+        map.insert("p01", LOCAL_BYPASS_PROFILE_STRIKE_THRESHOLD - 1);
+        let got = available_profile_ids(
+            &map,
+            LOCAL_BYPASS_PROFILE_STRIKE_THRESHOLD,
+            LOCAL_BYPASS_PROFILE_FLOOR,
+        );
+        assert!(!got.contains(&"p05"), "p05 at threshold must be excluded");
+        assert!(
+            got.contains(&"p01"),
+            "p01 just below threshold must remain in rotation"
+        );
+    }
+
+    /// Floor enforcement: when strike-blacklisting would drop the
+    /// available set below `floor`, the picker returns the full
+    /// fragmenting pool instead of starving. This is the
+    /// "stop-trying-this-host is the host-level breaker's job, not the
+    /// picker's" boundary — without the floor, a host that's failing
+    /// for non-profile-related reasons (e.g. IP-blocked destination)
+    /// would lock in one arbitrary profile forever.
+    #[test]
+    fn available_profile_ids_floor_resets_to_full_pool() {
+        let fragmenting: Vec<&'static str> = PROFILES
+            .iter()
+            .filter(|p| is_fragmenting_profile(p))
+            .map(|p| p.id)
+            .collect();
+        // Strike out every fragmenting profile.
+        let mut map: std::collections::HashMap<&'static str, u32> =
+            std::collections::HashMap::new();
+        for id in &fragmenting {
+            map.insert(id, LOCAL_BYPASS_PROFILE_STRIKE_THRESHOLD);
+        }
+        let got = available_profile_ids(
+            &map,
+            LOCAL_BYPASS_PROFILE_STRIKE_THRESHOLD,
+            LOCAL_BYPASS_PROFILE_FLOOR,
+        );
+        assert_eq!(
+            got, fragmenting,
+            "with everything struck out the floor must reset to the full pool"
+        );
+    }
+
+    /// Strike accumulation + scope: total-failure
+    /// (`note_dial_outcome(host, failed, None)`) increments per-host
+    /// per-profile counters; a sibling host stays untouched; and the
+    /// host-level success branch with no failed profiles still
+    /// clears the profile-level strikes once the entry compacts.
+    /// Note: the total-failure path strikes EVERY attempted profile
+    /// uniformly, which is intentionally a near-no-op for the
+    /// picker (they all hit threshold together and the floor resets
+    /// the pool). The blacklist's real adaptive value lives in the
+    /// partial-success case — see
+    /// `partial_success_strikes_failed_preferred_and_clears_winner`
+    /// for that.
+    #[test]
+    fn note_total_failures_accumulate_per_host_and_clear_on_success() {
+        let _guard = lock_breaker_for_test();
+        let host_a = "profilestrike-host-a.example.test";
+        let host_b = "profilestrike-host-b.example.test";
+        {
+            let mut map = local_bypass_breaker_map().lock().unwrap();
+            map.remove(&breaker_key(host_a));
+            map.remove(&breaker_key(host_b));
+        }
+
+        // Three total-failure rounds on host_a involving p01 and p05.
+        for _ in 0..LOCAL_BYPASS_PROFILE_STRIKE_THRESHOLD {
+            local_bypass_note_dial_outcome(host_a, &["p01", "p05"], None);
+        }
+
+        // host_a: p01 and p05 are now at threshold. The picker
+        // returns the floor-rescue full pool because too many
+        // profiles got struck simultaneously — but the *internal*
+        // strike map still records the failures, which is what
+        // matters for the partial-success branch test below.
+        {
+            let map = local_bypass_breaker_map().lock().unwrap();
+            let entry = map.get(&breaker_key(host_a)).expect("entry exists");
+            assert_eq!(
+                entry.profile_fails.get("p01").copied().unwrap_or(0),
+                LOCAL_BYPASS_PROFILE_STRIKE_THRESHOLD,
+                "p01 must record {} strikes on host_a",
+                LOCAL_BYPASS_PROFILE_STRIKE_THRESHOLD,
+            );
+            assert_eq!(
+                entry.profile_fails.get("p05").copied().unwrap_or(0),
+                LOCAL_BYPASS_PROFILE_STRIKE_THRESHOLD,
+                "p05 must record {} strikes on host_a",
+                LOCAL_BYPASS_PROFILE_STRIKE_THRESHOLD,
+            );
+            assert!(
+                entry.profile_fails.get("p07").is_none(),
+                "untouched profiles must not appear in the strike map",
+            );
+        }
+
+        // host_b: untouched by host_a's failures — global-scope
+        // contamination would silently turn the picker into a
+        // process-global filter, regressing per-host isolation.
+        let allowed_b = local_bypass_available_profile_ids(host_b);
+        assert!(
+            allowed_b.contains("p01") && allowed_b.contains("p05"),
+            "host_b must not inherit host_a's strikes"
+        );
+
+        // A success on host_a using p07 (a profile that wasn't
+        // struck) clears the host's breaker and p07's count. p01
+        // and p05's strike counts are PRESERVED — they didn't win
+        // and weren't reported as the loser of this specific dial,
+        // so their unknown state is left intact.
+        local_bypass_note_dial_outcome(host_a, &[], Some("p07"));
+        {
+            let map = local_bypass_breaker_map().lock().unwrap();
+            let entry = map.get(&breaker_key(host_a)).expect("entry exists");
+            assert_eq!(entry.consecutive_failures, 0);
+            assert!(entry.until.is_none());
+            assert_eq!(
+                entry.profile_fails.get("p01").copied().unwrap_or(0),
+                LOCAL_BYPASS_PROFILE_STRIKE_THRESHOLD,
+                "host-level success must NOT wipe unrelated profiles' strikes"
+            );
+        }
+
+        // Cleanup.
+        {
+            let mut map = local_bypass_breaker_map().lock().unwrap();
+            map.remove(&breaker_key(host_a));
+            map.remove(&breaker_key(host_b));
+        }
+    }
+
+    /// Integration-style: the adaptive blacklist must actually adapt
+    /// when a host has ONE bad preferred profile and ANOTHER profile
+    /// that works. Simulate the partial-success dial sequence
+    /// (fast-path failed with `p05`, race won with `p01`)
+    /// `LOCAL_BYPASS_PROFILE_STRIKE_THRESHOLD` times, then verify
+    /// that the picker excludes `p05` for this host while keeping
+    /// `p01` and the untouched profiles in rotation.
+    ///
+    /// This is the test that pins the bug the earlier port silently
+    /// shipped: when `note_success` removed the whole entry on every
+    /// success, `p05`'s strike count never accumulated and the
+    /// picker never learned to skip it. The new
+    /// `note_dial_outcome(host, &[preferred.id], Some(winner.id))`
+    /// shape preserves the strike on the failed fast-path profile
+    /// while clearing the winner's count and resetting the host
+    /// breaker.
+    #[test]
+    fn partial_success_strikes_failed_preferred_and_clears_winner() {
+        let _guard = lock_breaker_for_test();
+        let host = "partial-success.example.test";
+        {
+            let mut map = local_bypass_breaker_map().lock().unwrap();
+            map.remove(&breaker_key(host));
+        }
+
+        // Three partial-success rounds: each round, p05 (preferred)
+        // failed and p01 (race winner) succeeded. Mirrors the call
+        // shape in `try_local_bypass_tunnel`'s post-race branch.
+        for _ in 0..LOCAL_BYPASS_PROFILE_STRIKE_THRESHOLD {
+            local_bypass_note_dial_outcome(host, &["p05"], Some("p01"));
+        }
+
+        let allowed = local_bypass_available_profile_ids(host);
+        assert!(
+            !allowed.contains("p05"),
+            "p05 must be excluded after {} partial-success rounds where it \
+             definitively failed; if this asserts the blacklist is not actually \
+             adapting and is a no-op for the most realistic failure mode",
+            LOCAL_BYPASS_PROFILE_STRIKE_THRESHOLD,
+        );
+        assert!(
+            allowed.contains("p01"),
+            "p01 (the repeated winner) must remain in rotation"
+        );
+        assert!(
+            allowed.contains("p07"),
+            "untouched profiles must remain in rotation"
+        );
+
+        // Host-level breaker must be cleared (every round was a
+        // success at the host level), and p01 must have zero
+        // strikes recorded.
+        {
+            let map = local_bypass_breaker_map().lock().unwrap();
+            let entry = map
+                .get(&breaker_key(host))
+                .expect("entry persists while strikes are non-zero");
+            assert_eq!(entry.consecutive_failures, 0);
+            assert!(entry.until.is_none());
+            assert!(
+                !entry.profile_fails.contains_key("p01"),
+                "winner must not appear in the strike map"
+            );
+            assert_eq!(
+                entry.profile_fails.get("p05").copied().unwrap_or(0),
+                LOCAL_BYPASS_PROFILE_STRIKE_THRESHOLD,
+            );
+        }
+
+        // A future round where p05 finally wins clears its strike
+        // count too, and (because the entry is now fully empty) the
+        // compaction step removes the entry entirely — same
+        // "map stays small" behaviour the earlier `note_success`
+        // gave us.
+        local_bypass_note_dial_outcome(host, &[], Some("p05"));
+        {
+            let map = local_bypass_breaker_map().lock().unwrap();
+            assert!(
+                !map.contains_key(&breaker_key(host)),
+                "fully-empty entries must be compacted out",
+            );
+        }
+
+        // Cleanup is implicit (entry already removed by compaction),
+        // but be explicit for the "test crashed mid-way" case.
+        {
+            let mut map = local_bypass_breaker_map().lock().unwrap();
+            map.remove(&breaker_key(host));
         }
     }
 

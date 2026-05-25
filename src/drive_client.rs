@@ -1,6 +1,6 @@
 //! Drive-mode client — Google Drive as a covert mailbox transport.
 //!
-//! Mirrors the Skirk technique (ShahabSL/Skirk): every TCP session
+//! every TCP session
 //! becomes a sequence of encrypted frames uploaded to a shared Drive
 //! folder. A separate `rahgozar-drive-relay` binary on a VPS abroad
 //! polls the folder, dials the real destination, and writes response
@@ -42,17 +42,6 @@
 //! Hello into the seq=0 body removes one Drive upload + one cold-
 //! folder visibility wait from every new CONNECT.
 //!
-//! ## Limitations (v1)
-//!
-//! - **Single ordered stream per TCP session.** Each browser CONNECT
-//!   gets its own Drive sid and strictly ordered c2r/r2c sequence.
-//!   Uploads are batched and pipelined, but rahgozar does not yet
-//!   implement Skirk's full mux-v4 four-lane object grammar.
-//! - **No client-side orphan reaper.** Stale `r2c_*` files (relay
-//!   pushed after we closed the local socket) accumulate in the
-//!   shared folder until the relay's own reaper sweeps them. Fine
-//!   for now — the relay reaper sweeps every 2 minutes.
-
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
@@ -100,7 +89,7 @@ const SESSION_MAILBOX_DEPTH: usize = 64;
 
 /// After any non-empty poll cycle, drop the next sleep to this
 /// value (pipeline mode). Lets a burst of inbound replies land
-/// without paying the baseline interval again. Matches Skirk's
+/// without paying the baseline interval again.
 /// `BurstPollMS = 75`-ish range — aggressive enough that the
 /// per-RTT wait is dominated by Drive's `files.list` latency
 /// (~150-300 ms from Iran via the google_ip override) rather than
@@ -119,12 +108,9 @@ const IDLE_BACKOFF_STEP_MS: u64 = 100;
 /// under Drive's 10 QPS budget.
 const MAX_IDLE_INTERVAL_MS: u64 = 500;
 
-/// Skirk keeps the fresh-list cursor behind the newest observed
-/// Drive `modifiedTime` so delayed object visibility and same-timestamp
-/// files cannot slip behind the next `modifiedTime >= since` query.
 const MODIFIED_CURSOR_LOOKBACK_SECS: i64 = 8;
 
-// ── c2r batching (Skirk-inspired multi-frame uploads) ────────────────
+// c2r batching:
 //
 // Each Drive file carries 1..=BATCH_MAX_FRAMES frames sealed as one
 // AEAD batch. Coalesce delay is picked based on accumulated payload
@@ -381,9 +367,7 @@ pub async fn tunnel_connection_with_preface(
     //    derives `k_c2r` from the unsealed Hello prefix, then opens the
     //    rest with that key. One file = one Drive upload + one
     //    cold-folder visibility wait on the relay side, instead of the
-    //    previous two-file (`h_<sid>_0` + `c2r_<sid>_0`) handshake. The
-    //    first client bytes are embedded in the same batch when they
-    //    are already available, Skirk-style.
+    //    previous two-file (`h_<sid>_0` + `c2r_<sid>_0`) handshake.
     let send_cipher = AeadCipher::new(&keys.k_c2r);
     let mut next_c2r_seq: u64 = 1;
     let open_data_frames = if initial_client_bytes.is_empty() {
@@ -643,7 +627,7 @@ fn seal_batch(cipher: &AeadCipher, sid: SessionId, batch: &drive_wire::frame::Ba
 }
 
 /// Pick the coalesce wait window based on currently-accumulated batch
-/// payload bytes. Matches Skirk's tiered policy:
+/// payload bytes.
 ///   <  8 KB → 5 ms  (interactive: TLS records, request headers)
 ///   <  64 KB → 50 ms (medium: full request bodies)
 ///   ≥ 64 KB → 100 ms (bulk: large response bodies)
@@ -742,8 +726,7 @@ fn push_c2r_frame(
 ) {
     *pending_bytes += frame.payload.len();
     pending.push(frame);
-    // EAGER FLUSH on second+ frame in the batch (Skirk-style — see
-    // their `shouldCorkNormalBatchLocked` at mux.go:1460). The
+    // EAGER FLUSH on second+ frame in the batch. The
     // coalesce delay's only job is to let a 2nd frame ARRIVE; the
     // moment one does, batch + flush immediately. Waiting longer
     // just adds latency without packing more frames (subsequent
@@ -1052,7 +1035,7 @@ async fn poll_loop(weak: Weak<DriveMuxInner>) {
     // (full folder list); advanced after each cycle to the latest
     // modifiedTime seen, minus a small safety window so delayed
     // Drive visibility does not strand an older missing seq behind
-    // the cursor. Mirrors Skirk's `nextListSince` lookback logic.
+    // the cursor.
     let mut modified_cursor: Option<String> = None;
 
     tracing::info!(
@@ -1114,8 +1097,7 @@ fn adapt_interval(
 /// (multi-second visibility lag for newly uploaded mailbox files).
 /// Once we set a cursor, subsequent calls use the much-faster
 /// `modifiedTime >= ...` predicate over the folder's recently-modified
-/// children. The 8s lookback keeps Skirk's safety margin against
-/// out-of-order Drive visibility.
+/// children.
 fn advance_modified_cursor(
     files: &[DriveFile],
     cursor: &mut Option<String>,
@@ -1181,7 +1163,7 @@ async fn run_one_cycle(inner: Arc<DriveMuxInner>, modified_cursor: &mut Option<S
             return false;
         }
     };
-    // Advance the cursor before filtering / processing. Skirk's 8s
+    // Advance the cursor before filtering / processing. The 8s
     // lookback keeps us robust against out-of-order Drive visibility;
     // the `now` argument bootstraps the cursor when the listing is
     // empty so steady polling stops re-hitting the full-text name
@@ -1225,8 +1207,7 @@ async fn run_one_cycle(inner: Arc<DriveMuxInner>, modified_cursor: &mut Option<S
     let download_permits = Arc::new(tokio::sync::Semaphore::new(permits_cap));
 
     // Group by sid so commit stays strictly ordered per TCP stream,
-    // but let each group prefetch Drive bodies concurrently. This
-    // mirrors Skirk's receive workers without the unsafe part: Drive
+    // but let each group prefetch Drive bodies concurrently. Drive
     // download/decrypt/decode can race, while replay-window commit
     // and mpsc delivery happen later in sorted seq order.
     let mut frames_by_sid: std::collections::HashMap<SessionId, Vec<(DriveFile, DriveFilename)>> =
@@ -1267,8 +1248,7 @@ enum DeliveryOutcome {
 }
 
 /// Process one sid's r2c files with parallel Drive-body prefetch,
-/// then ordered commit. This is the client-side receive analogue of
-/// Skirk's workers: network-bound downloads run concurrently, but
+/// then ordered commit. Network-bound downloads run concurrently, but
 /// replay-window advancement and local socket delivery stay strictly
 /// sequential.
 async fn process_r2c_group(
@@ -1687,7 +1667,7 @@ mod tests {
     }
 
     #[test]
-    fn modified_cursor_advances_with_skirk_lookback() {
+    fn modified_cursor_advances_with_lookback() {
         // Files non-empty, file_max >= now → basis is file_max,
         // cursor advances to file_max - lookback.
         let mt = parse_rfc3339("2026-05-24T12:00:08Z");

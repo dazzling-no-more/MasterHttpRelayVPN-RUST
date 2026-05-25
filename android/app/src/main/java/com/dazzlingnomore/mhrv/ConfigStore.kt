@@ -91,7 +91,7 @@ enum class Mode {
     LOCAL_BYPASS,
 
     /**
-     * Drive-mailbox transport (Skirk technique). Every TCP session
+     * Drive-mailbox transport. Every TCP session
      * is sealed and uploaded as files to a shared Google Drive
      * folder; a separate `rahgozar-drive-relay` binary on a VPS
      * abroad polls the folder, dials the destination, and writes

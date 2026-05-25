@@ -37,7 +37,7 @@ pub enum Mode {
     /// against IP-level blocks (the destination must still be
     /// reachable from the user's network).
     LocalBypass,
-    /// Drive-mailbox transport (Skirk technique): every TLS CONNECT
+    /// Drive-mailbox transport: every TLS CONNECT
     /// is multiplexed into encrypted frames uploaded as files to a
     /// shared Google Drive folder. A separate `rahgozar-drive-relay`
     /// binary on a VPS the user controls polls the folder, dials the
@@ -93,7 +93,7 @@ impl Mode {
     }
 
     /// True iff this mode tunnels through the Google Drive mailbox
-    /// (Skirk technique) and therefore requires a non-empty
+    /// and therefore requires a non-empty
     /// `drive.oauth_refresh_token`, `drive.folder_id`, and
     /// `drive.relay_pubkey`. Single source of truth — same pattern as
     /// [`uses_apps_script_relay`] above; adding a future "Drive +

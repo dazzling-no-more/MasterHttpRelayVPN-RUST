@@ -133,8 +133,8 @@ arc-swap = "1"
 # All pure-Rust RustCrypto crates so the Android cdylib + mipsel-musl
 # router cross-compile inherits zero new C toolchain pain. Trade-off
 # vs ring (~10% slower on x86_64): irrelevant in a transport bounded
-# by Drive's ~hundreds-of-ms RTT floor. libsodium (Skirk's upstream
-# choice) would mean a C dep per target — declined.
+# by Drive's ~hundreds-of-ms RTT floor. libsodium would mean a C dep 
+# per target — declined.
 #
 #   chacha20poly1305 — IETF AEAD, RFC 8439. 12-byte nonce per the spec.
 #   x25519-dalek     — ECDH for the session-keys derivation. `static_secrets`

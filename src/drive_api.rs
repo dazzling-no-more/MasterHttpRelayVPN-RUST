@@ -181,9 +181,7 @@ pub fn build_drive_http_client(google_ip: Option<&str>) -> Result<reqwest::Clien
         // across the same TCP stream and avoids paying the handshake
         // cost again. The keep-alive ping interval (30 s) is short
         // enough that Google's edge doesn't drop the H2 connection
-        // during the typical browsing idle window. Skirk's equivalent
-        // is `GoogleHTTPClient` with the same posture — see
-        // `internal/skirk/httpclient.go`.
+        // during the typical browsing idle window.
         .http2_keep_alive_interval(Duration::from_secs(30))
         .http2_keep_alive_while_idle(true)
         .tcp_keepalive(Duration::from_secs(60))
@@ -299,8 +297,7 @@ impl DriveApiClient {
     /// only files newer than the previous high-water mark — a huge
     /// per-call latency win once a Drive folder has accumulated even
     /// a few hundred frames, since the server returns the bounded
-    /// delta instead of the full folder. Skirk-inspired: see
-    /// `ListFreshContainsPageStatus` at `internal/skirk/drive.go:557`.
+    /// delta instead of the full folder.
     ///
     /// `since=None` is equivalent to the unbounded list; useful for
     /// startup or test connection.
@@ -337,9 +334,7 @@ impl DriveApiClient {
                 ("fields", "nextPageToken,files(id,name,modifiedTime,size)"),
                 ("pageSize", page_size.as_str()),
                 // Runtime pollers use a sliding `modifiedTime >= since`
-                // cursor. Asking Drive for newest-first pages matches
-                // Skirk's fresh-list path and keeps hot objects near
-                // page 1 when a folder has stale backlog.
+                // cursor.
                 ("orderBy", "modifiedTime desc"),
                 ("spaces", "drive"),
             ];
