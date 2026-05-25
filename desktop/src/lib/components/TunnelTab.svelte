@@ -84,7 +84,10 @@
 
   // direct / google_only (legacy alias) / local_bypass / drive all
   // skip the Apps Script relay, so the deployment-IDs + auth-key
-  // form is disabled under any of them.
+  // form is hidden under any of them — switching back to
+  // apps_script or full restores it. (apps_script + full are the
+  // only modes that consult `script_ids` / `auth_key`, mirroring
+  // the Rust-side `Mode::uses_apps_script_relay`.)
   const noRelay = $derived(
     config?.mode === "direct" ||
       config?.mode === "google_only" ||
@@ -385,125 +388,114 @@
       <FrontingGroupsSection />
     {/if}
 
-    <!-- ── Apps Script relay ─────────────────────────────────────── -->
-    <section
-      class="bg-surface border-border-subtle rounded-lg border p-5 {noRelay
-        ? 'opacity-50'
-        : ''}"
-    >
-      <h2 class="text-secondary mb-3 text-xs font-semibold tracking-wider uppercase">
-        {t("tunnel.section.apps_script")}
-      </h2>
+    <!-- ── Apps Script relay ───────────────────────────────────────
+         Mode-gated: only renders for apps_script / full. Other modes
+         don't read script_ids / auth_key, so showing the editor just
+         implies the values matter when they don't. -->
+    {#if !noRelay}
+      <section class="bg-surface border-border-subtle rounded-lg border p-5">
+        <h2 class="text-secondary mb-3 text-xs font-semibold tracking-wider uppercase">
+          {t("tunnel.section.apps_script")}
+        </h2>
 
-      <!-- Deployment IDs row editor. -->
-      <div class="space-y-2">
-        <div class="text-primary text-sm font-semibold">
-          {t("tunnel.deployment_ids.label")}
+        <!-- Deployment IDs row editor. -->
+        <div class="space-y-2">
+          <div class="text-primary text-sm font-semibold">
+            {t("tunnel.deployment_ids.label")}
+          </div>
+          <p class="text-muted text-xs">{t("tunnel.deployment_ids.help")}</p>
+
+          <div class="space-y-1.5">
+            {#each config.script_ids as entry, i (i)}
+              <div class="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  bind:checked={config.script_ids[i].enabled}
+                  aria-label={tn("tunnel.deployment_ids.enable_aria", {
+                    n: i + 1,
+                  })}
+                  class="accent-accent h-4 w-4 cursor-pointer"
+                />
+                <span class="text-muted w-7 text-end font-mono text-xs">
+                  {String(i + 1).padStart(2, "0")}.
+                </span>
+                <input
+                  type="text"
+                  bind:value={config.script_ids[i].id}
+                  class="bg-input border-border-subtle focus:border-accent flex-1 rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors {entry.enabled
+                    ? ''
+                    : 'text-muted line-through opacity-60'}"
+                />
+                <button
+                  type="button"
+                  onclick={() => removeIdAt(i)}
+                  aria-label={tn("tunnel.deployment_ids.remove_aria", {
+                    n: i + 1,
+                  })}
+                  class="text-error/80 hover:text-error hover:bg-error/10 grid h-7 w-7 place-items-center rounded-md text-lg font-bold transition-colors"
+                >
+                  ×
+                </button>
+              </div>
+            {/each}
+          </div>
+
+          <!-- Bulk-paste / add row. -->
+          <div class="mt-2 flex items-start gap-2">
+            <textarea
+              bind:value={addBuffer}
+              rows="2"
+              placeholder={t("tunnel.deployment_ids.placeholder")}
+              class="bg-input border-border-subtle focus:border-accent placeholder:text-muted flex-1 rounded-md border px-3 py-2 font-mono text-xs outline-none transition-colors"
+            ></textarea>
+            <button
+              type="button"
+              onclick={addFromBuffer}
+              disabled={addBuffer.trim().length === 0}
+              class="bg-accent hover:bg-accent-hover rounded-md px-4 py-2 text-sm font-semibold text-black transition-colors disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {t("tunnel.add")}
+            </button>
+          </div>
+
+          <!-- Count summary: enabled / total. All rows blank → render
+               the "tip" copy (functionally the same state as zero
+               rows, even though there are blank placeholders the
+               user typed and emptied again). -->
+          {#if nonBlankTotal === 0}
+            <p class="text-muted text-xs">{t("tunnel.deployment_ids.tip_more")}</p>
+          {:else if enabledIdCount === 0}
+            <p class="text-error text-xs">
+              {tn("tunnel.deployment_ids.all_disabled", {
+                total: nonBlankTotal,
+              })}
+            </p>
+          {:else}
+            <p class="text-success text-xs">
+              {tn("tunnel.deployment_ids.summary", {
+                enabled: enabledIdCount,
+                total: nonBlankTotal,
+              })}
+            </p>
+          {/if}
         </div>
-        <p class="text-muted text-xs">{t("tunnel.deployment_ids.help")}</p>
 
-        <div class="space-y-1.5">
-          {#each config.script_ids as entry, i (i)}
-            <div class="flex items-center gap-2">
-              <input
-                type="checkbox"
-                bind:checked={config.script_ids[i].enabled}
-                disabled={noRelay}
-                aria-label={tn("tunnel.deployment_ids.enable_aria", {
-                  n: i + 1,
-                })}
-                class="accent-accent h-4 w-4 cursor-pointer disabled:cursor-not-allowed"
-              />
-              <span class="text-muted w-7 text-end font-mono text-xs">
-                {String(i + 1).padStart(2, "0")}.
-              </span>
-              <input
-                type="text"
-                bind:value={config.script_ids[i].id}
-                disabled={noRelay}
-                class="bg-input border-border-subtle focus:border-accent flex-1 rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors disabled:cursor-not-allowed {entry.enabled
-                  ? ''
-                  : 'text-muted line-through opacity-60'}"
-              />
-              <button
-                type="button"
-                onclick={() => removeIdAt(i)}
-                disabled={noRelay}
-                aria-label={tn("tunnel.deployment_ids.remove_aria", {
-                  n: i + 1,
-                })}
-                class="text-error/80 hover:text-error hover:bg-error/10 grid h-7 w-7 place-items-center rounded-md text-lg font-bold transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-              >
-                ×
-              </button>
-            </div>
-          {/each}
+        <!-- Auth key. -->
+        <div class="mt-5">
+          <label class="text-primary text-sm font-semibold" for="auth-key">
+            {t("tunnel.auth_key.label")}
+          </label>
+          <p class="text-muted text-xs">{t("tunnel.auth_key.help")}</p>
+          <input
+            id="auth-key"
+            type="password"
+            autocomplete="off"
+            bind:value={config.auth_key}
+            class="bg-input border-border-subtle focus:border-accent mt-1.5 w-full rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors"
+          />
         </div>
-
-        <!-- Bulk-paste / add row. -->
-        <div class="mt-2 flex items-start gap-2">
-          <textarea
-            bind:value={addBuffer}
-            disabled={noRelay}
-            rows="2"
-            placeholder={t("tunnel.deployment_ids.placeholder")}
-            class="bg-input border-border-subtle focus:border-accent placeholder:text-muted flex-1 rounded-md border px-3 py-2 font-mono text-xs outline-none transition-colors disabled:cursor-not-allowed"
-          ></textarea>
-          <button
-            type="button"
-            onclick={addFromBuffer}
-            disabled={noRelay || addBuffer.trim().length === 0}
-            class="bg-accent hover:bg-accent-hover rounded-md px-4 py-2 text-sm font-semibold text-black transition-colors disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {t("tunnel.add")}
-          </button>
-        </div>
-
-        <!-- Count summary: enabled / total.
-             - All rows blank → render the "tip" copy (functionally the
-               same state as zero rows, even though there are blank
-               placeholders the user typed and emptied again).
-             - All-disabled error only fires when the relay is actually
-               in play (`!noRelay`) and the user has at least one
-               non-blank row — otherwise it'd mislabel direct /
-               local_bypass mode (which save accepts with zero IDs),
-               or front-run the "At least one deployment ID is
-               required" error that save would actually emit for an
-               all-blank list. -->
-        {#if nonBlankTotal === 0}
-          <p class="text-muted text-xs">{t("tunnel.deployment_ids.tip_more")}</p>
-        {:else if !noRelay && enabledIdCount === 0}
-          <p class="text-error text-xs">
-            {tn("tunnel.deployment_ids.all_disabled", {
-              total: nonBlankTotal,
-            })}
-          </p>
-        {:else}
-          <p class="text-success text-xs">
-            {tn("tunnel.deployment_ids.summary", {
-              enabled: enabledIdCount,
-              total: nonBlankTotal,
-            })}
-          </p>
-        {/if}
-      </div>
-
-      <!-- Auth key. -->
-      <div class="mt-5">
-        <label class="text-primary text-sm font-semibold" for="auth-key">
-          {t("tunnel.auth_key.label")}
-        </label>
-        <p class="text-muted text-xs">{t("tunnel.auth_key.help")}</p>
-        <input
-          id="auth-key"
-          type="password"
-          autocomplete="off"
-          bind:value={config.auth_key}
-          disabled={noRelay}
-          class="bg-input border-border-subtle focus:border-accent mt-1.5 w-full rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors disabled:cursor-not-allowed"
-        />
-      </div>
-    </section>
+      </section>
+    {/if}
 
     <!-- ── Drive setup ──────────────────────────────────────────────
          Mode-gated: only renders when `mode === "drive"`. The Save

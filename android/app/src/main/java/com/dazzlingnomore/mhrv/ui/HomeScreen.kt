@@ -556,35 +556,37 @@ fun HomeScreen(
 
             Spacer(Modifier.height(4.dp))
 
-            val appsScriptEnabled = cfg.mode.usesAppsScriptRelay()
             // Wrapped in a collapsible so a long ID list (10+ deployments
             // is normal in full-tunnel rotations) doesn't dominate the
             // screen once it's set up. Starts expanded for first-run users
             // (no IDs/key yet) so the form is immediately discoverable.
-            CollapsibleSection(
-                title = stringResource(R.string.sec_apps_script_relay),
-                initiallyExpanded =
-                    appsScriptEnabled &&
-                        (!cfg.hasDeploymentId || cfg.authKey.isBlank()),
-            ) {
-                DeploymentIdsField(
-                    urls = cfg.appsScriptUrls,
-                    onChange = { persist(cfg.copy(appsScriptUrls = it)) },
-                    enabled = appsScriptEnabled,
-                )
+            //
+            // Mode-gated: only modes that actually consult script_ids +
+            // auth_key see this section. Switching to direct / local_bypass
+            // / drive hides it entirely (the field values stay on disk so
+            // they're preserved on a mode round-trip).
+            if (cfg.mode.usesAppsScriptRelay()) {
+                CollapsibleSection(
+                    title = stringResource(R.string.sec_apps_script_relay),
+                    initiallyExpanded = !cfg.hasDeploymentId || cfg.authKey.isBlank(),
+                ) {
+                    DeploymentIdsField(
+                        urls = cfg.appsScriptUrls,
+                        onChange = { persist(cfg.copy(appsScriptUrls = it)) },
+                    )
 
-                OutlinedTextField(
-                    value = cfg.authKey,
-                    onValueChange = { persist(cfg.copy(authKey = it)) },
-                    label = { Text(stringResource(R.string.field_auth_key)) },
-                    singleLine = true,
-                    enabled = appsScriptEnabled,
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
-                    modifier = Modifier.fillMaxWidth(),
-                    supportingText = {
-                        Text(stringResource(R.string.help_auth_key))
-                    },
-                )
+                    OutlinedTextField(
+                        value = cfg.authKey,
+                        onValueChange = { persist(cfg.copy(authKey = it)) },
+                        label = { Text(stringResource(R.string.field_auth_key)) },
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
+                        modifier = Modifier.fillMaxWidth(),
+                        supportingText = {
+                            Text(stringResource(R.string.help_auth_key))
+                        },
+                    )
+                }
             }
 
             // Drive-mode setup. Visible only when the user has picked
@@ -614,9 +616,14 @@ fun HomeScreen(
             // the Google direct path. LOCAL_BYPASS doesn't touch either
             // (every TLS host is dialed directly with the browser's
             // real ClientHello), so the row is just clutter that
-            // implies the values matter. Same applies to Auto-detect,
-            // SNI pool, and fronting groups below.
+            // implies the values matter. DRIVE still resolves Google
+            // endpoints via google_ip, so the fields stay visible there;
+            // only Auto-detect / SNI pool / fronting groups go away in
+            // DRIVE (Drive's relay never dispatches through
+            // `fronting_groups` or the SNI rotation pool).
             val showsGoogleFrontingFields = cfg.mode != Mode.LOCAL_BYPASS
+            val showsFrontingTechniques =
+                cfg.mode != Mode.LOCAL_BYPASS && cfg.mode != Mode.DRIVE
             if (showsGoogleFrontingFields) {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
@@ -697,12 +704,14 @@ fun HomeScreen(
                 }
             }
 
-            // SNI pool + CDN fronting groups are both inert in
-            // LOCAL_BYPASS (no SNI rewrite, no CDN-edge dial — just
-            // direct fragmented connect to every real destination),
-            // so the editors are hidden in that mode to avoid
-            // implying the values matter.
-            if (showsGoogleFrontingFields) {
+            // SNI pool + CDN fronting groups are inert in LOCAL_BYPASS
+            // (no SNI rewrite, no CDN-edge dial — just direct fragmented
+            // connect to every real destination) and in DRIVE (every
+            // request rides the Drive-mailbox transport, which has its
+            // own endpoint resolution and no fronting hop), so the
+            // editors are hidden in those modes to avoid implying the
+            // values matter.
+            if (showsFrontingTechniques) {
                 // SNI pool: collapsed by default. Users without a reason
                 // to touch it should leave Rust's auto-expansion to
                 // handle it.
@@ -1030,7 +1039,6 @@ private val ID_SEPARATORS = Regex("[\\s,;]+")
 private fun DeploymentIdsField(
     urls: List<DeploymentEntry>,
     onChange: (List<DeploymentEntry>) -> Unit,
-    enabled: Boolean = true,
 ) {
     var newEntry by remember { mutableStateOf("") }
 
@@ -1063,7 +1071,6 @@ private fun DeploymentIdsField(
                         updated[index] = entry.copy(enabled = checked)
                         onChange(updated)
                     },
-                    enabled = enabled,
                     modifier = Modifier.semantics { contentDescription = checkboxCd },
                 )
                 OutlinedTextField(
@@ -1087,7 +1094,6 @@ private fun DeploymentIdsField(
                         }
                         onChange(updated)
                     },
-                    enabled = enabled,
                     modifier = Modifier.weight(1f),
                     singleLine = true,
                     textStyle =
@@ -1110,7 +1116,6 @@ private fun DeploymentIdsField(
                     onClick = {
                         onChange(urls.filterIndexed { i, _ -> i != index })
                     },
-                    enabled = enabled,
                 ) {
                     Text("✕", color = MaterialTheme.colorScheme.error)
                 }
@@ -1128,7 +1133,6 @@ private fun DeploymentIdsField(
             OutlinedTextField(
                 value = newEntry,
                 onValueChange = { newEntry = it },
-                enabled = enabled,
                 modifier = Modifier.weight(1f),
                 singleLine = false,
                 minLines = 1,
@@ -1144,7 +1148,7 @@ private fun DeploymentIdsField(
                         newEntry = ""
                     }
                 },
-                enabled = enabled && newEntry.isNotBlank(),
+                enabled = newEntry.isNotBlank(),
                 contentPadding = PaddingValues(horizontal = 12.dp),
             ) {
                 Text(stringResource(R.string.btn_add_url))
