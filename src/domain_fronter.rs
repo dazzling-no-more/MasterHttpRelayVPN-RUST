@@ -5093,22 +5093,33 @@ fn parse_exit_node_response(body: &[u8], allow_brotli_zstd: bool) -> Result<Vec<
         })?
     };
 
-    // Detect the pre-v2.0.2 Code.gs double-wrap. If Apps Script ignored
-    // our `raw: true` flag and re-wrapped the exit-node response, the
-    // decoded body is itself another {s, h, b} envelope rather than the
-    // destination's bytes. Without this check the inner JSON would be
-    // handed to the browser as page content, which is what users saw on
-    // upstream issue #1239. Surface the misconfig as a specific error
-    // pointing at the fix (redeploy Code.gs) instead of letting raw JSON
-    // render in the browser silently.
+    // Detect the pre-v2.0.2 double-wrap. If any layer between rahgozar
+    // and the exit-node ignored our `raw: true` flag and re-wrapped the
+    // exit-node response, the decoded body is itself another {s, h, b}
+    // envelope rather than the destination's bytes. Without this check
+    // the inner JSON would be handed to the browser as page content,
+    // which is what users saw on upstream issue #1239. Surface the
+    // misconfig as a specific error pointing at the fix.
+    //
+    // In CFW mode the symptom is identical for three deployment states
+    // (Apps Script stale, Worker stale, or both), so the message must
+    // list both fixes rather than naming one — a chain simulation
+    // (`new GS + old Worker`, `old GS + new Worker`, `old GS + old
+    // Worker`) all produce this exact error indistinguishably.
     if looks_like_exit_node_envelope(&body_bytes) {
         return Err(FronterError::Relay(
-            "exit-node response was double-wrapped — Apps Script is running a \
-             pre-v2.0.2 Code.gs that ignores the `raw: true` flag. Open your \
-             Apps Script project, replace Code.gs with the v2.0.2+ version from \
-             assets/apps_script/Code.gs, then Deploy → Manage deployments → \
-             New version. Same fix applies to Cloudflare Worker deployments \
-             (assets/cloudflare/worker.js)."
+            "exit-node response was double-wrapped — at least one relay layer is \
+             still running pre-v2.0.2 code that ignores the `raw: true` flag. \
+             Redeploy BOTH of these:\n  \
+             1. Apps Script: paste assets/apps_script/Code.gs (or Code.cfw.gs in \
+                CFW mode), then Deploy → Manage deployments → pencil icon → \
+                Version: New version → Deploy. Saving without cutting a new \
+                version keeps the old code live at /exec.\n  \
+             2. Cloudflare Worker (only in CFW mode): paste \
+                assets/cloudflare/worker.js, then click \"Save and deploy\" in \
+                the dashboard editor — \"Save\" alone only saves the draft.\n\
+             Pasting code is not enough on either platform; both require an \
+             explicit deploy click."
                 .to_string(),
         ));
     }
@@ -7480,8 +7491,8 @@ mod tests {
             .expect_err("double-wrap must be detected");
         let msg = format!("{}", err);
         assert!(
-            msg.contains("double-wrapped") && msg.contains("Code.gs"),
-            "error should point at the Code.gs redeploy fix, got: {}",
+            msg.contains("double-wrapped") && msg.contains("Code.gs") && msg.contains("worker.js"),
+            "error must name both redeploy targets, got: {}",
             msg
         );
     }

@@ -46,8 +46,11 @@
     loading = true;
     try {
       const pool = await api.getSniPool();
-      rows = pool.map((e) => ({ ...e, probe: "idle" as ProbeStatus }));
-      pristine = structuredClone(rows);
+      const fresh: Row[] = pool.map((e) => ({ ...e, probe: "idle" as ProbeStatus }));
+      rows = fresh;
+      // Clone the plain array, not the reactive `rows` proxy.
+      // `structuredClone` on a Svelte 5 $state proxy throws DataCloneError.
+      pristine = fresh.map((r) => ({ ...r }));
     } catch (e) {
       toast.error(String(e));
     } finally {
@@ -103,7 +106,9 @@
       await api.saveSniPool(
         rows.map((r) => ({ host: r.host, enabled: r.enabled })),
       );
-      pristine = structuredClone(rows);
+      // Snapshot the rows by shallow-copying each entry — `structuredClone`
+      // on the reactive `rows` proxy throws DataCloneError (Svelte 5).
+      pristine = rows.map((r) => ({ ...r }));
       toast.success(t("sni.saved"));
       onclose();
     } catch (e) {

@@ -163,7 +163,10 @@
 
   async function onRevert() {
     if (!pristine) return;
-    config = structuredClone(pristine);
+    // `pristine` is reactive ($state); `structuredClone` on a Svelte 5
+    // proxy throws DataCloneError. Round-trip through JSON to deep-copy
+    // the plain shape.
+    config = JSON.parse(JSON.stringify(pristine));
   }
 
   // ── Drive-mode setup ─────────────────────────────────────────────
