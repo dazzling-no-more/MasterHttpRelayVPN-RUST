@@ -3799,7 +3799,7 @@ checksum = "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf"
 
 [[package]]
 name = "rahgozar"
-version = "2.9.0"
+version = "2.9.1"
 dependencies = [
  "arc-swap",
  "base64 0.22.1",
@@ -3849,7 +3849,7 @@ dependencies = [
 
 [[package]]
 name = "rahgozar-desktop"
-version = "2.9.0"
+version = "2.9.1"
 dependencies = [
  "rahgozar",
  "rand 0.8.6",
