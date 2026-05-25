@@ -19,7 +19,7 @@ import com.dazzlingnomore.mhrv.ProfileStore
 import com.dazzlingnomore.mhrv.R
 import com.dazzlingnomore.mhrv.RahgozarConfig
 import com.dazzlingnomore.mhrv.UiLang
-import com.dazzlingnomore.mhrv.VpnState
+import com.dazzlingnomore.mhrv.VpnStateSync
 import kotlinx.coroutines.launch
 
 /**
@@ -53,7 +53,7 @@ fun ProfileBar(
 ) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
-    val isVpnRunning by VpnState.isRunning.collectAsState()
+    val isVpnRunning by VpnStateSync.isRunning.collectAsState()
 
     // Bump this counter to force a re-read of the profiles file when
     // a profile action mutates it. We ALSO re-key the state read on

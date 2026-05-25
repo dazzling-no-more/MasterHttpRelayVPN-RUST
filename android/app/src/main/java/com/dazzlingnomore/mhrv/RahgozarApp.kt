@@ -23,6 +23,35 @@ class RahgozarApp : Application() {
     override fun onCreate() {
         super.onCreate()
 
+        // The VpnService is hosted in the `:vpn` Android process (see
+        // AndroidManifest.xml `<service android:process=":vpn">`).
+        // Android instantiates Application once per process, so
+        // RahgozarApp.onCreate runs in BOTH the UI process AND the
+        // `:vpn` process. The receiver below is only useful in the UI
+        // process — it consumes broadcasts the service sends FROM the
+        // `:vpn` process. Registering it in `:vpn` would be redundant
+        // (the service writes the source of truth there) and confuses
+        // observers when both ends update the same StateFlow.
+        //
+        // `Application.getProcessName()` is API 28+; under minSdk 24
+        // we fall back to walking `ActivityManager.runningAppProcesses`
+        // for our pid. Both routes return strings like
+        // `com.dazzlingnomore.mhrv` (UI process) or
+        // `com.dazzlingnomore.mhrv:vpn` (service process).
+        val procName: String =
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                getProcessName()
+            } else {
+                val mgr = getSystemService(android.app.ActivityManager::class.java)
+                val pid = android.os.Process.myPid()
+                mgr?.runningAppProcesses?.firstOrNull { it.pid == pid }?.processName ?: packageName
+            }
+        val isUiProcess = (procName == packageName)
+        Log.i(APP_TAG, "process=$procName uiProcess=$isUiProcess")
+        if (isUiProcess) {
+            VpnStateSync.registerInUiProcess(this)
+        }
+
         // Initialise rustls-platform-verifier with the Android Context
         // BEFORE anything that might touch TLS. The very first HTTPS
         // call out of the app (Drive OAuth device-code POST, update
@@ -30,6 +59,10 @@ class RahgozarApp : Application() {
         // rustls-platform-verifier to be initialized" without this.
         // Safe to call from onCreate: System.loadLibrary("rahgozar")
         // already ran via the Native.init block at first reference.
+        // Runs in BOTH processes — each one has its own loaded copy of
+        // librahgozar.so and its own rustls-platform-verifier init
+        // cell (the OnceCell is process-local; we want each process to
+        // initialise independently).
         Native.initAndroidTls(this)
 
         // Apply the saved UI-language preference before any UI class

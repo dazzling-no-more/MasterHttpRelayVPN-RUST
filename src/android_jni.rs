@@ -824,6 +824,96 @@ pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_runTun2proxy<'local>(
     .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
+/// `Native.stopTun2proxy()` — clears tun2proxy's process-global TUN_QUIT
+/// shutdown token via the plain `tun2proxy_stop` C entry point in
+/// libtun2proxy.so, resolved via dlsym (same path as
+/// [`Java_..._runTun2proxy`]).
+///
+/// Why dlsym a C symbol instead of calling the Kotlin `Tun2proxy.stop()`
+/// JNI shim that the tun2proxy crate also exports:
+///
+/// On Samsung Android 16+, calling `Tun2proxy.stop()` from the
+/// Kotlin-side `object Tun2proxy` triggers a FORTIFY abort about 1.8s
+/// later — `pthread_mutex_lock called on a destroyed mutex` inside
+/// `libhwui.so`'s static-data section, fatal on `hwuiTask0`. The
+/// likely chain is `Tun2proxy`'s lazy `init { System.loadLibrary }`
+/// firing for the first time during teardown, intersecting whatever
+/// libhwui does during render-thread shutdown. Going through dlsym
+/// against the SAME `.so` already loaded by `runTun2proxy`'s dlsym
+/// path avoids the JVM-side class init and System.loadLibrary entirely
+/// — the lookup is just a pointer table query, no library load.
+///
+/// `tun2proxy_stop()` is what releases tun2proxy's global `TUN_QUIT`
+/// `Mutex<Option<CancellationToken>>`; without that, the next
+/// `tun2proxy_run_with_cli_args` short-circuits with rc=-1
+/// ("tun2proxy already started"), the TUN fd leaks, and Android keeps
+/// the VPN slot held — symptom: VPN key icon stays in status bar after
+/// disconnect, and an 18+ s gap between `stopSelf()` and `onDestroy`.
+///
+/// Returns the underlying `tun2proxy_stop` rc (0 on a clean clear, -1
+/// when no run was outstanding) or a negative wrapper code:
+///   -10  dlopen of libtun2proxy.so failed
+///   -11  dlsym of `tun2proxy_stop` failed
+#[no_mangle]
+pub extern "system" fn Java_com_dazzlingnomore_mhrv_Native_stopTun2proxy<'local>(
+    mut env: EnvUnowned<'local>,
+    _class: JClass<'local>,
+) -> jni::sys::jint {
+    env.with_env(|_env| -> jni::errors::Result<jni::sys::jint> {
+        let rc = unsafe {
+            use std::ffi::{CStr, CString};
+
+            let lib = CString::new("libtun2proxy.so").unwrap();
+            let handle = libc::dlopen(lib.as_ptr(), libc::RTLD_NOW);
+            if handle.is_null() {
+                let err = CStr::from_ptr(libc::dlerror());
+                tracing::error!("dlopen libtun2proxy.so failed: {:?}", err);
+                return Ok(-10);
+            }
+
+            let sym = CString::new("tun2proxy_stop").unwrap();
+            let func = libc::dlsym(handle, sym.as_ptr());
+            if func.is_null() {
+                let err = CStr::from_ptr(libc::dlerror());
+                tracing::error!("dlsym tun2proxy_stop: {:?}", err);
+                // No dlclose here — see comment after the stop() call below.
+                return Ok(-11);
+            }
+
+            type StopFn = unsafe extern "C" fn() -> i32;
+            let stop: StopFn = std::mem::transmute(func);
+            let rc = stop();
+            // DELIBERATELY DO NOT dlclose(handle): `tun2proxy_stop` only
+            // SIGNALS the worker thread to begin shutdown via a
+            // CancellationToken — the thread is still alive when we
+            // return here, and will exit milliseconds later through
+            // `pthread_exit`, which walks `pthread_key_clean_all` to
+            // invoke registered TLS destructors. Those destructor
+            // function pointers live inside libtun2proxy.so's `.text`.
+            // If we drop our refcount here and we're the last holder,
+            // bionic's linker unmaps the library; the worker's pthread
+            // teardown then jumps to a now-invalid PC → SIGSEGV in
+            // `pthread_key_clean_all`. Holding the handle indefinitely
+            // costs one extra refcount + ~3 MB of mapped memory; both
+            // are exactly what we want since the .so was going to stay
+            // mapped anyway for any subsequent `runTun2proxy`.
+            //
+            // Same reasoning applied historically to the JVM-side
+            // `Tun2proxy.stop()` path — `System.loadLibrary` bumped the
+            // refcount, the Kotlin object's class init dropped it the
+            // moment its reference scope closed, racing libhwui's
+            // render-thread teardown with libtun2proxy unmapping.
+            // (Manifested as a FORTIFY abort on `hwuiTask0` ~1.8 s
+            // after disconnect on Samsung Android 16+.)
+            let _ = handle; // keep the binding alive in case of future edits
+            rc
+        };
+        tracing::info!("stopTun2proxy: rc={}", rc);
+        Ok(rc)
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
+}
+
 // ---------------------------------------------------------------------------
 // Drive-mode OAuth + helpers.
 //

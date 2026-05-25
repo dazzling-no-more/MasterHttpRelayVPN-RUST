@@ -53,7 +53,7 @@ import com.dazzlingnomore.mhrv.RahgozarConfig
 import com.dazzlingnomore.mhrv.SplitMode
 import com.dazzlingnomore.mhrv.UiLang
 import com.dazzlingnomore.mhrv.UpdateInstaller
-import com.dazzlingnomore.mhrv.VpnState
+import com.dazzlingnomore.mhrv.VpnStateSync
 import com.dazzlingnomore.mhrv.ui.theme.ErrRed
 import com.dazzlingnomore.mhrv.ui.theme.OkGreen
 import kotlinx.coroutines.Dispatchers
@@ -183,7 +183,7 @@ fun HomeScreen(
     // listener port — the new startProxy then failed with "Address already
     // in use".
     //
-    // `awaitingRunning` holds the value we expect VpnState.isRunning to
+    // `awaitingRunning` holds the value we expect VpnStateSync.isRunning to
     // settle on after the user's action; null means "no transition in
     // flight". The LaunchedEffect below suspends on the StateFlow until
     // the predicate matches, with a 12s backstop in case the service
@@ -196,7 +196,7 @@ fun HomeScreen(
         val target = awaitingRunning ?: return@LaunchedEffect
         try {
             withTimeoutOrNull(12_000) {
-                VpnState.isRunning.first { it == target }
+                VpnStateSync.isRunning.first { it == target }
             }
         } finally {
             awaitingRunning = null
@@ -396,7 +396,7 @@ fun HomeScreen(
             // session. Disabled state still acts as the "you're not set up
             // yet" signal — they'll expand the Apps Script section below to
             // resolve it.
-            val isVpnRunning by VpnState.isRunning.collectAsState()
+            val isVpnRunning by VpnStateSync.isRunning.collectAsState()
             Button(
                 onClick = {
                     if (isVpnRunning) {
@@ -2478,24 +2478,18 @@ private fun UsageTodayCard() {
     // tiers get 100k but most users are on free.
     val freeQuotaPerDay = 20_000
 
-    val handle by VpnState.proxyHandle.collectAsState()
-    val isRunning by VpnState.isRunning.collectAsState()
+    val handle by VpnStateSync.proxyHandle.collectAsState()
+    val isRunning by VpnStateSync.isRunning.collectAsState()
 
     // Nothing to poll until the proxy is up.
     if (!isRunning || handle == 0L) return
 
-    var statsJson by remember { mutableStateOf("") }
-    LaunchedEffect(handle) {
-        // Drop any stale snapshot from a previous run.
-        statsJson = ""
-        while (true) {
-            statsJson =
-                withContext(Dispatchers.IO) {
-                    runCatching { Native.statsJson(handle) }.getOrDefault("")
-                }
-            delay(1000)
-        }
-    }
+    // The service (in the `:vpn` process) pushes the stats blob via
+    // broadcast on its own ticker — calling `Native.statsJson` from
+    // this UI process wouldn't see a live handle anyway (the proxy's
+    // tokio runtime lives only in the service process). Observe the
+    // synced snapshot here instead of polling Native ourselves.
+    val statsJson by VpnStateSync.statsJson.collectAsState()
 
     val obj =
         remember(statsJson) {
@@ -2611,24 +2605,14 @@ private fun UsageRow(
 
 @Composable
 private fun PipelineDebugCard() {
-    val isRunning by VpnState.isRunning.collectAsState()
+    val isRunning by VpnStateSync.isRunning.collectAsState()
     if (!isRunning) return
 
-    var json by remember { mutableStateOf("") }
-    LaunchedEffect(isRunning) {
-        if (!isRunning) return@LaunchedEffect
-        while (true) {
-            val result =
-                withContext(Dispatchers.IO) {
-                    runCatching { Native.pipelineDebugJson() }
-                }
-            json = result.getOrDefault("")
-            if (result.isFailure) {
-                android.util.Log.e("PipeDbg", "pipelineDebugJson failed", result.exceptionOrNull())
-            }
-            delay(500)
-        }
-    }
+    // Same rationale as UsageTodayCard: the service process is the
+    // only one with a live tokio runtime + pipeline_debug counters,
+    // so we observe the rebroadcast snapshot rather than poll Native
+    // from the UI process (which would return an empty blob anyway).
+    val json by VpnStateSync.pipelineJson.collectAsState()
 
     val obj =
         remember(json) {

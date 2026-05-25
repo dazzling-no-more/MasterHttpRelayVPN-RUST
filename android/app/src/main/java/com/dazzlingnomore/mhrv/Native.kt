@@ -205,6 +205,30 @@ object Native {
         tunMtu: Int,
     ): Int
 
+    /**
+     * Stop tun2proxy by calling the plain-C `tun2proxy_stop` entry point
+     * via dlsym (same `libtun2proxy.so` already mapped by `runTun2proxy`).
+     *
+     * Substitutes for the Kotlin-side `Tun2proxy.stop()` JNI shim that
+     * the tun2proxy crate also exports. The Kotlin shim's first
+     * reference triggers `Tun2proxy`'s `init { System.loadLibrary("tun2proxy") }`,
+     * and on Samsung Android 16+ that load-during-teardown raced
+     * libhwui's render-thread shutdown — `hwuiTask0` would FORTIFY-abort
+     * ~1.8 s after disconnect on a destroyed mutex inside `libhwui.so`'s
+     * BSS. Going through dlsym from native code skips the JVM-side
+     * library load entirely.
+     *
+     * MUST be called on disconnect — without clearing tun2proxy's
+     * global `TUN_QUIT` token, the next `runTun2proxy` returns -1
+     * ("tun2proxy already started") immediately, the TUN fd leaks, and
+     * Android keeps the VPN slot active (visible: VPN key icon stays
+     * in status bar; `Service.onDestroy` is delayed ~18 s).
+     *
+     * @return 0 on a clean clear, -1 when no run was outstanding,
+     *         -10 on dlopen failure, -11 on dlsym failure.
+     */
+    external fun stopTun2proxy(): Int
+
     // ── Drive-mode setup ──────────────────────────────────────────────
     //
     // Six entries that the Drive setup UI in HomeScreen.kt drives.

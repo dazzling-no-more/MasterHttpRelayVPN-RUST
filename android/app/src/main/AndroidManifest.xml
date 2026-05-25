@@ -153,11 +153,24 @@
           is what lets the system show us in the "VPN" section of settings
           and route through us.
         -->
+        <!--
+          `android:process=":vpn"` is the workaround for a Samsung One UI 7 /
+          Android 16 bug where a libhwui static mutex is destroyed during
+          our process's render-thread teardown WHILE a queued render task
+          (`hwuiTask0`) tries to lock it. The trigger is the VPN service's
+          destruction happening in the same process as the Activity's HWUI
+          render context. By hosting the service in a separate `:vpn`
+          process, its destruction has no Activity / no libhwui render
+          context to race — the UI process keeps its libhwui intact.
+          Cross-process state sync goes through `VpnStateSync` (broadcasts);
+          stats polling moves into the service and is rebroadcast to the UI.
+        -->
         <service
             android:name=".RahgozarVpnService"
             android:exported="false"
             android:permission="android.permission.BIND_VPN_SERVICE"
-            android:foregroundServiceType="specialUse">
+            android:foregroundServiceType="specialUse"
+            android:process=":vpn">
             <intent-filter>
                 <action android:name="android.net.VpnService" />
             </intent-filter>

@@ -96,8 +96,30 @@ class RahgozarVpnService : VpnService() {
                 if (!notifTickerActive.get()) return
                 if (guards.isPaused || proxyHandle == 0L) return
                 try {
-                    val blob = Native.statsJson(proxyHandle)
-                    if (blob.isBlank()) {
+                    val statsBlob = Native.statsJson(proxyHandle)
+                    // Pipeline debug JSON is cheap (atomics + a small
+                    // HashMap snapshot) and only changes shape based on
+                    // the cargo `pipeline-debug` feature flag — release
+                    // builds get a stable empty payload. Poll it on the
+                    // same cadence so the UI's PipelineDebugCard can
+                    // observe it via VpnStateSync without a second
+                    // ticker.
+                    val pipelineBlob = runCatching { Native.pipelineDebugJson() }.getOrDefault("")
+                    // Mirror the latest snapshot to the UI process. The
+                    // `:vpn` service can't share a singleton StateFlow
+                    // with the UI process, so each tick rebroadcasts.
+                    // 2 s cadence matches the notification refresh — the
+                    // UI cards observe the same data without polling
+                    // Native themselves (Native.statsJson called from
+                    // the UI process would have no live proxy handle to
+                    // read against anyway).
+                    broadcastVpnState(
+                        running = true,
+                        handle = proxyHandle,
+                        statsJson = statsBlob,
+                        pipelineJson = pipelineBlob,
+                    )
+                    if (statsBlob.isBlank()) {
                         // Native.statsJson returns blank in any mode
                         // that doesn't run the Apps Script relay —
                         // DIRECT and LOCAL_BYPASS today, plus any
@@ -113,7 +135,7 @@ class RahgozarVpnService : VpnService() {
                         stopNotifTicker()
                         return
                     }
-                    val notif = buildNotif(NotifState.RUNNING, blob)
+                    val notif = buildNotif(NotifState.RUNNING, statsBlob)
                     getSystemService(NotificationManager::class.java)?.notify(NOTIF_ID, notif)
                 } catch (t: Throwable) {
                     Log.w(TAG, "notif tick: ${t.message}")
@@ -494,6 +516,7 @@ class RahgozarVpnService : VpnService() {
                 Log.i(TAG, "PROXY_ONLY mode: listeners up, skipping VpnService/TUN")
                 VpnState.setProxyHandle(proxyHandle)
                 VpnState.setRunning(true)
+                broadcastVpnState(running = true, handle = proxyHandle)
                 showDebugOverlay()
                 startNotifTicker()
                 return
@@ -689,6 +712,7 @@ class RahgozarVpnService : VpnService() {
             // a failed-to-establish run.
             VpnState.setProxyHandle(proxyHandle)
             VpnState.setRunning(true)
+            broadcastVpnState(running = true, handle = proxyHandle)
             showDebugOverlay()
             startNotifTicker()
         }
@@ -853,28 +877,50 @@ class RahgozarVpnService : VpnService() {
                 }
             }
 
-            // 2. Cooperative stop signal — DELIBERATELY SKIPPED to test a
-            //    libhwui FORTIFY abort that fires ~1.8s after teardown on
-            //    Samsung Android 16 (and possibly other vendor builds).
-            //    The crash bionic reports is
-            //      `pthread_mutex_lock called on a destroyed mutex` on
-            //    `hwuiTask0`, with the mutex address consistently inside
-            //    libhwui.so's .bss segment. We confirmed via /proc/self/maps
-            //    that the mutex is owned by Android's libhwui, not by us.
-            //    The original kdoc note above already characterised step 2
-            //    as "mostly redundant" because step 1 closes the SOCKS5
-            //    listener that the tun2proxy worker is blocked reading
-            //    from — the worker exits cleanly on EOF without needing the
-            //    cooperative `Tun2proxy.stop()` signal. Empirically that's
-            //    been holding (we see `tun2proxy exited rc=0` in logcat
-            //    consistently). Calling `Tun2proxy.stop()` is the only
-            //    teardown step that crosses into libtun2proxy.so via JNI,
-            //    so it's the most likely Rust-side trigger for the libhwui
-            //    cascade. Confirm in a future hardening pass: if disconnect
-            //    is stable without this call, leave the skip in; if some
-            //    edge case turns up where the worker hangs without the
-            //    explicit signal, reinstate with a narrower gate.
-            Log.i(TAG, "teardown: skipping Tun2proxy.stop() (libhwui crash workaround)")
+            // 2. Cooperative stop signal — REQUIRED to clear tun2proxy's
+            //    process-global `TUN_QUIT` cancellation token. Without it,
+            //    the next `runTun2proxy` short-circuits with rc=-1
+            //    ("tun2proxy already started"), the TUN fd leaks, Android
+            //    holds the VPN slot, and the status-bar VPN key icon
+            //    stays visible after disconnect.
+            //
+            //    We deliberately DO NOT call `Tun2proxy.stop()` here —
+            //    that Kotlin object's first reference triggers its
+            //    `init { System.loadLibrary("tun2proxy") }`, and on
+            //    Samsung Android 16+ that load-during-teardown races
+            //    libhwui's render-thread shutdown: ~1.8 s after
+            //    disconnect, `hwuiTask0` FORTIFY-aborts on a destroyed
+            //    mutex inside libhwui.so's BSS. We confirmed via
+            //    /proc/self/maps that the mutex address is owned by
+            //    libhwui, not by us — the trigger is some interaction
+            //    between the JVM-side library load and libhwui's static
+            //    teardown.
+            //
+            //    `Native.stopTun2proxy()` reaches the same
+            //    `general_api::tun2proxy_stop_internal` via dlsym from
+            //    inside librahgozar.so (libtun2proxy.so is already mapped
+            //    by `runTun2proxy`'s dlsym path), so there's no JVM-side
+            //    library load and no `Tun2proxy` class init. The libhwui
+            //    abort does not fire on this path. Bounded on a side
+            //    thread so a hung native call can't stall teardown.
+            if (tun2proxyRunning.get()) {
+                val stopper =
+                    Thread({
+                        try {
+                            val rc = Native.stopTun2proxy()
+                            Log.i(TAG, "Native.stopTun2proxy: rc=$rc")
+                        } catch (t: Throwable) {
+                            Log.w(TAG, "Native.stopTun2proxy: ${t.message}")
+                        }
+                    }, "rahgozar-tun2proxy-stop").apply { start() }
+                try {
+                    stopper.join(2_000)
+                } catch (_: InterruptedException) {
+                }
+                if (stopper.isAlive) {
+                    Log.w(TAG, "Native.stopTun2proxy did not return within 2s — proceeding")
+                }
+            }
 
             // 3. Drop our PFD reference. detachFd at startup means this
             //    close() is a no-op for the underlying fd — tun2proxy owns
@@ -916,9 +962,38 @@ class RahgozarVpnService : VpnService() {
             // the native-side cleanup actually happened, not optimistically.
             VpnState.setProxyHandle(0L)
             VpnState.setRunning(false)
+            broadcastVpnState(running = false, handle = 0L)
             Log.i(TAG, "teardown: done (hadNativeState=$hadNativeState)")
             hadNativeState
         }
+
+    /**
+     * Send a [VpnStateSync.ACTION_STATE] broadcast so the UI process (which
+     * lives in a different Android process and cannot see this service's
+     * in-memory [VpnState]) picks up the change. Called on every transition
+     * — start / teardown — and from the 2-second notification ticker so the
+     * UI's stats cards stay current without polling Native from the UI
+     * process. Stats / pipeline JSON are empty strings on transition
+     * events (the ticker fills them in on its next tick).
+     */
+    private fun broadcastVpnState(
+        running: Boolean,
+        handle: Long,
+        statsJson: String = "",
+        pipelineJson: String = "",
+    ) {
+        try {
+            VpnStateSync.broadcastFromService(
+                context = this,
+                running = running,
+                handle = handle,
+                statsJson = statsJson,
+                pipelineJson = pipelineJson,
+            )
+        } catch (t: Throwable) {
+            Log.w(TAG, "VpnStateSync broadcast: ${t.message}")
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
