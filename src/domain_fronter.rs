@@ -102,6 +102,14 @@ const POOL_REFILL_INTERVAL_SECS: u64 = 5;
 const POOL_MAX: usize = 80;
 const REQUEST_TIMEOUT_SECS: u64 = 25;
 const RANGE_PARALLEL_CHUNK_BYTES: u64 = 256 * 1024;
+/// Inclusive ms range for jittered backoff between per-chunk retries in
+/// `fetch_chunks_stream`. Tuned for the single-script-id case where
+/// retries land on the same Apps Script project: long enough to let a
+/// stuck server-side execution finish/time out (REQUEST_TIMEOUT_SECS
+/// caps it at 25 s but the script may complete sooner), short enough
+/// not to add user-visible latency on transient failures. Multi-script
+/// configs rotate inside `relay()` anyway so the backoff is harmless.
+const CHUNK_RETRY_BACKOFF_RANGE_MS: std::ops::RangeInclusive<u64> = 200..=600;
 /// HTTP/2 connection lifetime before we proactively reopen. Apps Script's
 /// edge has been observed to send GOAWAY at ~10 min anyway, so we cycle
 /// at 9 min to do an orderly reconnect on our schedule rather than
@@ -3220,8 +3228,78 @@ impl DomainFronter {
                 h.retain(|(k, _)| !k.eq_ignore_ascii_case("range"));
                 h.push(("Range".into(), format!("bytes={}-{}", s, e)));
                 async move {
-                    let raw = self.relay("GET", &url, &h, &[]).await;
-                    (s, e, extract_exact_range_body(&raw, s, e, total))
+                    // Bounded per-chunk retry. A multi-GB download splits
+                    // into tens of thousands of 256 KiB chunks; a single
+                    // transient Apps Script timeout would otherwise kill
+                    // the entire stream (see archive.org issue: chunk
+                    // 5767168-6029311 of a 3.8 GB download hit
+                    // REQUEST_TIMEOUT_SECS, `relay()` returned a synthetic
+                    // 504, `extract_exact_range_body` rejected it as
+                    // "expected 206 Partial Content", and the consumer
+                    // truncated the response after ~5.6 MB).
+                    //
+                    // `do_relay_with_retry` doesn't help here because
+                    // `relay_uncoalesced` catches timeouts and converts
+                    // them to a synthetic 504 *body* (intentional — the
+                    // 504 carries a user-readable hint about quota
+                    // exhaustion), so the retry path above us never sees
+                    // an `Err`. Chunk GETs with explicit Range are fully
+                    // idempotent so re-firing is safe; we only retry
+                    // categories that are plausibly transient
+                    // (relay-level 5xx, unparseable responses).
+                    //
+                    // A small jittered backoff between attempts matters
+                    // for the single-script-id deployment (typical
+                    // user config) where every retry lands on the same
+                    // Apps Script project; back-to-back retries would
+                    // race the still-stuck origin-side execution.
+                    // Multi-deployment configs rotate scripts inside
+                    // `relay()` anyway, so the backoff is harmless there.
+                    const MAX_CHUNK_ATTEMPTS: usize = 3;
+                    let mut last_err: &'static str = "no attempts";
+                    let mut attempts_used: usize = 0;
+                    for attempt in 0..MAX_CHUNK_ATTEMPTS {
+                        attempts_used = attempt + 1;
+                        let raw = self.relay("GET", &url, &h, &[]).await;
+                        match extract_exact_range_body(&raw, s, e, total) {
+                            Ok(body) => return (s, e, Ok(body)),
+                            Err(reason) => {
+                                last_err = reason;
+                                if !chunk_failure_is_retryable(&raw) {
+                                    break;
+                                }
+                                if attempt + 1 < MAX_CHUNK_ATTEMPTS {
+                                    tracing::warn!(
+                                        "range-parallel-stream: chunk {}-{} attempt {} failed \
+                                         ({}); retrying",
+                                        s,
+                                        e,
+                                        attempt + 1,
+                                        reason,
+                                    );
+                                    let backoff_ms =
+                                        rand::thread_rng().gen_range(CHUNK_RETRY_BACKOFF_RANGE_MS);
+                                    tokio::time::sleep(std::time::Duration::from_millis(
+                                        backoff_ms,
+                                    ))
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+                    // Single terminal log so the consumer's "invalid chunk
+                    // / truncating response" warning has a paired
+                    // "gave up after N attempts" line right before it —
+                    // makes the failure mode obvious in the log without
+                    // requiring the reader to count retry warnings.
+                    tracing::warn!(
+                        "range-parallel-stream: chunk {}-{} giving up after {} attempt(s) ({})",
+                        s,
+                        e,
+                        attempts_used,
+                        last_err,
+                    );
+                    (s, e, Err(last_err))
                 }
             })
             .buffered(max_parallel)
@@ -4429,6 +4507,32 @@ fn extract_exact_range_body(
         return Err("Content-Range/body length mismatch");
     }
     Ok(body.to_vec())
+}
+
+/// Decide whether a failed chunk fetch is worth retrying. Used by
+/// `fetch_chunks_stream` to recover from transient Apps Script /
+/// origin errors mid-stream without giving up on the whole download.
+///
+/// Retryable:
+///   * Unparseable response (`split_response` returned None) — relay
+///     layer hit a connection-level failure before getting a status
+///     line; another attempt may succeed.
+///   * 5xx status — relay-level 504 (Apps Script timeout, by far the
+///     common case at scale), 502 (Apps Script connection/quota
+///     error), or genuine origin 5xx; all plausibly transient.
+///
+/// Not retryable:
+///   * 2xx with wrong shape (e.g. origin started serving a 200 with
+///     full body instead of 206 — happens for tiny files where the
+///     origin ignored Range). The same request will return the same
+///     thing; retrying just burns quota.
+///   * 3xx / 4xx — origin's authoritative answer (range unsatisfiable,
+///     auth lapsed, etc.). Retrying won't change it.
+fn chunk_failure_is_retryable(raw: &[u8]) -> bool {
+    match split_response(raw) {
+        None => true,
+        Some((status, _, _)) => (500..600).contains(&status),
+    }
 }
 
 /// Rewrite a 206 response to a 200 OK, dropping Content-Range and
@@ -8234,6 +8338,67 @@ Content-Length: 5\r\n\r\n\
 hello";
         let err = extract_exact_range_body(raw, 10, 14, 20).unwrap_err();
         assert_eq!(err, "unexpected Content-Range");
+    }
+
+    #[test]
+    fn chunk_failure_is_retryable_for_relay_504_timeout() {
+        // The exact shape `relay_uncoalesced` returns on Apps Script
+        // timeout — the dominant failure mode behind the archive.org
+        // bug report (3.8 GB download died on chunk 22 of 14647).
+        let raw = error_response(
+            504,
+            "Relay timeout — Apps Script did not respond. \
+             Most likely cause: daily UrlFetchApp quota exhausted",
+        );
+        assert!(chunk_failure_is_retryable(&raw));
+    }
+
+    #[test]
+    fn chunk_failure_is_retryable_for_relay_502_error() {
+        // `relay_uncoalesced` returns a synthetic 502 for connection-
+        // level relay failures. Plausibly transient — another script
+        // ID / another deployment may succeed.
+        let raw = error_response(502, "Relay error: connection refused");
+        assert!(chunk_failure_is_retryable(&raw));
+    }
+
+    #[test]
+    fn chunk_failure_is_retryable_for_origin_5xx() {
+        // Origin 503 / 500 / 504 — same retry policy. The chunk fetch
+        // is idempotent (GET + explicit Range, no body) so re-firing
+        // is safe.
+        for status in [500u16, 503, 504, 599] {
+            let raw = error_response(status, "origin error");
+            assert!(
+                chunk_failure_is_retryable(&raw),
+                "{status} must be retryable",
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_failure_is_retryable_when_response_unparseable() {
+        // No HTTP head terminator: relay never got a full response.
+        // Treat like a connection-level failure and retry.
+        assert!(chunk_failure_is_retryable(b""));
+        assert!(chunk_failure_is_retryable(b"HTTP/1.1 ???"));
+    }
+
+    #[test]
+    fn chunk_failure_is_not_retryable_for_2xx_3xx_4xx() {
+        // 200/206/3xx/4xx are the origin's authoritative answer —
+        // retrying the same request burns quota without changing the
+        // result. Specifically: 206 here means
+        // `extract_exact_range_body` rejected the response for a
+        // shape mismatch (wrong Content-Range, body length, etc.) —
+        // a real protocol-level disagreement, not a transient glitch.
+        for status in [200u16, 204, 206, 301, 304, 400, 403, 404, 416, 429] {
+            let raw = error_response(status, "x");
+            assert!(
+                !chunk_failure_is_retryable(&raw),
+                "{status} must NOT be retryable",
+            );
+        }
     }
 
     #[test]

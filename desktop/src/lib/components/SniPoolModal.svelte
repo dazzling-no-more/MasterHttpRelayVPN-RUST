@@ -133,7 +133,7 @@
       class="absolute inset-0 bg-black/60 backdrop-blur-sm"
     ></button>
     <div
-      class="bg-surface border-border-subtle relative flex max-h-[80vh] w-[640px] max-w-[92vw] flex-col rounded-lg border shadow-xl"
+      class="bg-surface border-border-subtle relative flex max-h-[80vh] w-160 max-w-[92vw] flex-col rounded-lg border shadow-xl"
     >
       <header class="border-border-subtle border-b p-5">
         <h3 id="sni-modal-title" class="text-lg font-semibold tracking-tight">
