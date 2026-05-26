@@ -2,7 +2,7 @@
 
 This folder contains the prebuilt binaries from the latest release, committed directly to the repository for users who cannot reach the GitHub Releases page.
 
-Current version: **v2.9.1**
+Current version: **v2.9.2**
 
 > **Note:** The table below documents all artifacts produced by the release
 > matrix. Several rows (Windows ARM64 CLI, Windows portable .exe, OpenWRT
@@ -18,7 +18,7 @@ from another process.
 
 | File | Platform | Contents |
 |---|---|---|
-| `rahgozar-android-universal-v2.9.1.apk` | Android 7.0+ (all ABIs), Android TV | Universal APK — arm64-v8a, armeabi-v7a, x86_64, x86 in one file. Also installable on Android TV (Shield, Mi Box, Chromecast with Google TV) |
+| `rahgozar-android-universal-v2.9.2.apk` | Android 7.0+ (all ABIs), Android TV | Universal APK — arm64-v8a, armeabi-v7a, x86_64, x86 in one file. Also installable on Android TV (Shield, Mi Box, Chromecast with Google TV) |
 | `rahgozar-portable-windows-amd64.exe` | Windows 10 (20H1+) / 11 x86_64 | **Portable** Tauri desktop UI — no install, double-click to run. Requires WebView2 (preinstalled on Win10 20H1+ / Win11) |
 | `rahgozar-desktop-windows-amd64.msi` | Windows 10 / 11 x86_64 | Tauri-bundled desktop UI installer (MSI). Auto-updates via the in-app updater |
 | `rahgozar-desktop-macos.dmg` | macOS 11+ (Intel + Apple Silicon) | Tauri-bundled desktop UI disk image |
@@ -68,7 +68,7 @@ cd rahgozar-macos-arm64        # or wherever the archive extracted to
 
 ### Android
 
-Copy `rahgozar-android-universal-v2.9.1.apk` to your phone, tap it from the Files app, and allow "Install unknown apps" for whichever app is opening the APK (Files, Chrome, etc.). See [the Android guide](../docs/android.md) for the full walk-through of the first-run steps (Apps Script deployment, MITM CA install, VPN permission, SNI tester).
+Copy `rahgozar-android-universal-v2.9.2.apk` to your phone, tap it from the Files app, and allow "Install unknown apps" for whichever app is opening the APK (Files, Chrome, etc.). See [the Android guide](../docs/android.md) for the full walk-through of the first-run steps (Apps Script deployment, MITM CA install, VPN permission, SNI tester).
 
 See the [main README](../README.md) for desktop setup (Apps Script deployment, config, browser proxy settings).
 
@@ -78,7 +78,7 @@ See the [main README](../README.md) for desktop setup (Apps Script deployment, c
 
 این پوشه شامل فایل‌های آخرین نسخه است و مستقیماً در ریپو قرار گرفته برای کاربرانی که به صفحهٔ GitHub Releases دسترسی ندارند.
 
-نسخهٔ فعلی: **v2.9.1**
+نسخهٔ فعلی: **v2.9.2**
 
 ### دانلود از طریق ZIP
 
@@ -96,6 +96,6 @@ cd rahgozar-macos-arm64
 
 **ویندوز:** ساده‌ترین راه — فایل `rahgozar-portable-windows-amd64.exe` را دانلود و دو بار کلیک کنید؛ بدون نصب اجرا می‌شود. اگر می‌خواهید نصب کامل با آپدیت خودکار داشته باشید، `rahgozar-desktop-windows-amd64.msi` را اجرا کنید. کاربران لپ‌تاپ‌های Snapdragon X / Surface Pro X+11 می‌توانند نسخهٔ `rahgozar-windows-arm64.zip` (CLI) را دانلود کنند.
 
-**اندروید:** فایل `rahgozar-android-universal-v2.9.1.apk` را روی گوشی کپی کنید، از Files app روی آن tap کنید و اجازهٔ "نصب برنامه‌های ناشناس" را بدهید. راهنمای کامل شروع به کار (دیپلوی Apps Script، نصب CA، اجازهٔ VPN، تستر SNI) در [راهنمای اندروید](../docs/android.md) هست.
+**اندروید:** فایل `rahgozar-android-universal-v2.9.2.apk` را روی گوشی کپی کنید، از Files app روی آن tap کنید و اجازهٔ "نصب برنامه‌های ناشناس" را بدهید. راهنمای کامل شروع به کار (دیپلوی Apps Script، نصب CA، اجازهٔ VPN، تستر SNI) در [راهنمای اندروید](../docs/android.md) هست.
 
 برای راه‌اندازی کامل دسکتاپ (دیپلوی Apps Script، config، تنظیم proxy مرورگر) به [README اصلی](../README.md) مراجعه کنید.
