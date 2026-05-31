@@ -23,7 +23,7 @@ resolver = "2"
 
 [package]
 name = "rahgozar"
-version = "2.10.0"
+version = "2.10.1"
 edition = "2021"
 description = "rahgozar — community continuation of mhrv-rs (Rust port of MasterHttpRelayVPN). DPI bypass via Google Apps Script relay with domain fronting."
 license = "MIT"
