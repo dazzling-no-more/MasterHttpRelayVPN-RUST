@@ -1809,6 +1809,23 @@ private fun FrontingGroupsEditor(
                         style = MaterialTheme.typography.titleSmall,
                         modifier = Modifier.weight(1f),
                     )
+                    // Camouflage (force_ip) groups have no editable edge IP
+                    // — the destination IP is DoH-resolved at runtime and
+                    // the SNI is a decoy. Flag them so the empty IP below
+                    // doesn't read as a misconfiguration.
+                    if (g.forceIp) {
+                        Text(
+                            stringResource(R.string.fronting_group_camouflage_badge),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier =
+                                Modifier
+                                    .background(
+                                        MaterialTheme.colorScheme.primary.copy(alpha = 0.15f),
+                                        RoundedCornerShape(4.dp),
+                                    ).padding(horizontal = 6.dp, vertical = 2.dp),
+                        )
+                    }
                     TextButton(
                         onClick = {
                             val next = cfg.frontingGroups.toMutableList().apply { removeAt(idx) }
@@ -1820,7 +1837,11 @@ private fun FrontingGroupsEditor(
                     }
                 }
                 Text(
-                    "${g.ip}  via  ${g.sni}",
+                    if (g.forceIp) {
+                        stringResource(R.string.fronting_group_camouflage_detail, g.sni)
+                    } else {
+                        "${g.ip}  via  ${g.sni}"
+                    },
                     style =
                         MaterialTheme.typography.labelSmall.copy(
                             fontFamily = FontFamily.Monospace,

@@ -312,6 +312,8 @@
     <string name="fronting_latency_ms_fmt">%1$d میلی‌ثانیه</string>
     <string name="fronting_group_added_fmt">گروه fronting برای %1$s اضافه شد — دامنه‌ها را وارد کن و ذخیره بزن.</string>
     <string name="fronting_group_draft_warning">پیش‌نویس — تا وقتی حداقل یک دامنه وارد نکنی ذخیره نمی‌شود.</string>
+    <string name="fronting_group_camouflage_badge">استتار</string>
+    <string name="fronting_group_camouflage_detail">IP خودکار (DoH) · SNI تقلبی %1$s</string>
     <string name="fronting_edge_mismatch_warning">⚠ فقط دامنه‌هایی را وارد کن که می‌دانی روی همان edge SNI بالا میزبانی می‌شوند — در غیر این صورت خطای cert نادرست یا صفحهٔ پیش‌فرض دریافت می‌کنی.</string>
 
     <!-- "How to use" guide body. Localized — EN copy lives in values. -->

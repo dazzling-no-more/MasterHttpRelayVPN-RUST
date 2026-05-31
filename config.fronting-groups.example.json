@@ -145,6 +145,31 @@
       "domains": [
         "pmc.ncbi.nlm.nih.gov"
       ]
+    },
+    {
+      "name": "google-video",
+      "sni": "www.google.com",
+      "domains": [
+        "googlevideo.com"
+      ],
+      "force_ip": true
+    },
+    {
+      "name": "meta",
+      "sni": "www.microsoft.com",
+      "domains": [
+        "cdninstagram.com",
+        "facebook.com",
+        "facebook.net",
+        "fbcdn.net",
+        "fbsbx.com",
+        "instagram.com",
+        "messenger.com",
+        "threads.net",
+        "whatsapp.com",
+        "whatsapp.net"
+      ],
+      "force_ip": true
     }
   ]
 }

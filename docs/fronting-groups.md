@@ -47,7 +47,7 @@ mirrors the same coverage as the curated bundle below.
 ## Curated bundle (no-typing path)
 
 The binary ships [`assets/fronting-groups/curated.json`](../assets/fronting-groups/curated.json)
-with eight groups derived from the
+with ten groups derived from the
 [`patterniha/MITM-DomainFronting`](https://github.com/patterniha/MITM-DomainFronting)
 Xray config — the same set of (sni, edge IP, member-domain) tuples that
 project's author has tested in the field:
@@ -62,6 +62,13 @@ project's author has tested in the field:
 | `fastly` | `pypi.org` | `reddit.com`, `cnn.com`, `pinterest.com`, `buzzfeed.com`, `githubusercontent.com`, `pypi.org`, … (40 domains) |
 | `amazon-cloudfront` | `kubernetes.io` | `netlify.app`, `netlify.com` |
 | `pubmed` | `pubmed.ncbi.nlm.nih.gov` | `pmc.ncbi.nlm.nih.gov` |
+| `google-video` ⚡ | `www.google.com` (camouflage) | `googlevideo.com` — YouTube's video CDN (the EVA edge) |
+| `meta` ⚡ | `www.microsoft.com` (camouflage) | `instagram.com`, `cdninstagram.com`, `whatsapp.com`/`.net`, `facebook.com`/`.net`, `fbcdn.net`, `threads.net`, `messenger.com` |
+
+⚡ = **camouflage mode** (`force_ip: true`). These two edges have no
+shared front IP you can pin, so they use a different mechanism — see
+[Camouflage mode](#camouflage-mode-force_ip--for-edges-with-no-shared-front)
+below.
 
 Ordering is load-bearing. `match_fronting_group` is single-shot
 first-match-wins with **dot-anchored suffix** matching — an entry
@@ -96,6 +103,70 @@ phone, re-add them or load the curated bundle.)
 **CLI / config-file users** — copy `config.fronting-groups.example.json`
 into place, or splice the `fronting_groups` array from
 `assets/fronting-groups/curated.json` into your existing `config.json`.
+
+## Camouflage mode (`force_ip`) — for edges with no shared front
+
+The pinned-`ip` model above only works on edges that let you front
+*other* tenants through one shared IP (Vercel, Fastly, CloudFront). Two
+high-value targets don't:
+
+- **YouTube video** (`googlevideo.com`) lives on Google's separate "EVA"
+  edge, not the GFE that `www.google.com` resolves to. Pinning a GFE IP
+  and sending `Host: …googlevideo.com` returns a wrong-cert / wrong-edge
+  error — this is exactly why `googlevideo.com` was pulled from the
+  built-in SNI-rewrite list in v1.7.6.
+- **Meta** (Instagram / WhatsApp / Facebook) has no neutral shared front
+  you can pin either.
+
+patterniha's Xray config (v22) handles these with `domainStrategy:
+ForceIP` + `verifyPeerCertByName`. rahgozar ports that as **camouflage
+mode**:
+
+```jsonc
+{
+  "name": "meta",
+  "sni": "www.microsoft.com",   // FAKE — only to blind the on-path DPI
+  "domains": ["instagram.com", "whatsapp.com", "facebook.com", "..."],
+  "force_ip": true              // <-- the switch
+  // "verify_names": [...]      // optional; default = verify the real host
+}
+```
+
+What changes when `force_ip: true`:
+
+1. **Dial the destination's own IP.** Instead of a pinned `ip`, the
+   proxy resolves the real host's IP per-connection. Because Iran
+   DNS-poisons exactly these hosts, resolution goes through a built-in
+   **DoH client** (Cloudflare `1.1.1.1`) whose *own* TLS handshake is
+   itself camouflaged (SNI `www.microsoft.com`), so the lookups can't be
+   SNI-blocked. `ip` is ignored (leave it out).
+2. **Send a fake SNI.** The `sni` (`www.microsoft.com`,
+   `www.google.com`) is put on the wire purely so the DPI box sees a
+   benign, allow-listed name and lets the handshake through.
+3. **Verify the *real* cert.** The cert the real edge returns is
+   validated — against the actual destination host by default, or
+   against an explicit `verify_names` allow-list if you set one
+   (patterniha's `verifyPeerCertByName`). A wrong/poisoned IP can't
+   present a valid cert for the real host, so it **fails closed** rather
+   than splicing you into a hostile peer. The fake SNI never weakens
+   this: the certificate, not the SNI, is the trust anchor.
+
+> **Security review note (maintainers):** camouflage mode is the only
+> fronting path that verifies the cert against a name *other* than the
+> SNI on the wire (see `src/camouflage.rs::CamouflageVerifier` and
+> `src/doh.rs`). The reasoning is sound — verification is full webpki
+> chain validation against the real host — but because users at risk
+> rely on it, **field-test against the live censor and review the
+> verifier before shipping in a release.** Camouflage groups only
+> activate when at least one `force_ip` group is present (the DoH
+> resolver is built lazily); existing pinned groups are unaffected.
+
+When camouflage mode helps and when it doesn't: it defeats **SNI-based**
+blocking only. If an ISP IP-blocks the destination outright, neither
+camouflage nor TLS-fragmentation reaches it — the Apps Script relay
+(`mode = apps_script`) remains the fallback. For YouTube specifically,
+`mode = local_bypass` is the other serverless option (it fragments the
+real ClientHello instead of camouflaging the SNI).
 
 ## Picking the (ip, sni) pair
 
@@ -187,11 +258,19 @@ edge directly, not through the Apps Script relay or the Google edge.
 - **Browsers only for Android non-root**, same as the Google path —
   third-party apps that don't trust user CAs (Telegram, Instagram, …)
   can't be MITM'd, so this trick doesn't help them.
-- **Cert verification matches the SNI.** No per-group SAN allowlist
-  (their `verifyPeerCertByName`); the SNI you send IS what rustls
-  validates against. If you want stricter pinning, set `verify_ssl:
-  false` is the wrong answer — instead, pick an SNI whose cert
-  genuinely covers your targets.
+- **Cert verification: pinned groups match the SNI; camouflage groups
+  match the real host.** For pinned (`force_ip: false`) groups the SNI
+  you send IS what rustls validates against, so pick an SNI whose cert
+  genuinely covers your targets. For camouflage (`force_ip: true`)
+  groups the SNI is fake and the cert is validated against the real
+  destination host (or an explicit `verify_names` allow-list —
+  patterniha's `verifyPeerCertByName`). Note `verify_ssl: false` only
+  affects the pinned/built-in shared connector — camouflage groups build
+  their own verifier and **always** validate the real-host cert chain
+  regardless of that flag (a wrong/poisoned IP can't present a valid cert
+  for the real host, so it fails closed). Don't reach for `verify_ssl:
+  false` regardless; it disables verification on the pinned + Google
+  paths.
 
 ## Credit
 

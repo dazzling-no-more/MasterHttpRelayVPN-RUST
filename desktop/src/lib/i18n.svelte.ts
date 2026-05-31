@@ -268,6 +268,10 @@ const EN: Record<string, string> = {
   "tunnel.fronting.no_groups": "No fronting groups configured.",
   "tunnel.fronting.group_name": "Group name",
   "tunnel.fronting.group_ip": "Edge IP",
+  "tunnel.fronting.group_ip_auto": "auto (DoH-resolved)",
+  "tunnel.fronting.camouflage_badge": "camouflage",
+  "tunnel.fronting.camouflage_hint":
+    "Camouflage group: the destination IP is resolved at runtime via DoH and the SNI is a decoy. No edge IP to set.",
   "tunnel.fronting.group_sni": "SNI",
   "tunnel.fronting.group_domains": "Domains",
   "tunnel.fronting.domain_placeholder": "domain (e.g. python.org)",
@@ -552,6 +556,10 @@ const FA: Record<string, string> = {
   "tunnel.fronting.no_groups": "هیچ گروه فرانتینگی پیکربندی نشده.",
   "tunnel.fronting.group_name": "نام گروه",
   "tunnel.fronting.group_ip": "IP لبه",
+  "tunnel.fronting.group_ip_auto": "خودکار (از طریق DoH)",
+  "tunnel.fronting.camouflage_badge": "استتار",
+  "tunnel.fronting.camouflage_hint":
+    "گروه استتار: IP مقصد هنگام اجرا از طریق DoH پیدا می‌شود و SNI یک نام تقلبی است. نیازی به تنظیم IP لبه نیست.",
   "tunnel.fronting.group_sni": "SNI",
   "tunnel.fronting.group_domains": "دامنه‌ها",
   "tunnel.fronting.domain_placeholder": "دامنه (مثلاً python.org)",

@@ -139,6 +139,60 @@ class ConfigStoreFrontingGroupsTest {
     }
 
     @Test
+    fun round_trips_camouflage_force_ip_group() {
+        // Camouflage (force_ip) groups have an empty `ip` (the
+        // destination IP is DoH-resolved at runtime on the Rust side)
+        // and carry `force_ip` / optional `verify_names`. Earlier
+        // Android builds required a non-empty ip and dropped the two
+        // new fields entirely — loading + saving a curated config would
+        // silently delete google-video / meta. This pins the fix.
+        val original =
+            RahgozarConfig(
+                mode = Mode.DIRECT,
+                frontingGroups =
+                    listOf(
+                        FrontingGroup(
+                            name = "google-video",
+                            ip = "",
+                            sni = "www.google.com",
+                            domains = listOf("googlevideo.com"),
+                            forceIp = true,
+                        ),
+                        FrontingGroup(
+                            name = "meta",
+                            ip = "",
+                            sni = "www.microsoft.com",
+                            domains = listOf("instagram.com", "whatsapp.com"),
+                            forceIp = true,
+                            verifyNames = listOf("instagram.com"),
+                        ),
+                    ),
+            )
+        // Encoder shape: force_ip present + true, empty ip preserved.
+        val parsed = JSONObject(original.toJson())
+        val arr = parsed.getJSONArray("fronting_groups")
+        assertEquals(2, arr.length())
+        assertTrue(arr.getJSONObject(0).getBoolean("force_ip"))
+        assertEquals("", arr.getJSONObject(0).getString("ip"))
+        assertEquals(
+            "instagram.com",
+            arr.getJSONObject(1).getJSONArray("verify_names").getString(0),
+        )
+
+        // Full round-trip: the empty-ip camouflage groups must survive
+        // decode (not be dropped as "half-empty") with fields intact.
+        val reloaded = ConfigStore.decode(original.toJson())
+        assertTrue("decode returned null", reloaded != null)
+        val groups = reloaded!!.frontingGroups
+        assertEquals(2, groups.size)
+        assertEquals("google-video", groups[0].name)
+        assertTrue(groups[0].forceIp)
+        assertEquals("", groups[0].ip)
+        assertTrue(groups[1].forceIp)
+        assertEquals(listOf("instagram.com"), groups[1].verifyNames)
+    }
+
+    @Test
     fun load_skips_groups_missing_required_fields() {
         // Defensive parse: a JSON entry missing `name` / `ip` / `sni`
         // is silently dropped rather than crashing the load. The

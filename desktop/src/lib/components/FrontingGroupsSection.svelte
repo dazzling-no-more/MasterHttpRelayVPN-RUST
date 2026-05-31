@@ -174,6 +174,20 @@
     {:else}
       {#each groups as g, gi (gi)}
         <div class="bg-input border-border-subtle rounded-md border p-4">
+          {#if g.force_ip}
+            <!-- Camouflage (force_ip) group: no edge IP to set — the
+                 destination IP is DoH-resolved at runtime and the SNI is
+                 a decoy. Surface that as a read-only badge + hint so
+                 users don't try to fill in an IP. -->
+            <div class="mb-3 flex items-center gap-2">
+              <span
+                class="bg-accent/15 text-accent rounded px-2 py-0.5 text-[10px] font-semibold tracking-wider uppercase"
+              >
+                {t("tunnel.fronting.camouflage_badge")}
+              </span>
+              <span class="text-muted text-xs">{t("tunnel.fronting.camouflage_hint")}</span>
+            </div>
+          {/if}
           <div class="grid grid-cols-2 gap-3">
             <div>
               <label class="text-muted text-xs" for={`fg-name-${gi}`}>
@@ -194,7 +208,9 @@
                 id={`fg-ip-${gi}`}
                 type="text"
                 bind:value={groups[gi].ip}
-                class="bg-base border-border-subtle focus:border-accent mt-1 w-full rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors"
+                readonly={g.force_ip}
+                placeholder={g.force_ip ? t("tunnel.fronting.group_ip_auto") : ""}
+                class="bg-base border-border-subtle focus:border-accent placeholder:text-muted mt-1 w-full rounded-md border px-3 py-1.5 font-mono text-xs outline-none transition-colors read-only:opacity-50"
               />
             </div>
             <div class="col-span-2">

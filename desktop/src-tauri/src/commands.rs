@@ -953,6 +953,35 @@ pub fn get_fronting_groups() -> Result<Vec<FrontingGroup>, String> {
         .map_err(|e| format!("malformed fronting_groups: {}", e))
 }
 
+/// Per-group field validation shared by `save_fronting_groups`. Pure so
+/// it's unit-testable without touching disk. `ip` is required only for
+/// pinned groups — camouflage (`force_ip`) groups resolve the
+/// destination IP at runtime via DoH and ship with an empty `ip`,
+/// mirroring the Rust `Config::validate` rule.
+fn validate_fronting_group_fields(cleaned: &[FrontingGroup]) -> Result<(), String> {
+    for (i, g) in cleaned.iter().enumerate() {
+        if g.name.is_empty() {
+            return Err(format!("Group #{}: name is required", i + 1));
+        }
+        if !g.force_ip && g.ip.is_empty() {
+            return Err(format!(
+                "Group '{}': IP is required (unless it is a camouflage/force_ip group)",
+                g.name
+            ));
+        }
+        if g.sni.is_empty() {
+            return Err(format!("Group '{}': SNI is required", g.name));
+        }
+        if g.domains.is_empty() {
+            return Err(format!(
+                "Group '{}': at least one domain is required",
+                g.name
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Replace `config.json::fronting_groups` with the supplied list.
 /// Validates each entry (name, ip, sni, ≥1 domain non-blank) before
 /// touching disk. Same JSON-value overlay strategy as `save_config`
@@ -981,23 +1010,7 @@ pub fn save_fronting_groups(groups: Vec<FrontingGroup>) -> Result<Vec<FrontingGr
         })
         .collect();
 
-    for (i, g) in cleaned.iter().enumerate() {
-        if g.name.is_empty() {
-            return Err(format!("Group #{}: name is required", i + 1));
-        }
-        if g.ip.is_empty() {
-            return Err(format!("Group '{}': IP is required", g.name));
-        }
-        if g.sni.is_empty() {
-            return Err(format!("Group '{}': SNI is required", g.name));
-        }
-        if g.domains.is_empty() {
-            return Err(format!(
-                "Group '{}': at least one domain is required",
-                g.name
-            ));
-        }
-    }
+    validate_fronting_group_fields(&cleaned)?;
 
     // Fresh-install path: `read_or_default_config_json` returns a
     // minimal-but-valid Config base (mode, listen ports, google_ip,
@@ -2306,6 +2319,45 @@ fn drive_error_to_friendly(e: DriveApiError, folder_id: &str) -> String {
             e
         ),
         _ => format!("Drive API error: {}", e),
+    }
+}
+
+#[cfg(test)]
+mod fronting_group_validation_tests {
+    use super::*;
+
+    fn g(name: &str, ip: &str, sni: &str, force_ip: bool) -> FrontingGroup {
+        FrontingGroup {
+            name: name.into(),
+            ip: ip.into(),
+            sni: sni.into(),
+            domains: vec!["example.com".into()],
+            force_ip,
+            verify_names: vec![],
+        }
+    }
+
+    #[test]
+    fn pinned_group_requires_ip() {
+        let err = validate_fronting_group_fields(&[g("vercel", "", "react.dev", false)])
+            .expect_err("pinned group with empty ip must fail");
+        assert!(err.contains("IP is required"), "got: {}", err);
+    }
+
+    #[test]
+    fn camouflage_group_allows_empty_ip() {
+        // The Critical-1 regression: a curated google-video / meta group
+        // (force_ip, no ip) must save successfully through the desktop
+        // command path.
+        assert!(
+            validate_fronting_group_fields(&[g("meta", "", "www.microsoft.com", true)]).is_ok()
+        );
+    }
+
+    #[test]
+    fn camouflage_group_still_requires_sni_and_name() {
+        assert!(validate_fronting_group_fields(&[g("", "", "www.microsoft.com", true)]).is_err());
+        assert!(validate_fronting_group_fields(&[g("meta", "", "", true)]).is_err());
     }
 }
 

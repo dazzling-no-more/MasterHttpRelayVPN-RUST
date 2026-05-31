@@ -76,8 +76,30 @@ object CuratedGroups {
                             if (d.isNotEmpty()) add(d)
                         }
                     }
-                if (name.isEmpty() || ip.isEmpty() || sni.isEmpty() || domains.isEmpty()) continue
-                add(FrontingGroup(name, ip, sni, domains))
+                val forceIp = g.optBoolean("force_ip", false)
+                val verifyArr = g.optJSONArray("verify_names")
+                val verifyNames =
+                    if (verifyArr != null) {
+                        buildList {
+                            for (j in 0 until verifyArr.length()) {
+                                val v = verifyArr.optString(j).trim()
+                                if (v.isNotEmpty()) add(v)
+                            }
+                        }
+                    } else {
+                        emptyList()
+                    }
+                // `ip` is required only for pinned groups; camouflage
+                // (force_ip) groups like google-video / meta resolve the
+                // destination IP at runtime and ship with an empty ip.
+                if (name.isEmpty() ||
+                    (!forceIp && ip.isEmpty()) ||
+                    sni.isEmpty() ||
+                    domains.isEmpty()
+                ) {
+                    continue
+                }
+                add(FrontingGroup(name, ip, sni, domains, forceIp, verifyNames))
             }
         }
     }

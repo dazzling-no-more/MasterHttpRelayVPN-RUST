@@ -148,6 +148,11 @@ mod tests {
             // Other curated edges
             "netlify.app",
             "pmc.ncbi.nlm.nih.gov",
+            // Camouflage (force_ip) routes — patterniha v22 parity.
+            "googlevideo.com",
+            "instagram.com",
+            "whatsapp.com",
+            "facebook.com",
         ] {
             assert!(
                 all_domains.contains(expected),
@@ -206,6 +211,12 @@ mod tests {
             ("vercel.com", "vercel"),
             ("netlify.app", "amazon-cloudfront"),
             ("pmc.ncbi.nlm.nih.gov", "pubmed"),
+            // Camouflage (force_ip) routes.
+            ("r1---sn-aigl6n7e.googlevideo.com", "google-video"),
+            ("googlevideo.com", "google-video"),
+            ("scontent.cdninstagram.com", "meta"),
+            ("www.instagram.com", "meta"),
+            ("web.whatsapp.com", "meta"),
         ];
         for (host, expected) in cases {
             let got = match_fronting_group(host, &resolved).unwrap_or_else(|| {
@@ -226,6 +237,8 @@ mod tests {
             ip: "1.2.3.4".into(),
             sni: "user-edited.example".into(),
             domains: vec!["user.example".into()],
+            force_ip: false,
+            verify_names: vec![],
         }];
         let before_len = existing.len();
         let report = merge_into(&mut existing).expect("merge should succeed");
@@ -273,6 +286,12 @@ mod tests {
             assert_eq!(c.ip, e.ip, "group ip ({})", c.name);
             assert_eq!(c.sni, e.sni, "group sni ({})", c.name);
             assert_eq!(c.domains, e.domains, "group domains ({})", c.name);
+            assert_eq!(c.force_ip, e.force_ip, "group force_ip ({})", c.name);
+            assert_eq!(
+                c.verify_names, e.verify_names,
+                "group verify_names ({})",
+                c.name
+            );
         }
     }
 

@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
 // AtomicU64 polyfill — same reason `cache.rs` and `domain_fronter.rs`
@@ -571,6 +571,19 @@ pub struct RewriteCtx {
     /// SNI-rewrite-only users see no regression on networks where
     /// fragmentation can't beat DPI.
     pub direct_mode: Option<Arc<crate::direct_mode::DirectModeCtx>>,
+    /// Poison-safe DoH resolver used by `force_ip` (camouflage) fronting
+    /// groups to find the destination's real IP without trusting the
+    /// (likely poisoned) system resolver. `None` if no `force_ip` group
+    /// is configured or the camouflage connector failed to build at
+    /// startup. When DoH can't resolve a host (resolver `None`, query
+    /// failure, empty answer) the dispatcher does NOT consume the socket
+    /// — it falls through to the normal routing (relay in apps_script,
+    /// raw-TCP in direct). `do_camouflage_tunnel` likewise establishes
+    /// the upstream *before* MITM-accepting the browser and hands the
+    /// socket back on a total upstream failure, so an IP-blocked /
+    /// wrong-cert destination also falls through rather than dropping the
+    /// CONNECT. Built once, shared.
+    pub doh_resolver: Option<Arc<crate::doh::DohResolver>>,
 }
 
 type ModeState = (Option<Arc<DomainFronter>>, Arc<RewriteCtx>, Mode);
@@ -937,31 +950,80 @@ pub(crate) fn classify_early_route(
 /// parsed into a `ServerName` so we don't repay that on every dialed
 /// connection, and domain entries are pre-lower-cased + dot-trimmed
 /// so the per-request match path is just byte comparisons.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct FrontingGroupResolved {
     pub name: String,
     pub ip: String,
     pub sni: String,
     pub server_name: ServerName<'static>,
     domains_normalized: Vec<String>,
+    /// Camouflage mode (patterniha `ForceIP`): dial the destination's own
+    /// resolved IP, send `sni` only to blind DPI, verify the cert against
+    /// the real destination host (or `verify_names` when set). See
+    /// [`FrontingGroup::force_ip`].
+    pub force_ip: bool,
+    /// Normalized explicit cert-name allow-list for camouflage mode.
+    /// Empty (the default) means "verify against the actual per-request
+    /// destination host", which is correct for arbitrary subdomains
+    /// (`scontent-x.cdninstagram.com` etc.). A non-empty list pins the
+    /// accepted names verbatim — patterniha's `verifyPeerCertByName`.
+    pub verify_names: Vec<String>,
+}
+
+// `TlsConnector` isn't `Debug`; hand-roll one that elides it so the
+// surrounding `tracing` / test `assert_eq!` ergonomics that relied on the
+// old derive keep working.
+impl std::fmt::Debug for FrontingGroupResolved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FrontingGroupResolved")
+            .field("name", &self.name)
+            .field("ip", &self.ip)
+            .field("sni", &self.sni)
+            .field("domains", &self.domains_normalized)
+            .field("force_ip", &self.force_ip)
+            .field("verify_names", &self.verify_names)
+            .finish()
+    }
 }
 
 impl FrontingGroupResolved {
     pub(crate) fn from_config(g: &FrontingGroup) -> Result<Self, String> {
         let server_name = ServerName::try_from(g.sni.clone())
             .map_err(|e| format!("invalid sni '{}': {}", g.sni, e))?;
-        let domains_normalized = g
+        let domains_normalized: Vec<String> = g
             .domains
             .iter()
             .map(|d| d.trim().trim_end_matches('.').to_ascii_lowercase())
             .filter(|d| !d.is_empty())
             .collect();
+
+        if !g.force_ip && g.ip.trim().is_empty() {
+            return Err("ip is required unless force_ip = true".into());
+        }
+
+        let verify_names: Vec<String> = g
+            .verify_names
+            .iter()
+            .map(|d| d.trim().trim_end_matches('.').to_ascii_lowercase())
+            .filter(|d| !d.is_empty())
+            .collect();
+
+        // Fail fast at startup if an explicit verify list is unusable —
+        // better than discovering it per-connection at dial time. (Empty
+        // list = verify against the real host, validated per-connection.)
+        if g.force_ip && !verify_names.is_empty() {
+            crate::camouflage::build_camouflage_connector(&verify_names)
+                .map_err(|e| format!("force_ip verify_names: {}", e))?;
+        }
+
         Ok(Self {
             name: g.name.clone(),
             ip: g.ip.clone(),
             sni: g.sni.clone(),
             server_name,
             domains_normalized,
+            force_ip: g.force_ip,
+            verify_names,
         })
     }
 }
@@ -1279,6 +1341,43 @@ fn build_mode_state(config: &Config) -> Result<ModeState, ProxyError> {
 
     let direct_mode = build_direct_mode_ctx(&config.direct_mode);
 
+    // Only stand up the DoH resolver when a force_ip (camouflage) group
+    // actually needs it. Build failure is non-fatal — the affected
+    // groups no-op and the dispatcher falls through to its other paths.
+    //
+    // `fallback_system_dns = false` is deliberate and load-bearing for
+    // the fall-through contract: the dispatcher resolves *before*
+    // MITM-terminating the browser, and only commits to the force_ip
+    // tunnel if resolution succeeds. If we let a poisoned system-DNS
+    // answer count as "success", dispatch would consume the socket, then
+    // fail cert verification, then close — exactly the blackhole the
+    // fall-through is meant to avoid. DoH-only means a DoH miss returns
+    // an error, the dispatcher falls through to relay/raw, and the host
+    // stays reachable. (In Iran the system resolver is poisoned for
+    // precisely these hosts, so the fallback would be actively harmful
+    // here anyway.)
+    let doh_resolver = if fronting_groups.iter().any(|g| g.force_ip) {
+        match crate::doh::DohResolver::with_default_resolvers(false) {
+            Ok(r) => {
+                tracing::info!(
+                    "force_ip fronting active — DoH resolver up (Cloudflare {}/1.0.0.1 camouflaged + Google dns.google)",
+                    crate::doh::DEFAULT_RESOLVER_IP,
+                );
+                Some(Arc::new(r))
+            }
+            Err(e) => {
+                tracing::error!(
+                    "force_ip groups configured but DoH resolver failed to build: {} \
+                     — those groups will be inactive",
+                    e
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let rewrite_ctx = Arc::new(RewriteCtx {
         google_ip: config.google_ip.clone(),
         front_domain: config.front_domain.clone(),
@@ -1298,6 +1397,7 @@ fn build_mode_state(config: &Config) -> Result<ModeState, ProxyError> {
         bypass_doh_hosts: config.bypass_doh_hosts.clone(),
         fronting_groups,
         direct_mode,
+        doh_resolver,
     });
 
     Ok((fronter, rewrite_ctx, mode))
@@ -3199,23 +3299,86 @@ async fn dispatch_tunnel(
         // await below without keeping `rewrite_ctx` borrowed.
         let group_match = match_fronting_group(&host, &rewrite_ctx.fronting_groups).map(Arc::clone);
         if let Some(group) = group_match {
-            tracing::info!(
-                "dispatch {}:{} -> sni-rewrite tunnel (fronting group '{}', edge {} sni={})",
-                host,
-                port,
-                group.name,
-                group.ip,
-                group.sni
-            );
-            return do_sni_rewrite_tunnel_from_tcp(
-                sock,
-                &host,
-                port,
-                mitm,
-                rewrite_ctx,
-                Some(group),
-            )
-            .await;
+            if group.force_ip {
+                // Camouflage mode: resolve the destination's real IP via
+                // poison-safe DoH *before* consuming the socket. A DoH
+                // miss MUST fall through to the rest of the dispatch
+                // (relay in apps_script, raw-TCP in direct) rather than
+                // MITM-terminate the browser and then drop the CONNECT —
+                // dropping would regress a curated host like
+                // googlevideo.com from "slow relay" to "connection
+                // closes". The resolved IPs are threaded into the tunnel
+                // so we don't pay a second lookup.
+                //
+                // Breaker check first (keyed by group name): if this
+                // group's edge is already known-unreachable, fall through
+                // *without even resolving DNS* — a tripped group's
+                // fall-through is then truly free.
+                let resolved = if camouflage_breaker_tripped(&group.name) {
+                    None
+                } else {
+                    match &rewrite_ctx.doh_resolver {
+                        Some(r) => r.resolve(&host).await.ok().filter(|v| !v.is_empty()),
+                        None => None,
+                    }
+                };
+                match resolved {
+                    Some(ips) => {
+                        tracing::info!(
+                            "dispatch {}:{} -> camouflage tunnel (fronting group '{}', force_ip/DoH sni={})",
+                            host,
+                            port,
+                            group.name,
+                            group.sni
+                        );
+                        // Camouflage establishes the upstream BEFORE
+                        // MITM-accepting the browser; on total upstream
+                        // failure it returns the untouched socket so we
+                        // fall through to the normal route instead of
+                        // dropping the CONNECT.
+                        match do_camouflage_tunnel(sock, &host, port, mitm.clone(), &group, ips)
+                            .await
+                        {
+                            Ok(()) => return Ok(()),
+                            Err(returned) => {
+                                sock = returned;
+                                tracing::debug!(
+                                    "force_ip group '{}': upstream unreachable for {} — falling through to normal dispatch",
+                                    group.name,
+                                    host
+                                );
+                                // Fall through: sock/mitm/rewrite_ctx intact.
+                            }
+                        }
+                    }
+                    None => {
+                        tracing::debug!(
+                            "force_ip group '{}': DoH could not resolve {} — falling through to normal dispatch",
+                            group.name,
+                            host
+                        );
+                        // Fall through: sock/mitm/rewrite_ctx untouched.
+                    }
+                }
+            } else {
+                tracing::info!(
+                    "dispatch {}:{} -> sni-rewrite tunnel (fronting group '{}', edge {} sni={})",
+                    host,
+                    port,
+                    group.name,
+                    group.ip,
+                    group.sni
+                );
+                return do_sni_rewrite_tunnel_from_tcp(
+                    sock,
+                    &host,
+                    port,
+                    mitm,
+                    rewrite_ctx,
+                    Some(group),
+                )
+                .await;
+            }
         }
     }
 
@@ -3839,17 +4002,25 @@ async fn relay_http_stream_raw(
     }
 }
 
+/// Cap on how many DoH-resolved IPs a `force_ip` group will try before
+/// giving up. The first reachable one almost always wins; the extras are
+/// just resilience against a single dead edge IP. Bounded so a host that
+/// resolves to a large anycast set doesn't blow the per-CONNECT latency
+/// budget on serial connect attempts.
+const FORCE_IP_MAX_TARGETS: usize = 3;
+
 async fn do_sni_rewrite_tunnel_from_tcp<S>(
     sock: S,
     host: &str,
     port: u16,
     mitm: Arc<Mutex<MitmCertManager>>,
     rewrite_ctx: Arc<RewriteCtx>,
-    // When Some, overrides the default Google edge target with a
-    // user-configured fronting group's (ip, sni). `Arc` so the
-    // dispatcher hands us a refcount-only clone — the resolved
-    // group also carries the matcher's normalized domain list which
-    // we don't need here. None = built-in Google edge path.
+    // When Some, a *pinned* fronting group: dial its edge `ip` with
+    // SNI=`sni`, cert verified against `sni` (the shared connector).
+    // None = built-in Google edge (dial `google_ip`, SNI=`front_domain`).
+    // Camouflage (`force_ip`) groups do NOT use this path — they go
+    // through `do_camouflage_tunnel`, which dials upstream before
+    // MITM-accepting the browser so it can fall through on failure.
     group: Option<Arc<FrontingGroupResolved>>,
 ) -> std::io::Result<()>
 where
@@ -3906,7 +4077,7 @@ where
         }
     };
 
-    // Open outbound TLS to google_ip with SNI=front_domain.
+    // Open outbound TLS to the edge with SNI=outbound_sni.
     let upstream_tcp = match tokio::time::timeout(
         std::time::Duration::from_secs(10),
         TcpStream::connect((target_ip.as_str(), port)),
@@ -3926,7 +4097,6 @@ where
             return Ok(());
         }
     };
-    let _ = upstream_tcp.set_nodelay(true);
 
     let outbound = match rewrite_ctx
         .tls_connector
@@ -3948,6 +4118,241 @@ where
     tokio::select! {
         _ = client_to_server => {}
         _ = server_to_client => {}
+    }
+    Ok(())
+}
+
+/// Per-attempt budget (TCP connect + camouflaged TLS handshake) for one
+/// candidate IP. Deliberately tight: the whole point of camouflage mode
+/// is *fast* fall-through, and a reachable Google/Meta edge completes
+/// well under a second. A loose 10 s here, multiplied by
+/// `FORCE_IP_MAX_TARGETS`, would turn an IP-blocked host into a 30 s
+/// per-CONNECT stall before falling through — see the breaker below.
+const CAMOUFLAGE_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a fronting *group* stays marked "upstream unreachable" after
+/// a CONNECT where every candidate IP failed. While tripped, subsequent
+/// CONNECTs routed to that group fall through to the normal route
+/// *immediately* instead of re-paying the connect attempts.
+///
+/// **Keyed by group name, not host.** This is the load-bearing choice:
+/// YouTube fans out to ephemeral per-session subdomains
+/// (`r1---sn-….googlevideo.com`), each seen once, so a per-host breaker
+/// would essentially never get a repeat hit on the exact case it exists
+/// for. But if a group's edge IPs are blackholed, they're blackholed for
+/// the whole group — so one trip short-circuits every host the group
+/// fronts for the cooldown. Mirrors the DoH negative cache, but for the
+/// IP-blocked-yet-resolvable case DNS can't catch (the resolver returns
+/// valid IPs; the IPs themselves are dropped).
+const CAMOUFLAGE_BREAKER_COOLDOWN: Duration = Duration::from_secs(30);
+/// Hard cap on the breaker map so a config with many force_ip groups
+/// can't grow it without bound. Expired entries are swept first. (With
+/// group-name keying this is tiny in practice — one entry per group.)
+const CAMOUFLAGE_BREAKER_MAX_ENTRIES: usize = 512;
+
+fn camouflage_breaker_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, Instant>>
+{
+    static MAP: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Instant>>> =
+        std::sync::OnceLock::new();
+    MAP.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// True if `key` (a fronting group name) is currently breaker-tripped.
+fn camouflage_breaker_tripped(key: &str) -> bool {
+    let map = match camouflage_breaker_map().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    map.get(key).is_some_and(|until| Instant::now() < *until)
+}
+
+/// Mark `key` (a group name) unreachable for `CAMOUFLAGE_BREAKER_COOLDOWN`.
+/// Sweeps expired entries (and, if still at cap, the soonest-expiring one)
+/// before inserting so the map stays bounded.
+fn camouflage_note_unreachable(key: &str) {
+    let mut map = match camouflage_breaker_map().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    if map.len() >= CAMOUFLAGE_BREAKER_MAX_ENTRIES && !map.contains_key(key) {
+        let now = Instant::now();
+        map.retain(|_, until| now < *until);
+        if map.len() >= CAMOUFLAGE_BREAKER_MAX_ENTRIES {
+            if let Some(k) = map.iter().min_by_key(|(_, u)| **u).map(|(k, _)| k.clone()) {
+                map.remove(&k);
+            }
+        }
+    }
+    map.insert(
+        key.to_string(),
+        Instant::now() + CAMOUFLAGE_BREAKER_COOLDOWN,
+    );
+}
+
+/// Clear any breaker entry for `key` (a group name) after a successful dial.
+fn camouflage_note_reachable(key: &str) {
+    let mut map = match camouflage_breaker_map().lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    map.remove(key);
+}
+
+/// Camouflage (`force_ip`) tunnel: dial the destination's own
+/// DoH-resolved IP with a decoy SNI and a verifier bound to the real
+/// host, then MITM the browser and splice.
+///
+/// **Outbound-first ordering is load-bearing.** We establish the upstream
+/// TCP+TLS connection BEFORE accepting (MITM-terminating) the browser's
+/// TLS. If every candidate IP is unreachable / IP-blocked / wrong-cert,
+/// the browser socket is still untouched, so we hand it back
+/// (`Err(sock)`) and the dispatcher falls through to the normal route
+/// (Apps Script relay in apps_script, raw TCP in direct) instead of
+/// black-holing the CONNECT. Accepting the browser first (as the
+/// pinned/built-in path does) would make an upstream failure
+/// unrecoverable — that was the v1 regression for IP-blocked googlevideo.
+///
+/// Returns `Ok(())` when handled (success, or a browser-side failure
+/// after we committed); `Err(sock)` when the upstream couldn't be
+/// established and the caller should fall through with the untouched
+/// socket.
+async fn do_camouflage_tunnel(
+    sock: TcpStream,
+    host: &str,
+    port: u16,
+    mitm: Arc<Mutex<MitmCertManager>>,
+    group: &FrontingGroupResolved,
+    ips: Vec<std::net::IpAddr>,
+) -> Result<(), TcpStream> {
+    // Fast fall-through when this group's edge is known-unreachable: a
+    // recent CONNECT routed here already found every candidate IP
+    // blackholed. Keyed by group name (not host) because YouTube fans out
+    // to ephemeral per-session subdomains — a per-host breaker would never
+    // hit twice, but the group's edge IPs are blocked for the whole group.
+    // Skip the dial and hand the socket back so the dispatcher uses
+    // relay/raw. (The dispatcher also pre-checks this before resolving DNS;
+    // this is the self-contained guard.)
+    if camouflage_breaker_tripped(&group.name) {
+        tracing::debug!(
+            "force_ip '{}': breaker tripped — falling through without dialing ({})",
+            group.name,
+            host
+        );
+        return Err(sock);
+    }
+
+    // Verify the upstream cert against the real destination host (the
+    // cert the EVA/Meta edge actually serves), or the explicit allow-list
+    // when the group pins one. The SNI on the wire stays the decoy `sni`.
+    let verify: Vec<String> = if group.verify_names.is_empty() {
+        vec![host.to_ascii_lowercase()]
+    } else {
+        group.verify_names.clone()
+    };
+    let connector = match crate::camouflage::build_camouflage_connector(&verify) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!(
+                "force_ip group '{}': camouflage connector build failed: {}",
+                group.name,
+                e
+            );
+            return Err(sock);
+        }
+    };
+
+    // Dial the candidate IPs CONCURRENTLY and take the first that completes
+    // the camouflaged handshake. Done BEFORE touching the browser socket so
+    // a total failure can fall through. Racing (rather than a serial loop)
+    // bounds the all-fail latency to one `CAMOUFLAGE_ATTEMPT_TIMEOUT`
+    // instead of `FORCE_IP_MAX_TARGETS ×` it — important because on a
+    // blocked group every IP just times out.
+    let dials: Vec<_> = ips
+        .into_iter()
+        .take(FORCE_IP_MAX_TARGETS)
+        .map(|ip| {
+            let connector = &connector;
+            let server_name = group.server_name.clone();
+            Box::pin(async move {
+                let target = ip.to_string();
+                match tokio::time::timeout(CAMOUFLAGE_ATTEMPT_TIMEOUT, async {
+                    let tcp = TcpStream::connect((target.as_str(), port)).await?;
+                    let _ = tcp.set_nodelay(true);
+                    connector
+                        .connect(server_name, tcp)
+                        .await
+                        .map_err(std::io::Error::other)
+                })
+                .await
+                {
+                    Ok(r) => r,
+                    Err(_) => Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "dial timeout",
+                    )),
+                }
+            })
+        })
+        .collect();
+    if dials.is_empty() {
+        camouflage_note_unreachable(&group.name);
+        return Err(sock);
+    }
+    let outbound = match futures_util::future::select_ok(dials).await {
+        Ok((stream, _rest)) => stream,
+        Err(e) => {
+            // Every candidate failed — trip the group breaker so the next
+            // CONNECT routed here falls through immediately, and hand the
+            // (untouched) socket back to the dispatcher.
+            tracing::debug!(
+                "force_ip '{}': all upstreams failed for {}: {}",
+                group.name,
+                host,
+                e
+            );
+            camouflage_note_unreachable(&group.name);
+            return Err(sock);
+        }
+    };
+    // Reached a working edge — clear any stale breaker mark.
+    camouflage_note_reachable(&group.name);
+
+    // Upstream is up. Mint the MITM leaf and accept the browser TLS. A
+    // cert-gen failure can still fall through (sock not yet consumed);
+    // once `accept` consumes the socket a browser-side failure cannot.
+    let server_config = {
+        let mut m = mitm.lock().await;
+        match m.get_server_config(host) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(
+                    "force_ip '{}': cert gen failed for {}: {}",
+                    group.name,
+                    host,
+                    e
+                );
+                return Err(sock);
+            }
+        }
+    };
+    let inbound = match TlsAcceptor::from(server_config).accept(sock).await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::debug!(
+                "force_ip '{}': inbound TLS accept failed for {}: {}",
+                group.name,
+                host,
+                e
+            );
+            return Ok(());
+        }
+    };
+
+    let (mut ir, mut iw) = tokio::io::split(inbound);
+    let (mut or, mut ow) = tokio::io::split(outbound);
+    tokio::select! {
+        _ = tokio::io::copy(&mut ir, &mut ow) => {}
+        _ = tokio::io::copy(&mut or, &mut iw) => {}
     }
     Ok(())
 }
@@ -5980,6 +6385,8 @@ mod tests {
                 ip: "127.0.0.1".into(),
                 sni: sni.into(),
                 domains: domains.iter().map(|s| s.to_string()).collect(),
+                force_ip: false,
+                verify_names: vec![],
             })
             .expect("test fronting group should resolve"),
         )
@@ -6745,8 +7152,85 @@ mod tests {
             ip: "127.0.0.1".into(),
             sni: "not a valid hostname".into(),
             domains: vec!["x.com".into()],
+            force_ip: false,
+            verify_names: vec![],
         };
         assert!(FrontingGroupResolved::from_config(&bad).is_err());
+    }
+
+    #[test]
+    fn camouflage_breaker_trips_and_clears() {
+        // Unique host so the process-global breaker map can't collide
+        // with another test.
+        let h = "breaker-unit-test.invalid";
+        assert!(!camouflage_breaker_tripped(h));
+        camouflage_note_unreachable(h);
+        assert!(camouflage_breaker_tripped(h));
+        camouflage_note_reachable(h);
+        assert!(!camouflage_breaker_tripped(h));
+    }
+
+    /// The load-bearing invariant: when every candidate upstream IP fails
+    /// to connect, `do_camouflage_tunnel` must return the browser socket
+    /// *untouched* (never MITM-accepted) so the dispatcher can fall
+    /// through to relay/raw. Also pins that the breaker trips after.
+    #[tokio::test]
+    async fn camouflage_tunnel_returns_untouched_socket_on_upstream_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = tokio_rustls::rustls::crypto::ring::default_provider().install_default();
+
+        // A definitely-closed port (bind then drop) → connect refused fast.
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let closed_port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        // Browser <-> proxy socket pair.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let (sock, _peer) = listener.accept().await.unwrap();
+
+        // MITM manager is required by the signature but never used on the
+        // all-fail path (we return before the cert mint), so a throwaway
+        // CA dir is fine.
+        let tmp = std::env::temp_dir().join(format!(
+            "rahgozar-cam-test-{}-{}",
+            std::process::id(),
+            closed_port
+        ));
+        let mitm = Arc::new(Mutex::new(
+            crate::mitm::MitmCertManager::new_in(&tmp).unwrap(),
+        ));
+
+        let host = "camo-unreachable-test.invalid";
+        // Unique group name so the process-global breaker map can't
+        // collide with another test.
+        let group = FrontingGroupResolved::from_config(&FrontingGroup {
+            name: "camo-test-group".into(),
+            ip: "".into(),
+            sni: "www.microsoft.com".into(),
+            domains: vec![host.into()],
+            force_ip: true,
+            verify_names: vec![],
+        })
+        .unwrap();
+        // Loopback + closed port → every dial attempt fails fast.
+        let ips = vec!["127.0.0.1".parse().unwrap()];
+
+        let res = do_camouflage_tunnel(sock, host, closed_port, mitm, &group, ips).await;
+        let mut returned = res.expect_err("must hand the socket back on all-upstream-fail");
+
+        // Prove the socket was never MITM-accepted: a raw byte still
+        // round-trips on it. A TLS accept would have consumed/garbled it.
+        client.write_all(b"Z").await.unwrap();
+        let mut b = [0u8; 1];
+        let n = returned.read(&mut b).await.unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(&b, b"Z");
+
+        // And the breaker is now tripped for this group (keyed by name).
+        assert!(camouflage_breaker_tripped(&group.name));
+        camouflage_note_reachable(&group.name); // cleanup shared state
     }
 
     #[test]

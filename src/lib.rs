@@ -2,12 +2,14 @@
 
 pub mod bot_block;
 pub mod cache;
+pub mod camouflage;
 pub mod cdn_discover;
 pub mod cert_installer;
 pub mod config;
 pub mod curated_groups;
 pub mod data_dir;
 pub mod direct_mode;
+pub mod doh;
 pub mod domain_fronter;
 pub mod drive_api;
 pub mod drive_client;

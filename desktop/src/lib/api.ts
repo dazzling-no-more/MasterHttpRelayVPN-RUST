@@ -119,12 +119,20 @@ export interface CaStatusDto {
  * One fronting group — mirrors `rahgozar::config::FrontingGroup`.
  * Routes `domains` (case-insensitive, dot-anchored suffix match)
  * through `ip` with `sni` on the outbound TLS handshake.
+ *
+ * Camouflage mode (`force_ip`): dial the destination's own DoH-resolved
+ * IP instead of `ip` (which may be empty), send `sni` only to blind DPI,
+ * and verify the cert against the real host (or `verify_names`). Used by
+ * the curated `google-video` / `meta` groups. Both fields are optional
+ * and omitted by the backend when unset (force_ip=false / empty list).
  */
 export interface FrontingGroup {
   name: string;
   ip: string;
   sni: string;
   domains: string[];
+  force_ip?: boolean;
+  verify_names?: string[];
 }
 
 export interface DiscoverResultDto {

@@ -319,6 +319,8 @@
     <string name="fronting_latency_ms_fmt">%1$d ms</string>
     <string name="fronting_group_added_fmt">Added fronting group for %1$s — fill in domains and Save.</string>
     <string name="fronting_group_draft_warning">Draft — won\'t save until you list at least one domain.</string>
+    <string name="fronting_group_camouflage_badge">camouflage</string>
+    <string name="fronting_group_camouflage_detail">auto-IP (DoH) · decoy SNI %1$s</string>
     <string name="fronting_edge_mismatch_warning">⚠ Only list domains you know are served by the same edge as the SNI above — a mismatch returns wrong-cert errors or a default page.</string>
 
     <!-- "How to use" guide body. Localized — FA copy lives in values-fa. -->

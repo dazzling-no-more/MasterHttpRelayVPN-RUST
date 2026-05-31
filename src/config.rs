@@ -993,20 +993,36 @@ fn default_direct_mode_enabled() -> bool {
 /// as `sni`; the cert it serves will be valid for that name (rustls
 /// validates against `sni`, not against the inner `Host`), and the
 /// edge will route based on the `Host` header.
+/// `skip_serializing_if` predicate for `bool` fields that default false —
+/// keeps the serialized config clean (omit when false) and reads clearer
+/// than an inline `std::ops::Not::not` path.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct FrontingGroup {
     /// Human-readable name used in log lines. Free-form; uniqueness not
     /// enforced but recommended.
     pub name: String,
-    /// Edge IP to dial. A single IP for now — most edges have many but
-    /// one is enough to validate the technique. IP rotation per-group
-    /// can come later.
+    /// Edge IP to dial in the pinned-front model (`force_ip = false`). A
+    /// single IP for now — most edges have many but one is enough to
+    /// validate the technique. **Ignored when `force_ip = true`**: in
+    /// that mode the destination's own IP is resolved per-connection
+    /// (via DoH), so `ip` may be left empty.
+    #[serde(default)]
     pub ip: String,
-    /// SNI to send on the outbound TLS handshake. Must be a real domain
-    /// served by the same edge as `domains`, otherwise the edge will
-    /// either refuse the handshake or serve a default page that 404s
-    /// the inner Host. Examples: `react.dev` for Vercel, `www.python.org`
-    /// for Fastly.
+    /// SNI to send on the outbound TLS handshake.
+    ///
+    /// - Pinned-front model (`force_ip = false`): must be a real domain
+    ///   served by the same edge as `domains`, otherwise the edge will
+    ///   either refuse the handshake or serve a default page that 404s
+    ///   the inner Host. Examples: `react.dev` for Vercel, `www.python.org`
+    ///   for Fastly. The cert is verified against this name.
+    /// - Camouflage model (`force_ip = true`): a *fake* benign host used
+    ///   only to blind on-path SNI DPI (e.g. `www.microsoft.com` for
+    ///   Meta, `www.google.com` for googlevideo). The cert is NOT verified
+    ///   against this name — see `verify_names`.
     pub sni: String,
     /// Member domain list. Matching is case-insensitive: an entry
     /// matches the host exactly OR as an unconditional dot-anchored
@@ -1020,6 +1036,26 @@ pub struct FrontingGroup {
     /// `vercel.com` both work — the matcher is the source of truth
     /// for equality.
     pub domains: Vec<String>,
+    /// **Camouflage mode.** When true, the proxy dials the destination's
+    /// *own* IP (resolved out-of-band via poison-safe DoH) instead of the
+    /// pinned `ip`, sends the fake `sni` purely to blind DPI, and verifies
+    /// the peer cert against `verify_names` (the destination's real
+    /// names) rather than `sni`. This is patterniha's `ForceIP` +
+    /// `verifyPeerCertByName` technique — required for destinations with
+    /// no frontable shared edge (Google video / EVA edge, Meta). Default
+    /// `false` (the original pinned-front behaviour).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub force_ip: bool,
+    /// Cert names accepted in camouflage mode (`force_ip = true`). The
+    /// upstream cert must be valid for at least one. **Empty (the
+    /// default) = verify against the actual per-request destination
+    /// host** — correct for arbitrary subdomains like
+    /// `scontent-x.cdninstagram.com` where a fixed apex wouldn't match a
+    /// `*.cdninstagram.com` cert. Set an explicit list only to pin
+    /// names verbatim (patterniha's `verifyPeerCertByName`). Ignored
+    /// when `force_ip = false`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verify_names: Vec<String>,
 }
 
 fn default_fetch_ips_from_api() -> bool {
@@ -1495,9 +1531,13 @@ impl Config {
                     i
                 )));
             }
-            if g.ip.trim().is_empty() {
+            // `ip` is the pinned edge to dial in the classic (non-force_ip)
+            // model. In camouflage mode (`force_ip = true`) the
+            // destination's own IP is resolved per-connection via DoH, so
+            // an empty `ip` is expected and fine there.
+            if !g.force_ip && g.ip.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!(
-                    "fronting_groups[{}] ('{}'): ip is empty",
+                    "fronting_groups[{}] ('{}'): ip is empty (required unless force_ip = true)",
                     i, g.name
                 )));
             }
@@ -1530,6 +1570,26 @@ impl Config {
                     return Err(ConfigError::Invalid(format!(
                         "fronting_groups[{}] ('{}'): empty domain entry",
                         i, g.name
+                    )));
+                }
+            }
+            // Explicit camouflage `verify_names` are a documented config
+            // field, so validate them on the same load path as `sni`
+            // rather than letting an invalid entry surface only later in
+            // `FrontingGroupResolved::from_config`. Empty list = verify
+            // against the real host (nothing to validate here).
+            for v in &g.verify_names {
+                let v = v.trim().trim_end_matches('.');
+                if v.is_empty() {
+                    return Err(ConfigError::Invalid(format!(
+                        "fronting_groups[{}] ('{}'): empty verify_names entry",
+                        i, g.name
+                    )));
+                }
+                if let Err(e) = ServerName::try_from(v.to_string()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "fronting_groups[{}] ('{}'): invalid verify_names entry '{}': {}",
+                        i, g.name, v, e
                     )));
                 }
             }

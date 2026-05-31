@@ -342,13 +342,18 @@ private fun driveRelayBigIntegerToLittleEndian(v: BigInteger): ByteArray {
 data class FrontingGroup(
     /** Human-readable label used in log lines. Free-form. */
     val name: String,
-    /** Edge IP to dial. Today a single IP per group. */
+    /**
+     * Edge IP to dial in the pinned-front model. Ignored (and may be
+     * empty) when [forceIp] is true — the destination's own IP is then
+     * resolved per-connection via DoH on the Rust side.
+     */
     val ip: String,
     /**
      * SNI on the outbound TLS handshake. Must be served by the same
      * edge as [domains] or the edge will refuse / 404. Auto-populated
      * from the hostname the user typed when discovering via
-     * `Native.discoverFront`.
+     * `Native.discoverFront`. In camouflage mode ([forceIp] true) this
+     * is a *fake* benign SNI used only to blind DPI.
      */
     val sni: String,
     /**
@@ -357,6 +362,20 @@ data class FrontingGroup(
      * `vercel.com` matches `app.vercel.com` too).
      */
     val domains: List<String>,
+    /**
+     * Camouflage mode (patterniha `ForceIP`): dial the destination's own
+     * DoH-resolved IP, send the fake [sni] to blind DPI, verify the cert
+     * against the real host (or [verifyNames]). Used by the curated
+     * `google-video` / `meta` groups. Default false. Round-tripped here
+     * so Save doesn't drop it — the field is interpreted entirely on the
+     * Rust side.
+     */
+    val forceIp: Boolean = false,
+    /**
+     * Optional explicit cert-name allow-list for camouflage mode. Empty
+     * = verify against the real per-request host (the usual case).
+     */
+    val verifyNames: List<String> = emptyList(),
 )
 
 /**
@@ -739,6 +758,15 @@ data class RahgozarConfig(
                                                 g.domains.forEach { put(it) }
                                             },
                                         )
+                                        if (g.forceIp) put("force_ip", true)
+                                        if (g.verifyNames.isNotEmpty()) {
+                                            put(
+                                                "verify_names",
+                                                JSONArray().apply {
+                                                    g.verifyNames.forEach { put(it) }
+                                                },
+                                            )
+                                        }
                                     },
                                 )
                             }
@@ -1089,6 +1117,13 @@ object ConfigStore {
                                 put("ip", g.ip)
                                 put("sni", g.sni)
                                 put("domains", JSONArray().apply { g.domains.forEach { put(it) } })
+                                if (g.forceIp) put("force_ip", true)
+                                if (g.verifyNames.isNotEmpty()) {
+                                    put(
+                                        "verify_names",
+                                        JSONArray().apply { g.verifyNames.forEach { put(it) } },
+                                    )
+                                }
                             },
                         )
                     }
@@ -1442,10 +1477,32 @@ object ConfigStore {
                                     } else {
                                         emptyList()
                                     }
+                                val forceIp = g.optBoolean("force_ip", false)
+                                val verifyArr = g.optJSONArray("verify_names")
+                                val verifyNames =
+                                    if (verifyArr != null) {
+                                        buildList {
+                                            for (j in 0 until verifyArr.length()) {
+                                                val v = verifyArr.optString(j).trim()
+                                                if (v.isNotEmpty()) add(v)
+                                            }
+                                        }
+                                    } else {
+                                        emptyList()
+                                    }
                                 // Skip half-empty entries — same shape as the
                                 // Rust validator in src/config.rs would reject.
-                                if (name.isEmpty() || ip.isEmpty() || sni.isEmpty() || domains.isEmpty()) continue
-                                add(FrontingGroup(name, ip, sni, domains))
+                                // `ip` is required only for pinned groups; in
+                                // camouflage mode (force_ip) the destination IP
+                                // is resolved at runtime, so an empty ip is fine.
+                                if (name.isEmpty() ||
+                                    (!forceIp && ip.isEmpty()) ||
+                                    sni.isEmpty() ||
+                                    domains.isEmpty()
+                                ) {
+                                    continue
+                                }
+                                add(FrontingGroup(name, ip, sni, domains, forceIp, verifyNames))
                             }
                         }
                     }.orEmpty(),
