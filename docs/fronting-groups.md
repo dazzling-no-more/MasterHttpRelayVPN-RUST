@@ -47,7 +47,7 @@ mirrors the same coverage as the curated bundle below.
 ## Curated bundle (no-typing path)
 
 The binary ships [`assets/fronting-groups/curated.json`](../assets/fronting-groups/curated.json)
-with ten groups derived from the
+with eleven groups derived from the
 [`patterniha/MITM-DomainFronting`](https://github.com/patterniha/MITM-DomainFronting)
 Xray config — the same set of (sni, edge IP, member-domain) tuples that
 project's author has tested in the field:
@@ -62,11 +62,12 @@ project's author has tested in the field:
 | `fastly` | `pypi.org` | `reddit.com`, `cnn.com`, `pinterest.com`, `buzzfeed.com`, `githubusercontent.com`, `pypi.org`, … (40 domains) |
 | `amazon-cloudfront` | `kubernetes.io` | `netlify.app`, `netlify.com` |
 | `pubmed` | `pubmed.ncbi.nlm.nih.gov` | `pmc.ncbi.nlm.nih.gov` |
+| `youtube-web` ⚡ | `www.google.com` (camouflage) | `youtube.com`, `youtu.be`, `youtube-nocookie.com`, `ytimg.com`, `youtubei.googleapis.com` — the YouTube web app + feed API + thumbnails |
 | `google-video` ⚡ | `www.google.com` (camouflage) | `googlevideo.com` — YouTube's video CDN (the EVA edge) |
 | `meta` ⚡ | `www.microsoft.com` (camouflage) | `instagram.com`, `cdninstagram.com`, `whatsapp.com`/`.net`, `facebook.com`/`.net`, `fbcdn.net`, `threads.net`, `messenger.com` |
 
-⚡ = **camouflage mode** (`force_ip: true`). These two edges have no
-shared front IP you can pin, so they use a different mechanism — see
+⚡ = **camouflage mode** (`force_ip: true`). These edges have no shared
+front IP you can pin, so they use a different mechanism — see
 [Camouflage mode](#camouflage-mode-force_ip--for-edges-with-no-shared-front)
 below.
 
@@ -107,14 +108,16 @@ into place, or splice the `fronting_groups` array from
 ## Camouflage mode (`force_ip`) — for edges with no shared front
 
 The pinned-`ip` model above only works on edges that let you front
-*other* tenants through one shared IP (Vercel, Fastly, CloudFront). Two
-high-value targets don't:
+*other* tenants through one shared IP (Vercel, Fastly, CloudFront).
+Several high-value targets don't:
 
-- **YouTube video** (`googlevideo.com`) lives on Google's separate "EVA"
-  edge, not the GFE that `www.google.com` resolves to. Pinning a GFE IP
-  and sending `Host: …googlevideo.com` returns a wrong-cert / wrong-edge
-  error — this is exactly why `googlevideo.com` was pulled from the
-  built-in SNI-rewrite list in v1.7.6.
+- **YouTube** — both the video CDN (`googlevideo.com`, on Google's
+  separate "EVA" edge) and the web app / feed API (`youtube.com`,
+  `youtubei.googleapis.com`, `ytimg.com`). Pinning a GFE IP and sending
+  `Host: …googlevideo.com` returns a wrong-cert / wrong-edge error — this
+  is exactly why `googlevideo.com` was pulled from the built-in
+  SNI-rewrite list in v1.7.6. The web app additionally needs HTTP/2 (see
+  below), which the pinned/SNI-rewrite paths can't provide.
 - **Meta** (Instagram / WhatsApp / Facebook) has no neutral shared front
   you can pin either.
 
@@ -127,8 +130,10 @@ mode**:
   "name": "meta",
   "sni": "www.microsoft.com",   // FAKE — only to blind the on-path DPI
   "domains": ["instagram.com", "whatsapp.com", "facebook.com", "..."],
-  "force_ip": true              // <-- the switch
-  // "verify_names": [...]      // optional; default = verify the real host
+  "force_ip": true,             // <-- the switch
+  "verify_names": ["www.microsoft.com"]  // extra accepted cert name(s) —
+                                // the real host is ALWAYS accepted too;
+                                // pin the decoy SNI's name here (see #3)
 }
 ```
 
@@ -143,13 +148,19 @@ What changes when `force_ip: true`:
 2. **Send a fake SNI.** The `sni` (`www.microsoft.com`,
    `www.google.com`) is put on the wire purely so the DPI box sees a
    benign, allow-listed name and lets the handshake through.
-3. **Verify the *real* cert.** The cert the real edge returns is
-   validated — against the actual destination host by default, or
-   against an explicit `verify_names` allow-list if you set one
-   (patterniha's `verifyPeerCertByName`). A wrong/poisoned IP can't
-   present a valid cert for the real host, so it **fails closed** rather
-   than splicing you into a hostile peer. The fake SNI never weakens
-   this: the certificate, not the SNI, is the trust anchor.
+3. **Verify the cert.** The cert the real edge returns is validated —
+   always against the actual destination host, **plus** any names pinned
+   in `verify_names` (patterniha's `verifyPeerCertByName`). The pinned
+   names matter because some edges answer with a cert matching the *SNI
+   you sent* rather than the inner Host — Google's GFE returns a
+   `www.google.com` cert for a `www.google.com`-SNI handshake — so the
+   curated `youtube-web` / `google-video` groups pin `www.google.com` and
+   `meta` pins `www.microsoft.com`. Either way it's full webpki chain
+   validation against a name owned by the legitimate destination (or the
+   decoy provider); a wrong/poisoned IP can't present any valid public
+   cert, so it **fails closed** rather than splicing you into a hostile
+   peer. The fake SNI never weakens this: the certificate, not the SNI,
+   is the trust anchor.
 
 > **Security review note (maintainers):** camouflage mode is the only
 > fronting path that verifies the cert against a name *other* than the
@@ -160,6 +171,16 @@ What changes when `force_ip: true`:
 > verifier before shipping in a release.** Camouflage groups only
 > activate when at least one `force_ip` group is present (the DoH
 > resolver is built lazily); existing pinned groups are unaffected.
+
+**HTTP/2 across the splice.** Camouflage dials the upstream offering
+`h2` + `http/1.1`, sees which the real edge picked, and then presents the
+browser *exactly that* protocol — so the raw byte-splice stays
+protocol-coherent end to end. This is why `youtube-web` is a camouflage
+group rather than a pinned/SNI-rewrite route: YouTube's web app (the feed
+/ infinite scroll) is built for HTTP/2 multiplexing and stalls — "spins,
+nothing loads" — when forced through the relay/SNI-rewrite path, which is
+locked to HTTP/1.1 because those paths parse HTTP. The pinned and
+built-in Google paths remain http/1.1-only.
 
 When camouflage mode helps and when it doesn't: it defeats **SNI-based**
 blocking only. If an ISP IP-blocks the destination outright, neither

@@ -962,11 +962,11 @@ pub struct FrontingGroupResolved {
     /// the real destination host (or `verify_names` when set). See
     /// [`FrontingGroup::force_ip`].
     pub force_ip: bool,
-    /// Normalized explicit cert-name allow-list for camouflage mode.
-    /// Empty (the default) means "verify against the actual per-request
-    /// destination host", which is correct for arbitrary subdomains
-    /// (`scontent-x.cdninstagram.com` etc.). A non-empty list pins the
-    /// accepted names verbatim — patterniha's `verifyPeerCertByName`.
+    /// Normalized extra cert names for camouflage mode, accepted *in
+    /// addition to* the real per-request destination host (always
+    /// accepted). Used to pin the decoy SNI's own name for edges that
+    /// return a cert matching the SNI rather than the Host. See
+    /// [`FrontingGroup::verify_names`].
     pub verify_names: Vec<String>,
 }
 
@@ -4241,25 +4241,47 @@ async fn do_camouflage_tunnel(
         return Err(sock);
     }
 
-    // Verify the upstream cert against the real destination host (the
-    // cert the EVA/Meta edge actually serves), or the explicit allow-list
-    // when the group pins one. The SNI on the wire stays the decoy `sni`.
-    let verify: Vec<String> = if group.verify_names.is_empty() {
-        vec![host.to_ascii_lowercase()]
-    } else {
-        group.verify_names.clone()
-    };
-    let connector = match crate::camouflage::build_camouflage_connector(&verify) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!(
-                "force_ip group '{}': camouflage connector build failed: {}",
-                group.name,
-                e
-            );
-            return Err(sock);
+    // Peek (non-consuming) the browser's ClientHello to learn which ALPN
+    // protocols it offered. We then offer the upstream only those, and
+    // later hand the browser exactly the one the upstream picked — so the
+    // raw splice's two TLS legs always agree on protocol. This is what
+    // lets YouTube's web app run over HTTP/2 (it stalls/spins over forced
+    // http/1.1). Peeking keeps the socket intact for fall-through; a
+    // failed/partial peek degrades to http/1.1 on both legs (never a
+    // mismatch). 8 KiB covers a normal ClientHello in one segment.
+    let browser_alpn = {
+        let mut peek = [0u8; 8192];
+        match tokio::time::timeout(std::time::Duration::from_millis(500), sock.peek(&mut peek))
+            .await
+        {
+            Ok(Ok(n)) if n > 0 => crate::camouflage::client_hello_alpn(&peek[..n]),
+            _ => None,
         }
     };
+    let upstream_offer = crate::camouflage::choose_upstream_alpn(browser_alpn.as_deref());
+
+    // Always accept a cert for the real requested host, AND any names the
+    // group pins via `verify_names`. The pinned names matter because some
+    // edges return a cert matching the decoy SNI we sent (e.g. Google's
+    // GFE returns a `www.google.com` cert) rather than one for the inner
+    // Host — so we accept either. Every name here is owned by the
+    // legitimate destination (or the decoy provider, e.g. Google /
+    // Microsoft), so a censor MITM — which can't present any valid public
+    // cert — still fails closed regardless.
+    let mut verify: Vec<String> = vec![host.to_ascii_lowercase()];
+    verify.extend(group.verify_names.iter().cloned());
+    let connector =
+        match crate::camouflage::build_camouflage_connector_with_alpn(&verify, &upstream_offer) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(
+                    "force_ip group '{}': camouflage connector build failed: {}",
+                    group.name,
+                    e
+                );
+                return Err(sock);
+            }
+        };
 
     // Dial the candidate IPs CONCURRENTLY and take the first that completes
     // the camouflaged handshake. Done BEFORE touching the browser socket so
@@ -4317,12 +4339,20 @@ async fn do_camouflage_tunnel(
     // Reached a working edge — clear any stale breaker mark.
     camouflage_note_reachable(&group.name);
 
+    // Which protocol did the real edge negotiate? Offer the browser
+    // exactly that so the spliced legs stay coherent. Default to
+    // http/1.1 when the edge negotiated no ALPN.
+    let negotiated_alpn: Vec<Vec<u8>> = match outbound.get_ref().1.alpn_protocol() {
+        Some(p) => vec![p.to_vec()],
+        None => vec![b"http/1.1".to_vec()],
+    };
+
     // Upstream is up. Mint the MITM leaf and accept the browser TLS. A
     // cert-gen failure can still fall through (sock not yet consumed);
     // once `accept` consumes the socket a browser-side failure cannot.
     let server_config = {
         let mut m = mitm.lock().await;
-        match m.get_server_config(host) {
+        match m.get_server_config_alpn(host, &negotiated_alpn) {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(

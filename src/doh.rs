@@ -94,6 +94,7 @@ impl DohEndpoint {
         verify_names: &[String],
         path: &'static str,
     ) -> Result<Self, String> {
+        // No ALPN: DoH is a plain HTTP/1.1 GET, and we read to EOF.
         let connector = crate::camouflage::build_camouflage_connector(verify_names)?;
         let server_name = ServerName::try_from(sni.to_string())
             .map_err(|e| format!("invalid sni '{}': {}", sni, e))?;

@@ -145,8 +145,36 @@ impl MitmCertManager {
     }
 
     /// Return a rustls ServerConfig for the given domain, ALPN ["http/1.1"].
+    /// Used by the relay / HTTP-forward paths, which parse HTTP/1.1 and so
+    /// must never negotiate h2.
     pub fn get_server_config(&mut self, domain: &str) -> Result<Arc<ServerConfig>, MitmError> {
-        if let Some(cfg) = self.cache.get(domain) {
+        self.get_server_config_alpn(domain, &[b"http/1.1".to_vec()])
+    }
+
+    /// Like [`get_server_config`] but with a caller-chosen ALPN list. The
+    /// camouflage / SNI-rewrite *splice* paths use this to offer the
+    /// browser exactly the protocol the upstream negotiated (h2 or
+    /// http/1.1), keeping the two TLS legs protocol-coherent across the
+    /// raw byte splice. Cached per (domain, ALPN) so the leaf cert is
+    /// reused across the small number of ALPN variants a host uses.
+    pub fn get_server_config_alpn(
+        &mut self,
+        domain: &str,
+        alpn: &[Vec<u8>],
+    ) -> Result<Arc<ServerConfig>, MitmError> {
+        // Cache key = domain + each ALPN protocol, NUL-separated. NUL
+        // can't appear in a hostname or an ALPN token, so distinct
+        // (domain, alpn) inputs can't collide onto the same key.
+        let cache_key = {
+            let mut k = String::with_capacity(domain.len() + 16);
+            k.push_str(domain);
+            for p in alpn {
+                k.push('\x00');
+                k.push_str(&String::from_utf8_lossy(p));
+            }
+            k
+        };
+        if let Some(cfg) = self.cache.get(&cache_key) {
             return Ok(cfg.clone());
         }
         let (leaf_der, leaf_key_der) = self.issue_leaf(domain)?;
@@ -157,9 +185,9 @@ impl MitmCertManager {
         let mut cfg = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(chain, key)?;
-        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        cfg.alpn_protocols = alpn.to_vec();
         let arc = Arc::new(cfg);
-        self.cache.insert(domain.to_string(), arc.clone());
+        self.cache.insert(cache_key, arc.clone());
         Ok(arc)
     }
 
