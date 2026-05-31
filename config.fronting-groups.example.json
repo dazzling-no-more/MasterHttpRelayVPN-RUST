@@ -147,12 +147,30 @@
       ]
     },
     {
+      "name": "youtube-web",
+      "sni": "www.google.com",
+      "domains": [
+        "youtube.com",
+        "youtu.be",
+        "youtube-nocookie.com",
+        "ytimg.com",
+        "youtubei.googleapis.com"
+      ],
+      "force_ip": true,
+      "verify_names": [
+        "www.google.com"
+      ]
+    },
+    {
       "name": "google-video",
       "sni": "www.google.com",
       "domains": [
         "googlevideo.com"
       ],
-      "force_ip": true
+      "force_ip": true,
+      "verify_names": [
+        "www.google.com"
+      ]
     },
     {
       "name": "meta",
@@ -169,7 +187,10 @@
         "whatsapp.com",
         "whatsapp.net"
       ],
-      "force_ip": true
+      "force_ip": true,
+      "verify_names": [
+        "www.microsoft.com"
+      ]
     }
   ]
 }

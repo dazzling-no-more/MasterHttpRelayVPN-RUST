@@ -150,6 +150,9 @@ mod tests {
             "pmc.ncbi.nlm.nih.gov",
             // Camouflage (force_ip) routes — patterniha v22 parity.
             "googlevideo.com",
+            "youtube.com",
+            "youtubei.googleapis.com",
+            "ytimg.com",
             "instagram.com",
             "whatsapp.com",
             "facebook.com",
@@ -214,6 +217,10 @@ mod tests {
             // Camouflage (force_ip) routes.
             ("r1---sn-aigl6n7e.googlevideo.com", "google-video"),
             ("googlevideo.com", "google-video"),
+            ("www.youtube.com", "youtube-web"),
+            ("youtube.com", "youtube-web"),
+            ("i.ytimg.com", "youtube-web"),
+            ("youtubei.googleapis.com", "youtube-web"),
             ("scontent.cdninstagram.com", "meta"),
             ("www.instagram.com", "meta"),
             ("web.whatsapp.com", "meta"),

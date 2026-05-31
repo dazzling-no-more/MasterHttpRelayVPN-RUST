@@ -1046,14 +1046,19 @@ pub struct FrontingGroup {
     /// `false` (the original pinned-front behaviour).
     #[serde(default, skip_serializing_if = "is_false")]
     pub force_ip: bool,
-    /// Cert names accepted in camouflage mode (`force_ip = true`). The
-    /// upstream cert must be valid for at least one. **Empty (the
-    /// default) = verify against the actual per-request destination
-    /// host** — correct for arbitrary subdomains like
-    /// `scontent-x.cdninstagram.com` where a fixed apex wouldn't match a
-    /// `*.cdninstagram.com` cert. Set an explicit list only to pin
-    /// names verbatim (patterniha's `verifyPeerCertByName`). Ignored
-    /// when `force_ip = false`.
+    /// Extra cert names accepted in camouflage mode (`force_ip = true`),
+    /// *in addition to* the real per-request destination host (which is
+    /// always accepted — correct for arbitrary subdomains like
+    /// `scontent-x.cdninstagram.com`). Pin the decoy SNI's own name here
+    /// when an edge returns a cert matching the SNI you sent rather than
+    /// the inner Host — e.g. Google's GFE answers a `www.google.com`-SNI
+    /// handshake with a `www.google.com` cert, so the curated
+    /// `youtube-web` / `google-video` groups pin `www.google.com` and
+    /// `meta` pins `www.microsoft.com` (mirrors patterniha's
+    /// `verifyPeerCertByName`). Every entry must be a name owned by the
+    /// legitimate destination or decoy provider — a censor can't forge any
+    /// valid public cert, so this stays fail-closed. Empty = accept only
+    /// the real host. Ignored when `force_ip = false`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verify_names: Vec<String>,
 }
